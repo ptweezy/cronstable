@@ -24,7 +24,7 @@ Installing the `cronstable` distribution pulls in the following, taken from
 | Dependency | Version constraint |
 | --- | --- |
 | `strictyaml` | `>=1.7.3,<2` |
-| `aiohttp` | `>=3.14.4,<4` |
+| `aiohttp` | `>=3.14.5,<4` |
 | `sentry-sdk` | `>=2.71.0,<3` |
 | `aiosmtplib` | `>=5.1.3,<6` |
 | `jinja2` | `>=3.1.6,<4` |
@@ -241,6 +241,10 @@ This installs the self-contained release binary for your platform (signed and
 notarized on macOS; glibc `amd64`/`arm64` from Homebrew on Linux), so no Python
 is required. Upgrade later with `brew upgrade cronstable`.
 
+macOS has neither cgroup v2 nor Job Objects, so
+[`resourceLimits`](Resource-Limits) caps are not enforced there. On Linux,
+the caps need a delegated cgroup.
+
 ## Install using WinGet
 
 On Windows, install the
@@ -303,7 +307,7 @@ configuration:
 | Path | Contents |
 | --- | --- |
 | `/usr/bin/cronstable` | The binary. |
-| `/usr/lib/systemd/system/cronstable.service` | The service unit, running as the `cronstable` user. |
+| `/usr/lib/systemd/system/cronstable.service` | The service unit, running as the `cronstable` user. `Delegate=memory pids` hands cronstable the unit's cgroup with the memory and pids controllers, so each run of a job with [`resourceLimits`](Resource-Limits) can get a cgroup of its own with memory and process caps, and cronstable and its jobs share CPU with the other system services by nice value. CPU caps need `Delegate=yes` in a drop-in (see [CPU caps and priority](Resource-Limits#cpu-caps-and-priority)). `OOMPolicy=continue`, which systemd 243 and later already give a delegated unit, keeps the service running when a job is killed at its own memory cap. |
 | `/etc/cronstable.d/cronstable.yaml` | Starter configuration, marked as a config file, so your edits survive an upgrade. |
 | `/var/lib/cronstable` | The durable store, created by systemd on first start. |
 
@@ -334,6 +338,15 @@ The packages declare the glibc version their binary needs, so a host too old for
 a given architecture refuses the install rather than failing at first run.
 Removing the package leaves `/etc/cronstable.d` and `/var/lib/cronstable` in
 place; delete them by hand when you mean to drop the schedule and its history.
+
+Resource caps need the unified cgroup v2 hierarchy. On a cgroup v1 host, the
+caps are not enforced, and cronstable logs why when it loads the capped jobs.
+systemd before 243 has no `OOMPolicy=` key: it logs a warning about the line
+and ignores it. systemd before 236 cannot parse `Delegate=memory pids` and
+leaves the unit undelegated; on such a host, set `Delegate=yes` in a drop-in.
+On systemd before 240, `systemctl reload cronstable` fails once a
+configuration with a capped job has loaded; see
+[the packaged systemd unit](Resource-Limits#the-packaged-systemd-unit).
 
 Both formats are vendor packages built from the release binary. They are not in
 Debian or Fedora proper and carry no distribution changelog or copyright file.
@@ -379,6 +392,10 @@ interrupting running jobs. The service runs under `supervise-daemon`, so a crash
 is restarted, and stopping it gives cronstable two minutes to drain its running
 jobs before they are killed (`cronstable_retry` in `/etc/conf.d/cronstable`).
 
+The OpenRC service does not delegate a cgroup to the `cronstable` user, so
+[`resourceLimits`](Resource-Limits) caps are not enforced under it, and the
+daemon logs why.
+
 Most Alpine users run the [container image](#run-with-docker) instead, which is
 built on the same musl base.
 
@@ -415,6 +432,10 @@ service cronstable status
 `service cronstable reload` sends `SIGHUP` to reparse the configuration in
 place. Settings live in `/etc/rc.conf`: `cronstable_config`, `cronstable_user`,
 `cronstable_statedir` and `cronstable_flags`.
+
+FreeBSD has neither cgroup v2 nor Job Objects, so
+[`resourceLimits`](Resource-Limits) caps are not enforced there, and each
+configuration load logs a warning that names the capped jobs.
 
 ## Install using ubi or mise
 

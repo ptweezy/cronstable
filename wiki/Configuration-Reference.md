@@ -82,7 +82,7 @@ push: { ... }       # optional: E2E-encrypted push alerts (relay + device regist
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `listen` | `Seq(Str)` | required | Listen URLs, such as `http://127.0.0.1:8080`, `https://0.0.0.0:8443`, or `unix:///tmp/cronstable.sock`. `http://` and `https://` listeners work everywhere, and a list may mix schemes, each address serving the same app over its own transport. An `https://` entry needs the later `tls.cert`/`tls.key` keys, and both a host and a port. Windows does not support `unix://` listeners (the Proactor loop lacks `create_unix_server`); they are skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. See [running on Windows](Running-on-Windows) and [listener TLS](Listener-TLS). |
-| `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. A `Content-Type` entry (in any spelling) is ignored: every endpoint owns its own content type. |
+| `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. A `Content-Type` entry (in any spelling) is ignored: every endpoint owns its own content type. Some routes set headers themselves, such as `ETag`, `Vary`, and `Cache-Control`, and an entry can't replace those; see [response headers](HTTP-API#response-headers). |
 | `allowedOrigins` | `Seq(Str)` | `[]` | Extra exact-match browser `Origin`s allowed to call the **mutating** endpoints: every mutating (non-GET/HEAD/OPTIONS) route except `/mcp`, such as job start/cancel/pause/resume, DAG trigger/backfill/recover, task decisions, `/push/devices`, and `/shutdown`. Cross-site browser requests to them are refused `403` as a CSRF/DNS-rebinding defense. Same-origin requests (the served dashboard) and clients that send no `Origin` (curl, monitoring) always pass. `/mcp` keeps enforcing its own `mcp.allowedOrigins`. A `headers` entry of `Access-Control-Allow-Origin: <origin>` allow-lists that origin implicitly. `Access-Control-Allow-Origin: "*"` disables the check (logged loudly). |
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable does not start the web API (it logs the error; scheduled jobs keep running). `--validate-config` does not resolve token sources, so it does not catch this. |
 | `authTokens` | `Seq(Map)`, each with the `authToken` source triple, `scopes` (`Seq` of `view`/`control`/`approve`/`params`), and an optional `label` | none | Multiple named bearer tokens with per-token scopes (`control`, `approve`, and `params` imply `view`). `params` lets a token that also holds `control` choose [run parameter](Orchestration-and-DAGs#run-parameters) values. `label` identifies a token in logs and lets you revoke it by dropping the entry and reloading. Tokens must resolve nonempty and be distinct from each other and from `authToken`. See [HTTP control API](HTTP-API#authentication). |
@@ -93,6 +93,7 @@ push: { ... }       # optional: E2E-encrypted push alerts (relay + device regist
 | `tls.clientCa` | `EmptyNone() \| Str` | none | Path to a CA. When set, every `https://` listener **requires** a client certificate signed by it (mutual TLS) and rejects the handshake otherwise. Unset, the listener does no client authentication. That CA file is the caller allowlist, because a server does no hostname verification. Point it at a dedicated CA issued only to cronstable clients, never a shared organizational one. Requires `tls.cert`/`tls.key`. Also satisfies the `mcp.enabled` no-token gate on an `https://` listener (see [`mcp`](#mcp) later). |
 | `ui` | `Bool` | `true` | Serve the browser dashboard at `/`. `ui: false` omits the dashboard page while every JSON endpoint keeps working, for an API-only deployment. See [web dashboard](Web-Dashboard). |
 | `metrics` | `Bool \| Map` with `enabled` / `public` (each `Bool`) and `durationBuckets` (`Seq(Float)`) | enabled | The Prometheus `GET /metrics` endpoint, served by default whenever the web API is on. `metrics: false` (the bool form) disables it. The map form sets `enabled` (default `true`), `public` (default `false`, exempting only `/metrics` from `authToken`), and `durationBuckets` (histogram bounds in seconds; must be finite, positive, and strictly increasing, else a `ConfigError`). See [metrics with Prometheus](Metrics-with-Prometheus). |
+| `badges` | `Bool \| Map` with `enabled` / `public` (each `Bool`) | enabled | The SVG status badges at `GET /badge.svg` and `GET /jobs/{name}/badge.svg`, served by default whenever the web API is on. `badges: false` (the bool form) disables both routes. The map form sets `enabled` (default `true`) and `public` (default `false`). `public: true` exempts only the two badge routes from `authToken`, sends `Cross-Origin-Resource-Policy: cross-origin` in place of `same-origin`, and leaves out `frame-ancestors` and `X-Frame-Options`, so an image proxy can fetch the badges without a token and pages on other origins can load them. See [status badges](Status-Badges). |
 | `nodeHistory` | `Bool \| Map` with `enabled` (`Bool`), `interval` (`Float`), and `points` (`Int`) | enabled | Background node CPU/memory sampling for the dashboard's node history chart, served by `GET /node/history`. On by default whenever the web API is on; `nodeHistory: false` disables the sampling task. The map form sets `interval` (seconds between samples, default `5.0`, minimum `1.0`) and `points` (ring size, default `720`, the last hour at the default cadence; 10–50000). The ring is in-memory only and follows the web app's lifecycle. |
 | `bonjour` | `Bool \| Map` with `enabled` (`Bool`) and `name` (`Str`) | off | Opt-in zero-config LAN discovery: advertises the web API as a `_cronstable._tcp` mDNS/Bonjour service so a companion app on the same network finds the daemon without a typed URL. Requires the `discovery` extra (python-zeroconf) and at least one TCP listen address; enabling it without the library is a `ConfigError`, never a silent no-advert. The map form overrides the advertised instance name. See [LAN discovery](LAN-Discovery). |
 
@@ -492,9 +493,9 @@ constraints. For `xcom`, the text is compared as it is and holds at most
 Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,
 `maxLineLength`, `streamPrefix`, `failsWhen`, `executionTimeout`,
-`killTimeout`, `priority`, `statsd`, `user` / `group`, `env_file`,
-`workingDirectory`, `secrets`, `stateAllowedScopes`, `verify`, `pool`,
-`poolSlots`, `queuePriority`, `queueTimeout`, and report-only
+`killTimeout`, `priority`, `resourceLimits`, `statsd`, `user` / `group`,
+`env_file`, `workingDirectory`, `secrets`, `stateAllowedScopes`, `verify`,
+`pool`, `poolSlots`, `queuePriority`, `queueTimeout`, and report-only
 `onFailure` / `onSuccess` hooks (each accepts a `report` block that fires on
 the task's runs; there is no `onFailure.retry` on a task, because a task's
 attempts come from the node's `retries` field listed earlier). Where a task's
@@ -836,9 +837,18 @@ Raising a priority (any level whose nice sits below cronstable's own; from the
 usual nice 0 that means `above-normal` and `high`) needs `CAP_SYS_NICE` or
 `RLIMIT_NICE` headroom on POSIX. The daemon says so once, at config load,
 naming the job. If the kernel then refuses the renice, cronstable does **not**
-fail the run. The job runs at the priority it inherited, and the refusal is
-logged at `DEBUG`. Windows hands every one of these classes to an unprivileged
-account, so nothing is refused there.
+fail the run. The job's processes keep the nice value they inherited, and the
+refusal is logged at `DEBUG`. Windows hands every one of these classes to an
+unprivileged account, so nothing is refused there.
+
+On Linux, a nice value orders a job only against the processes in its CPU
+group. Under the packaged systemd unit, that group holds the system's
+services. A unit with `Delegate=yes` makes cronstable a group of its own.
+With the cpu controller delegated that way, each run is a group of its own
+while a job has a `resourceLimits.cpu` cap, and its CPU weight follows its
+`priority`, even when the kernel refuses the renice. That weight orders the
+run only against cronstable's other runs, within cronstable's own share. See
+[priority and Linux CPU groups](Commands-and-Environment#priority-and-linux-cpu-groups).
 
 `realtime` is deliberately not on the list. On Windows that class outranks the
 threads that service disk, keyboard, and mouse, so a runaway job at `REALTIME`
@@ -847,6 +857,34 @@ can put the host out of reach of the operator who has to stop it.
 See [commands and environment](Commands-and-Environment#priority).
 [Running on Windows](Running-on-Windows#process-priority) shows how the levels
 line up with Task Scheduler's `-Priority` numbers.
+
+### Resource limits
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `resourceLimits` | `Map` | none | Per-run caps on CPU, memory, and process count, enforced by the kernel through a cgroup per run on Linux (cgroup v2) and a Job Object per run on Windows. Takes the four keys in the following rows. Merges key by key under `defaults:`. A map that sets no cap, or sets every cap to `max`, means no caps. Part of the [job-set ID](Job-Set-ID) only when set, with normalized values. See [resource limits](Resource-Limits). |
+| `resourceLimits.cpu` | `Str` (a number, or `max`) | none | CPU cap in CPUs, like `docker run --cpus`: `1.5` allows one and a half CPUs' worth of CPU time on any number of cores. Python `float()` syntax with ASCII digits, from `0.01` to `1000000`. A run at the cap is throttled and does not fail for it. |
+| `resourceLimits.memory` | `Str` (a size, or `max`) | none | Memory cap. A byte count, or a number with a `B`, `K`, `M`, `G`, or `T` unit; `K`, `M`, `G`, and `T` can be followed by `i`, `B`, or `iB`. Units are case-insensitive powers of 1024, such as `512M` or `1.5GiB`. At least 1 MiB and below 8 EiB. Linux counts cgroup memory and Windows the commit charge. A run that goes over the cap is killed with all its processes and fails with `memory limit exceeded (<cap>)`, whatever `failsWhen` says. |
+| `resourceLimits.processes` | `Str` (a whole number, or `max`) | none | The most processes the run can have at once, from `1` to `4194304`. On Linux, threads count too. |
+| `resourceLimits.required` | `Bool` | `false` | Fail a run whose caps the host cannot enforce, with `resource limits could not be enforced: <reason> (resourceLimits.required is set)`, instead of running it uncapped. |
+
+Every cap accepts `max` in any letter case, which also lifts a cap inherited
+from `defaults:`. A bare `resourceLimits:` cannot clear an inherited map. The
+schema reads each cap as text, so a `${VAR}` value follows the same rules as a
+literal; `required` is a boolean and takes no `${VAR}`. An unreadable value
+is a `ConfigError` that names the key, such as
+`Job <name>: resourceLimits.memory: cannot read '512X' as a size; ...`.
+Approval gates reject `resourceLimits` and ignore one inherited from
+`defaults:`.
+
+On Linux the caps need cgroup v2 and a cgroup delegated to cronstable; the
+packaged systemd unit sets `Delegate=memory pids` and `OOMPolicy=continue`,
+and CPU caps need `Delegate=yes` in a drop-in. Windows needs no setup. macOS,
+the BSDs, and illumos cannot enforce caps, and each config load there logs
+one warning that names the capped jobs. Where the host cannot enforce a cap,
+the run goes ahead without it, its record says so, and the daemon logs one
+warning for each change. Full feature guide:
+[resource limits](Resource-Limits).
 
 ### Metrics
 
@@ -923,7 +961,9 @@ node sampler entirely.
 strictyaml enforces only the type (`Int`/`Float`). After type validation,
 `JobConfig._validate_numeric_ranges` enforces value ranges (plus one
 cross-field rule) and raises a `ConfigError` (prefixed `Job <name>:`) on
-violation. These checks run at load time, not at run time.
+violation. `JobConfig._validate_resource_limits` checks the `resourceLimits`
+rows the same way after it reads each cap from its text. These checks run at
+load time, not at run time.
 
 | Rule | Condition |
 | --- | --- |
@@ -942,6 +982,9 @@ violation. These checks run at load time, not at run time.
 | an `onLate` reporter requires an `sla` threshold | when a reporter is configured (a mail `to`/`from`, a sentry `dsn`, a shell `command`, a webhook `url`, or an enabled `push` or `eventlog` block) while all three `sla` keys are unset |
 | `monitorResources.interval >= 0.1` | always (a sub-100ms cadence would busy-loop the process-table walk) |
 | `0 <= monitorResources.history <= 2000` | always (bounds what one run adds to a durable ledger record) |
+| `0.01 <= resourceLimits.cpu <= 1000000` | only when `cpu` is a number (the floor is the kernel's smallest `cpu.max` quota, 1 ms per 100 ms period) |
+| `1 MiB <= resourceLimits.memory < 8 EiB` | only when `memory` is a size (the ceiling keeps the cap inside a signed 64-bit field) |
+| `1 <= resourceLimits.processes <= 4194304` | only when `processes` is a number (4194304 is the largest `pids.max` a 64-bit Linux kernel accepts; a 32-bit kernel accepts up to 32768) |
 
 ## Minimal valid example
 

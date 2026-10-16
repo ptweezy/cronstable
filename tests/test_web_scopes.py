@@ -774,6 +774,8 @@ async def test_anonymous_view_end_to_end(caplog):
                     # this process, and no listeners: the grant leaves
                     # the bind addresses out
                     "instance": cron._web_instance,
+                    # other origins need web.badges.public
+                    "badges": {"public": False, "dashboard": True},
                 }
                 assert resp.headers[INSTANCE_HEADER] == cron._web_instance
             # ...but cannot act, on any of the three mutating gates

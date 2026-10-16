@@ -581,6 +581,39 @@ async def test_job_resources_series_and_not_found():
     assert result["isError"] is True
 
 
+async def test_job_resources_tool_names_the_caps():
+    h = _handler()
+    tools = {
+        t["name"]: t for t in (await _req(h, "tools/list"))["result"]["tools"]
+    }
+    description = tools["cron_get_job_resources"]["description"]
+    assert "resourceLimits" in description
+    assert "limits record" in description
+    # the payload carries the caps slot even for an uncapped job
+    result = await _call(h, "cron_get_job_resources", {"name": "heavy"})
+    assert result["structuredContent"]["limits"] is None
+
+
+async def test_node_tool_reports_the_limits_capability(monkeypatch):
+    from cronstable import limits
+    from cronstable.limits import Capability
+
+    class _Manager:
+        def capability(self):
+            return Capability(False, None, frozenset(), "no cgroup", "hint")
+
+    monkeypatch.setattr(limits, "_MANAGER", _Manager())
+    h = _handler()
+    result = await _call(h, "cron_get_node", {})
+    assert result["structuredContent"]["limits"] == {
+        "available": False,
+        "mechanism": None,
+        "resources": [],
+        "reason": "no cgroup",
+        "hint": "hint",
+    }
+
+
 async def test_cluster_fleet_and_node_views():
     h = _handler()
     result = await _call(h, "cron_get_cluster")

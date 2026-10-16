@@ -3,6 +3,9 @@
 # the POSIX release lanes share one gate. Windows runs the same checks in
 # pwsh (binaries-windows).
 #
+# Every row first runs check_bundle.sh, which fails when the bundle lacks a
+# cap backend; Windows runs it on each layout it ships.
+#
 # The push-plus-bonjour config validates only when PyNaCl and zeroconf both
 # import inside the bundle, and a bundle whose build env kept cryptography
 # must seal xwing (see install_extra.sh header). A soft row that dropped a
@@ -23,6 +26,7 @@ bin=$1
 policy=${2:-soft}
 PY="${PY:-python}"
 
+PY="$PY" sh pyinstaller/check_bundle.sh "$bin"
 if [ "$policy" = hard ] || $PY -c "import nacl" 2>/dev/null; then
     "$bin" --validate-config -c pyinstaller/smoke-push.yaml
 fi

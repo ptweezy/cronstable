@@ -3156,6 +3156,30 @@ def test_mark_tasks_finished_batch_applies_and_fences():
     assert _state(body, "pk") == dag.RUNNING
 
 
+def test_mark_tasks_finished_records_limits_only_when_present():
+    spec = _spec(TaskSpec("capped"), TaskSpec("plain"))
+    body = _body(spec)
+    for tid in ("capped", "plain"):
+        body["tasks"][tid]["state"] = dag.RUNNING
+    record = {"enforced": True, "memory_exceeded": False, "unenforced": []}
+    marks = [
+        {
+            "taskkey": "capped", "success": True, "exit_code": 0,
+            "task": spec.by_id["capped"], "limits": record,
+        },
+        {
+            "taskkey": "plain", "success": True, "exit_code": 0,
+            "task": spec.by_id["plain"], "limits": None,
+        },
+    ]
+    _, applied = dag.mark_tasks_finished(marks, 5.0)(body)
+    assert set(applied) == {"capped", "plain"}
+    assert body["tasks"]["capped"]["limits"] == record
+    # an uncapped task keeps the entry shape
+    assert "limits" not in body["tasks"]["plain"]
+    assert set(body["tasks"]["plain"]) == set(dag._TASK_ENTRY)
+
+
 def test_mark_tasks_finished_none_body_and_all_dropped():
     spec = _spec(TaskSpec("a"))
     # None body -> keep, empty applied list.

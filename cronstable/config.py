@@ -13,7 +13,7 @@ import sys
 import threading
 import types
 from collections import Counter, OrderedDict
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, BinaryIO, Literal, NamedTuple, NewType
 from urllib.parse import ParseResult, urlparse
@@ -768,6 +768,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "statsd": None,
     "verify": None,
     "pool": None,
+    # per-run CPU, memory and process caps (see JobConfig.resourceLimits)
+    "resourceLimits": None,
 }
 
 # An SLA breach has no run to report on, so the onLate defaults swap the
@@ -1046,6 +1048,17 @@ _job_defaults_common = {
     Opt("verify"): EmptyNone()
     | Map({"command": Str() | Seq(Str()), Opt("timeout"): Float()}),
     Opt("pool"): EmptyNone() | Str(),
+    # Every cap arrives as text, so a literal and a ${VAR} value share one
+    # grammar; JobConfig reads them.  No EmptyNone(): mergedicts keeps an
+    # inherited map under a bare key, so `max` per cap is the opt-out.
+    Opt("resourceLimits"): Map(
+        {
+            Opt("cpu"): Str(),
+            Opt("memory"): Str(),
+            Opt("processes"): Str(),
+            Opt("required"): Bool(),
+        }
+    ),
 }
 
 _job_schema_dict = dict(_job_defaults_common)
@@ -1093,6 +1106,7 @@ _DAG_TASK_LAUNCH_KEYS = frozenset(
         "poolSlots",
         "queuePriority",
         "queueTimeout",
+        "resourceLimits",
     }
 )
 _dag_task_launch_fields = {
@@ -1280,6 +1294,17 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("enabled"): Bool(),
                         Opt("public"): Bool(),
                         Opt("durationBuckets"): Seq(Float()),
+                    }
+                ),
+                # SVG status badges at GET /badge.svg and
+                # GET /jobs/{name}/badge.svg (default on). The map form can
+                # make them public (no authToken), so a README or wiki can
+                # embed them. See cronstable/badge.py.
+                Opt("badges"): Bool()
+                | Map(
+                    {
+                        Opt("enabled"): Bool(),
+                        Opt("public"): Bool(),
                     }
                 ),
                 # node CPU/memory history ring for the dashboard's node chart
@@ -1561,6 +1586,147 @@ def _normalize_monitor_resources(raw: Any) -> tuple[bool, float, int]:
     return (bool(raw), SAMPLE_INTERVAL, MONITOR_HISTORY_DEFAULT)
 
 
+_BINARY_UNITS = ("B", "KiB", "MiB", "GiB", "TiB")
+
+
+def format_size(num_bytes: int) -> str:
+    """``num_bytes`` in binary units to one decimal: ``1023 B``, ``1 GiB``.
+
+    The unit is the smallest (TiB at most) whose rounded value stays below
+    1024.
+    """
+    if num_bytes < 1024:
+        return "{} B".format(int(num_bytes))
+    value = num_bytes / 1024
+    index = 1
+    text = "{:.1f}".format(value)
+    while float(text) >= 1024 and index < len(_BINARY_UNITS) - 1:
+        value /= 1024
+        index += 1
+        text = "{:.1f}".format(value)
+    return "{} {}".format(text.removesuffix(".0"), _BINARY_UNITS[index])
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceLimits:
+    """A job's normalized ``resourceLimits``: ``None`` fields are uncapped.
+
+    Defined here, not in :mod:`cronstable.limits`, so building a job loads
+    no runtime code.
+    """
+
+    cpu: float | None = None
+    memory: int | None = None
+    processes: int | None = None
+    required: bool = False
+
+    def describe(self) -> str:
+        """The caps as a phrase: ``1.5 CPUs, 512 MiB, 64 processes``."""
+        parts = []
+        if self.cpu is not None:
+            # fixed point, trailing zeros stripped: 1e6 reads 1000000
+            cpus = "{:f}".format(self.cpu).rstrip("0").rstrip(".")
+            parts.append("{} CPU{}".format(cpus, "" if cpus == "1" else "s"))
+        if self.memory is not None:
+            parts.append(format_size(self.memory))
+        if self.processes is not None:
+            parts.append(
+                "{} process{}".format(
+                    self.processes, "" if self.processes == 1 else "es"
+                )
+            )
+        return ", ".join(parts)
+
+    def to_payload(self) -> dict[str, Any]:
+        """The caps as the JSON object the API serves."""
+        return {
+            "cpu": self.cpu,
+            "memory_bytes": self.memory,
+            "processes": self.processes,
+            "required": self.required,
+        }
+
+
+#: ``resourceLimits`` bounds.  The CPU floor is the kernel's 1 ms ``cpu.max``
+#: quota per 100 ms period.  The ceilings keep each cap inside the fields
+#: that carry it: the backends' CPU arithmetic stays finite, ctypes
+#: truncates an oversized int silently, and ``pids.max`` takes at most
+#: PID_MAX_LIMIT (4194304 on a 64-bit kernel, 32768 on a 32-bit one).
+MIN_CPU_LIMIT = 0.01
+MAX_CPU_LIMIT = 1_000_000
+MIN_MEMORY_LIMIT = 1024 * 1024
+MAX_MEMORY_LIMIT = 2**63 - 1
+MAX_PROCESS_LIMIT = 4194304
+
+# 1 to 30 digits with single "_" separators, so int() stays far below
+# CPython's 4300-digit limit.
+_DIGITS = r"[0-9](?:_?[0-9]){0,29}"
+_WHOLE_RE = re.compile(r"[+-]?" + _DIGITS)
+_SIZE_RE = re.compile(
+    r"\+?({d}(?:\.(?:{d})?)?|\.{d})\s*(?:([kmgt])i?b?|b)?".format(d=_DIGITS),
+    re.ASCII | re.IGNORECASE,
+)
+_SIZE_SHIFTS = {"k": 10, "m": 20, "g": 30, "t": 40}
+
+
+def _parse_size(text: str) -> int | None:
+    """Bytes for ``512M``, ``1.5GiB``, ``2Gi`` or ``+4_096``, else None.
+
+    Every unit is a power of 1024 (Docker's ``--memory`` convention); the
+    arithmetic is exact, truncating toward zero.
+    """
+    match = _SIZE_RE.fullmatch(text)
+    if match is None:
+        return None
+    number, unit = match.groups()
+    whole, _, fraction = number.replace("_", "").partition(".")
+    shift = _SIZE_SHIFTS[unit.lower()] if unit else 0
+    scale: int = 10 ** len(fraction)
+    return (int(whole + fraction) << shift) // scale
+
+
+def _parse_cpu(text: str) -> float | None:
+    """CPUs in Python ``float()`` syntax with ASCII digits, else None."""
+    if not text.isascii():
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_processes(text: str) -> int | None:
+    """Python ``int(text, 10)`` syntax, 30 digits at most, else None."""
+    return int(text, 10) if _WHOLE_RE.fullmatch(text) else None
+
+
+#: Per ``resourceLimits`` key: the text reader, and the forms an error names.
+_LIMIT_READERS: dict[str, tuple[Callable[[str], Any], str]] = {
+    "cpu": (
+        _parse_cpu,
+        "a CPU count; use a number between {} and {}, such as 0.5 or 2".format(
+            MIN_CPU_LIMIT, MAX_CPU_LIMIT
+        ),
+    ),
+    "memory": (
+        _parse_size,
+        "a size; use a byte count or a number with a K, M, G, or T suffix "
+        "(powers of 1024), at least 1 MiB and below 8 EiB, such as 512M",
+    ),
+    "processes": (
+        _parse_processes,
+        "a process count; use a whole number between 1 and {}".format(
+            MAX_PROCESS_LIMIT
+        ),
+    ),
+}
+
+
+def limits_supported_os() -> bool:
+    """True on the OSes with a cap mechanism: Linux and Windows."""
+    return platform.IS_WINDOWS or sys.platform.startswith("linux")
+
+
 def _merge_lists(key: str, base: list, override: list) -> list:
     """Combine two list values under the defaults-merge rules.
 
@@ -1787,6 +1953,7 @@ class JobConfig:
         "executionTimeout",
         "killTimeout",
         "priority",
+        "resourceLimits",
         "statsd",
         "user",
         "group",
@@ -1799,6 +1966,7 @@ class JobConfig:
         "schedule_findings_json",
         "schedule_resolved_or_none",
         "sla_thresholds",
+        "limits_payload",
         # Memoized job digest, filled on demand by
         # cronstable.fingerprint.job_digest_cached (never by this class).
         "_digest",
@@ -1945,6 +2113,11 @@ class JobConfig:
         # the level is host-independent, and it changes how the job runs, so
         # replicas that disagree on it must show as drift.
         self.priority = config.pop("priority")
+        # Per-run caps, None when the job sets none.  Fingerprinted only when
+        # set, like priority.
+        self.resourceLimits: ResourceLimits | None = (
+            self._validate_resource_limits(config.pop("resourceLimits"))
+        )
         self.statsd = config.pop("statsd")
 
         self.uid: int | None = None
@@ -2004,6 +2177,11 @@ class JobConfig:
             {k: v for k, v in self.sla.items() if v is not None}
             if self.has_sla
             else _NO_SLA_THRESHOLDS
+        )
+        # The /jobs `limits` object; None for a job without caps.
+        limits = self.resourceLimits
+        self.limits_payload: dict[str, Any] | None = (
+            None if limits is None else limits.to_payload()
         )
 
     def _lint_schedule(self, lint_cache: LintCache | None) -> list[Finding]:
@@ -2320,6 +2498,67 @@ class JobConfig:
         """
         return ConfigError("Job {}: {}".format(self.name, message))
 
+    def _validate_resource_limits(
+        self, raw: dict[str, Any] | None
+    ) -> ResourceLimits | None:
+        """``resourceLimits`` normalized and range-checked.
+
+        None when no cap is set (each unset or ``max``), even with
+        ``required``.  The negated cpu check refuses NaN, which fails every
+        comparison (see :meth:`_validate_numeric_ranges`).
+        """
+        if raw is None:
+            return None
+        cpu = self._read_limit("cpu", raw.get("cpu"))
+        memory = self._read_limit("memory", raw.get("memory"))
+        processes = self._read_limit("processes", raw.get("processes"))
+        if cpu is not None and not (MIN_CPU_LIMIT <= cpu <= MAX_CPU_LIMIT):
+            raise self._reject(
+                "resourceLimits.cpu must be a finite number between {} and "
+                "{} (CPUs)".format(MIN_CPU_LIMIT, MAX_CPU_LIMIT)
+            )
+        if memory is not None and not (
+            MIN_MEMORY_LIMIT <= memory <= MAX_MEMORY_LIMIT
+        ):
+            raise self._reject(
+                "resourceLimits.memory must be at least 1 MiB and below 8 EiB"
+            )
+        if processes is not None and not (1 <= processes <= MAX_PROCESS_LIMIT):
+            raise self._reject(
+                "resourceLimits.processes must be between 1 and {}".format(
+                    MAX_PROCESS_LIMIT
+                )
+            )
+        if cpu is None and memory is None and processes is None:
+            return None
+        return ResourceLimits(
+            cpu=None if cpu is None else float(cpu),
+            memory=memory,
+            processes=processes,
+            required=bool(raw.get("required", False)),
+        )
+
+    def _read_limit(self, key: str, value: Any) -> Any:
+        """One cap read from its text: a number, or None if unset or ``max``.
+
+        The schema hands over text; ``str()`` also reads a number from a
+        config built as a dict.
+        """
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text.lower() == "max":
+            return None
+        read, wanted = _LIMIT_READERS[key]
+        number = read(text)
+        if number is None:
+            raise self._reject(
+                "resourceLimits.{}: cannot read {!r} as {}, or max".format(
+                    key, value, wanted
+                )
+            )
+        return number
+
     def _validate_numeric_ranges(self) -> None:
         # strictyaml only enforces the type; fail fast on values that would
         # otherwise produce obscure runtime behavior.  Plain `if ... raise`
@@ -2620,12 +2859,20 @@ class DagTaskConfig:
                 or raw_task.get("verify") is not None
             ):
                 raise ConfigError("approval gates cannot use pool or verify")
+            if raw_task.get("resourceLimits") is not None:
+                raise ConfigError(
+                    "dag {!r}: task {!r}: an approval gate runs no process, "
+                    "so it cannot use resourceLimits".format(dag_name, self.id)
+                )
+            # inherited from `defaults:`, these would describe a process the
+            # gate never starts
             for key in (
                 "pool",
                 "poolSlots",
                 "queuePriority",
                 "queueTimeout",
                 "verify",
+                "resourceLimits",
             ):
                 job_dict[key] = DEFAULT_CONFIG[key]
         job_dict["name"] = "{}.{}".format(dag_name, self.id)
@@ -5034,6 +5281,38 @@ def _build_push_config(raw: dict) -> dict[str, Any]:
     }
 
 
+def resolve_web_toggle(
+    web_config: Mapping[str, Any], key: str
+) -> Mapping[str, Any] | None:
+    """The map form of the on-by-default ``web.<key>`` option, or ``None``.
+
+    ``false`` or ``enabled: false`` turns the option off. An absent option
+    and ``true`` give an empty map, so every setting takes its default.
+    """
+    raw: Mapping[str, Any] | bool | None = web_config.get(key)
+    if raw is False:
+        return None
+    if raw is None or raw is True:
+        return {}
+    if not raw.get("enabled", True):
+        return None
+    return raw
+
+
+def resolve_badges_config(
+    web_config: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve the raw ``web.badges`` option into effective settings.
+
+    Returns ``None`` when the badge routes are off, else a dict with
+    ``public`` (serve the badges without a bearer token).
+    """
+    raw = resolve_web_toggle(web_config, "badges")
+    if raw is None:
+        return None
+    return {"public": bool(raw.get("public", False))}
+
+
 def resolve_bonjour_config(
     web_config: WebConfig | None,
 ) -> dict[str, Any] | None:
@@ -5283,6 +5562,50 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _validate_mcp_config(config)
     _validate_push_config(config)
     _validate_eventlog_config(config)
+    _warn_if_resource_limits_unsupported(config)
+
+
+def capped_jobs(
+    config: CronstableConfig,
+) -> list[tuple[str, ResourceLimits]]:
+    """``(name, caps)`` for every job and DAG task template with caps.
+
+    Names read ``job X`` and ``dag D task T``.  Approval gates never carry
+    caps (see :class:`DagTaskConfig`).
+    """
+    capped = []
+    for job in config.jobs:
+        if job.resourceLimits is not None:
+            capped.append(("job {}".format(job.name), job.resourceLimits))
+    for dag_config in config.dags:
+        for taskkey, template in dag_config.task_templates.items():
+            if template.resourceLimits is not None:
+                capped.append(
+                    (
+                        "dag {} task {}".format(dag_config.name, taskkey),
+                        template.resourceLimits,
+                    )
+                )
+    return capped
+
+
+def _warn_if_resource_limits_unsupported(config: CronstableConfig) -> None:
+    """Warn once per load when caps are set on an OS that has no mechanism.
+
+    It logs instead of refusing the load, so one config serves a mixed
+    fleet (the ``report.eventlog`` precedent).  The daemon reports Linux
+    delegation at runtime.
+    """
+    if limits_supported_os():
+        return
+    capped = capped_jobs(config)
+    if capped:
+        logger.warning(
+            "resourceLimits is set (%s), but this platform has neither "
+            "cgroup v2 nor Job Objects, so those jobs run without caps; runs "
+            "of jobs with resourceLimits.required fail",
+            ", ".join(name for name, _ in capped),
+        )
 
 
 def _validate_dags(config: CronstableConfig) -> None:

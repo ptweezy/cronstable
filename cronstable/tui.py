@@ -59,6 +59,7 @@ from typing import (
 
 from cronstable import _cliargs
 from cronstable import params as run_params
+from cronstable.badge import badge_addressable, badge_markdown
 from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import (
     Finding,
@@ -307,6 +308,159 @@ def fmt_bytes(n: float | None) -> str:
             return "%.1f%s" % (value, unit)
         value /= 1024
     return "—"  # pragma: no cover - unreachable
+
+
+def fmt_size(n: float) -> str:
+    """A configured size as the daemon's ``format_size`` writes it:
+    ``1023 B``, ``512 MiB``, ``1.5 GiB``."""
+    if n < 1024:
+        return "%d B" % n
+    units = ("KiB", "MiB", "GiB", "TiB")
+    value = n / 1024
+    index = 0
+    text = "%.1f" % value
+    while float(text) >= 1024 and index < len(units) - 1:
+        value /= 1024
+        index += 1
+        text = "%.1f" % value
+    return "%s %s" % (text.removesuffix(".0"), units[index])
+
+
+def _finite(value: Any) -> float | None:
+    """A JSON number as a finite float; ``None`` for anything else."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def caps_text(caps: Any) -> str:
+    """A job's ``limits`` payload as ``1.5 CPU · 512 MiB · 64 procs``,
+    plus `` (required)``; ``""`` when it sets no cap."""
+    if not isinstance(caps, dict):
+        return ""
+    parts = []
+    cpu = _finite(caps.get("cpu"))
+    if cpu is not None:
+        parts.append("%s CPU" % ("%f" % cpu).rstrip("0").rstrip("."))
+    memory = _finite(caps.get("memory_bytes"))
+    if memory is not None:
+        parts.append(fmt_size(memory))
+    procs = _finite(caps.get("processes"))
+    if procs is not None:
+        parts.append("%d proc%s" % (procs, "" if procs == 1 else "s"))
+    if not parts:
+        return ""
+    required = " (required)" if caps.get("required") is True else ""
+    return " · ".join(parts) + required
+
+
+#: Theme color for each marker :func:`run_marks` can return.
+LIMIT_MARK_COLOR = {
+    "memory cap": "fail",
+    "check memory cap": "fail",
+    "caps off": "warn",
+}
+
+
+def limit_marks(limits: Any) -> list[str]:
+    """Markers for a run's ``limits`` record: ``memory cap`` when the
+    memory cap killed it, ``caps off`` when a cap was not enforced."""
+    if not isinstance(limits, dict):
+        return []
+    marks = []
+    if limits.get("memory_exceeded") is True:
+        marks.append("memory cap")
+    if limits.get("enforced") is False:
+        marks.append("caps off")
+    return marks
+
+
+def run_marks(run: Any) -> list[str]:
+    """A history run's :func:`limit_marks`, plus ``check memory cap``
+    when the memory cap killed its verify check: second, or first when
+    the run has no marker of its own."""
+    if not isinstance(run, dict):
+        return []
+    marks = limit_marks(run.get("limits"))
+    check = run.get("verification")
+    check = check.get("limits") if isinstance(check, dict) else None
+    if isinstance(check, dict) and check.get("memory_exceeded") is True:
+        marks.insert(1, "check memory cap")
+    return marks
+
+
+def limit_cells(limits: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(text, ink)`` cells for a run's ``limits`` record: the markers,
+    the kernel's peak memory, throttled CPU time, process-cap hits, and
+    why caps were off; ``caps on`` when there is nothing else."""
+    cells = [(mark, LIMIT_MARK_COLOR[mark]) for mark in limit_marks(limits)]
+    peak = _finite(limits.get("peak_memory_bytes"))
+    if peak is not None:
+        cells.append(("kernel peak %s" % fmt_bytes(peak), "dim"))
+    throttled = _finite(limits.get("cpu_throttled_seconds")) or 0
+    if throttled > 0:
+        cells.append(("throttled %s" % fmt_duration(throttled), "dim"))
+    hits = _finite(limits.get("process_limit_hits")) or 0
+    if hits > 0:
+        cells.append(
+            ("%d process cap hit%s" % (hits, "" if hits == 1 else "s"), "dim")
+        )
+    reason = limits.get("reason")
+    if reason and limits.get("enforced") is False:
+        cells.append((oneline(reason), "dim"))
+    return cells or [("caps on", "dim")]
+
+
+def cells_width(cells: list[tuple[str, str]]) -> int:
+    """Display cells :func:`paint_cells` needs to show ``cells`` whole."""
+    return sum(text_width(text) for text, _ in cells) + 3 * max(
+        0, len(cells) - 1
+    )
+
+
+def paint_cells(
+    paint: "Painter", cells: list[tuple[str, str]], budget: int
+) -> str:
+    """``cells`` joined by `` · `` in their own inks, cut to ``budget``
+    display cells; a cut ends in an ellipsis."""
+    out: list[str] = []
+    room = budget
+    for index, (text, ink) in enumerate(cells):
+        sep = " · " if out else ""
+        width = text_width(text)
+        # a cell with more after it keeps two cells for a closing " …"
+        spare = 2 if index < len(cells) - 1 else 0
+        if len(sep) + width + spare <= room:
+            if sep:
+                out.append(paint.style(sep, "dim"))
+            out.append(paint.style(text, ink))
+            room -= len(sep) + width
+            continue
+        left = room - len(sep)
+        if out and left < 3:
+            # too little room to cut the next cell: a dim ellipsis marks
+            # the drop
+            out.append(paint.style(" " + _ELLIPSIS, "dim"))
+        elif left > 0:
+            if sep:
+                out.append(paint.style(sep, "dim"))
+            out.append(paint.style(truncate(text + _ELLIPSIS, left), ink))
+        break
+    return "".join(out)
+
+
+def short_stamp(iso: Any) -> str:
+    """An ISO stamp as local ``MM-DD HH:MM``; ``?`` when unreadable."""
+    started = parse_iso(iso)
+    return (
+        datetime.datetime.fromtimestamp(started).strftime("%m-%d %H:%M")
+        if started
+        else "?"
+    )
 
 
 def parse_iso(value: Any) -> float | None:
@@ -3321,6 +3475,15 @@ class App:
         self.fetched_mono = 0.0  # monotonic stamp of the last good /jobs
         self.version = ""
         self.job_set_id = ""
+        # /whoami's badges: None until a daemon that serves them says so.
+        # Read on the first good poll after start, a token change, a failed
+        # poll, or a minute since the last read (polls keep succeeding
+        # across a reload that changes web.badges), and on each poll until
+        # a read succeeds.
+        self.badges: dict[str, Any] | None = None
+        self._badges_due = True
+        self._badges_read = 0.0  # monotonic stamp of the last /whoami read
+        self._badges_busy = False  # a /whoami read in flight
         self.cluster: dict[str, Any] | None = None
         self.fleet: dict[str, Any] | None = None
         self.dags: list[dict[str, Any]] = []
@@ -3497,6 +3660,7 @@ class App:
                 str,
                 list[dict[str, Any]],
                 list[dict[str, Any]],
+                bool,
                 bool,
                 list[_PaletteRow],
             ]
@@ -3824,6 +3988,43 @@ class App:
         with contextlib.suppress(Exception):
             await self._load_dags()
 
+    async def _load_badges(self) -> bool:
+        """Read whether the daemon serves status badges (``/whoami``).
+
+        A daemon with ``web.badges: false``, or one older than the badges,
+        sends no ``badges`` object, and the palette hides its copy-badge
+        rows. Returns whether the read succeeded; a failed one keeps the
+        last answer.
+        """
+        try:
+            whoami = await self.api.get_json("/whoami")
+        except ApiError as exc:
+            if exc.status >= 500:
+                return False
+            # a daemon or proxy that does not serve /whoami serves no badges
+            self.badges = None
+            return True
+        except Exception:  # noqa: BLE001 - the next poll reads it again
+            return False
+        badges = whoami.get("badges") if isinstance(whoami, dict) else None
+        self.badges = badges if isinstance(badges, dict) else None
+        return True
+
+    async def _read_badges(self) -> None:
+        """Run :meth:`_load_badges` as the one read in flight.
+
+        ``_poll_once`` spawns it beside the fan-out. A failed read marks
+        the badges due again. Success leaves ``_badges_due`` as it is, so
+        a token change or failed poll during the read still gets a fresh
+        read.
+        """
+        try:
+            if not await self._load_badges():
+                self._badges_due = True
+            self.mark()
+        finally:
+            self._badges_busy = False
+
     # ---------------------------------------------------------------
     #  background loops
     # ---------------------------------------------------------------
@@ -3896,6 +4097,7 @@ class App:
             self.connected = False
             self.conn_error = "unauthorized"
             self._mark_signal(False)
+            self._badges_due = True
             if not self.is_open("token"):
                 self.open("token")
                 self.focus = "token"
@@ -3905,6 +4107,8 @@ class App:
             self.connected = False
             self.conn_error = str(exc) or exc.__class__.__name__
             self._mark_signal(False)
+            # the daemon may come back with another web.badges setting
+            self._badges_due = True
             self.mark()
             return
         first = self.fetched_mono == 0.0
@@ -3916,6 +4120,15 @@ class App:
         self.fetched_mono = time.monotonic()
         self._fleet_sound(first)
         self.recompute_view()
+        if not self._badges_busy and (
+            self._badges_due or time.monotonic() - self._badges_read > 60
+        ):
+            # spawned, never awaited: a stalled /whoami must not hold up
+            # the fan-out and the verdict below
+            self._badges_busy = True
+            self._badges_due = False
+            self._badges_read = time.monotonic()
+            self._spawn(self._read_badges())
         # verdict rides the cluster alert; /cluster is refreshed in the
         # same fan-out the web page does on every successful poll
         await self._fanout()
@@ -5284,6 +5497,17 @@ class AppPalette(AppActions):
             ("▮", "Toggle startup checks", self._toggle_boot),
             ("❏", "Copy version", lambda: self._copy_chip(self.version)),
             ("❏", "Copy job-set ID", lambda: self._copy_chip(self.job_set_id)),
+            *(
+                [
+                    (
+                        "❏",
+                        "Copy fleet badge Markdown",
+                        lambda: self._copy_badge_markdown(None),
+                    )
+                ]
+                if self.badges is not None
+                else []
+            ),
             ("⚙", "Open settings", lambda: self.open("settings")),
             ("?", "Keyboard shortcuts", lambda: self.open("help")),
             ("⚿", "Set access token", self._open_token),
@@ -5360,6 +5584,14 @@ class AppPalette(AppActions):
                     functools.partial(self._copy_job_command, name),
                 )
             )
+            if self.badges is not None and badge_addressable(name):
+                out.append(
+                    (
+                        "❏",
+                        "Copy badge Markdown: %s" % name,
+                        functools.partial(self._copy_badge_markdown, name),
+                    )
+                )
             out.append(
                 (
                     "◴",
@@ -5401,13 +5633,15 @@ class AppPalette(AppActions):
 
         One build serves the key handler and every frame the palette is
         open: the rows are a pure function of the query, the two payload
-        lists (swapped wholesale per poll) and the glyph set, and each
-        action reads app state when invoked, not when built.  The slot
-        pins both lists, so a recycled id cannot validate a stale entry.
+        lists (swapped wholesale per poll), the glyph set, and whether the
+        daemon serves badges, and each action reads app state when
+        invoked, not when built.  The slot pins both lists, so a recycled
+        id cannot validate a stale entry.
         """
         query = self.inputs["palette"].strip()
         jobs, dags = self.jobs, self.dags
         ascii_mode = bool(self.prefs["ascii"])
+        badges = self.badges is not None
         cached = self._palette_memo
         if (
             cached is not None
@@ -5415,8 +5649,9 @@ class AppPalette(AppActions):
             and cached[1] is jobs
             and cached[2] is dags
             and cached[3] == ascii_mode
+            and cached[4] == badges
         ):
-            return cached[4]
+            return cached[5]
         scored: list[tuple[int, tuple[str, str, Callable[[], Any]]]] = []
         for icon, label, action in self.palette_commands():
             score = fuzzy(query, label)
@@ -5430,7 +5665,7 @@ class AppPalette(AppActions):
                 60, scored, key=lambda pair: pair[0]
             )
         ]
-        self._palette_memo = (query, jobs, dags, ascii_mode, matches)
+        self._palette_memo = (query, jobs, dags, ascii_mode, badges, matches)
         return matches
 
     # small palette helpers -------------------------------------------
@@ -5500,6 +5735,33 @@ class AppPalette(AppActions):
         job = self.by_name.get(name)
         if job:
             self.copy_command(job)
+
+    def _copy_badge_markdown(self, name: str | None) -> None:
+        """Copy Markdown that embeds a status badge, as the page does.
+
+        ``name`` picks one job's badge, and ``None`` the fleet's.
+        """
+        from cronstable import pairlink
+
+        badges = self.badges or {}
+        try:
+            # the Markdown goes into a README, so it must not carry the
+            # credentials in --url
+            base = pairlink.base_url(self.api.url)
+        except ValueError:
+            self.toast("fail", "copy badge Markdown: --url is not http(s)")
+            return
+        link = bool(badges.get("dashboard", True))
+        copy_to_clipboard(self.term, badge_markdown(base, name, link=link))
+        # a page elsewhere shows only public badges, so name the setting;
+        # at most 40 cells, the toast width on an 80-column terminal
+        public = bool(badges.get("public"))
+        self.toast(
+            "ok",
+            "❏ copied badge Markdown"
+            if public
+            else "❏ copied; embeds need web.badges.public",
+        )
 
     def _open_token(self) -> None:
         self.open("token")
@@ -5703,6 +5965,8 @@ class AppKeys(AppPalette):
             self.close("token")
             self.focus = None
             self.toast("ok", "⚿ token %s" % ("set" if value else "cleared"))
+            # a token-gated /whoami answers only now
+            self._badges_due = True
             self.refresh_now()
             self._start_unauthorized_streams()
             if self.is_open("pair"):
@@ -8849,13 +9113,22 @@ class AppDrawers(AppOverlays):
             r.get("duration") for r in runs if r.get("duration") is not None
         ]
         top = max(durations) if durations else 0
+        bar_w = 12
+        # the first cap marker takes the bar's slot, which every drawer
+        # width shows; a second goes before the free-form reason, which
+        # the width cut trims first.  A marker longer than the bar widens
+        # the slot on every row and narrows the detail to match.
+        run_mark_lists = [run_marks(run) for run in runs]
+        slot_w = max(
+            [bar_w + 1]
+            + [len(marks[0]) + 1 for marks in run_mark_lists if marks]
+        )
         run_rows: list[str] = []
-        for run in runs:
+        for run, marks in zip(runs, run_mark_lists, strict=True):
             outcome = str(run.get("outcome", ""))
             key = outcome_key(outcome)
             color = OUTCOME_COLOR[key]
             dur = run.get("duration")
-            bar_w = 12
             bar = ""
             if dur is not None and top:
                 filled = max(1, int((dur / top) * bar_w))
@@ -8867,12 +9140,23 @@ class AppDrawers(AppOverlays):
                 stamp = datetime.datetime.fromtimestamp(t).strftime(
                     "%m-%d %H:%M:%S"
                 )
+            slot = (
+                paint.style(
+                    pad_to(marks[0], slot_w), LIMIT_MARK_COLOR[marks[0]]
+                )
+                if marks
+                else paint.style(pad_to(bar, slot_w), color)
+            )
             detail = ""
+            reason = None
             if outcome == "failure":
                 exit_code = run.get("exit_code")
                 detail = " exit %s" % ("?" if exit_code is None else exit_code)
-                if run.get("fail_reason"):
-                    detail += " · %s" % run["fail_reason"]
+                reason = run.get("fail_reason")
+            for mark in marks[1:]:
+                detail += " · %s" % mark
+            if reason:
+                detail += " · %s" % reason
             resources = run.get("resources") or {}
             if resources.get("cpu_total_seconds") is not None:
                 detail += " · %.1fs cpu" % resources["cpu_total_seconds"]
@@ -8881,8 +9165,10 @@ class AppDrawers(AppOverlays):
                 + paint.style(paint.glyph(key, ascii_mode), color)
                 + paint.style(" %s " % stamp, "fg")
                 + paint.style(pad_to(fmt_duration(dur), 8), "dim")
-                + paint.style(pad_to(bar, bar_w + 1), color)
-                + paint.style(truncate(detail, max(0, width - 44)), "dim")
+                + slot
+                + paint.style(
+                    truncate(detail, max(0, width - 31 - slot_w)), "dim"
+                )
             )
         return rows, run_rows
 
@@ -8892,77 +9178,160 @@ class AppDrawers(AppOverlays):
         data = self.drawer_res
         if data is None:
             return [paint.style("  loading resource data…", "dim")]
-        if not data.get("monitored"):
-            return [
-                paint.style("  this job has no resource monitoring", "dim"),
-                paint.style(
-                    "  (set monitorResources: true on the job)", "dim"
-                ),
-            ]
-        # the live line, the column header and every run row are a pure
-        # function of the payload (swapped wholesale by
-        # _load_drawer_resources): built once, sliced per frame, cleared
-        # by _retheme() like _history_body
+        # the caps and live lines, the column header and every run's rows
+        # are a pure function of the payload (swapped wholesale by
+        # _load_drawer_resources) and the width: built once, scrolled per
+        # frame, cleared by _retheme() like _history_body
         cached = self._res_body
-        if cached is not None and cached[0] is data:
-            head, run_rows = cached[1], cached[2]
+        if cached is not None and cached[0] is data and cached[1] == width:
+            head, entries = cached[2], cached[3]
         else:
-            head, run_rows = self._resource_rows(paint, data)
-            self._res_body = (data, head, run_rows)
-        rows = list(head)
-        rows.extend(run_rows[: body_lines - len(head)])
+            head, entries = self._resource_rows(paint, data, width)
+            self._res_body = (data, width, head, entries)
+        return list(head) + self._scrolled_entries(
+            entries, body_lines - len(head)
+        )
+
+    def _scrolled_entries(
+        self, entries: list[list[str]], available: int
+    ) -> list[str]:
+        """The rows of ``entries`` from entry ``panel_scroll`` on that fit
+        in ``available`` rows.  An entry shows whole or not at all; only a
+        first entry taller than ``available`` shows cut.  The scroll stops
+        once the last entry shows."""
+        # the first entry of the longest tail that fits whole
+        tail = len(entries)
+        used = 0
+        while tail and used + len(entries[tail - 1]) <= available:
+            tail -= 1
+            used += len(entries[tail])
+        self.panel_scroll = max(
+            0, min(self.panel_scroll, tail, len(entries) - 1)
+        )
+        rows: list[str] = []
+        for entry in entries[self.panel_scroll :]:
+            if len(rows) + len(entry) > available:
+                if not rows:
+                    rows.extend(entry[: max(0, available)])
+                break
+            rows.extend(entry)
         return rows
 
     def _resource_rows(
-        self, paint: Painter, data: dict[str, Any]
-    ) -> tuple[list[str], list[str]]:
-        """``(head rows, one row per run, newest first)`` of the
-        resources tab."""
+        self, paint: Painter, data: dict[str, Any], width: int
+    ) -> tuple[list[str], list[list[str]]]:
+        """``(head rows, one entry of rows per run, newest first)`` of
+        the resources tab."""
         rows: list[str] = []
-        live = data.get("live") or []
-        if live:
-            snap = live[-1] if isinstance(live, list) else {}
+        caps = caps_text(data.get("limits"))
+        if caps:
             rows.append(
                 " "
-                + paint.style(
-                    "live: %s cpu · %s rss"
-                    % (
-                        fmt_percent(snap.get("cpu_percent")),
-                        fmt_bytes(snap.get("rss_bytes")),
-                    ),
-                    "run",
-                    bold=True,
-                )
+                + paint.style("caps  ", "dim")
+                + paint.style(truncate(caps, max(0, width - 9)), "accent")
             )
+        runs = list(reversed(data.get("runs") or []))
+        if not data.get("monitored"):
+            return self._unmonitored_rows(paint, rows, runs, width)
+        live = data.get("live") or []
+        if live:
+            rows.append(self._live_row(paint, live))
+        # a run's limits sit in the limits column when they fit there
+        # whole, else on their own row under the run, 20 cells wider
+        cells = [
+            limit_cells(run["limits"])
+            if isinstance(run.get("limits"), dict)
+            else None
+            for run in runs
+        ]
+        column = any(
+            c is not None and cells_width(c) <= width - 40 for c in cells
+        )
         rows.append(
             paint.style(
-                pad_to(" started", 18) + pad_to("cpu", 10) + "peak rss",
+                pad_to(" started", 18)
+                + pad_to("cpu", 10)
+                + (
+                    pad_to("peak rss", 10) + "limits" if column else "peak rss"
+                ),
                 "dim",
                 bold=True,
             )
         )
-        run_rows: list[str] = []
-        for run in reversed(data.get("runs") or []):
-            started = parse_iso(run.get("started_at"))
-            stamp = (
-                datetime.datetime.fromtimestamp(started).strftime(
-                    "%m-%d %H:%M"
-                )
-                if started
-                else "?"
-            )
+        entries: list[list[str]] = []
+        for run, run_cells in zip(runs, cells, strict=True):
             usage = run.get("resources") or run
-            run_rows.append(
-                paint.style(pad_to(" " + stamp, 18), "fg")
-                + paint.style(
-                    pad_to(
-                        "%.1fs" % (usage.get("cpu_total_seconds") or 0), 10
-                    ),
-                    "dim",
-                )
-                + paint.style(fmt_bytes(usage.get("max_rss_bytes")), "dim")
+            cpu = usage.get("cpu_total_seconds")
+            rss = fmt_bytes(usage.get("max_rss_bytes"))
+            row = paint.style(
+                pad_to(" " + short_stamp(run.get("started_at")), 18), "fg"
+            ) + paint.style(
+                pad_to("—" if cpu is None else "%.1fs" % cpu, 10), "dim"
             )
-        return rows, run_rows
+            if run_cells is None:
+                entries.append([row + paint.style(rss, "dim")])
+            elif cells_width(run_cells) <= width - 40:
+                entries.append(
+                    [
+                        row
+                        + paint.style(pad_to(rss, 10), "dim")
+                        + paint_cells(paint, run_cells, width - 40)
+                    ]
+                )
+            else:
+                entries.append(
+                    [
+                        row + paint.style(rss, "dim"),
+                        " " * 18 + paint_cells(paint, run_cells, width - 20),
+                    ]
+                )
+        return rows, entries
+
+    def _live_row(self, paint: Painter, live: Any) -> str:
+        """The resources tab's live line, from the newest instance."""
+        snap = live[-1] if isinstance(live, list) else {}
+        # the daemon nests the reading under "current"; a flat entry reads
+        # as is
+        current = snap.get("current", snap) if isinstance(snap, dict) else {}
+        if not isinstance(current, dict):
+            current = {}
+        return " " + paint.style(
+            "live: %s cpu · %s rss"
+            % (
+                fmt_percent(current.get("cpu_percent")),
+                fmt_bytes(current.get("rss_bytes")),
+            ),
+            "run",
+            bold=True,
+        )
+
+    def _unmonitored_rows(
+        self, paint: Painter, rows: list[str], runs: list[Any], width: int
+    ) -> tuple[list[str], list[list[str]]]:
+        """The resources tab of an unmonitored job: the hint, then each
+        run's limits record."""
+        rows.append(
+            paint.style("  this job has no resource monitoring", "dim")
+        )
+        rows.append(
+            paint.style("  (set monitorResources: true on the job)", "dim")
+        )
+        capped = [run for run in runs if isinstance(run.get("limits"), dict)]
+        if not capped:
+            return rows, []
+        rows.append(paint.style("", "fg"))
+        rows.append(
+            paint.style(pad_to(" started", 18) + "limits", "dim", bold=True)
+        )
+        return rows, [
+            [
+                paint.style(
+                    pad_to(" " + short_stamp(run.get("started_at")), 18), "fg"
+                )
+                + paint_cells(paint, limit_cells(run["limits"]), width - 20)
+            ]
+            for run in capped
+        ]
 
     def _drawer_schedule(
         self, paint: Painter, width: int, body_lines: int

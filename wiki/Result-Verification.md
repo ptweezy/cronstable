@@ -49,6 +49,10 @@ The command's exit code remains intact. History includes a separate
 diagnostics. Diagnostic text is redacted, retains at most 64 lines per stream,
 and is capped at 16384 characters per stream; oversized lines are discarded.
 `output_truncated` identifies truncation of retained output.
+For a job with [`resourceLimits`](Resource-Limits), the verifier runs under
+the same caps in a cgroup or Job Object of its own, and `limits` holds its
+record (see
+[verify checks and DAG tasks](Resource-Limits#verify-checks-and-dag-tasks)).
 Live output uses the `verify.stdout` and `verify.stderr` stream names.
 Report templates can inspect `verification`.
 

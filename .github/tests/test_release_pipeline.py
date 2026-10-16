@@ -799,6 +799,7 @@ def test_every_required_build_and_preparation_gates_publication():
         "tox",
         "tox-mindeps",
         "backends-live",
+        "cgroups-live",
         "tox-static",
         "licenses",
         "preflight",
@@ -829,7 +830,7 @@ def test_every_required_build_and_preparation_gates_publication():
 
 def test_builds_overlap_tests_but_advisory_jobs_wait_for_required_rows():
     jobs = workflow()["jobs"]
-    checks = {"tox", "tox-mindeps", "backends-live", "dist"}
+    checks = {"tox", "tox-mindeps", "backends-live", "cgroups-live", "dist"}
     for name in checks:
         assert "tox-static" in ancestors(jobs, name)
         assert "preflight" not in ancestors(jobs, name)

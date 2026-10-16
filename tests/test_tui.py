@@ -1312,6 +1312,7 @@ class FakeDaemon:
                     "name": name,
                     "monitored": False,
                     "interval": None,
+                    "limits": None,
                     "live": [],
                     "runs": [],
                 }
@@ -4440,7 +4441,8 @@ def test_drawer_resources_variants(tmp_path):
     assert "no resource monitoring" in none_body
     app.drawer_res = {
         "monitored": True,
-        "live": [{"cpu_percent": 40.0, "rss_bytes": 2048}],
+        "limits": None,
+        "live": [_live_entry(40.0, 2048)],
         "runs": [
             {
                 "started_at": _iso_ago(120),
@@ -4452,7 +4454,772 @@ def test_drawer_resources_variants(tmp_path):
         ],
     }
     body = _txt(app._drawer_resources(paint, 90, 20))
-    assert "live:" in body and "peak rss" in body
+    assert "live: 40% cpu · 2.0KiB rss" in body and "peak rss" in body
+    # an uncapped job gets no caps line and no limits column
+    assert "caps" not in body and "limits" not in body
+
+
+def _live_entry(cpu_percent, rss_bytes, **extra):
+    """One ``live`` entry of ``/jobs/{name}/resources``, the daemon's
+    shape: the reading nests under ``current``."""
+    entry = {
+        "started_at": _iso_ago(10),
+        "pid": 4242,
+        "current": {
+            "cpu_seconds": 1.0,
+            "cpu_percent": cpu_percent,
+            "rss_bytes": rss_bytes,
+        },
+        "series": [],
+    }
+    entry.update(extra)
+    return entry
+
+
+def _caps(**overrides):
+    caps = {
+        "cpu": 1.5,
+        "memory_bytes": 512 * 1024 * 1024,
+        "processes": 64,
+        "required": True,
+    }
+    caps.update(overrides)
+    return caps
+
+
+def _limits_record(**overrides):
+    """A run's ``limits`` record (LimitsRecord.to_dict)."""
+    record = {
+        "cpu": 1.5,
+        "memory_bytes": 512 * 1024 * 1024,
+        "processes": 64,
+        "required": False,
+        "enforced": True,
+        "mechanism": "cgroup-v2",
+        "unenforced": [],
+        "reason": None,
+        "refused": False,
+        "memory_exceeded": False,
+        "process_limit_hits": None,
+        "peak_memory_bytes": None,
+        "cpu_throttled_seconds": None,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_caps_text_and_size_formatting():
+    from cronstable.tui import caps_text, fmt_size
+
+    assert caps_text(_caps()) == (
+        "1.5 CPU · 512 MiB · 64 procs (required)"
+    )
+    assert caps_text(_caps(required=False)) == (
+        "1.5 CPU · 512 MiB · 64 procs"
+    )
+    # each cap alone; a lifted cap (null) drops out
+    assert caps_text({"cpu": 2.0, "memory_bytes": None}) == "2 CPU"
+    assert caps_text({"cpu": 0.01}) == "0.01 CPU"
+    assert caps_text({"cpu": 1000000.0}) == "1000000 CPU"
+    assert caps_text({"memory_bytes": 1536 * 1024 * 1024}) == "1.5 GiB"
+    assert caps_text({"processes": 1}) == "1 proc"
+    # nothing capped, or not a payload at all
+    assert caps_text({"required": True}) == ""
+    assert caps_text(None) == "" and caps_text("1.5") == ""
+    # foreign values never crash: bools, text, non-finite, huge ints
+    assert caps_text(
+        {
+            "cpu": True,
+            "memory_bytes": "512M",
+            "processes": float("inf"),
+        }
+    ) == ""
+    assert caps_text({"processes": 10**400}) == ""
+    assert fmt_size(1023) == "1023 B"
+    assert fmt_size(1024) == "1 KiB"
+    assert fmt_size(2**30 - 1) == "1 GiB"
+    assert fmt_size(1048552) == "1 MiB"
+    assert fmt_size(2**50) == "1024 TiB"
+
+
+def test_limit_marks_and_cells():
+    from cronstable.tui import limit_cells, limit_marks
+
+    assert limit_marks(None) == [] and limit_marks("x") == []
+    assert limit_marks(_limits_record()) == []
+    assert limit_marks(
+        _limits_record(memory_exceeded=True, enforced=False)
+    ) == ["memory cap", "caps off"]
+    # an enforced run with nothing measured still says so
+    assert limit_cells(_limits_record()) == [("caps on", "dim")]
+    cells = limit_cells(
+        _limits_record(
+            memory_exceeded=True,
+            peak_memory_bytes=512 * 1024 * 1024,
+            cpu_throttled_seconds=3.25,
+            process_limit_hits=1,
+        )
+    )
+    assert cells == [
+        ("memory cap", "fail"),
+        ("kernel peak 512.0MiB", "dim"),
+        ("throttled 3.2s", "dim"),
+        ("1 process cap hit", "dim"),
+    ]
+    # zero throttling and zero hits stay quiet; the reason closes the row
+    off = limit_cells(
+        _limits_record(
+            enforced=False,
+            unenforced=["memory"],
+            reason="cronstable runs in\nthe root cgroup",
+            cpu_throttled_seconds=0.0,
+            process_limit_hits=3,
+        )
+    )
+    assert off == [
+        ("caps off", "warn"),
+        ("3 process cap hits", "dim"),
+        ("cronstable runs in the root cgroup", "dim"),
+    ]
+    # an enforced record's reason is not shown
+    assert limit_cells(_limits_record(reason="x")) == [("caps on", "dim")]
+
+
+def test_paint_cells_cuts_to_the_budget(tmp_path):
+    from cronstable.tui import paint_cells
+
+    paint = _paint(_bare_app(tmp_path))
+    cells = [("memory cap", "fail"), ("caps off", "warn"), ("tail", "dim")]
+    whole = "memory cap · caps off · tail"
+    assert strip_ansi(paint_cells(paint, cells, 80)) == whole
+    assert strip_ansi(paint_cells(paint, cells, 28)) == whole
+
+    def cut(budget):
+        return strip_ansi(paint_cells(paint, cells, budget))
+
+    # every cut ends in an ellipsis: the overflowing cell is cut short,
+    # or a dim one follows the last whole cell when the next would show
+    # under two characters
+    assert cut(27) == "memory cap · caps off · ta…"
+    assert cut(26) == "memory cap · caps off …"
+    assert cut(22) == "memory cap · caps off…"
+    assert cut(21) == "memory cap · caps of…"
+    assert cut(15) == "memory cap …"
+    assert cut(12) == "memory cap …"
+    assert cut(11) == "memory cap…"
+    assert cut(4) == "mem…"
+    assert cut(1) == "…"
+    assert paint_cells(paint, cells, 15).endswith(paint.style(" …", "dim"))
+    assert paint_cells(paint, cells, 0) == ""
+    assert paint_cells(paint, cells, -5) == ""
+    for budget in range(28):
+        text = cut(budget)
+        assert text_width(text) <= budget
+        assert text.endswith("…") or (budget == 0 and text == "")
+    # a lone cell needs no room for a closing ellipsis
+    assert strip_ansi(paint_cells(paint, [("caps on", "dim")], 7)) == (
+        "caps on"
+    )
+
+
+def test_drawer_resources_caps_line_and_run_limits(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.drawer_res = {
+        "monitored": True,
+        "interval": 2.0,
+        "limits": _caps(),
+        "live": [_live_entry(87.5, 5 * 1024 * 1024)],
+        "runs": [
+            {
+                "started_at": _iso_ago(300),
+                "resources": {
+                    "cpu_total_seconds": 2.0,
+                    "max_rss_bytes": 4096,
+                },
+            },
+            {
+                "started_at": _iso_ago(200),
+                "resources": {
+                    "cpu_total_seconds": 1.5,
+                    "max_rss_bytes": 4096,
+                },
+                "limits": _limits_record(
+                    memory_exceeded=True,
+                    peak_memory_bytes=512 * 1024 * 1024,
+                    cpu_throttled_seconds=4.0,
+                ),
+            },
+            {
+                "started_at": _iso_ago(100),
+                "resources": None,
+                "limits": _limits_record(
+                    enforced=False,
+                    unenforced=["cpu", "memory", "processes"],
+                    reason="cronstable runs in the root cgroup",
+                ),
+            },
+        ],
+    }
+    rows = [strip_ansi(r) for r in app._drawer_resources(paint, 90, 20)]
+    assert rows[0] == " caps  1.5 CPU · 512 MiB · 64 procs (required)"
+    assert rows[1] == " live: 88% cpu · 5.0MiB rss"
+    assert rows[2].split() == ["started", "cpu", "peak", "rss", "limits"]
+    # newest first: caps off with its reason (no usage: dashes), then
+    # the memory-cap kill with the kernel's peak and throttled time,
+    # then an uncapped run with no limits cell at all
+    assert rows[3].endswith(
+        "—         —         caps off · cronstable runs in the root cgroup"
+    )
+    assert rows[4].endswith(
+        "1.5s      4.0KiB    memory cap · kernel peak 512.0MiB"
+        " · throttled 4.0s"
+    )
+    assert rows[5].endswith("2.0s      4.0KiB")
+    assert len(rows) == 6
+
+
+def test_drawer_resources_caps_without_monitoring(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # a capped job that has not run yet: its caps, then the hint
+    app.drawer_res = {
+        "monitored": False,
+        "interval": None,
+        "limits": _caps(required=False),
+        "live": [],
+        "runs": [],
+    }
+    rows = [strip_ansi(r) for r in app._drawer_resources(paint, 90, 20)]
+    assert rows == [
+        " caps  1.5 CPU · 512 MiB · 64 procs",
+        "  this job has no resource monitoring",
+        "  (set monitorResources: true on the job)",
+    ]
+    # with runs: each run's limits record under the hint
+    app.drawer_res = {
+        "monitored": False,
+        "interval": None,
+        "limits": _caps(),
+        "live": [],
+        "runs": [
+            {
+                "started_at": _iso_ago(200),
+                "resources": None,
+                "limits": _limits_record(
+                    peak_memory_bytes=100 * 1024 * 1024
+                ),
+            },
+            {"started_at": _iso_ago(150), "resources": None},
+            {
+                "started_at": None,
+                "resources": None,
+                "limits": _limits_record(memory_exceeded=True),
+            },
+        ],
+    }
+    rows = [strip_ansi(r) for r in app._drawer_resources(paint, 90, 20)]
+    assert rows[0].startswith(" caps  1.5 CPU") and "(required)" in rows[0]
+    assert "no resource monitoring" in rows[1]
+    assert "monitorResources: true" in rows[2]
+    assert rows[3] == ""
+    assert rows[4].split() == ["started", "limits"]
+    # newest first; a run without a limits record is left out, and an
+    # unreadable stamp shows ?
+    assert rows[5] == pad_to(" ?", 18) + "memory cap"
+    assert rows[6].endswith("kernel peak 100.0MiB")
+    assert len(rows) == 7
+    # the body slices and scrolls like the monitored one
+    assert len(app._drawer_resources(paint, 90, 6)) == 6
+    app.panel_scroll = 5
+    rows = [strip_ansi(r) for r in app._drawer_resources(paint, 90, 6)]
+    assert rows[-1].endswith("kernel peak 100.0MiB") and len(rows) == 6
+    assert app.panel_scroll == 1
+    # an uncapped, unmonitored job keeps the bare hint
+    app.drawer_res = {"monitored": False, "limits": None, "runs": []}
+    assert [
+        strip_ansi(r) for r in app._drawer_resources(paint, 90, 20)
+    ] == [
+        "  this job has no resource monitoring",
+        "  (set monitorResources: true on the job)",
+    ]
+
+
+def test_drawer_resources_live_line_shapes(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+
+    def live_line(live):
+        app.drawer_res = {"monitored": True, "live": live, "runs": []}
+        return strip_ansi(app._drawer_resources(paint, 90, 20)[0])
+
+    # the daemon's shape: the newest instance's reading under "current"
+    assert live_line(
+        [_live_entry(5.0, 1024), _live_entry(42.0, 2048)]
+    ) == " live: 42% cpu · 2.0KiB rss"
+    # a flat entry reads as is
+    assert live_line([{"cpu_percent": 4.0, "rss_bytes": 1024}]) == (
+        " live: 4.0% cpu · 1.0KiB rss"
+    )
+    # sampled series but no reading yet, and foreign shapes: dashes
+    assert live_line([_live_entry(1.0, 1, current=None)]) == (
+        " live: — cpu · — rss"
+    )
+    assert live_line(["junk"]) == " live: — cpu · — rss"
+    assert live_line({"cpu_percent": 9.0}) == " live: — cpu · — rss"
+    # no running instance: no live line, the header leads
+    assert live_line([]).split() == ["started", "cpu", "peak", "rss"]
+
+
+def test_drawer_resources_narrow_widths_fit(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    long_reason = "could not set memory.swap.max: " + "x" * 200
+    app.drawer_res = {
+        "monitored": True,
+        "limits": _caps(cpu=0.25),
+        "live": [_live_entry(100.0, 1023 * 1024 * 1024)],
+        "runs": [
+            {
+                "started_at": _iso_ago(60),
+                "resources": {
+                    "cpu_total_seconds": 1234.5,
+                    "max_rss_bytes": 1023 * 1024 * 1024,
+                },
+                "limits": _limits_record(
+                    enforced=False,
+                    memory_exceeded=True,
+                    reason=long_reason,
+                    peak_memory_bytes=2**40,
+                ),
+            }
+        ],
+    }
+    payloads = (app.drawer_res, dict(app.drawer_res, monitored=False))
+    job = _job("capped", outcome="success")
+    app.jobs = [job]
+    app.by_name = {"capped": job}
+    app.drawer_job = "capped"
+    app.drawer_tab = "resources"
+    # the drawer is never narrower than 46 columns; every row fits
+    # inside its border there and wider
+    for payload in payloads:
+        app.drawer_res = payload
+        for width in (46, 60, 90):
+            rows = app._drawer_resources(paint, width, 20)
+            assert any("memor" in strip_ansi(r) for r in rows)
+            for row in rows:
+                assert text_width(strip_ansi(row)) <= width - 1
+    # limits too long for the limits column move to their own row under
+    # the run, and no run fills the column, so it has no header
+    app.drawer_res = payloads[0]
+    rows = [strip_ansi(r) for r in app._drawer_resources(paint, 48, 20)]
+    assert rows[2].split() == ["started", "cpu", "peak", "rss"]
+    assert rows[3].endswith("1234.5s   1023.0MiB")
+    assert rows[4] == " " * 18 + "memory cap · caps off · ker…"
+    assert len(rows) == 5
+    wide = [strip_ansi(r) for r in app._drawer_resources(paint, 60, 20)]
+    assert wide[2].split()[-1] == "rss" and len(wide) == 5
+    assert wide[4] == (
+        " " * 18 + "memory cap · caps off · kernel peak 1.0…"
+    )
+    # far narrower still renders, without crashing
+    for payload in payloads:
+        app.drawer_res = payload
+        for width in (0, 1, 5, 12, 30):
+            app._drawer_resources(paint, width, 20)
+            app.render_drawer_panel(paint, width, 24)
+
+
+def test_drawer_resources_limits_column_never_shows_less(tmp_path):
+    from cronstable.tui import limit_cells, paint_cells
+
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    long_limits = _limits_record(
+        memory_exceeded=True,
+        peak_memory_bytes=512 * 1024 * 1024,
+        cpu_throttled_seconds=4.0,
+    )
+    short_limits = _limits_record(peak_memory_bytes=200 * 1024 * 1024)
+    whole = "memory cap · kernel peak 512.0MiB · throttled 4.0s"
+    app.drawer_res = {
+        "monitored": True,
+        "limits": _caps(),
+        "live": [],
+        "runs": [
+            {
+                "started_at": _iso_ago(200),
+                "resources": {
+                    "cpu_total_seconds": 1.0,
+                    "max_rss_bytes": 4096,
+                },
+                "limits": short_limits,
+            },
+            {
+                "started_at": _iso_ago(100),
+                "resources": {
+                    "cpu_total_seconds": 2.0,
+                    "max_rss_bytes": 4096,
+                },
+                "limits": long_limits,
+            },
+        ],
+    }
+    job = _job("capped", outcome="failure", exit_code=137)
+    app.jobs = [job]
+    app.by_name = {"capped": job}
+    app.drawer_job = "capped"
+    app.drawer_tab = "resources"
+    # (terminal columns, drawer width, a "limits" header, the long run
+    # in the column, the short run in the column)
+    layouts = (
+        (94, 56, False, False, False),
+        (100, 60, True, False, True),
+        (120, 72, True, False, True),
+        (150, 90, True, True, True),
+    )
+    for cols, width, header, long_in, short_in in layouts:
+        assert tui.drawer_widths(cols)[0] == width
+        screen = [
+            strip_ansi(r)[cols - width :].rstrip()
+            for r in app._compose_drawer(paint, [], cols, 24, "drawer")
+        ]
+        # past the title, tabs, rule and caps line: the column header
+        body = [r for r in screen if r][4:]
+        assert body[0].split()[:2] == ["started", "cpu"]
+        assert (body[0].split()[-1] == "limits") is header
+        # a run's limits never show less than its own row would
+        for limits, in_column in (
+            (long_limits, long_in),
+            (short_limits, short_in),
+        ):
+            cells = limit_cells(limits)
+            wrapped = strip_ansi(paint_cells(paint, cells, width - 20))
+            if in_column:
+                assert any(r.endswith("4.0KiB    " + wrapped) for r in body)
+            else:
+                assert " " * 18 + wrapped in body
+    # the long run reads whole on its own row from a 72-column drawer
+    screen = [
+        strip_ansi(r)[48:].rstrip()
+        for r in app._compose_drawer(paint, [], 120, 24, "drawer")
+    ]
+    assert " " * 18 + whole in screen
+
+
+def _capped_resource_runs(count):
+    """``count`` monitored runs a minute apart, oldest first.  Each
+    limits record is too wide for an 80-column terminal's limits
+    column, so every run takes two rows there."""
+    return [
+        {
+            "started_at": _iso_ago(60 * (count - k)),
+            "resources": {
+                "cpu_total_seconds": 101.0 + k,
+                "max_rss_bytes": 4096,
+            },
+            "limits": _limits_record(
+                peak_memory_bytes=200 * 1024 * 1024,
+                cpu_throttled_seconds=0.5,
+            ),
+        }
+        for k in range(count)
+    ]
+
+
+async def test_drawer_resources_scrolls_whole_runs(tmp_path):
+    from cronstable.tui import short_stamp
+
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    runs = _capped_resource_runs(20)
+    app.drawer_res = {
+        "monitored": True,
+        "limits": _caps(),
+        "live": [],
+        "runs": runs,
+    }
+    job = _job("capped", outcome="success")
+    app.jobs = [job]
+    app.by_name = {"capped": job}
+    app.drawer_job = "capped"
+    app.drawer_tab = "resources"
+    stamps = [short_stamp(run["started_at"]) for run in runs]
+    assert len(set(stamps)) == 20
+    wrap = " " * 18 + "kernel peak 200.0MiB"
+
+    def view():
+        """The stamps of the runs on an 80x24 screen, top to bottom."""
+        # the drawer's text starts after the 31-cell gutter and the
+        # border; the column header sits under the title, tabs, rule
+        # and caps line
+        screen = [
+            strip_ansi(r)[32:].rstrip()
+            for r in app._compose_drawer(paint, [], 80, 24, "drawer")
+        ]
+        assert screen[4].split()[:2] == ["started", "cpu"]
+        body = [r for r in screen[5:] if r]
+        # every run row has its wrap row right under it
+        assert len(body) % 2 == 0
+        assert all(r.startswith(wrap) for r in body[1::2])
+        assert not any(r.startswith(" " * 18) for r in body[::2])
+        return [r[1:12] for r in body[::2]]
+
+    # 9 of the 20 runs fit, newest first
+    assert view() == stamps[:10:-1]
+    # PgDn past the end stops at the view with the oldest run and
+    # without the newest; one step back moves the view by one run
+    await app._key_drawer("pgdn")
+    await app._key_drawer("pgdn")
+    assert view() == stamps[8::-1]
+    assert stamps[0] in view() and stamps[-1] not in view()
+    assert app.panel_scroll == 11
+    await app._key_drawer("k")
+    assert view() == stamps[9:0:-1]
+    # switching tabs starts the scroll over
+    await app._key_drawer("tab")
+    await app._key_drawer("shift+tab")
+    assert view() == stamps[:10:-1]
+
+
+def test_scrolled_entries_keep_each_entry_whole(tmp_path):
+    app = _bare_app(tmp_path)
+    entries = [["a1", "a2"], ["b"], ["c1", "c2"]]
+
+    def view(scroll, available):
+        app.panel_scroll = scroll
+        rows = app._scrolled_entries(entries, available)
+        return rows, app.panel_scroll
+
+    # everything fits: no scroll
+    assert view(5, 9) == (["a1", "a2", "b", "c1", "c2"], 0)
+    # an entry that would cross the bottom edge is left out
+    assert view(0, 4) == (["a1", "a2", "b"], 0)
+    # the scroll stops at the longest tail that fits whole
+    assert view(9, 4) == (["b", "c1", "c2"], 1)
+    assert view(9, 2) == (["c1", "c2"], 2)
+    # an entry taller than the whole body shows its top rows
+    assert view(0, 1) == (["a1"], 0)
+    assert view(9, 1) == (["c1"], 2)
+    # no room, or nothing to show
+    assert view(3, 0) == ([], 2)
+    assert view(3, -2) == ([], 2)
+    app.panel_scroll = 4
+    assert app._scrolled_entries([], 5) == [] and app.panel_scroll == 0
+
+
+def _history_with_limits():
+    """A ``/jobs/{name}/runs`` payload, oldest first: a memory-cap kill,
+    a kill whose CPU cap was off, a run with caps off, an enforced
+    run."""
+    reason = "memory limit exceeded (512 MiB)"
+    return {
+        "stats": {"total": 4, "success_rate": 0.5},
+        "runs": [
+            {
+                "outcome": "failure",
+                "started_at": _iso_ago(400),
+                "duration": 3.0,
+                "exit_code": 137,
+                "fail_reason": reason,
+                "resources": {"cpu_total_seconds": 1.2},
+                "limits": _limits_record(memory_exceeded=True),
+            },
+            {
+                "outcome": "failure",
+                "started_at": _iso_ago(300),
+                "duration": 2.0,
+                "exit_code": 137,
+                "fail_reason": reason,
+                "limits": _limits_record(
+                    memory_exceeded=True,
+                    enforced=False,
+                    unenforced=["cpu"],
+                ),
+            },
+            {
+                "outcome": "success",
+                "started_at": _iso_ago(200),
+                "duration": 1.0,
+                "limits": _limits_record(
+                    enforced=False, reason="cronstable runs in the root"
+                ),
+            },
+            {
+                "outcome": "success",
+                "started_at": _iso_ago(100),
+                "duration": 1.0,
+                "limits": _limits_record(),
+            },
+        ],
+    }
+
+
+def test_drawer_history_limit_markers(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.drawer_runs = _history_with_limits()
+    raw = app._drawer_history(paint, 130, 24)
+    rows = [strip_ansi(r) for r in raw]
+    newest, unenforced, both, killed = rows[-4:]
+    # the first marker takes the duration bar's slot, in its own ink
+    assert killed.endswith(
+        "3.0s    memory cap    exit 137 · memory limit exceeded (512 MiB)"
+        " · 1.2s cpu"
+    )
+    assert paint.style(pad_to("memory cap", 13), "fail") in raw[-1]
+    assert unenforced.endswith("1.0s    caps off     ")
+    assert paint.style(pad_to("caps off", 13), "warn") in raw[-3]
+    # a second marker goes before the free-form reason, which a narrow
+    # drawer trims first
+    assert both.endswith(
+        "2.0s    memory cap    exit 137 · caps off"
+        " · memory limit exceeded (512 MiB)"
+    )
+    # an enforced run without a hit keeps its bar and carries no marker
+    assert "▪" in newest
+    assert "caps" not in newest and "memory cap" not in newest
+
+
+def test_drawer_history_markers_at_80_columns(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.drawer_runs = _history_with_limits()
+    job = _job("capped", outcome="failure", exit_code=137)
+    app.jobs = [job]
+    app.by_name = {"capped": job}
+    app.drawer_job = "capped"
+    app.drawer_tab = "history"
+    # an 80-column terminal gives a 48-column drawer; the drawer's text
+    # starts after the 31-cell gutter and the border
+    assert tui.drawer_widths(80) == (48, 32)
+    screen = [
+        strip_ansi(r)[32:]
+        for r in app._compose_drawer(paint, [], 80, 24, "drawer")
+    ]
+    runs = [r for r in screen if r.strip()][-4:]
+    newest, unenforced, both, killed = runs
+    assert "3.0s    memory cap" in killed
+    assert "2.0s    memory cap" in both
+    assert "1.0s    caps off" in unenforced
+    assert "caps" not in newest and "▪" in newest
+    for row in runs:
+        assert text_width(row) <= 47
+
+
+def _check(**limits):
+    """A run's ``verification`` result with the check's own limits
+    record."""
+    return {
+        "outcome": "failure",
+        "exit_code": -9,
+        "fail_reason": "memory limit exceeded (96 MiB)",
+        "limits": _limits_record(**limits),
+    }
+
+
+def test_run_marks_add_a_check_memory_kill():
+    from cronstable.tui import LIMIT_MARK_COLOR, run_marks
+
+    killed = _check(memory_exceeded=True)
+    assert run_marks(None) == [] and run_marks("x") == []
+    assert run_marks({"limits": _limits_record()}) == []
+    # the check's marker leads when the run's own caps are fine, and
+    # comes second otherwise
+    assert run_marks(
+        {"limits": _limits_record(), "verification": killed}
+    ) == ["check memory cap"]
+    assert run_marks({"verification": killed}) == ["check memory cap"]
+    assert run_marks(
+        {"limits": _limits_record(enforced=False), "verification": killed}
+    ) == ["caps off", "check memory cap"]
+    assert run_marks(
+        {
+            "limits": _limits_record(memory_exceeded=True, enforced=False),
+            "verification": killed,
+        }
+    ) == ["memory cap", "check memory cap", "caps off"]
+    # a check within its cap, an uncapped check, an older daemon's
+    # result, or a foreign shape adds nothing
+    for verification in (
+        _check(),
+        {"outcome": "success", "limits": None},
+        {"outcome": "success"},
+        {"outcome": "failure", "limits": "memory_exceeded"},
+        "failure",
+        None,
+    ):
+        assert run_marks(
+            {"limits": _limits_record(), "verification": verification}
+        ) == []
+    assert LIMIT_MARK_COLOR["check memory cap"] == "fail"
+
+
+def test_drawer_history_check_memory_marker(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    reason = "verification failed: memory limit exceeded (96 MiB)"
+    killed = _check(memory_exceeded=True)
+    app.drawer_runs = {
+        "stats": {"total": 3, "success_rate": 1 / 3},
+        "runs": [
+            {
+                "outcome": "failure",
+                "started_at": _iso_ago(300),
+                "duration": 2.0,
+                "exit_code": 0,
+                "fail_reason": reason,
+                "limits": _limits_record(enforced=False, unenforced=["cpu"]),
+                "verification": killed,
+            },
+            {
+                "outcome": "failure",
+                "started_at": _iso_ago(200),
+                "duration": 2.0,
+                "exit_code": 0,
+                "fail_reason": reason,
+                "limits": _limits_record(),
+                "verification": killed,
+            },
+            {
+                "outcome": "success",
+                "started_at": _iso_ago(100),
+                "duration": 1.0,
+                "limits": _limits_record(),
+                "verification": dict(_check(), outcome="success"),
+            },
+        ],
+    }
+    raw = app._drawer_history(paint, 140, 24)
+    newest, check_only, both = [strip_ansi(r) for r in raw[-3:]]
+    # with the run's own caps fine, the check's marker takes the bar's
+    # slot; it is wider than the bar, so every row's slot widens
+    assert check_only.endswith("2.0s    check memory cap  exit 0 · " + reason)
+    assert paint.style(pad_to("check memory cap", 17), "fail") in raw[-2]
+    # behind the run's own marker it goes before the reason
+    assert both.endswith(
+        "2.0s    caps off          exit 0 · check memory cap · " + reason
+    )
+    assert check_only.index("exit 0") == both.index("exit 0")
+    # a check within its cap leaves the bar in place
+    assert "▪" in newest and "check" not in newest
+    # an 80-column terminal shows the whole marker, and every row fits
+    # its 48-column drawer
+    job = _job("checked", outcome="failure", exit_code=0)
+    app.jobs = [job]
+    app.by_name = {"checked": job}
+    app.drawer_job = "checked"
+    app.drawer_tab = "history"
+    screen = [
+        strip_ansi(r)[32:]
+        for r in app._compose_drawer(paint, [], 80, 24, "drawer")
+    ]
+    runs = [r for r in screen if r.strip()][-3:]
+    assert "2.0s    check memory cap" in runs[1]
+    assert "2.0s    caps off" in runs[2]
+    for row in runs:
+        assert text_width(row) <= 47
 
 
 def test_drawer_schedule_variants(tmp_path):
@@ -6252,17 +7019,19 @@ def test_drawer_history_and_resources_bodies_are_built_once(
     # resources: the live line, the header and every run, then a slice
     app.drawer_res = {
         "monitored": True,
-        "live": [{"cpu_percent": 4.0, "rss_bytes": 1024}],
+        "limits": _caps(),
+        "live": [_live_entry(4.0, 1024)],
         "runs": [
             {
                 "started_at": _iso_ago(30 * i),
                 "resources": {"cpu_total_seconds": i, "max_rss_bytes": 512},
+                "limits": _limits_record(),
             }
             for i in range(6)
         ],
     }
     full = app._drawer_resources(paint, 80, 20)
-    assert len(full) == 8
+    assert len(full) == 9
     built = []
     real_res = app._resource_rows
     monkeypatch.setattr(
@@ -6272,6 +7041,15 @@ def test_drawer_history_and_resources_bodies_are_built_once(
     assert app._drawer_resources(paint, 80, 5) == full[:5] and built == []
     app._res_body = None
     assert app._drawer_resources(paint, 80, 5) == full[:5] and built == [1]
+    # the limits cells are cut to the width, so another width rebuilds
+    app._drawer_resources(paint, 60, 5)
+    app._drawer_resources(paint, 60, 5)
+    assert built == [1, 1]
+    # an unmonitored payload is cached the same way
+    app.drawer_res = dict(app.drawer_res, monitored=False)
+    caps_only = app._drawer_resources(paint, 60, 20)
+    assert app._drawer_resources(paint, 60, 20) == caps_only
+    assert built == [1, 1, 1]
     # both bodies carry ink, so a retheme drops them
     app._retheme()
     assert app._history_body is None and app._res_body is None

@@ -19,6 +19,7 @@ stamp epoch floats (``createdAt``).
 import asyncio
 import datetime
 import io
+import re
 import time
 
 from cronstable import tui
@@ -28,10 +29,17 @@ from cronstable.tui import (
     LogTail,
     Term,
     copy_to_clipboard,
+    short_stamp,
     strip_ansi,
 )
 
-from tests.test_tui import FakeDaemon, Harness, _job, _wait_for
+from tests.test_tui import (
+    FakeDaemon,
+    Harness,
+    _job,
+    _limits_record,
+    _wait_for,
+)
 
 
 def _iso(seconds_ago: float) -> str:
@@ -80,6 +88,21 @@ def install_fleet_fixtures(daemon: FakeDaemon) -> None:
         "nextRetryAt": _iso(-30),
         "delaySeconds": 30,
     }
+    retrying["last_run"]["limits"] = {
+        "cpu": None,
+        "memory_bytes": 256 * 1024 * 1024,
+        "processes": None,
+        "required": False,
+        "enforced": False,
+        "mechanism": None,
+        "unenforced": ["memory"],
+        "reason": "cronstable runs in the root cgroup",
+        "refused": False,
+        "memory_exceeded": False,
+        "process_limit_hits": None,
+        "peak_memory_bytes": None,
+        "cpu_throttled_seconds": None,
+    }
     spread = _job("owned-job", outcome="success")
     spread["clusterPolicy"] = "Leader"
     spread["clusterOwner"] = "node-b"
@@ -121,15 +144,69 @@ def install_fleet_fixtures(daemon: FakeDaemon) -> None:
         "name": "risk-model",
         "monitored": True,
         "interval": 1,
-        "live": [{"cpu_percent": 42.0, "rss_bytes": 2048}],
+        "limits": {
+            "cpu": 1.5,
+            "memory_bytes": 512 * 1024 * 1024,
+            "processes": 64,
+            "required": False,
+        },
+        "live": [
+            {
+                "started_at": _iso(10),
+                "pid": 4242,
+                "current": {
+                    "cpu_seconds": 12.0,
+                    "cpu_percent": 42.0,
+                    "rss_bytes": 2048,
+                },
+                "series": [[0, 40.0, 2048], [1, 42.0, 2048]],
+            }
+        ],
         "runs": [
+            {
+                "started_at": _iso(240),
+                "resources": {
+                    "cpu_total_seconds": 2.5,
+                    "max_rss_bytes": 8192,
+                },
+                "limits": {
+                    "cpu": 1.5,
+                    "memory_bytes": 512 * 1024 * 1024,
+                    "processes": 64,
+                    "required": False,
+                    "enforced": True,
+                    "mechanism": "cgroup-v2",
+                    "unenforced": [],
+                    "reason": None,
+                    "refused": False,
+                    "memory_exceeded": True,
+                    "process_limit_hits": None,
+                    "peak_memory_bytes": 512 * 1024 * 1024,
+                    "cpu_throttled_seconds": 0.0,
+                },
+            },
             {
                 "started_at": _iso(120),
                 "resources": {
                     "cpu_total_seconds": 1.5,
                     "max_rss_bytes": 4096,
                 },
-            }
+                "limits": {
+                    "cpu": 1.5,
+                    "memory_bytes": 512 * 1024 * 1024,
+                    "processes": 64,
+                    "required": False,
+                    "enforced": True,
+                    "mechanism": "cgroup-v2",
+                    "unenforced": [],
+                    "reason": None,
+                    "refused": False,
+                    "memory_exceeded": False,
+                    "process_limit_hits": None,
+                    "peak_memory_bytes": None,
+                    "cpu_throttled_seconds": None,
+                },
+            },
         ],
     }
     daemon.cluster = {
@@ -342,12 +419,19 @@ async def test_tour_drawer_tabs_and_log_tools(tmp_path, monkeypatch):
         h.keys.send("j", "k", "pgdn", "pgup")
         screen = await snap_text(h)
         assert "runs" in screen
-        # resources tab (monitored fixture)
+        # the run whose caps were not enforced carries the marker in the
+        # duration bar's slot
+        assert re.search(r"caps off +exit 7 · ", screen)
+        # resources tab (monitored, capped fixture): the short record
+        # sits in the limits column, the long one on its own row
         app.open_drawer("risk-model", "resources")
         await _wait_for(lambda: app.drawer_res is not None)
         screen = await snap_text(h)
-        assert "live:" in screen
-        assert "peak rss" in screen
+        assert "caps  1.5 CPU · 512 MiB · 64 procs" in screen
+        assert "live: 42% cpu · 2.0KiB rss" in screen
+        assert re.search(r"peak rss +limits", screen)
+        assert re.search(r"4\.0KiB +caps on", screen)
+        assert re.search(r"│ {18}memory cap · kernel peak 512\.0MiB", screen)
         # schedule tab
         app.drawer_tab = "schedule"
         screen = await snap_text(h)
@@ -385,6 +469,120 @@ async def test_tour_drawer_unmonitored_and_wrap(tmp_path):
         await _wait_for(lambda: app.drawer_res is not None)
         screen = await snap_text(h)
         assert "no resource monitoring" in screen
+        assert "caps" not in screen
+    finally:
+        await h.stop()
+
+
+async def test_tour_drawer_caps_without_monitoring(tmp_path):
+    h = Harness()
+    h.daemon.jobs = [_job("capped", outcome="failure", exit_code=137)]
+    h.daemon.job_resources["capped"] = {
+        "name": "capped",
+        "monitored": False,
+        "interval": None,
+        "limits": {
+            "cpu": None,
+            "memory_bytes": 96 * 1024 * 1024,
+            "processes": 8,
+            "required": True,
+        },
+        "live": [],
+        "runs": [
+            {
+                "outcome": "failure",
+                "started_at": _iso(60),
+                "resources": None,
+                "limits": {
+                    "cpu": None,
+                    "memory_bytes": 96 * 1024 * 1024,
+                    "processes": 8,
+                    "required": True,
+                    "enforced": True,
+                    "mechanism": "job-object",
+                    "unenforced": [],
+                    "reason": None,
+                    "refused": False,
+                    "memory_exceeded": True,
+                    "process_limit_hits": 2,
+                    "peak_memory_bytes": 96 * 1024 * 1024,
+                    "cpu_throttled_seconds": None,
+                },
+            }
+        ],
+    }
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 1)
+        app.open_drawer("capped", "resources")
+        await _wait_for(lambda: app.drawer_res is not None)
+        screen = await snap_text(h)
+        assert "caps  96 MiB · 8 procs (required)" in screen
+        assert "no resource monitoring" in screen
+        assert "monitorResources: true" in screen
+        assert "memory cap · kernel peak 96.0MiB" in screen
+    finally:
+        await h.stop()
+
+
+async def test_tour_drawer_check_kill_and_resources_scroll(tmp_path):
+    h = Harness()
+    h.term = HeadlessTerm(80, 24)
+    reason = "verification failed: memory limit exceeded (96 MiB)"
+    job = _job("checked", outcome="failure", exit_code=0, fail_reason=reason)
+    job["last_run"]["limits"] = _limits_record(memory_bytes=96 * 1024**2)
+    job["last_run"]["verification"] = {
+        "outcome": "failure",
+        "exit_code": -9,
+        "fail_reason": "memory limit exceeded (96 MiB)",
+        "limits": _limits_record(
+            memory_bytes=96 * 1024**2, memory_exceeded=True
+        ),
+    }
+    h.daemon.jobs = [job]
+    runs = [
+        {
+            "started_at": _iso(60 * (20 - k)),
+            "resources": {
+                "cpu_total_seconds": 101.0 + k,
+                "max_rss_bytes": 4096,
+            },
+            "limits": _limits_record(
+                peak_memory_bytes=200 * 1024**2, cpu_throttled_seconds=0.5
+            ),
+        }
+        for k in range(20)
+    ]
+    h.daemon.job_resources["checked"] = {
+        "name": "checked",
+        "monitored": True,
+        "interval": 1,
+        "limits": {"cpu": 1.5, "memory_bytes": 96 * 1024**2},
+        "live": [],
+        "runs": runs,
+    }
+    oldest = short_stamp(runs[0]["started_at"])
+    newest = short_stamp(runs[-1]["started_at"])
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 1)
+        # the run's own caps held, so the check's kill takes the marker
+        # slot and shows whole in an 80-column terminal's drawer
+        app.open_drawer("checked", "history")
+        await _wait_for(lambda: app.drawer_runs is not None)
+        screen = await snap_text(h)
+        assert re.search(r"1\.0s +check memory cap", screen)
+        # the resources tab shows the newest runs; PgDn reaches the
+        # oldest, each with its wrap row
+        app.open_drawer("checked", "resources")
+        await _wait_for(lambda: app.drawer_res is not None)
+        screen = await snap_text(h)
+        assert newest in screen and oldest not in screen
+        h.keys.send("pgdn", "pgdn")
+        await _wait_for(lambda: oldest in h.term.screen())
+        screen = await snap_text(h)
+        assert oldest in screen and newest not in screen
+        assert re.search(r"│ {18}kernel peak 200\.0MiB", screen)
     finally:
         await h.stop()
 

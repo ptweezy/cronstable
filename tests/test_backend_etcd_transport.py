@@ -277,8 +277,11 @@ async def _auth_cluster(tmp_path, members=1):
 
 
 def _https(server):
-    # the leaf's SANs cover localhost and the loopback IPs
-    return "https://localhost:{}".format(server.port)
+    # Dial the address the fake listens on, which the leaf's SANs cover. The
+    # name localhost resolves to ::1 too, where the fake has no listener and
+    # another socket can hold the same port number. The lookup itself counts
+    # against the per-endpoint timeout.
+    return "https://127.0.0.1:{}".format(server.port)
 
 
 async def test_post_reauthenticates_exactly_once_on_401(tmp_path):

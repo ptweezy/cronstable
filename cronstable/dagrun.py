@@ -2383,9 +2383,11 @@ class DagScheduler:
             # run registration and re-raise, like maybe_launch_job.  The
             # claim stays RUNNING under our token; with its registry key
             # dropped, the next advance releases and re-claims it
-            # (_repair_lost_claims).  A cancel that lands after the
-            # subprocess spawned keeps the key: that launch is live.
-            if running.proc is None:
+            # (_repair_lost_claims).  A start cancelled during its limits
+            # attach has killed its child (start_discarded) and is released
+            # the same way.  Any other cancel after the spawn keeps the
+            # key: that launch is live.
+            if running.proc is None or running.start_discarded:
                 await self._cron._pools.finish(
                     pool_ticket, "queued", "launch interrupted"
                 )
@@ -2544,9 +2546,11 @@ class DagScheduler:
             self._drop_completion(ref, dref.taskkey)
             return
         success = running.fail_reason is None
-        # sampled usage (monitorResources) rides the completion into the
-        # dag_run document, serialised here so dag.py stays data-only.
+        # sampled usage (monitorResources) and the caps record
+        # (resourceLimits) ride the completion into the dag_run document,
+        # serialised here so dag.py stays data-only.
         usage = running.resource_usage
+        caps = getattr(running, "limits_record", None)
         # Buffer, don't record: the reaper hands over each finished task one at
         # a time, and flush_completions (invoked once it has drained the whole
         # batch) folds a run's completions into a single RMW. Recording here
@@ -2567,6 +2571,7 @@ class DagScheduler:
                 "poke": dref.poke,
                 "resources": usage.to_dict() if usage is not None else None,
                 "verification": running.verification,
+                "limits": caps.to_dict() if caps is not None else None,
             }
         )
 
@@ -2639,6 +2644,7 @@ class DagScheduler:
                     "expected_poke": entry["poke"],
                     "resources": entry.get("resources"),
                     "verification": entry.get("verification"),
+                    "limits": entry.get("limits"),
                 }
             )
             live.append(entry)

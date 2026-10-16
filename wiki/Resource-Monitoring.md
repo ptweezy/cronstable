@@ -4,7 +4,7 @@ Enable `monitorResources` to record a job's **total CPU time** (user + system), 
 
 The run record carries the numbers to every surface that already reports a run: the [web dashboard](Web-Dashboard), the [terminal dashboard](Terminal-Dashboard), the [HTTP API](HTTP-API), [Prometheus](Metrics-with-Prometheus), [statsd](Metrics-with-Statsd), failure [reports](Reporting), and the durable [run ledger](Durable-State).
 
-It is observability only. Monitoring never changes a run's success/failure verdict, never delays or crashes a job, and is off by default. A per-run sampling task is spawned only when it is on.
+It is observability only. Monitoring never changes a run's success/failure verdict, never delays or crashes a job, and is off by default. A per-run sampling task is spawned only when it is on. To cap a run's CPU, memory, or process count, see [resource limits](Resource-Limits).
 
 psutil is a core dependency. If it is unavailable, monitoring reports no data and the job continues.
 
@@ -44,7 +44,8 @@ The option merges normally under `defaults:` and is **not** part of the [job-set
 
 The monitor attaches to the launched child's pid immediately after launch, takes a first reading right away (so even a short run has a chance of a sample), then polls on the configured `interval`. It takes one final opportunistic reading when the run ends.
 
-- **The whole tree is accounted.** Each sample reads the child and all of its descendants. CPU time is tracked per tree member. A member that exits has its last reading banked before it is forgotten, so sequential children (`sh -c 'a; b'`) accumulate instead of plateauing. The only CPU that escapes accounting entirely is a child that spawns *and* exits within a single sampling gap.
+- **The whole tree is accounted.** Each sample reads the child and all of its descendants. CPU time is tracked per tree member. A member that exits has its last reading banked before it is forgotten, so sequential children (`sh -c 'a; b'`) accumulate instead of plateauing. For an uncapped run, the only CPU that escapes accounting entirely is a child that spawns *and* exits within a single sampling gap.
+- **A capped run's CPU total is exact.** When the job also sets [`resourceLimits`](Resource-Limits) and the run is inside its own cgroup (Linux) or Job Object (Windows), each sample takes the run's members from that container instead of walking the process tree, and the CPU totals come from the kernel's accounting for the container. They include children that started and exited between samples, and processes that left the tree. `max_rss_bytes` is the sampled RSS sum, as for any run. On Linux, while cronstable's cpu controller is on, which takes a job with a `cpu` cap and a delegated cpu controller (as with `Delegate=yes`), every run has a cgroup of its own (see [CPU caps and priority](Resource-Limits#cpu-caps-and-priority)), so an uncapped run is sampled this way too. A run that never got into its container is sampled by walking its process tree. With [`verify`](Result-Verification), a capped run's figures end before its check starts.
 - **Peak RSS is a sampled high-water mark.** The recorded maximum is the highest resident-set sum observed across samples, so a spike narrower than the sampling gap can be missed. A shorter `interval` narrows that window.
 - **Best-effort, never fatal.** Every psutil interaction is guarded. A process that exits mid-sample, a platform that denies the read, or psutil raising anything at all yields whatever was captured so far. A run where nothing could be sampled carries no resource stats (`resources` is `null` in the API). It is never an error.
 - **Short runs have fewer samples.** Measurements are less precise when a run finishes between samples.
@@ -63,7 +64,7 @@ The series is embedded in the durable run record's `resources.series`, so charts
 
 | Surface | What appears |
 | --- | --- |
-| [Web Dashboard](Web-Dashboard) | Live CPU/memory chips on a running job's row and drawer; per-run CPU and peak-memory columns and stats in the drawer's **History** tab. The drawer's **Resources** tab charts the live instance, the recorded profile of recent runs, and per-run trend strips; for an unmonitored job it points at the config instead of an empty chart. |
+| [Web Dashboard](Web-Dashboard) | Live CPU/memory chips on a running job's row and drawer; per-run CPU and peak-memory columns and stats in the drawer's **History** tab. The drawer's **Resources** tab charts the live instance, the recorded profile of recent runs, and per-run trend strips; for an unmonitored job it points at the config instead of an empty chart, and for an unmonitored job with [resource limits](Resource-Limits) it lists the recent runs' cap records. |
 | [Terminal Dashboard](Terminal-Dashboard) | Live CPU/memory chips on monitored rows, a resources view in the job drawer, and a node resources panel. |
 | [HTTP API](HTTP-API) | `running_resources` (live, summed over running instances) on [`GET /jobs`](HTTP-API#get-jobs). A per-run `resources` object plus windowed CPU/RSS aggregates on [`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns). The chart-grade series on [`GET /jobs/{name}/resources`](HTTP-API#get-jobsnameresources). |
 | [Prometheus](Metrics-with-Prometheus#per-job) | `cronstable_job_cpu_seconds_total{job_name, mode}`, `cronstable_job_peak_rss_bytes`, `cronstable_job_last_run_cpu_seconds`, and `cronstable_job_last_run_max_rss_bytes`; emitted only after the job has a monitored run. A `state:` store makes the two cumulative families restart-durable. |
@@ -89,6 +90,7 @@ Three adjacent surfaces report the **node's** load rather than a job's. None of 
 ## See also
 
 - [Configuration Reference](Configuration-Reference#metrics): the per-job option table and load-time numeric validation.
+- [Resource Limits](Resource-Limits): per-run CPU, memory, and process caps that the kernel enforces.
 - [HTTP Control API](HTTP-API): the endpoints that carry the numbers, with response examples.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the resource metric families and their restart-durability.
 - [Metrics with statsd](Metrics-with-Statsd): the exact wire format of the `cpu` / `max_rss` lines.

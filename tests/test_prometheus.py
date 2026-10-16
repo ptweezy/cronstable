@@ -1579,6 +1579,162 @@ async def test_job_families_omit_last_run_cpu_when_unmonitored():
     assert _last_run_rss(text, job_name="alpha") is None
 
 
+# ---------------------------------------------------------------------------
+# resourceLimits families: cap gauges, the memory counter, last-run enforced
+# ---------------------------------------------------------------------------
+
+_cpu_limit = partial(sample_value, name="cronstable_job_cpu_limit_cpus")
+_memory_limit = partial(sample_value, name="cronstable_job_memory_limit_bytes")
+_process_limit = partial(sample_value, name="cronstable_job_process_limit")
+_memory_exceeded = partial(
+    sample_value, name="cronstable_job_memory_limit_exceeded_total"
+)
+_limits_enforced = partial(
+    sample_value, name="cronstable_job_last_run_limits_enforced"
+)
+
+_CAPPED_JOBS = """
+jobs:
+  - name: capped
+    command: echo hi
+    schedule: "0 0 1 1 *"
+    resourceLimits:
+      cpu: 1.5
+      memory: 512M
+      processes: 64
+  - name: cpuonly
+    command: echo hi
+    schedule: "0 0 1 1 *"
+    resourceLimits:
+      cpu: 0.5
+  - name: memonly
+    command: echo hi
+    schedule: "0 0 1 1 *"
+    resourceLimits:
+      memory: 64M
+  - name: plain
+    command: echo hi
+    schedule: "0 0 1 1 *"
+"""
+
+
+def _limits_record(**over):
+    from cronstable.limits import LimitsRecord
+
+    fields = {
+        "cpu": 1.5,
+        "memory_bytes": 512 * 1024 * 1024,
+        "processes": 64,
+        "required": False,
+        "enforced": True,
+        "mechanism": "cgroup-v2",
+        "unenforced": (),
+        "reason": None,
+    }
+    fields.update(over)
+    return LimitsRecord(**fields)
+
+
+def _capped_run(limits=None):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return JobRunInfo(
+        outcome="failure" if limits is not None else "success",
+        exit_code=0,
+        started_at=now - datetime.timedelta(seconds=3),
+        finished_at=now,
+        fail_reason=None,
+        output=_closed_output(),
+        limits=limits,
+    )
+
+
+async def test_limit_families_cover_capped_jobs_only():
+    cron = Cron(None, config_yaml=_CAPPED_JOBS)
+    text = cron.metrics.render(cron)
+    assert _cpu_limit(text, job_name="capped") == 1.5
+    assert _memory_limit(text, job_name="capped") == 512 * 1024 * 1024
+    assert _process_limit(text, job_name="capped") == 64
+    # zero-filled once the memory cap exists, so increase() sees it
+    assert _memory_exceeded(text, job_name="capped") == 0
+    # each family needs its own cap
+    assert _cpu_limit(text, job_name="cpuonly") == 0.5
+    assert _memory_limit(text, job_name="cpuonly") is None
+    assert _process_limit(text, job_name="cpuonly") is None
+    assert _memory_exceeded(text, job_name="cpuonly") is None
+    assert _cpu_limit(text, job_name="memonly") is None
+    assert _memory_limit(text, job_name="memonly") == 64 * 1024 * 1024
+    assert _memory_exceeded(text, job_name="memonly") == 0
+    for family in (_cpu_limit, _memory_limit, _process_limit):
+        assert family(text, job_name="plain") is None
+    assert _memory_exceeded(text, job_name="plain") is None
+    # no run yet, so no last-run gauge
+    assert _limits_enforced(text, job_name="capped") is None
+
+
+async def test_uncapped_fleet_exports_no_limit_families():
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    text = cron.metrics.render(cron, openmetrics=True)
+    for family in (
+        "cronstable_job_cpu_limit_cpus",
+        "cronstable_job_memory_limit_bytes",
+        "cronstable_job_process_limit",
+        "cronstable_job_memory_limit_exceeded",
+        "cronstable_job_last_run_limits_enforced",
+    ):
+        assert family not in text
+
+
+async def test_memory_limit_counter_and_last_run_gauge():
+    cron = Cron(None, config_yaml=_CAPPED_JOBS)
+    hit = _limits_record(memory_exceeded=True)
+    cron._record_run("capped", _capped_run(hit))
+    cron._record_run("capped", _capped_run(_limits_record()))
+    cron._record_run("plain", _capped_run())
+    text = cron.metrics.render(cron)
+    assert _memory_exceeded(text, job_name="capped") == 1
+    assert _limits_enforced(text, job_name="capped") == 1
+    cron._record_run(
+        "capped",
+        _capped_run(_limits_record(enforced=False, unenforced=("memory",))),
+    )
+    text = cron.metrics.render(cron)
+    assert _limits_enforced(text, job_name="capped") == 0
+    # a capped job whose last run had no record has no gauge
+    cron._record_run("cpuonly", _capped_run())
+    text = cron.metrics.render(cron)
+    assert _limits_enforced(text, job_name="cpuonly") is None
+
+
+def test_memory_limit_counter_survives_a_snapshot_round_trip():
+    metrics = PrometheusMetrics()
+    hit = _limits_record(memory_exceeded=True)
+    metrics.job_run_recorded("j", "failure", 1.0, limits=hit)
+    metrics.job_run_recorded("j", "failure", 1.0, limits=hit)
+    metrics.job_run_recorded("j", "success", 1.0, limits=_limits_record())
+    metrics.job_run_recorded("other", "success", 1.0)
+    snap = metrics.counters_snapshot()
+    assert snap["jobs"]["j"]["memory_limit_exceeded"] == 2
+    # an untouched job keeps its snapshot shape
+    assert "memory_limit_exceeded" not in snap["jobs"]["other"]
+
+    restored = PrometheusMetrics()
+    restored.job_run_recorded("j", "failure", 1.0, limits=hit)
+    assert restored.seed_counters(snap, keep=["j", "other"]) == 2
+    assert restored._jobs["j"].memory_limit_exceeded == 3
+    assert restored._jobs["other"].memory_limit_exceeded == 0
+
+
+@pytest.mark.parametrize("bad", [-2, 0, True, "3", 2.5, None, [1]])
+def test_seed_counters_rejects_a_corrupt_memory_limit_count(bad):
+    metrics = PrometheusMetrics()
+    snap = {
+        "buckets": list(DEFAULT_DURATION_BUCKETS),
+        "jobs": {"j": {"memory_limit_exceeded": bad}},
+    }
+    assert metrics.seed_counters(snap, keep=["j"]) == 1
+    assert metrics._jobs["j"].memory_limit_exceeded == 0
+
+
 # ---- the two-phase render seam (families / render_prepared) ----------------
 
 

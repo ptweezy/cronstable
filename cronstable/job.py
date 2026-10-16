@@ -30,7 +30,7 @@ from typing import (
 )
 from urllib.parse import urlsplit, urlunsplit
 
-from cronstable import platform, push
+from cronstable import limits, platform, push
 from cronstable.config import (
     ConfigError,
     JobConfig,
@@ -1061,6 +1061,39 @@ class MailReporter(Reporter):
             smtp.close()
 
 
+def _limits_env(job: Any) -> dict[str, str]:
+    """The shell reporter's resource-limit variables for ``job``.
+
+    ``CRONSTABLE_LIMITS_ENFORCED`` is empty when the job has no caps.
+    """
+    record = getattr(job, "limits_record", None)
+    if not isinstance(record, limits.LimitsRecord):
+        return {
+            "CRONSTABLE_LIMITS_ENFORCED": "",
+            "CRONSTABLE_MEMORY_LIMIT_EXCEEDED": "",
+        }
+    return {
+        "CRONSTABLE_LIMITS_ENFORCED": "1" if record.enforced else "0",
+        "CRONSTABLE_MEMORY_LIMIT_EXCEEDED": (
+            "1" if record.memory_exceeded else ""
+        ),
+    }
+
+
+def _run_nice(priority: str) -> int | None:
+    """The absolute nice that a run's CPU weight follows; None on Windows.
+
+    A ``normal`` run takes the daemon's own nice, as its process does.
+    """
+    if platform.IS_WINDOWS:  # pragma: no cover (windows) - no cgroup weights
+        return None
+    else:  # pragma: no cover (posix) - os.getpriority is POSIX-only
+        nice = platform.posix_nice_for(priority)
+        if nice is None:
+            nice = os.getpriority(os.PRIO_PROCESS, 0)
+        return nice
+
+
 class ShellReporter(Reporter):
     async def report(
         self, success: bool, job: "RunningJob", config: dict[str, Any]
@@ -1143,6 +1176,7 @@ class ShellReporter(Reporter):
         env["CRONSTABLE_MAX_RSS_BYTES"] = (
             str(usage.max_rss_bytes) if usage is not None else ""
         )
+        env.update(_limits_env(job))
         # run context: identity and timing of the run being reported. A
         # SlaBreachContext (onLate) carries no run, so run_id/started_at are
         # absent there and export empty. host is the daemon's, always set.
@@ -1636,6 +1670,15 @@ def _eventlog_detail(outcome: str, tvars: dict[str, Any]) -> str:
         value = tvars.get(key)
         if value is not None:
             usage.append("{}={}".format(key, value))
+    record = tvars.get("limits")
+    if isinstance(record, dict):
+        # a capped run only; appended so earlier keys keep their places
+        usage.append(
+            "limits_enforced={} memory_limit_exceeded={}".format(
+                int(record.get("enforced") is True),
+                int(record.get("memory_exceeded") is True),
+            )
+        )
     return " ".join(usage)
 
 
@@ -2079,6 +2122,7 @@ STANDARD_TEMPLATE_VARS = (
     "cpu_system_seconds",
     "max_rss_bytes",
     "verification",
+    "limits",
 )
 
 
@@ -2090,12 +2134,13 @@ def _base_template_vars(
     started_at: str | None = None,
     run_id: str | None = None,
     usage: ResourceUsage | None = None,
+    limits_record: limits.LimitsRecord | None = None,
 ) -> dict:
     """The STANDARD_TEMPLATE_VARS keys, read off one reporting context.
 
     Callers pass the run-shaped values their context actually has; the
     defaults are the "nothing ran" shape the SLA and notify contexts
-    share (started_at/run_id/resource keys all None).
+    share (started_at/run_id/resource/limits keys all None).
     """
     return {
         "name": ctx.config.name,
@@ -2118,6 +2163,10 @@ def _base_template_vars(
         "cpu_system_seconds": usage.cpu_system_seconds if usage else None,
         "max_rss_bytes": usage.max_rss_bytes if usage else None,
         "verification": getattr(ctx, "verification", None),
+        # the run's resource-limit record; None when the job has no caps
+        "limits": (
+            limits_record.to_dict() if limits_record is not None else None
+        ),
     }
 
 
@@ -2296,10 +2345,23 @@ class RunningJob:
         # _on_stop before the statsd emission that reports it.
         self._resource_monitor: ResourceMonitor | None = None
         self.resource_usage: ResourceUsage | None = None
+        # resourceLimits: _limits is the run's container handle (a run
+        # without caps has one while cronstable weighs CPU between runs);
+        # limits_record is its record, set when the run is refused or ends
+        # (None for a job without caps).
+        self._limits: limits.RunLimits | None = None
+        self.limits_record: limits.LimitsRecord | None = None
+        # the monitor-then-limits step of a run in a container (see
+        # _settle), run once and shared by wait()'s verify decision and
+        # every stop
+        self._settling: asyncio.Future | None = None
         # set when the subprocess could not be launched at all (e.g. the
         # command does not exist). Lets wait() treat it as a normal job
         # failure instead of raising RuntimeError("process is not running").
         self.start_failed = False
+        # set by _discard_child: a start cancelled after the spawn killed
+        # its child, so the caller treats the launch as never made
+        self.start_discarded = False
         # guards against _on_stop running twice (cancel() racing wait())
         self._stopped = False
         # set once a cancel has terminated the verification check: the run
@@ -2358,25 +2420,20 @@ class RunningJob:
         # only be emitted once. Safe without locking because asyncio is
         # single-threaded and there is no await before the flag is set.
         if self._stopped:
+            # a racing stop of a capped run waits for its limits record
+            if self._settling is not None:
+                await asyncio.shield(self._settling)
             return
         self._stopped = True
         if self.ended_at is None:
             self.ended_at = datetime.now(timezone.utc)
         # Finalize resource accounting before statsd reports it. _on_stop
         # is the single idempotent choke point every completion path
-        # funnels through, so usage is captured exactly once. Guarded so a
-        # monitor bug can never break job completion.
-        if self._resource_monitor is not None:
-            try:
-                self.resource_usage = await self._resource_monitor.stop()
-            except Exception:  # noqa: BLE001 - accounting must never be fatal
-                logger.warning(
-                    "Job %s: failed to finalize resource monitoring",
-                    self.config.name,
-                    exc_info=True,
-                )
-            finally:
-                self._resource_monitor = None
+        # funnels through, so usage is captured exactly once.
+        if self._limits is not None:
+            await self._settle()
+        elif self._resource_monitor is not None:
+            await self._stop_monitor()
         task = self._start_telemetry
         self._start_telemetry = None
         if task is not None and task.done():
@@ -2435,36 +2492,8 @@ class RunningJob:
         kwargs: dict[str, Any] = platform.new_process_group_kwargs(
             config.priority
         )
-        if isinstance(config.command, list):
-            create: Any = asyncio.create_subprocess_exec
-            cmd = config.command
-        else:
-            if config.shell:
-                create, cmd, shell_kwargs = shell_spawn(
-                    config.shell, config.command
-                )
-                kwargs.update(shell_kwargs)
-            else:
-                create = asyncio.create_subprocess_shell
-                cmd = [config.command]
-        custom_env = bool(config.environment or self.extra_env)
-        if custom_env or pyinstaller_env_leaks():
-            env = dict(os.environ)
-            fixup_pyinstaller_env(env)
-            drop_inherited_params(env, self.owns_params)
-            for envvar in config.environment:
-                env[envvar["key"]] = envvar["value"]
-            # The daemon-injected control-channel vars go last, so a job's own
-            # environment cannot shadow the loopback URL/token it needs to
-            # reach the state API (CRONSTABLE_* is reserved for cronstable's
-            # use).
-            env.update(self.extra_env)
-            if custom_env:
-                # self.env feeds the report templates' `environment` var; a
-                # job with no custom environment keeps rendering None there
-                # even when the scrub forces an explicit child env.
-                self.env = env
-            kwargs["env"] = env
+        create, cmd = self._spawn_call(kwargs)
+        self._child_env(kwargs)
         if config.workingDirectory is not None:
             # The directory the child starts in.  Omitted rather than passed
             # as None when unset, so a job that does not ask for one keeps
@@ -2488,6 +2517,9 @@ class RunningJob:
             kwargs["stderr"] = asyncio.subprocess.PIPE
         if capture_stdout:
             kwargs["stdout"] = asyncio.subprocess.PIPE
+        # after preexec_fn is in place: on Linux the container wraps it
+        if not await self._prepare_limits(kwargs):
+            return
         if config.executionTimeout:
             self.execution_deadline = (
                 time.perf_counter() + config.executionTimeout
@@ -2529,16 +2561,25 @@ class RunningJob:
             # spawn path and kill the whole scheduler.
             OSError,
         ):
-            logger.exception(
-                "Error launching subprocess of job %s, cmd=%r, kwargs=%s "
-                "(system encoding: %s)",
-                config.name,
-                cmd,
-                loggable_spawn_kwargs(kwargs),
-                sys.getdefaultencoding(),
-            )
+            self._abort_limits()
+            # A required Linux child that cannot join its cgroup fails the
+            # spawn on purpose; the abort logs that as a limits failure.
+            if self._limits is None or not self._limits.refused:
+                logger.exception(
+                    "Error launching subprocess of job %s, cmd=%r, kwargs=%s "
+                    "(system encoding: %s)",
+                    config.name,
+                    cmd,
+                    loggable_spawn_kwargs(kwargs),
+                    sys.getdefaultencoding(),
+                )
             self.start_failed = True
             return
+        finally:
+            # a cancelled or otherwise aborted spawn releases the container
+            if self.proc is None:
+                if not self.start_failed:
+                    self._abort_limits()
 
         if self.proc.pid is not None:
             # POSIX: renice the group now that it exists (on Windows the
@@ -2549,6 +2590,10 @@ class RunningJob:
             # apply_priority logs it, so there is nothing to decide here and
             # nothing to say twice.
             platform.apply_priority(self.proc.pid, config.priority)
+            if self._limits is not None:
+                # Next, with no await before it: a capped Windows child
+                # stays suspended until it is in its Job Object.
+                await self._attach_limits(self._limits, self.proc.pid)
 
         # Spawned, not awaited: every launch path holds the daemon-wide
         # spawn gate around start(), and a stalled statsd send would hold
@@ -2560,35 +2605,199 @@ class RunningJob:
         if config.monitorResources and self.proc.pid is not None:
             # Best-effort: if psutil cannot attach the monitor stays inert
             # and resource_usage ends up None. Started right after launch.
+            run = self._limits
             self._resource_monitor = ResourceMonitor(
                 self.proc.pid,
                 interval=config.monitorResourcesInterval,
                 history=config.monitorResourcesHistory,
+                container=run.container if run is not None else None,
             )
             self._resource_monitor.start()
 
-        if capture_stderr:
-            assert self.proc.stderr is not None
+        self._start_readers()
+
+    def _spawn_call(self, kwargs: dict[str, Any]) -> tuple[Any, list[str]]:
+        """The spawn function and argv for this run's command.
+
+        A string command under an explicit ``shell:`` adds that shell's
+        spawn options to ``kwargs`` (see :func:`shell_spawn`).
+        """
+        config = self.config
+        if isinstance(config.command, list):
+            return asyncio.create_subprocess_exec, config.command
+        if config.shell:
+            create, cmd, shell_kwargs = shell_spawn(
+                config.shell, config.command
+            )
+            kwargs.update(shell_kwargs)
+            return create, cmd
+        return asyncio.create_subprocess_shell, [config.command]
+
+    def _child_env(self, kwargs: dict[str, Any]) -> None:
+        """Set ``kwargs["env"]`` when the child needs an explicit one."""
+        config = self.config
+        custom_env = bool(config.environment or self.extra_env)
+        if custom_env or pyinstaller_env_leaks():
+            env = dict(os.environ)
+            fixup_pyinstaller_env(env)
+            drop_inherited_params(env, self.owns_params)
+            for envvar in config.environment:
+                env[envvar["key"]] = envvar["value"]
+            # The daemon-injected control-channel vars go last, so a job's own
+            # environment cannot shadow the loopback URL/token it needs to
+            # reach the state API (CRONSTABLE_* is reserved for cronstable's
+            # use).
+            env.update(self.extra_env)
+            if custom_env:
+                # self.env feeds the report templates' `environment` var; a
+                # job with no custom environment keeps rendering None there
+                # even when the scrub forces an explicit child env.
+                self.env = env
+            kwargs["env"] = env
+
+    def _start_readers(self) -> None:
+        """Start reading the captured output pipes."""
+        config = self.config
+        proc = self.proc
+        assert proc is not None
+        if config.captureStderr:
+            assert proc.stderr is not None
             self._stderr_reader = StreamReader(
                 config.name,
                 self._output_prefix + "stderr",
-                self.proc.stderr,
+                proc.stderr,
                 config.streamPrefix,
                 config.saveLimit,
                 on_line=self.output.publish,
                 max_line_length=config.maxLineLength,
             )
-        if capture_stdout:
-            assert self.proc.stdout is not None
+        if config.captureStdout:
+            assert proc.stdout is not None
             self._stdout_reader = StreamReader(
                 config.name,
                 self._output_prefix + "stdout",
-                self.proc.stdout,
+                proc.stdout,
                 config.streamPrefix,
                 config.saveLimit,
                 on_line=self.output.publish,
                 max_line_length=config.maxLineLength,
             )
+
+    async def _prepare_limits(self, kwargs: dict[str, Any]) -> bool:
+        """Create the run's container, if it has one, and fit the spawn to it.
+
+        A run has a container when its job sets caps, and while cronstable
+        weighs CPU between runs (:func:`cronstable.limits.weighting_active`).
+        False when the job requires caps the host cannot enforce: the run
+        is then a start failure that never spawns.
+        """
+        config = self.config
+        caps = config.resourceLimits
+        if caps is None and not limits.weighting_active():
+            return True
+        run = await limits.prepare(
+            caps, config.name, nice=_run_nice(config.priority)
+        )
+        if run is None:
+            return True
+        self._limits = run
+        if run.refused:
+            self._keep_record(run.record)
+            self.start_failed = True
+            return False
+        run.spawn_kwargs(kwargs)
+        return True
+
+    def _keep_record(self, record: limits.LimitsRecord) -> None:
+        """Keep ``record`` as the run's limits record when the run has caps.
+
+        A run without caps keeps ``limits_record`` None, whatever container
+        it ran in.
+        """
+        run = self._limits
+        if run is not None and run.recorded:
+            self.limits_record = record
+
+    def _abort_limits(self) -> None:
+        """Release the container of a run that did not spawn."""
+        if self._limits is not None:
+            self._keep_record(self._limits.abort())
+
+    async def _attach_limits(self, run: limits.RunLimits, pid: int) -> None:
+        """Put the spawned child in its container.
+
+        A required run whose child could not be contained is refused: the
+        container has terminated the child, and :meth:`wait` collects it.
+        A cancelled attach kills the child, as a cancelled spawn does.
+        """
+        try:
+            await run.attach(pid)
+        except asyncio.CancelledError:
+            await self._discard_child(run)
+            raise
+        if run.refused:
+            self._keep_record(run.record)
+
+    async def _discard_child(self, run: limits.RunLimits) -> None:
+        """Kill the child of a cancelled start and release its container.
+
+        Callers register a run only once start() returns, so nothing else
+        would end it. ``start_discarded`` tells them the launch never
+        happened.
+        """
+        self.start_discarded = True
+        killed = False
+        try:
+            killed = await asyncio.shield(run.kill())
+        finally:
+            if not killed:
+                self._signal_child(force=True)
+            self._keep_record(run.abort())
+            # no reader runs yet; this closes the pipes
+            await self._read_job_streams(close_output=False)
+
+    async def _stop_monitor(self) -> None:
+        """Take the monitor's final reading into resource_usage.
+
+        Guarded so a monitor bug can never break job completion.
+        """
+        if self._resource_monitor is None:
+            return
+        try:
+            self.resource_usage = await self._resource_monitor.stop()
+        except Exception:  # noqa: BLE001 - accounting must never be fatal
+            logger.warning(
+                "Job %s: failed to finalize resource monitoring",
+                self.config.name,
+                exc_info=True,
+            )
+        finally:
+            self._resource_monitor = None
+
+    async def _settle(self) -> None:
+        """Run :meth:`_settle_limits` once; every caller waits for it."""
+        if self._settling is None:
+            self._settling = asyncio.ensure_future(self._settle_limits())
+        await asyncio.shield(self._settling)
+
+    async def _settle_limits(self) -> None:
+        """Stop the monitor, then read the final limits record.
+
+        In that order: the monitor's last sample reads the container.
+        """
+        await self._stop_monitor()
+        run = self._limits
+        assert run is not None
+        try:
+            self._keep_record(await run.finish())
+        except Exception:  # noqa: BLE001 - accounting must never be fatal
+            logger.warning(
+                "Job %s: failed to finalize resource limits",
+                self.config.name,
+                exc_info=True,
+            )
+            # the caps without the kernel's counters
+            self._keep_record(run.record)
 
     def live_resources(self) -> dict[str, Any] | None:
         """Current live CPU/memory of this running instance, or ``None``.
@@ -2682,21 +2891,33 @@ class RunningJob:
         await self._read_job_streams(close_output=self.config.verify is None)
         try:
             if self.config.verify is not None and not self._terminated:
-                if self.skipped:
-                    self.verification = {
-                        "outcome": "skipped",
-                        "fail_reason": "command skipped the task",
-                    }
-                elif self.failed:
-                    self.verification = {
-                        "outcome": "skipped",
-                        "fail_reason": "command failed",
-                    }
-                else:
-                    await self._verify_result()
+                await self._verify_or_skip()
         finally:
             self.output.close()
             await self._on_stop()
+
+    async def _verify_or_skip(self) -> None:
+        """Run the verify check, or record why it is skipped.
+
+        A capped run settles its limits first, so a run killed at its
+        memory cap skips its check.
+        """
+        if self._limits is not None and self._limits.recorded:
+            await self._settle()
+            if self._terminated:
+                return  # cancelled while the limits settled
+        if self.skipped:
+            self.verification = {
+                "outcome": "skipped",
+                "fail_reason": "command skipped the task",
+            }
+        elif self.failed:
+            self.verification = {
+                "outcome": "skipped",
+                "fail_reason": "command failed",
+            }
+        else:
+            await self._verify_result()
 
     async def _output_open_at_deadline(self) -> bool:
         """Whether a captured pipe is still open at the execution deadline.
@@ -2805,6 +3026,12 @@ class RunningJob:
                 for s in (check.stdout, check.stderr)
             )
             or bool(check.stdout_discarded or check.stderr_discarded),
+            # the check's own caps; the run's record covers only the run
+            "limits": (
+                check.limits_record.to_dict()
+                if check.limits_record is not None
+                else None
+            ),
         }
 
     async def _read_job_streams(self, *, close_output: bool = True):
@@ -2900,17 +3127,24 @@ class RunningJob:
         """Whether the command exited with one of ``skip_exit_codes``.
 
         Only a command that started and exited by itself can skip its run.
-        A timeout, a cancel, and a failed launch never do.
+        A timeout, a cancel, a failed launch, a memory kill, and a refused
+        run never do.
         """
+        record = self.limits_record
         return (
             bool(self.skip_exit_codes)
             and self.retcode in self.skip_exit_codes
             and not self._terminated
             and not self.start_failed
+            and (record is None or record.failure is None)
         )
 
     @property
     def fail_reason(self) -> str | None:
+        # A memory kill or a refused run fails whatever failsWhen says.
+        record = self.limits_record
+        if record is not None and record.failure is not None:
+            return record.failure
         if self.skip_exit_codes and self.skipped:
             # a skip is decided ahead of failsWhen and is never a failure
             return None
@@ -3019,15 +3253,29 @@ class RunningJob:
     async def _kill_group(self, *, force: bool) -> bool:
         """Signal this run's process group; return whether it was signaled.
 
+        A forced kill of a run in a container goes to the container first,
+        which also reaches descendants that left the group. On POSIX the
+        group kill follows it and reaches a process that left the
+        container but kept the group. On Windows a container kill that
+        succeeds is the whole forced step: it ends every process in the
+        Job Object, and the tree kill finds descendants only through live
+        parents, which that kill ended.
+
         Once the leader is reaped, a process that exists under its pid is
         an unrelated one. This run's group is then empty, and no signal is
         sent (see :func:`cronstable.platform.pid_reused`).
         """
         proc = self.proc
         assert proc is not None
+        contained = bool(
+            force and self._limits is not None and await self._limits.kill()
+        )
+        if contained and platform.IS_WINDOWS:
+            return True
         if proc.returncode is not None and platform.pid_reused(proc.pid):
-            return False
-        return await platform.kill_process_group(proc.pid, force=force)
+            return contained
+        signaled = await platform.kill_process_group(proc.pid, force=force)
+        return signaled or contained
 
     def _signal_child(self, *, force: bool) -> None:
         """Signal the direct child of a group that could not be signaled.
@@ -3188,6 +3436,7 @@ class RunningJob:
             ),
             run_id=self.run_id,
             usage=self.resource_usage,
+            limits_record=self.limits_record,
         )
 
 
@@ -3225,6 +3474,7 @@ class SlaBreachContext:
         self.stdout_discarded = 0
         self.stderr_discarded = 0
         self.resource_usage: ResourceUsage | None = None
+        self.limits_record: limits.LimitsRecord | None = None
         self.env = {"HOSTNAME": report_hostname()}
         # read by ShellReporter for the CRONSTABLE_SLA_* exports.
         self.sla_vars = {
@@ -3323,6 +3573,7 @@ class NotifyEventContext:
         self.stdout_discarded = 0
         self.stderr_discarded = 0
         self.resource_usage: ResourceUsage | None = None
+        self.limits_record: limits.LimitsRecord | None = None
         self.env = {"HOSTNAME": report_hostname()}
 
     @property

@@ -22,6 +22,7 @@ block. The types and defaults come from the strictyaml schema and
 | `env_file` | `Str` | `None` | Path to a `KEY=VALUE` file whose variables are merged into `environment`. |
 | `workingDirectory` | `Str` or null | `None` | Directory the subprocess starts in. With it unset, the job inherits cronstable's own working directory. See [workingDirectory](#workingdirectory) later on this page. |
 | `priority` | `Enum(idle, below-normal, normal, above-normal, high)` | `normal` | Scheduling priority of the subprocess. Descendants inherit a lowered level. A raised level applies to the subprocess itself on Windows. The default level is never applied: the job keeps cronstable's own nice on POSIX, and cronstable's own class on Windows only when cronstable is at idle or below-normal, otherwise NORMAL. See [priority](#priority) later on this page. |
+| `resourceLimits` | `Map` | unset | Per-run CPU, memory, and process-count caps on the subprocess and everything it starts, enforced with cgroup v2 on Linux and Job Objects on Windows. See [resource limits](Resource-Limits). |
 | `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. POSIX only. Setting it on Windows raises a configuration error (see [running on Windows](Running-on-Windows)). |
 | `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. POSIX only. Setting it on Windows raises a configuration error (see [running on Windows](Running-on-Windows)). |
 
@@ -397,8 +398,10 @@ Two behaviors to know before relying on it:
 
 ## priority
 
-`priority` is how the job is scheduled against everything else on the host. It
-takes one of five levels, lowest first:
+`priority` is how the job is scheduled against the other processes on the host.
+On Linux, those are the processes in its CPU group (see
+[priority and Linux CPU groups](#priority-and-linux-cpu-groups)). It takes one
+of five levels, lowest first:
 
 ```yaml
 jobs:
@@ -468,11 +471,13 @@ instead:
 - at config load, if the level is a raise from cronstable's own nice and
   cronstable is not root, it logs one `WARNING` naming the job, so the warning
   lands on the deployment that introduces the raise;
-- at run time, a refusal from the kernel does **not** fail the run. The job
-  runs at the priority it inherited and cronstable logs the refusal at
-  `DEBUG`. A minutely job on an unprivileged host would otherwise emit some
-  1,440 warnings a day about a condition that does not change until the
-  deployment does.
+- at run time, a refusal from the kernel does **not** fail the run. The
+  job's processes keep the nice value they inherited, and cronstable logs
+  the refusal at `DEBUG`. A minutely job on an unprivileged host would
+  otherwise emit some 1,440 warnings a day about a condition that does not
+  change until the deployment does. While cronstable weighs CPU per run, the
+  run's cgroup weight follows the raised level (see
+  [priority and Linux CPU groups](#priority-and-linux-cpu-groups)).
 
 Windows grants all five classes to an unprivileged account, so none of that
 applies there.
@@ -489,6 +494,39 @@ about how a job is scheduled show as drift. A set level also appears on the
 [`GET /jobs`](HTTP-API#get-jobs) payload. See
 [running on Windows](Running-on-Windows#process-priority) for how the levels
 compare with Task Scheduler's own `-Priority` numbers.
+
+### Priority and Linux CPU groups
+
+On Linux, a nice value orders a process only against the processes in its
+own CPU group: a cgroup whose parent has the cpu controller on. Each group
+gets a share of contended CPU by its weight, whatever the nice values inside
+it. What `priority` reaches depends on the setup:
+
+- Under the packaged systemd unit, which delegates only the memory and pids
+  controllers, cronstable and its jobs share a CPU group with the other
+  system services, and `priority` orders a job against all of them. Another
+  unit can make systemd turn the cpu controller on for every service, and
+  then the next case applies.
+- A unit with `Delegate=yes`, which CPU caps need, makes cronstable a CPU
+  group of its own among the system's services. `priority` then orders a
+  job only against the daemon and cronstable's other jobs.
+- Where the cpu controller is delegated, as with `Delegate=yes`, cronstable
+  turns it on while a job has a [`resourceLimits.cpu`](Resource-Limits)
+  cap. Every run then gets a cgroup of its own whose CPU weight
+  (`cpu.weight.nice`) follows its `priority`, with the daemon's own nice for
+  `normal`. The kernel shares CPU per run, not per thread, and the nice
+  value orders the threads inside each run. After a reload removes the last
+  `cpu` cap, this ends once no run with a cpu cap is still going. The
+  packaged unit does not delegate the cpu controller.
+
+While cronstable weighs CPU per run, a run's cgroup weight follows its
+configured `priority` even when the kernel refuses the renice. That weight
+orders the run only against cronstable's other runs, within cronstable's own
+share of CPU.
+
+See [CPU caps and priority](Resource-Limits#cpu-caps-and-priority). Windows
+priority classes have no such groups: a Job Object's CPU rate cap groups no
+other processes, so a class orders a job against every process on the host.
 
 ## user and group (privilege switching)
 

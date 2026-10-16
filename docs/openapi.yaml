@@ -80,6 +80,8 @@ tags:
     description: Cluster, fleet, and node views.
   - name: calendar
     description: iCalendar feeds.
+  - name: badges
+    description: SVG status badges to embed in a README, a wiki, or a dashboard.
   - name: state
     description: Durable-state inspector (metadata only).
   - name: push
@@ -335,7 +337,7 @@ paths:
         - $ref: "#/components/parameters/JobName"
         - name: limit
           in: query
-          description: Number of recent monitored runs to include (clamped).
+          description: Number of recent monitored or capped runs to include (clamped).
           schema: { type: integer }
         - name: runs
           in: query
@@ -352,8 +354,19 @@ paths:
                   name: { type: string }
                   monitored: { type: boolean }
                   interval: { type: number, nullable: true }
+                  limits:
+                    allOf: [{ $ref: "#/components/schemas/ResourceLimits" }]
+                    nullable: true
+                    description: The job's `resourceLimits`, or null.
                   live: { type: array, items: { type: object, additionalProperties: true } }
-                  runs: { type: array, items: { type: object, additionalProperties: true } }
+                  runs:
+                    type: array
+                    description: >-
+                      Recent finished runs, oldest first, that were monitored
+                      or capped (the `JobRun` shape with its chart series).
+                      `resources` is null for a capped run without
+                      monitoring.
+                    items: { type: object, additionalProperties: true }
                 additionalProperties: true
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1173,6 +1186,116 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /badge.svg:
+    get:
+      tags: [badges]
+      summary: The fleet's status badge
+      operationId: getFleetBadge
+      description: >-
+        An SVG badge for the whole job set, such as `cronstable | 2 failing`.
+        The message counts the jobs whose own badges show the most urgent of
+        `failing`, `overdue`, and `passing`, in that order. It reads
+        `no status` when no job shows one of the three, and `no jobs` when
+        none is configured. The count reads the jobs as the serving node
+        sees them, not the cluster-wide `/fleet` view. Registered unless
+        `web.badges: false`. With `web.badges.public: true`, exempt from
+        the bearer token and loadable by pages on any origin. Supports
+        `ETag` / `If-None-Match` (304).
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/BadgeLabel"
+        - $ref: "#/components/parameters/BadgeStyle"
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: The badge image.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
+          content:
+            image/svg+xml:
+              schema: { type: string }
+        "304":
+          description: Not modified (matching `If-None-Match`).
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
+        "400":
+          description: A blank or overlong `label`, one with a control character or line break, or an unknown `style`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /jobs/{name}/badge.svg:
+    get:
+      tags: [badges]
+      summary: One job's status badge
+      operationId: getJobBadge
+      description: >-
+        An SVG badge that shows the job's name beside its verdict: `passing`,
+        `failing`, `overdue` (an SLA check is in breach), `paused`,
+        `disabled`, `cancelled`, `unknown`, `running` (a run is in progress
+        and the daemon has no earlier run of the job on record), or
+        `pending` (the daemon has no record of a run of the job). When a
+        run is on record, a run in progress or a slot that a pause held
+        back leaves the last run's verdict in place. The verdict reads the
+        runs that the serving node has on record. Registered unless
+        `web.badges: false`. With `web.badges.public: true`, exempt from
+        the bearer token and loadable by pages on any origin. Supports
+        `ETag` / `If-None-Match` (304).
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+        - $ref: "#/components/parameters/BadgeLabel"
+        - $ref: "#/components/parameters/BadgeStyle"
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: The badge image.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
+          content:
+            image/svg+xml:
+              schema: { type: string }
+        "304":
+          description: Not modified (matching `If-None-Match`).
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Content-Security-Policy:
+              $ref: "#/components/headers/BadgeContentSecurityPolicy"
+            X-Frame-Options:
+              $ref: "#/components/headers/BadgeFrameOptions"
+            Cross-Origin-Resource-Policy:
+              $ref: "#/components/headers/BadgeResourcePolicy"
+        "400":
+          description: A blank or overlong `label`, one with a control character or line break, or an unknown `style`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /state:
     get:
       tags: [state]
@@ -1278,7 +1401,8 @@ paths:
         suites this daemon can seal push alerts under. Every shape also
         carries `instance`, which identifies the daemon. `listeners`, the
         daemon's bound TCP listeners, is in every shape except the
-        `web.anonymousScopes` one.
+        `web.anonymousScopes` one. `badges` says whether the daemon serves
+        the status badges, and whether they're public.
       responses:
         "200":
           description: The matched token's identity.
@@ -1918,6 +2042,24 @@ components:
       required: false
       description: The auth token, for calendar clients that cannot send a bearer header.
       schema: { type: string }
+    BadgeLabel:
+      name: label
+      in: query
+      required: false
+      description: >-
+        Text that replaces the badge's left half, which otherwise shows the
+        job's name, or `cronstable` on the fleet badge. 1 to 64 characters,
+        with no control characters or line breaks.
+      schema: { type: string, minLength: 1, maxLength: 64 }
+    BadgeStyle:
+      name: style
+      in: query
+      required: false
+      description: >-
+        `flat`, with rounded corners and a soft gradient, or `flat-square`,
+        with square corners and no gradient. An empty value takes the
+        default.
+      schema: { type: string, enum: [flat, flat-square], default: flat }
     DeviceId:
       name: id
       in: path
@@ -1928,6 +2070,28 @@ components:
   headers:
     ETag:
       description: A content hash for conditional `If-None-Match` requests.
+      schema: { type: string }
+    BadgeContentSecurityPolicy:
+      description: >-
+        `default-src 'none'; frame-ancestors 'self'`, so a browser refuses
+        to frame the badge in a page from another origin, or
+        `default-src 'none'` with `web.badges.public: true`. A `web.headers`
+        entry of the same name replaces it.
+      schema: { type: string }
+    BadgeFrameOptions:
+      description: >-
+        `SAMEORIGIN`, which refuses a frame in a page from another origin
+        when a `web.headers` `Content-Security-Policy` leaves out
+        `frame-ancestors`. Not sent with `web.badges.public: true`. A
+        `web.headers` entry of the same name replaces it, or adds it to a
+        public badge.
+      schema: { type: string }
+    BadgeResourcePolicy:
+      description: >-
+        `same-origin`, so a browser refuses to load the badge as an image
+        into a page from another origin, or `cross-origin` with
+        `web.badges.public: true`. A `web.headers` entry of the same name
+        replaces it.
       schema: { type: string }
     CronstableInstance:
       description: >-
@@ -2093,6 +2257,21 @@ components:
             `http://0.0.0.0:8080`. The list has no entry for a unix socket.
             The reply to a credential-less request served through
             `web.anonymousScopes` omits the field.
+        badges:
+          type: object
+          nullable: true
+          description: >-
+            `null` while the daemon serves no status badges
+            (`web.badges: false`). `public` is the `web.badges.public`
+            setting, which lets an image proxy fetch the badges without a
+            token and lets pages from other origins load them. `dashboard`
+            is false under `web.ui: false`, where copied badge Markdown has
+            no dashboard page to link to. The dashboards list their
+            copy-badge commands only when the object is present.
+          properties:
+            public: { type: boolean }
+            dashboard: { type: boolean }
+          required: [public, dashboard]
       required: [authenticated, scopes, allScopes, pairLinkBase]
 
     PushDevice:
@@ -2249,7 +2428,77 @@ components:
         paused:
           allOf: [{ $ref: "#/components/schemas/Pause" }]
           nullable: true
+        limits:
+          allOf: [{ $ref: "#/components/schemas/ResourceLimits" }]
+          description: The job's `resourceLimits`; present only when set.
       required: [name, enabled, schedule, running]
+      additionalProperties: true
+
+    ResourceLimits:
+      type: object
+      description: A job's configured caps. A null cap is uncapped.
+      required: [cpu, memory_bytes, processes, required]
+      properties:
+        cpu: { type: number, nullable: true, description: CPUs. }
+        memory_bytes: { type: integer, format: int64, nullable: true }
+        processes: { type: integer, nullable: true }
+        required: { type: boolean }
+
+    LimitsRecord:
+      type: object
+      description: >-
+        A run's caps and what the kernel recorded. `peak_memory_bytes` is
+        the figure the memory cap is measured on (cgroup `memory.peak`, or
+        a Job Object's commit charge), not the sampled RSS.
+      required: [enforced]
+      properties:
+        cpu: { type: number, nullable: true }
+        memory_bytes: { type: integer, format: int64, nullable: true }
+        processes: { type: integer, nullable: true }
+        required: { type: boolean }
+        enforced:
+          type: boolean
+          description: Every configured cap applied for the whole run.
+        mechanism:
+          type: string
+          nullable: true
+          description: "`cgroup-v2` or `job-object`; null when no cap applied."
+        unenforced:
+          type: array
+          description: The configured caps that did not apply (`cpu`, `memory`, `processes`).
+          items: { type: string }
+        reason: { type: string, nullable: true, description: Why caps did not apply. }
+        refused:
+          type: boolean
+          description: >-
+            `true` when `resourceLimits.required` refused the run: the command
+            never started, or cronstable ended its process because it could
+            not be moved into its cgroup or Job Object. A Linux process that
+            cannot join its cgroup never starts the command, so its run
+            reports the start failure's 127. A run whose process cronstable
+            ended reports the kill's exit code instead (1 on Windows, -9 on
+            Linux).
+        memory_exceeded:
+          type: boolean
+          description: The run hit its memory cap and was killed.
+        process_limit_hits: { type: integer, nullable: true }
+        peak_memory_bytes: { type: integer, format: int64, nullable: true }
+        cpu_throttled_seconds: { type: number, nullable: true, description: Linux only. }
+      additionalProperties: true
+
+    LimitsCapability:
+      type: object
+      description: Whether this host can enforce `resourceLimits`.
+      required: [available, mechanism, resources, reason, hint]
+      properties:
+        available: { type: boolean }
+        mechanism: { type: string, nullable: true }
+        resources:
+          type: array
+          description: The caps this host can apply (`cpu`, `memory`, `processes`).
+          items: { type: string }
+        reason: { type: string, nullable: true, description: Why caps are unavailable or partial. }
+        hint: { type: string, nullable: true, description: What the operator can do. }
       additionalProperties: true
 
     ResourcePool:
@@ -2340,6 +2589,13 @@ components:
         stdout_discarded: { type: integer }
         stderr_discarded: { type: integer }
         output_truncated: { type: boolean }
+        limits:
+          allOf: [{ $ref: "#/components/schemas/LimitsRecord" }]
+          nullable: true
+          description: >-
+            The check's own caps record, or null when its job has no
+            `resourceLimits`. A check killed at its memory cap is recorded
+            here; the run's `limits` covers the run's own processes.
 
     JobRun:
       type: object
@@ -2374,6 +2630,9 @@ components:
           type: object
           nullable: true
           additionalProperties: true
+        limits:
+          allOf: [{ $ref: "#/components/schemas/LimitsRecord" }]
+          description: Present only for a run of a job with `resourceLimits`.
       additionalProperties: true
 
     JobRuns:
@@ -2693,4 +2952,5 @@ components:
             proc_rss_bytes: { type: integer }
             proc_cpu_percent: { type: number }
           additionalProperties: true
+        limits: { $ref: "#/components/schemas/LimitsCapability" }
       additionalProperties: true

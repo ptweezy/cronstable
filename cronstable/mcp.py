@@ -846,7 +846,9 @@ class MCPHandler:
                 "cron_get_job_resources",
                 "Resource usage",
                 "CPU/RSS time series for a job's live and recent runs "
-                "(monitorResources jobs).",
+                "(monitorResources jobs), plus its resourceLimits caps and "
+                "each capped run's limits record, which says whether the "
+                "caps applied and whether the run hit its memory cap.",
                 obj({"name": _STR, "runs": _INT}, ["name"]),
                 self._t_get_job_resources,
             ),

@@ -37,10 +37,12 @@ from typing import (
 )
 
 import cronstable.version
+from cronstable.config import resolve_web_toggle
 from cronstable.cronexpr import CronTab
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle guard, types only
     from cronstable.cron import Cron
+    from cronstable.limits import LimitsRecord
     from cronstable.resources import ResourceUsage
 
 logger = logging.getLogger("prometheus")
@@ -423,12 +425,8 @@ def resolve_metrics_config(
     default whenever the web API itself is on; ``metrics: false`` /
     ``metrics: true`` are shorthands for the map form.
     """
-    raw = web_config.get("metrics")
-    if raw is False:
-        return None
-    if raw is None or raw is True:
-        raw = {}
-    if not raw.get("enabled", True):
+    raw = resolve_web_toggle(web_config, "metrics")
+    if raw is None:
         return None
     buckets = raw.get("durationBuckets")
     return {
@@ -456,6 +454,7 @@ class _JobMetrics:
         "cpu_system_sum",
         "cpu_count",
         "max_rss_observed",
+        "memory_limit_exceeded",
         "paused",
         "sla_late",
         "sla_breaches",
@@ -481,6 +480,8 @@ class _JobMetrics:
         self.cpu_count = 0
         # high-water peak RSS across every monitored run of this job (bytes).
         self.max_rss_observed = 0
+        # runs killed at their resourceLimits.memory cap
+        self.memory_limit_exceeded = 0
         # runtime pause flag, pushed by the scheduler on pause/resume/
         # auto-expire/rehydrate (not derived at scrape time).
         self.paused = False
@@ -683,6 +684,8 @@ class PrometheusMetrics:
         outcome: str,
         duration: float | None,
         resources: "ResourceUsage | None" = None,
+        *,
+        limits: "LimitsRecord | None" = None,
     ) -> None:
         job = self._job(name)
         job.runs[outcome] = job.runs.get(outcome, 0) + 1
@@ -704,6 +707,8 @@ class PrometheusMetrics:
             job.max_rss_observed = max(
                 job.max_rss_observed, resources.max_rss_bytes
             )
+        if limits is not None and limits.memory_exceeded:
+            job.memory_limit_exceeded += 1
 
     def job_start_failed(self, name: str) -> None:
         self._job(name).start_failures += 1
@@ -756,7 +761,7 @@ class PrometheusMetrics:
         """
         jobs: dict[str, Any] = {}
         for name, job in self._jobs.items():
-            jobs[name] = {
+            jobs[name] = entry = {
                 "runs": dict(job.runs),
                 "retries": job.retries,
                 "permanent_failures": job.permanent_failures,
@@ -772,6 +777,9 @@ class PrometheusMetrics:
                 "max_rss_observed": job.max_rss_observed,
                 "sla_breaches": dict(job.sla_breaches),
             }
+            # omitted while zero, so an uncapped fleet's snapshot gains no key
+            if job.memory_limit_exceeded:
+                entry["memory_limit_exceeded"] = job.memory_limit_exceeded
         return {"buckets": list(self._buckets), "jobs": jobs}
 
     def seed_counters(
@@ -817,7 +825,12 @@ class PrometheusMetrics:
             job = self._job(name)
             _seed_counter_map(job.runs, data.get("runs"))
             _seed_counter_map(job.sla_breaches, data.get("sla_breaches"))
-            for attr in ("retries", "permanent_failures", "start_failures"):
+            for attr in (
+                "retries",
+                "permanent_failures",
+                "start_failures",
+                "memory_limit_exceeded",
+            ):
                 value = data.get(attr)
                 if (
                     isinstance(value, int)
@@ -1428,7 +1441,62 @@ class PrometheusMetrics:
             last_run_success,
             last_run_cpu,
             last_run_max_rss,
+            *self._limits_families(cron),
         ]
+
+    def _limits_families(self, cron: "Cron") -> list[MetricFamily]:
+        """The ``resourceLimits`` families; series only for capped jobs.
+
+        A cap gauge appears when its cap is set, and the memory counter
+        with the memory cap.  The last-run gauge needs a capped job whose
+        last run had caps.
+        """
+        cpu = MetricFamily(
+            "cronstable_job_cpu_limit_cpus",
+            "gauge",
+            "The job's CPU cap in CPUs (absent unless resourceLimits.cpu "
+            "is set).",
+        )
+        memory = MetricFamily(
+            "cronstable_job_memory_limit_bytes",
+            "gauge",
+            "The job's memory cap in bytes (absent unless "
+            "resourceLimits.memory is set).",
+        )
+        processes = MetricFamily(
+            "cronstable_job_process_limit",
+            "gauge",
+            "The job's process-count cap (absent unless "
+            "resourceLimits.processes is set).",
+        )
+        exceeded = MetricFamily(
+            "cronstable_job_memory_limit_exceeded",
+            "counter",
+            "Runs killed for exceeding the job's memory cap (absent unless "
+            "resourceLimits.memory is set).",
+        )
+        enforced = MetricFamily(
+            "cronstable_job_last_run_limits_enforced",
+            "gauge",
+            "Whether every cap of the job's most recent run was enforced "
+            "(absent unless the job and that run have resourceLimits).",
+        )
+        for name, job_config in cron.cron_jobs.items():
+            caps = job_config.resourceLimits
+            if caps is None:
+                continue
+            labels = self._label_sets(name)[0]
+            if caps.cpu is not None:
+                cpu.add(labels, caps.cpu)
+            if caps.memory is not None:
+                memory.add(labels, caps.memory)
+                exceeded.add(labels, self._jobs[name].memory_limit_exceeded)
+            if caps.processes is not None:
+                processes.add(labels, caps.processes)
+            last = cron.last_run.get(name)
+            if last is not None and last.limits is not None:
+                enforced.add(labels, 1 if last.limits.enforced else 0)
+        return [cpu, memory, processes, exceeded, enforced]
 
     def _cluster_families(self, cron: "Cron") -> list[MetricFamily]:
         families = []

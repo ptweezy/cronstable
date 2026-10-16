@@ -2267,6 +2267,12 @@ def test_validating_a_config_loads_no_asyncio(tmp_path):
         "    command: echo a\n"
         '    schedule: "0 * * * *"\n'
         "    monitorResources: true\n"
+        # caps parse in config.py; the runtime modules that apply them stay
+        # unloaded
+        "    resourceLimits:\n"
+        "      cpu: 0.5\n"
+        "      memory: 256MiB\n"
+        "      processes: 32\n"
     )
     code = textwrap.dedent(
         """
@@ -2281,7 +2287,15 @@ def test_validating_a_config_loads_no_asyncio(tmp_path):
             print("EXIT", stop.code)
         print(sorted(
             m for m in sys.modules
-            if m in ("asyncio", "aiohttp", "psutil", "cronstable.resources")
+            if m in (
+                "asyncio",
+                "aiohttp",
+                "psutil",
+                "cronstable.resources",
+                "cronstable.limits",
+                "cronstable._cgroups",
+                "cronstable._jobobjects",
+            )
         ))
         """
     )
@@ -2687,6 +2701,773 @@ def test_a_raise_that_may_be_refused_is_advised_at_load(
         # it has to name the job, or an operator with 300 of them cannot act
         assert "'p'" in advisories[0]
         assert "high" in advisories[0]
+
+
+# ---- resourceLimits: grammar, bounds, inheritance and the OS advisory ------
+
+_MIB = 1024 * 1024
+_GIB = 1024 * _MIB
+
+
+def _limits_job(snippet):
+    """The single job of a config with ``snippet`` under resourceLimits."""
+    return config.parse_config_string(
+        "jobs:\n"
+        "  - name: lim\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+        "    resourceLimits:\n" + snippet,
+        "",
+    ).jobs[0]
+
+
+def test_resource_limits_default_to_none():
+    job = _priority_job("")
+    assert job.resourceLimits is None
+    assert job.limits_payload is None
+
+
+def test_resource_limits_normalize_and_precompute_the_payload():
+    job = _limits_job(
+        "      cpu: 1.5\n"
+        "      memory: 512M\n"
+        "      processes: 64\n"
+        "      required: true\n"
+    )
+    assert job.resourceLimits == config.ResourceLimits(
+        cpu=1.5, memory=512 * _MIB, processes=64, required=True
+    )
+    assert job.limits_payload == {
+        "cpu": 1.5,
+        "memory_bytes": 512 * _MIB,
+        "processes": 64,
+        "required": True,
+    }
+
+
+# Every cap reaches JobConfig as text, so a literal and a ${VAR} value take
+# the same path; the grammar tests run both spellings anyway.
+_SPELLINGS = pytest.mark.parametrize(
+    "interpolated",
+    [
+        pytest.param(False, id="literal"),
+        pytest.param(True, id="interpolated"),
+    ],
+)
+
+
+def _cap_job(monkeypatch, interpolated, key, text, others=""):
+    """The job of :func:`_limits_job` with ``key`` set to the text ``text``."""
+    if interpolated:
+        monkeypatch.setenv("LIM_VALUE", text)
+        scalar = "${LIM_VALUE}"
+    elif text and text == text.strip():
+        scalar = text
+    else:
+        # a plain scalar cannot be empty or keep edge whitespace
+        scalar = "'{}'".format(text)
+    return _limits_job("      {}: {}\n{}".format(key, scalar, others))
+
+
+@_SPELLINGS
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        pytest.param("536870912", 512 * _MIB, id="int-bytes"),
+        pytest.param("+1048576", _MIB, id="plus-sign"),
+        pytest.param("1_048_576", _MIB, id="underscores"),
+        pytest.param("+1_024K", _MIB, id="signed-underscored-unit"),
+        # 10.5 MiB
+        pytest.param("1_0.5_0M", 11010048, id="underscored-decimal"),
+        pytest.param("1048576b", _MIB, id="b"),
+        pytest.param("1048576B", _MIB, id="B"),
+        pytest.param("1024k", _MIB, id="k"),
+        pytest.param("1024K", _MIB, id="K"),
+        pytest.param("1024kb", _MIB, id="kb"),
+        pytest.param("1024KiB", _MIB, id="KiB"),
+        pytest.param("1024Ki", _MIB, id="Ki"),
+        pytest.param("512m", 512 * _MIB, id="m"),
+        pytest.param("512M", 512 * _MIB, id="M"),
+        pytest.param("512MB", 512 * _MIB, id="MB"),
+        pytest.param("512MiB", 512 * _MIB, id="MiB"),
+        pytest.param("512mIb", 512 * _MIB, id="mixed-case"),
+        pytest.param("1g", _GIB, id="g"),
+        pytest.param("1GB", _GIB, id="GB"),
+        pytest.param("2Gi", 2 * _GIB, id="Gi"),
+        pytest.param("1t", 1024 * _GIB, id="t"),
+        pytest.param("1TiB", 1024 * _GIB, id="TiB"),
+        pytest.param("1.5g", 3 * _GIB // 2, id="decimal"),
+        pytest.param(".5G", _GIB // 2, id="leading-point"),
+        pytest.param("1024.k", _MIB, id="trailing-point"),
+        # exact arithmetic, truncated toward zero: 1.1 * 2**20 = 1153433.6
+        pytest.param("1.1m", 1153433, id="truncates"),
+        pytest.param("1." + "0" * 30 + "M", _MIB, id="30-digit-fraction"),
+        pytest.param("512 MiB", 512 * _MIB, id="space-before-unit"),
+        pytest.param(" 512M ", 512 * _MIB, id="padded"),
+        pytest.param("max", None, id="max"),
+        pytest.param("MAX", None, id="max-upper"),
+        pytest.param(" max ", None, id="max-padded"),
+    ],
+)
+def test_resource_limits_memory_grammar(
+    monkeypatch, interpolated, value, expected
+):
+    job = _cap_job(
+        monkeypatch, interpolated, "memory", value, "      cpu: 1\n"
+    )
+    assert job.resourceLimits.memory == expected
+
+
+@_SPELLINGS
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        pytest.param("2", 2.0, id="int"),
+        pytest.param("0.5", 0.5, id="decimal"),
+        pytest.param(".5", 0.5, id="leading-point"),
+        pytest.param("2.", 2.0, id="trailing-point"),
+        pytest.param("+1.5", 1.5, id="plus-sign"),
+        pytest.param("1_000.5", 1000.5, id="underscores"),
+        pytest.param("2.5e1", 25.0, id="exponent"),
+        pytest.param("1E-2", 0.01, id="negative-exponent"),
+        pytest.param("0.01", 0.01, id="floor"),
+        pytest.param("1000000", 1e6, id="ceiling"),
+        pytest.param("1e6", 1e6, id="ceiling-exponent"),
+        pytest.param(" 1.5 ", 1.5, id="padded"),
+        pytest.param("Max", None, id="max"),
+    ],
+)
+def test_resource_limits_cpu_grammar(
+    monkeypatch, interpolated, value, expected
+):
+    job = _cap_job(
+        monkeypatch, interpolated, "cpu", value, "      processes: 1\n"
+    )
+    assert job.resourceLimits.cpu == expected
+    assert job.resourceLimits.cpu is None or isinstance(
+        job.resourceLimits.cpu, float
+    )
+
+
+@_SPELLINGS
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        pytest.param("64", 64, id="int"),
+        pytest.param("+64", 64, id="plus-sign"),
+        pytest.param("1_024", 1024, id="underscores"),
+        pytest.param("0064", 64, id="leading-zeros"),
+        pytest.param("1", 1, id="floor"),
+        pytest.param("4194304", 4194304, id="ceiling"),
+        pytest.param(" 64 ", 64, id="padded"),
+        pytest.param("max", None, id="max"),
+    ],
+)
+def test_resource_limits_processes_grammar(
+    monkeypatch, interpolated, value, expected
+):
+    job = _cap_job(
+        monkeypatch, interpolated, "processes", value, "      cpu: 1\n"
+    )
+    assert job.resourceLimits.processes == expected
+
+
+def test_resource_limits_interpolate_env_vars(monkeypatch):
+    # ${VAR} expands after the schema; the text reads like a literal
+    monkeypatch.setenv("LIM_CPU", "0.25")
+    monkeypatch.setenv("LIM_MEM", "268435456")
+    monkeypatch.setenv("LIM_PROCS", "16")
+    job = _limits_job(
+        "      cpu: ${LIM_CPU}\n"
+        "      memory: ${LIM_MEM}\n"
+        "      processes: ${LIM_PROCS}\n"
+    )
+    assert job.resourceLimits == config.ResourceLimits(
+        cpu=0.25, memory=256 * _MIB, processes=16
+    )
+    monkeypatch.setenv("LIM_MEM", "1G")
+    monkeypatch.setenv("LIM_CPU", "max")
+    job = _limits_job("      cpu: ${LIM_CPU}\n      memory: ${LIM_MEM}\n")
+    assert job.resourceLimits == config.ResourceLimits(memory=_GIB)
+
+
+_MEMORY_FORMS = (
+    "as a size; use a byte count or a number with a K, M, G, or T suffix "
+    "(powers of 1024), at least 1 MiB and below 8 EiB, such as 512M, or max"
+)
+_CPU_FORMS = (
+    "as a CPU count; use a number between 0.01 and 1000000, such as 0.5 "
+    "or 2, or max"
+)
+_PROCESSES_FORMS = (
+    "as a process count; use a whole number between 1 and 4194304, or max"
+)
+
+
+@_SPELLINGS
+@pytest.mark.parametrize(
+    "key, text, forms",
+    [
+        pytest.param("memory", "512X", _MEMORY_FORMS, id="memory-unit"),
+        pytest.param("memory", "1P", _MEMORY_FORMS, id="memory-petabytes"),
+        pytest.param("memory", "1e9", _MEMORY_FORMS, id="memory-exponent"),
+        pytest.param("memory", "-1M", _MEMORY_FORMS, id="memory-negative"),
+        pytest.param("memory", "-5", _MEMORY_FORMS, id="memory-minus-bytes"),
+        pytest.param("memory", "1,024M", _MEMORY_FORMS, id="memory-comma"),
+        pytest.param("memory", "512Bi", _MEMORY_FORMS, id="memory-bytes-i"),
+        pytest.param("memory", "512 M B", _MEMORY_FORMS, id="memory-split"),
+        pytest.param("memory", "", _MEMORY_FORMS, id="memory-empty"),
+        pytest.param("memory", "G", _MEMORY_FORMS, id="memory-unit-only"),
+        pytest.param("memory", "1__0M", _MEMORY_FORMS, id="memory-double-_"),
+        pytest.param("memory", "_1M", _MEMORY_FORMS, id="memory-leading-_"),
+        pytest.param("memory", "1_M", _MEMORY_FORMS, id="memory-trailing-_"),
+        pytest.param("memory", "1._5M", _MEMORY_FORMS, id="memory-point-_"),
+        pytest.param("memory", ".", _MEMORY_FORMS, id="memory-point"),
+        pytest.param("cpu", "two", _CPU_FORMS, id="cpu-word"),
+        pytest.param("cpu", "1.5 CPUs", _CPU_FORMS, id="cpu-unit"),
+        pytest.param("cpu", "", _CPU_FORMS, id="cpu-empty"),
+        pytest.param("cpu", ".", _CPU_FORMS, id="cpu-point"),
+        # YAML's spellings; float() syntax is inf and nan
+        pytest.param("cpu", ".inf", _CPU_FORMS, id="cpu-yaml-inf"),
+        pytest.param("cpu", "-.inf", _CPU_FORMS, id="cpu-yaml-minus-inf"),
+        pytest.param("cpu", ".nan", _CPU_FORMS, id="cpu-yaml-nan"),
+        pytest.param("cpu", "e5", _CPU_FORMS, id="cpu-exponent-only"),
+        pytest.param("cpu", "1e", _CPU_FORMS, id="cpu-empty-exponent"),
+        pytest.param("cpu", "1__0", _CPU_FORMS, id="cpu-double-_"),
+        pytest.param("cpu", "_1", _CPU_FORMS, id="cpu-leading-_"),
+        pytest.param("cpu", "0x10", _CPU_FORMS, id="cpu-hex"),
+        pytest.param("cpu", "1,5", _CPU_FORMS, id="cpu-comma"),
+        # float() reads these, but every cap takes ASCII digits only
+        pytest.param(
+            "cpu", "\N{FULLWIDTH DIGIT TWO}", _CPU_FORMS, id="cpu-fullwidth"
+        ),
+        pytest.param(
+            "cpu",
+            "\N{ARABIC-INDIC DIGIT ONE}",
+            _CPU_FORMS,
+            id="cpu-arabic-indic",
+        ),
+        pytest.param("processes", "1.5", _PROCESSES_FORMS, id="proc-fraction"),
+        pytest.param("processes", "lots", _PROCESSES_FORMS, id="proc-word"),
+        pytest.param("processes", "1e3", _PROCESSES_FORMS, id="proc-exponent"),
+        pytest.param("processes", "0x10", _PROCESSES_FORMS, id="proc-hex"),
+        pytest.param("processes", "", _PROCESSES_FORMS, id="proc-empty"),
+        pytest.param("processes", "1__0", _PROCESSES_FORMS, id="proc-2-_"),
+        pytest.param("processes", "+-1", _PROCESSES_FORMS, id="proc-2-signs"),
+        pytest.param(
+            "processes",
+            "\N{ARABIC-INDIC DIGIT ONE}",
+            _PROCESSES_FORMS,
+            id="proc-arabic-indic",
+        ),
+    ],
+)
+def test_resource_limits_refuse_unreadable_values(
+    monkeypatch, interpolated, key, text, forms
+):
+    with pytest.raises(ConfigError) as exc:
+        _cap_job(monkeypatch, interpolated, key, text)
+    assert str(exc.value) == (
+        "Job lim: resourceLimits.{}: cannot read {!r} {}".format(
+            key, text, forms
+        )
+    )
+
+
+@pytest.mark.parametrize("key", ["cpu", "memory", "processes"])
+def test_resource_limits_refuse_a_bare_key(key):
+    # `cpu:` is the text '', which no reader accepts
+    with pytest.raises(ConfigError) as exc:
+        _limits_job("      {}:\n".format(key))
+    assert str(exc.value).startswith(
+        "Job lim: resourceLimits.{}: cannot read '' as".format(key)
+    )
+
+
+_RANGES = {
+    "cpu": "must be a finite number between 0.01 and 1000000 (CPUs)",
+    "memory": "must be at least 1 MiB and below 8 EiB",
+    "processes": "must be between 1 and 4194304",
+}
+
+
+@_SPELLINGS
+@pytest.mark.parametrize(
+    "key, text",
+    [
+        pytest.param("cpu", "0.009", id="cpu-floor"),
+        pytest.param("cpu", "0", id="cpu-zero"),
+        pytest.param("cpu", "-1", id="cpu-negative"),
+        pytest.param("cpu", "1000001", id="cpu-ceiling"),
+        pytest.param("cpu", "1000000.5", id="cpu-ceiling-fraction"),
+        # float()'s spellings; NaN fails every comparison
+        pytest.param("cpu", "nan", id="cpu-nan"),
+        pytest.param("cpu", "inf", id="cpu-inf"),
+        pytest.param("cpu", "-inf", id="cpu-negative-inf"),
+        pytest.param("cpu", "Infinity", id="cpu-infinity"),
+        # finite, but round() in the backends overflows on it
+        pytest.param("cpu", "1e308", id="cpu-1e308"),
+        pytest.param("memory", "1048575", id="memory-floor"),
+        pytest.param("memory", "1023K", id="memory-kib"),
+        pytest.param("memory", "0", id="memory-zero"),
+        pytest.param("memory", "+0", id="memory-plus-zero"),
+        pytest.param("memory", "8388608T", id="memory-ceiling"),
+        pytest.param("processes", "0", id="processes-zero"),
+        pytest.param("processes", "+0", id="processes-plus-zero"),
+        pytest.param("processes", "-1", id="processes-negative"),
+        pytest.param("processes", "4194305", id="processes-ceiling"),
+    ],
+)
+def test_resource_limits_out_of_range(monkeypatch, interpolated, key, text):
+    with pytest.raises(ConfigError) as exc:
+        _cap_job(monkeypatch, interpolated, key, text)
+    assert str(exc.value) == "Job lim: resourceLimits.{} {}".format(
+        key, _RANGES[key]
+    )
+
+
+_GIANT = "9" * 5000
+
+
+@_SPELLINGS
+@pytest.mark.parametrize(
+    "key, text, failure",
+    [
+        # float() has no digit limit: these are numbers out of range
+        pytest.param("cpu", _GIANT, "cpu must be", id="cpu"),
+        pytest.param(
+            "cpu", "0." + "0" * 5000 + "1", "cpu must be", id="cpu-tiny"
+        ),
+        pytest.param("memory", _GIANT, "memory: cannot read", id="memory"),
+        pytest.param(
+            "memory", _GIANT + "K", "memory: cannot read", id="memory-unit"
+        ),
+        pytest.param(
+            "memory",
+            "1." + _GIANT + "G",
+            "memory: cannot read",
+            id="memory-fraction",
+        ),
+        pytest.param(
+            "processes", _GIANT, "processes: cannot read", id="processes"
+        ),
+    ],
+)
+def test_resource_limits_refuse_giant_digit_runs(
+    monkeypatch, interpolated, key, text, failure
+):
+    # int() of more than 4300 digits raises a bare ValueError; the grammar
+    # stops at 30, so the refusal is a ConfigError naming the key
+    with pytest.raises(ConfigError) as exc:
+        _cap_job(monkeypatch, interpolated, key, text)
+    assert str(exc.value).startswith("Job lim: resourceLimits." + failure)
+
+
+@pytest.mark.parametrize(
+    "key, text, failure",
+    [
+        pytest.param("memory", "9" * 30, " must be", id="memory-30"),
+        pytest.param("memory", "9" * 31, ": cannot read", id="memory-31"),
+        pytest.param(
+            "memory", "9" * 30 + "K", " must be", id="memory-30-unit"
+        ),
+        pytest.param(
+            "memory", "9" * 31 + "K", ": cannot read", id="memory-31-unit"
+        ),
+        # separators do not count
+        pytest.param(
+            "memory", "9_" * 29 + "9", " must be", id="memory-30-separated"
+        ),
+        pytest.param(
+            "memory",
+            "1." + "0" * 31 + "M",
+            ": cannot read",
+            id="memory-31-fraction",
+        ),
+        pytest.param("processes", "9" * 30, " must be", id="procs-30"),
+        pytest.param("processes", "9" * 31, ": cannot read", id="procs-31"),
+    ],
+)
+def test_resource_limits_read_digit_runs_up_to_30_digits(key, text, failure):
+    # a run of 30 digits reaches the range check; one more is unreadable
+    with pytest.raises(ConfigError) as exc:
+        _limits_job("      {}: {}\n".format(key, text))
+    assert str(exc.value).startswith(
+        "Job lim: resourceLimits." + key + failure
+    )
+
+
+def test_a_giant_cap_in_a_config_dir_is_a_config_error(tmp_path):
+    # the unreadable file joins the directory's ConfigError report; a raw
+    # ValueError would abort the whole load
+    job = "jobs:\n  - name: {}\n    command: x\n    schedule: '* * * * *'\n"
+    (tmp_path / "a.yaml").write_text(job.format("a"), encoding="utf-8")
+    (tmp_path / "b.yaml").write_text(
+        job.format("b")
+        + "    resourceLimits:\n      memory: {}K\n".format("9" * 4400),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ConfigError, match=r"Job b: resourceLimits\.memory: cannot read"
+    ):
+        config.parse_config(str(tmp_path))
+
+
+def test_resource_limits_read_numbers_from_a_dict_built_config():
+    # str() puts a number from a config built in Python on the text path
+    job = config.JobConfig(
+        config.mergedicts(
+            config.DEFAULT_CONFIG,
+            {
+                "name": "lim",
+                "command": "echo hi",
+                "schedule": "* * * * *",
+                "resourceLimits": {
+                    "cpu": 2,
+                    "memory": 512 * _MIB,
+                    "processes": 8,
+                },
+            },
+        )
+    )
+    assert job.resourceLimits == config.ResourceLimits(
+        cpu=2.0, memory=512 * _MIB, processes=8
+    )
+
+
+def test_resource_limits_upper_bounds_are_inclusive():
+    job = _limits_job(
+        "      cpu: 1000000\n"
+        "      memory: {}\n"
+        "      processes: 4194304\n".format(2**63 - 1)
+    )
+    assert job.resourceLimits.cpu == 1_000_000.0
+    assert job.resourceLimits.memory == 2**63 - 1
+    assert job.resourceLimits.processes == 4194304
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        pytest.param("      required: true\n", id="required-only"),
+        pytest.param(
+            "      cpu: max\n      memory: MAX\n      processes: max\n"
+            "      required: true\n",
+            id="all-max",
+        ),
+    ],
+)
+def test_resource_limits_without_a_cap_are_none(snippet):
+    job = _limits_job(snippet)
+    assert job.resourceLimits is None
+    assert job.limits_payload is None
+
+
+def test_resource_limits_required_defaults_false():
+    assert _limits_job("      cpu: 1\n").resourceLimits.required is False
+
+
+def test_resource_limits_merge_from_defaults_key_by_key():
+    # mergedicts merges the two maps per key, so a job overrides one cap
+    # and keeps the rest, and `max` lifts a single inherited cap
+    conf = config.parse_config_string(
+        """
+defaults:
+  resourceLimits:
+    cpu: 1
+    memory: 1G
+    required: true
+
+jobs:
+  - name: inherits
+    command: echo hi
+    schedule: "* * * * *"
+  - name: overrides
+    command: echo hi
+    schedule: "* * * * *"
+    resourceLimits:
+      memory: 256M
+  - name: lifts-memory
+    command: echo hi
+    schedule: "* * * * *"
+    resourceLimits:
+      memory: max
+  - name: lifts-all
+    command: echo hi
+    schedule: "* * * * *"
+    resourceLimits:
+      cpu: max
+      memory: max
+""",
+        "",
+    )
+    assert {job.name: job.resourceLimits for job in conf.jobs} == {
+        "inherits": config.ResourceLimits(
+            cpu=1.0, memory=_GIB, required=True
+        ),
+        "overrides": config.ResourceLimits(
+            cpu=1.0, memory=256 * _MIB, required=True
+        ),
+        "lifts-memory": config.ResourceLimits(cpu=1.0, required=True),
+        "lifts-all": None,
+    }
+
+
+def test_resource_limits_reach_dag_task_templates():
+    # a launch key: `defaults:` reaches every task and a task may set its own
+    conf = config.parse_config_string(
+        """
+defaults:
+  resourceLimits:
+    memory: 1G
+
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+      - id: b
+        command: bar
+        dependsOn:
+          - a
+        resourceLimits:
+          cpu: 2
+          memory: max
+""",
+        "",
+    )
+    templates = {
+        task.id: task.job_template.resourceLimits
+        for task in conf.dags[0].tasks
+    }
+    assert templates == {
+        "a": config.ResourceLimits(memory=_GIB),
+        "b": config.ResourceLimits(cpu=2.0),
+    }
+
+
+def test_approval_gates_drop_inherited_resource_limits():
+    # a gate runs no process, so caps inherited from `defaults:` are reset
+    conf = config.parse_config_string(
+        """
+defaults:
+  resourceLimits:
+    memory: 1G
+
+dags:
+  - name: pipe
+    tasks:
+      - id: gate
+        type: approval
+      - id: work
+        command: foo
+        dependsOn:
+          - gate
+""",
+        "",
+    )
+    templates = {
+        task.id: task.job_template.resourceLimits
+        for task in conf.dags[0].tasks
+    }
+    assert templates == {
+        "gate": None,
+        "work": config.ResourceLimits(memory=_GIB),
+    }
+
+
+def test_approval_gates_refuse_their_own_resource_limits():
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            """
+dags:
+  - name: pipe
+    tasks:
+      - id: gate
+        type: approval
+        resourceLimits:
+          cpu: 1
+""",
+            "",
+        )
+    assert str(exc.value) == (
+        "dag 'pipe': task 'gate': an approval gate runs no process, so it "
+        "cannot use resourceLimits"
+    )
+
+
+def test_approval_gates_keep_the_pool_and_verify_refusal():
+    # pool and verify share this message; resourceLimits has its own
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            """
+dags:
+  - name: pipe
+    tasks:
+      - id: gate
+        type: approval
+        verify:
+          command: "true"
+""",
+            "",
+        )
+    assert str(exc.value) == "approval gates cannot use pool or verify"
+
+
+@pytest.mark.parametrize(
+    "caps, expected",
+    [
+        pytest.param(
+            config.ResourceLimits(cpu=1.5, memory=512 * _MIB, processes=64),
+            "1.5 CPUs, 512 MiB, 64 processes",
+            id="all",
+        ),
+        pytest.param(
+            config.ResourceLimits(cpu=1.0, processes=1),
+            "1 CPU, 1 process",
+            id="singular",
+        ),
+        pytest.param(
+            config.ResourceLimits(memory=3 * _GIB // 2),
+            "1.5 GiB",
+            id="memory-only",
+        ),
+        pytest.param(config.ResourceLimits(), "", id="none"),
+        # fixed point, trailing zeros stripped: 1e6 reads 1000000
+        pytest.param(config.ResourceLimits(cpu=0.01), "0.01 CPUs", id="floor"),
+        pytest.param(config.ResourceLimits(cpu=2.0), "2 CPUs", id="whole"),
+        pytest.param(
+            config.ResourceLimits(cpu=1e6), "1000000 CPUs", id="ceiling"
+        ),
+        pytest.param(
+            config.ResourceLimits(cpu=1234567.0), "1234567 CPUs", id="large"
+        ),
+        pytest.param(
+            config.ResourceLimits(cpu=1 / 3), "0.333333 CPUs", id="six-places"
+        ),
+        # the plural follows the text shown
+        pytest.param(
+            config.ResourceLimits(cpu=1.0000001), "1 CPU", id="rounds-to-one"
+        ),
+    ],
+)
+def test_resource_limits_describe(caps, expected):
+    assert caps.describe() == expected
+
+
+@pytest.mark.parametrize(
+    "num_bytes, expected",
+    [
+        pytest.param(0, "0 B", id="zero"),
+        pytest.param(1023, "1023 B", id="bytes"),
+        pytest.param(1024, "1 KiB", id="one-kib"),
+        pytest.param(1536, "1.5 KiB", id="fraction"),
+        pytest.param(512 * _MIB, "512 MiB", id="whole"),
+        # 1023.94 KiB rounds below 1024; 1023.98 KiB rounds to it
+        pytest.param(1048514, "1023.9 KiB", id="below-promotion"),
+        pytest.param(1048552, "1 MiB", id="promotes"),
+        pytest.param(_GIB - 1, "1 GiB", id="one-byte-short-of-gib"),
+        pytest.param(_GIB - 1024, "1 GiB", id="one-kib-short-of-gib"),
+        pytest.param(1024 * _GIB - 1, "1 TiB", id="promotes-to-largest"),
+        pytest.param(2**50, "1024 TiB", id="largest-unit"),
+        pytest.param(2**63 - 1, "8388608 TiB", id="memory-ceiling"),
+    ],
+)
+def test_format_size_uses_binary_units(num_bytes, expected):
+    assert config.format_size(num_bytes) == expected
+
+
+_CAPPED_LOAD = """
+state:
+  path: /tmp/x
+defaults:
+  resourceLimits:
+    memory: 1G
+jobs:
+  - name: a
+    command: echo hi
+    schedule: "* * * * *"
+dags:
+  - name: pipe
+    tasks:
+      - id: gate
+        type: approval
+      - id: t
+        command: foo
+        dependsOn:
+          - gate
+"""
+
+
+def _capped_conf(tmp_path, text=_CAPPED_LOAD):
+    """Parse through parse_config, which runs the cross-section checks."""
+    (tmp_path / "jobs.yaml").write_text(text, encoding="utf-8")
+    return config.parse_config(str(tmp_path))
+
+
+def test_capped_jobs_names_every_capped_job_and_task(tmp_path):
+    conf = _capped_conf(tmp_path)
+    caps = config.ResourceLimits(memory=_GIB)
+    # the gate inherits nothing, so it is not listed
+    assert config.capped_jobs(conf) == [
+        ("job a", caps),
+        ("dag pipe task t", caps),
+    ]
+
+
+def test_resource_limits_on_an_unsupported_os_warn_once_naming_every_user(
+    tmp_path, caplog, monkeypatch
+):
+    monkeypatch.setattr(config, "limits_supported_os", lambda: False)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        _capped_conf(tmp_path)
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if "resourceLimits is set" in r.getMessage()
+    ]
+    assert warnings == [
+        "resourceLimits is set (job a, dag pipe task t), but this platform "
+        "has neither cgroup v2 nor Job Objects, so those jobs run without "
+        "caps; runs of jobs with resourceLimits.required fail"
+    ]
+
+
+def test_resource_limits_on_linux_or_windows_stay_quiet(
+    tmp_path, caplog, monkeypatch
+):
+    monkeypatch.setattr(config, "limits_supported_os", lambda: True)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        _capped_conf(tmp_path)
+    assert "resourceLimits is set" not in caplog.text
+
+
+def test_no_resource_limits_means_no_advisory_anywhere(
+    tmp_path, caplog, monkeypatch
+):
+    monkeypatch.setattr(config, "limits_supported_os", lambda: False)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        _capped_conf(
+            tmp_path,
+            "jobs:\n  - name: a\n    command: x\n    schedule: '* * * * *'\n",
+        )
+    assert "resourceLimits is set" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "is_windows, platform_name, expected",
+    [
+        pytest.param(False, "linux", True, id="linux"),
+        pytest.param(True, "win32", True, id="windows"),
+        pytest.param(False, "darwin", False, id="macos"),
+        pytest.param(False, "freebsd14", False, id="freebsd"),
+    ],
+)
+def test_limits_supported_os(monkeypatch, is_windows, platform_name, expected):
+    monkeypatch.setattr(config.platform, "IS_WINDOWS", is_windows)
+    monkeypatch.setattr(sys, "platform", platform_name)
+    assert config.limits_supported_os() is expected
 
 
 # ---- web.nodeHistory validation ---------------------------------------------

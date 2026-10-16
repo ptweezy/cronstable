@@ -5,9 +5,10 @@ configuration paths, shells, output decoding, unattended operation, shutdown,
 and shared-store coordination. It also lists unsupported POSIX features.
 The rest of the wiki applies unless a Windows-specific difference is noted here.
 
-A single module (`cronstable/platform.py`) holds all the OS-specific
-behavior. The scheduler, job runner, config loader, and entry point read the
-same on every platform.
+`cronstable/platform.py` holds the OS-specific behavior, and the Job Object
+backend of [resource limits](#resource-limits) lives in
+`cronstable/_jobobjects.py`. The scheduler, job runner, config loader, and
+entry point read the same on every platform.
 
 ## Supported platforms and architectures
 
@@ -582,7 +583,9 @@ curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:8080/shutdown
 ```
 
 Ending the process outright (`taskkill /F`, Task Manager) skips the drain and
-leaves any spawned job trees running.
+leaves any spawned job trees running. A capped run that is still starting is
+ended or left suspended, and one whose kill-on-close limit Windows would not
+clear is ended (see [Windows behavior](Resource-Limits#windows-behavior)).
 
 **A log file.** An unattended daemon's stderr goes nowhere. Give the root
 logger a rotating file through the `logging:` section (a plain
@@ -680,6 +683,7 @@ the run. The scope and meaning of the two steps differ by platform:
 | --- | --- | --- |
 | POSIX | `SIGTERM` to the job's whole process group (trappable; each job is spawned in its own session) | `SIGKILL` to the whole group, sent unconditionally |
 | Windows | `CTRL_BREAK_EVENT` to the job's whole process group (trappable; each job is spawned in its own group) | `taskkill /F /T` on the job's live process tree |
+| Windows, a run in its own Job Object ([resource limits](#resource-limits)) | `CTRL_BREAK_EVENT` to the job's whole process group | `TerminateJobObject` on the run's job: every process in it exits with code `1` |
 
 Each job is spawned into its own console process group
 (`CREATE_NEW_PROCESS_GROUP`), so the graceful step is a real, trappable
@@ -698,12 +702,16 @@ job's own process exits or the wait ends. It runs
 the job's own process. While that process is running, the walk ends it and
 each descendant whose parent chain is alive. Once that process has exited,
 the walk finds no process, and a descendant that is still running survives,
-as the bounds later in this section describe.
+as the bounds later in this section describe. A run in its own Job Object
+gets `TerminateJobObject` as its forced step instead of the walk.
 
 The break needs a console shared between the daemon and the job. Where there
 is none, such as a daemon started by a service wrapper with no console, the
 graceful step cannot be delivered and becomes the forced step immediately. The
-job gets no notice there, and `killTimeout` has nothing left to bound.
+job gets no notice there, and `killTimeout` has nothing left to bound. For a
+run in its own Job Object, that immediate step is still the tree walk, and
+`TerminateJobObject` follows it once the job's own process has exited, so a
+process that the walk missed ends too.
 
 A service installed with `cronstable service install --console` allocates one
 so the two-step sequence keeps working. That option is off by default
@@ -722,6 +730,12 @@ Honest bounds on the sequence:
   process has exited, that holds for every descendant that is still running,
   such as a program that the command launched with `start` and did not wait
   for.
+- A run in its own Job Object has none of these survivors. Every process
+  that the job's processes create joins the job, and `TerminateJobObject`
+  ends all of them, whatever their process group or parent. A process that
+  another service starts for the job, such as through WMI, is outside the
+  job, and so is one that the job started after lifting its own Job Object's
+  limits (see [security](Resource-Limits#security)).
 
 A survivor cannot strand the run: the wait for a stopped run's output pipes to
 drain is separately bounded.
@@ -739,7 +753,9 @@ running, a process that never receives it (see the preceding bounds), and
 any process under a daemon with no console keep the output open. The daemon
 then records the run with exit code `-100` after the 30-second bound for
 each captured stream, up to 60 seconds with both captured, and that process
-keeps running.
+keeps running. In a run's own Job Object, the forced step ends that process
+instead, the output closes, and the daemon records the run with exit code
+`-100` then.
 
 For the full cancellation sequence (the process-group signaling, the
 unconditional forced step, the bounded drain), the `-100` timeout return code,
@@ -822,6 +838,28 @@ way cronstable never promotes a job the operator did not ask to promote.
 
 See [priority](Commands-and-Environment#priority) for the POSIX half and the
 full semantics.
+
+## Resource limits
+
+Each run of a job with `resourceLimits` gets a Job Object of its own.
+[Resource limits](Resource-Limits) covers the options and what each cap
+counts on Windows, and its [Windows behavior](Resource-Limits#windows-behavior)
+section covers the suspended start, the watcher thread, and the setups that
+narrow what a Job Object enforces. Two parts of the Windows process model
+work differently for a capped run:
+
+- The forced step of a stop is `TerminateJobObject` in place of the
+  `taskkill /F /T` tree walk. It ends every process in the run's job,
+  including descendants in a process group of their own and ones whose parent
+  has exited, and they exit with code `1`, as after `taskkill /F` (see
+  [job termination semantics](#job-termination-semantics)).
+- A run with no console to inherit, such as a run of a
+  [service](Windows-Service) installed without `--console`, gets a
+  conhost.exe that Windows starts inside the run's job. Its commit counts
+  toward the memory cap, and it appears in a monitored run's process tree,
+  but the process cap does not count it. Stopping such a run starts with the
+  immediate tree walk, and `TerminateJobObject` follows once the job's own
+  process has exited.
 
 ## Features not supported on Windows
 

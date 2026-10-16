@@ -69,7 +69,15 @@ When the job has [`monitorResources`](Configuration-Reference#metrics) on (see [
 
 These two lines are omitted for a run that was not monitored (or where sampling caught nothing), so an unmonitored job's stop datagram is unchanged.
 
-A run whose command never launches (the subprocess could not be spawned; `start_failed` is set) emits neither metric. On that path, `wait()` returns early, `_on_stop` (hence `job_stopped`) is never called, and `_on_start` was likewise never reached. Separately, `job_stopped` itself guards on a recorded start time (`if self.start_time is None: return`). That guard suppresses a stop metric for a run stopped without a corresponding `job_started` (for example, the `cancel()`/`wait()` race under `concurrencyPolicy: Replace`).
+A run killed at its [`resourceLimits.memory`](Resource-Limits) cap adds one more line to the same stop datagram:
+
+```text
+<prefix>.memory_limit_exceeded:1|c
+```
+
+`|c` is the statsd counter type. Every other run, capped or not, sends no such line.
+
+A run whose command never launches (the subprocess could not be spawned, or `resourceLimits.required` refused the run before the spawn; `start_failed` is set) emits neither metric. On that path, `wait()` returns early, `_on_stop` (hence `job_stopped`) is never called, and `_on_start` was likewise never reached. Separately, `job_stopped` itself guards on a recorded start time (`if self.start_time is None: return`). That guard suppresses a stop metric for a run stopped without a corresponding `job_started` (for example, the `cancel()`/`wait()` race under `concurrencyPolicy: Replace`).
 
 ## Best-effort delivery
 
@@ -103,6 +111,7 @@ A run canceled during its command gets `_on_stop` at the end of `cancel()`. A ca
 
 - [Metrics with Prometheus](Metrics-with-Prometheus): the pull-side option, a scrapeable `/metrics` endpoint on the web API.
 - [Resource Monitoring](Resource-Monitoring): the `monitorResources` sampling behind the `cpu` / `max_rss` lines.
+- [Resource Limits](Resource-Limits): the memory cap behind the `memory_limit_exceeded` line.
 - [Configuration Reference](Configuration-Reference): full per-job option list.
 - [Reporting (Mail, Sentry, Shell, Webhook, Push, Event Log)](Reporting): the other outbound notification channels.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): how `job.failed` (and thus `success:0`/`success:1`) is determined.

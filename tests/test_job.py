@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
@@ -18,6 +19,8 @@ import cronstable.config
 import cronstable.job
 import cronstable.platform
 import cronstable.statsd
+from cronstable import limits
+from cronstable.limits import Capability, LimitsRecord
 from cronstable.platform import DEFAULT_SHELL, IS_WINDOWS
 from tests._commands import (
     PYTHON,
@@ -1570,6 +1573,11 @@ def test_template_vars_key_sets_stay_in_step():
         "subject",
         "message",
     }
+    # no run, so no limits record in any of the three
+    assert job.template_vars["limits"] is None
+    assert breach.template_vars["limits"] is None
+    assert event.template_vars["limits"] is None
+    assert event.limits_record is None
 
 
 @pytest.mark.parametrize(
@@ -3677,6 +3685,9 @@ GOLDEN_SHELL_ENV_KEYS = frozenset(
         # monitored), see ShellReporter.report / cronstable.resources.
         "CRONSTABLE_CPU_SECONDS",
         "CRONSTABLE_MAX_RSS_BYTES",
+        # resource limits: always exported, empty when the job has no caps.
+        "CRONSTABLE_LIMITS_ENFORCED",
+        "CRONSTABLE_MEMORY_LIMIT_EXCEEDED",
         # run context: the daemon host (always set), plus the run's ledger id
         # and start instant (empty on an onLate dispatch, which has no run).
         "CRONSTABLE_HOST",
@@ -3707,7 +3718,14 @@ jobs:
 
 
 async def _capture_shell_reporter_env(
-    monkeypatch, *, stdout, stderr, retcode=7, fail_reason="boom", failed=True
+    monkeypatch,
+    *,
+    stdout,
+    stderr,
+    retcode=7,
+    fail_reason="boom",
+    failed=True,
+    **job_over,
 ):
     # Drop any ambient CRONSTABLE_* so the exact-set assertion is deterministic
     # regardless of how the suite was launched.
@@ -3742,6 +3760,7 @@ async def _capture_shell_reporter_env(
         resource_usage=None,
         run_id="run-abc123",
         started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=timezone.utc),
+        **job_over,
     )
     await cronstable.job.ShellReporter().report(
         False, job, job_config.onFailure["report"]
@@ -3771,6 +3790,9 @@ async def test_report_shell_full_env_contract(monkeypatch):
     # unmonitored run: resource vars present but empty
     assert env["CRONSTABLE_CPU_SECONDS"] == ""
     assert env["CRONSTABLE_MAX_RSS_BYTES"] == ""
+    # no caps (and the Mock's auto limits_record is not a record): empty
+    assert env["CRONSTABLE_LIMITS_ENFORCED"] == ""
+    assert env["CRONSTABLE_MEMORY_LIMIT_EXCEEDED"] == ""
     # run context: host is the daemon's, run id and start instant come off the
     # (mocked) run.
     assert env["CRONSTABLE_HOST"] == "host-sentinel-3"
@@ -5420,6 +5442,7 @@ def test_sla_breach_context_full_template_var_contract(monkeypatch):
         "cpu_user_seconds",
         "cpu_system_seconds",
         "max_rss_bytes",
+        "limits",
         "sla_check",
         "threshold_seconds",
         "observed_seconds",
@@ -5433,6 +5456,7 @@ def test_sla_breach_context_full_template_var_contract(monkeypatch):
     assert tv["exit_code"] is None
     assert tv["cpu_seconds"] is None
     assert tv["max_rss_bytes"] is None
+    assert tv["limits"] is None
     # a breach describes a job that did NOT run: no start instant, no run id.
     assert tv["started_at"] is None
     assert tv["run_id"] is None
@@ -5449,6 +5473,7 @@ def test_sla_breach_context_full_template_var_contract(monkeypatch):
     assert ctx.failed is True
     assert ctx.retcode is None
     assert ctx.resource_usage is None
+    assert ctx.limits_record is None
     assert ctx.stdout_discarded == 0
     assert ctx.stderr_discarded == 0
 
@@ -5938,3 +5963,1289 @@ jobs:
     env = captured[-1][1]["env"]
     assert env["CRONSTABLE_JOB_NAME"] == "test"
     assert [k for k in env if k.startswith("_PYI_")] == []
+
+
+# ---------------------------------------------------------------------------
+# resourceLimits: how a run uses its container.
+#
+# A fake backend stands behind a real LimitsManager, installed with
+# limits.set_manager and restored afterwards, so nothing here creates a
+# cgroup or a Job Object (the real Linux backend would move the pytest
+# process into a delegated cgroup).  tests/test_limits_live.py runs the same
+# paths on real kernels.
+# ---------------------------------------------------------------------------
+
+MIB = 1024 * 1024
+_ALL_CAPS = frozenset({"cpu", "memory", "processes"})
+_NO_CAPTURE = "    captureStdout: false\n    captureStderr: false\n"
+_REFUSED = (
+    "resource limits could not be enforced: {} "
+    "(resourceLimits.required is set)"
+)
+
+
+class _Join:
+    """The fake Linux ``preexec_fn``: joins, then calls the wrapped hook."""
+
+    def __init__(self, events, then):
+        self.events = events
+        self.then = then
+
+    def __call__(self):
+        self.events.append("join")
+        if self.then is not None:
+            self.then()
+
+
+class _FakeContainer:
+    """One run's container (the backend interface); records its calls."""
+
+    def __init__(self, backend, caps):
+        self.backend = backend
+        self.applied = frozenset(
+            r for r in limits.RESOURCES if getattr(caps, r) is not None
+        )
+        self.unenforced = {}
+        self.calls = []
+        self.stats = dict(backend.stats)
+
+    def spawn_kwargs(self, kwargs, *, required):
+        self.calls.append(("spawn_kwargs", required))
+        if self.backend.mode == "linux":
+            kwargs["preexec_fn"] = _Join(
+                self.backend.events, kwargs.get("preexec_fn")
+            )
+        elif self.backend.mode == "windows":
+            cronstable.platform.suspend_at_spawn(kwargs, windows=True)
+
+    def attach(self, pid, *, required):
+        self.calls.append(("attach", pid, required))
+        loses = self.backend.attach_loses
+        if loses and required:
+            return next(iter(loses.values()))
+        self.unenforced.update(loses or {})
+        return None
+
+    def abort(self):
+        self.calls.append(("abort",))
+        self.unenforced.update(self.backend.abort_loses or {})
+
+    def kill(self):
+        self.calls.append(("kill",))
+        return self.backend.kill_result
+
+    def finish(self):
+        self.calls.append(("finish",))
+        gate = self.backend.finish_gate
+        if gate is not None:
+            assert gate.wait(10)
+        return dict(self.stats)
+
+    def members(self):
+        return None
+
+    def cpu_times(self):
+        return None
+
+
+class _FakeLimitsBackend:
+    """A backend whose capability and container behavior tests set."""
+
+    mechanism = "fake-mech"
+
+    def __init__(self):
+        self.cap = Capability(True, "fake-mech", _ALL_CAPS, None, None)
+        # None leaves the spawn kwargs alone, so real processes can run
+        self.mode = None
+        self.events = []
+        self.created = []
+        self.attach_loses = None
+        self.abort_loses = None
+        self.kill_result = True
+        self.finish_gate = None
+        self.stats = {
+            "memory_exceeded": False,
+            "process_limit_hits": 0,
+            "peak_memory_bytes": 4 * MIB,
+            "cpu_throttled_seconds": None,
+        }
+
+    def capability(self):
+        return self.cap
+
+    def setup(self):
+        return self.cap
+
+    def create(self, caps, name, *, nice=None):
+        container = _FakeContainer(self, caps)
+        container.nice = nice
+        self.created.append((caps, name, container))
+        return container
+
+    def collect(self):
+        pass
+
+    @property
+    def container(self):
+        """The only container created."""
+        assert len(self.created) == 1, self.created
+        return self.created[0][2]
+
+
+@pytest.fixture
+def fake_limits():
+    backend = _FakeLimitsBackend()
+    previous = limits._MANAGER
+    limits.set_manager(limits.LimitsManager(backend))
+    try:
+        yield backend
+    finally:
+        limits.set_manager(previous)
+
+
+def _capped_yaml(caps="      cpu: 1\n", command=None, extra=""):
+    return (
+        "jobs:\n  - name: capped\n"
+        + yaml_command(cmd_print(out="hi") if command is None else command)
+        + '\n    schedule: "* * * * *"\n'
+        + extra
+        + "    resourceLimits:\n"
+        + caps
+    )
+
+
+def _fake_procs(monkeypatch, returncode=0, on_spawn=None):
+    """Fake both spawns with a process (pid 4242) that exits ``returncode``.
+
+    Returns the list of (kind, kwargs) spawned.  ``on_spawn()`` runs just
+    before a spawn returns.
+    """
+    captured = []
+
+    def recorder(kind):
+        async def spawn(*args, **kwargs):
+            captured.append((kind, kwargs))
+            proc = Mock(stdout=None, stderr=None, pid=4242, returncode=None)
+
+            async def wait():
+                proc.returncode = returncode
+                return returncode
+
+            proc.wait = wait
+            if on_spawn is not None:
+                on_spawn()
+            return proc
+
+        return spawn
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", recorder("exec"))
+    monkeypatch.setattr("asyncio.create_subprocess_shell", recorder("shell"))
+    return captured
+
+
+def _limits_record(**over):
+    fields = {
+        "cpu": None,
+        "memory_bytes": 64 * MIB,
+        "processes": None,
+        "required": False,
+        "enforced": True,
+        "mechanism": "fake-mech",
+        "unenforced": (),
+        "reason": None,
+    }
+    fields.update(over)
+    return LimitsRecord(**fields)
+
+
+async def test_a_capped_run_records_its_limits(fake_limits):
+    job = _running_job(
+        _capped_yaml("      cpu: 1.5\n      memory: 256M\n      processes: 16\n")
+    )
+    await job.start()
+    await job.wait()
+    assert fake_limits.created[0][1] == "capped"
+    calls = fake_limits.container.calls
+    assert calls == [
+        ("spawn_kwargs", False),
+        ("attach", job.proc.pid, False),
+        ("finish",),
+    ]
+    assert job.limits_record == LimitsRecord(
+        cpu=1.5,
+        memory_bytes=256 * MIB,
+        processes=16,
+        required=False,
+        enforced=True,
+        mechanism="fake-mech",
+        unenforced=(),
+        reason=None,
+        process_limit_hits=0,
+        peak_memory_bytes=4 * MIB,
+    )
+    assert job.retcode == 0 and not job.failed
+    assert not job.start_discarded
+    assert job.template_vars["limits"] == job.limits_record.to_dict()
+
+
+async def test_a_capped_run_hands_its_nice_to_its_container(
+    fake_limits, monkeypatch
+):
+    # a backend that weighs CPU between runs is given the nice
+    fake_limits.weighting = True
+    _fake_procs(monkeypatch)
+    # the fake pid names no group of this run's
+    monkeypatch.setattr(
+        cronstable.platform, "apply_priority", lambda pid, priority: True
+    )
+    job = _running_job(
+        _capped_yaml(extra=_NO_CAPTURE + "    priority: below-normal\n")
+    )
+    await job.start()
+    await job.wait()
+    # the cgroup's CPU weight follows it; Windows has the priority class
+    assert fake_limits.container.nice == (None if IS_WINDOWS else 10)
+    assert job.limits_record.enforced
+
+
+async def test_an_uncapped_run_gets_a_weight_only_container(
+    fake_limits, monkeypatch
+):
+    fake_limits.weighting = True
+    assert limits.weighting_active()
+    _fake_procs(monkeypatch)
+    job = _running_job(_PLAIN_JOB)
+    await job.start()
+    await job.wait()
+    ((caps, name, container),) = fake_limits.created
+    assert (caps, name) == (cronstable.config.ResourceLimits(), "t")
+    # normal: the daemon's own nice
+    nice = None if IS_WINDOWS else os.getpriority(os.PRIO_PROCESS, 0)
+    assert container.nice == nice
+    assert container.calls == [
+        ("spawn_kwargs", False),
+        ("attach", 4242, False),
+        ("finish",),
+    ]
+    assert not job._limits.recorded
+    assert job.limits_record is None and job.fail_reason is None
+    assert job.template_vars["limits"] is None
+
+
+async def test_a_run_whose_weight_cannot_apply_runs_as_if_unweighed(
+    fake_limits, monkeypatch
+):
+    fake_limits.weighting = True
+    real_create = fake_limits.create
+
+    def create(caps, name, **kwargs):
+        container = real_create(caps, name, **kwargs)
+        container.weight_problem = "could not create a cgroup: no space"
+        return container
+
+    fake_limits.create = create
+    _fake_procs(monkeypatch)
+    job = _running_job(_PLAIN_JOB)
+    await job.start()
+    await job.wait()
+    # the container is released before the spawn, which goes on without it
+    assert fake_limits.container.calls == [("abort",)]
+    assert job._limits is None and job.limits_record is None
+    assert job.retcode == 0 and job.fail_reason is None
+
+
+async def test_an_uncapped_run_never_touches_the_limits_module(monkeypatch):
+    def untouched(*args, **kwargs):
+        raise AssertionError("an uncapped run reached cronstable.limits")
+
+    monkeypatch.setattr(limits, "get_manager", untouched)
+    monkeypatch.setattr(limits, "prepare", untouched)
+    # while cronstable weighs no CPU; the check reads a flag, no manager
+    assert not limits.weighting_active()
+    captured = _spawn_recorder(monkeypatch)
+    job = _running_job(_PLAIN_JOB)
+    await job.start()
+    kwargs = captured[-1][1]
+    # nothing beyond what the group isolation sets: no preexec_fn and no
+    # extra creation flags
+    assert "preexec_fn" not in kwargs
+    plain = cronstable.platform.new_process_group_kwargs(job.config.priority)
+    assert kwargs.get("creationflags") == plain.get("creationflags")
+    for key, value in plain.items():
+        assert kwargs[key] == value
+
+
+async def test_an_uncapped_run_records_no_limits(monkeypatch):
+    def untouched(*args, **kwargs):
+        raise AssertionError("an uncapped run reached cronstable.limits")
+
+    monkeypatch.setattr(limits, "get_manager", untouched)
+    monkeypatch.setattr(limits, "prepare", untouched)
+    job = _running_job(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_sleep(30))
+        + '\n    schedule: "* * * * *"\n'
+        + "    killTimeout: 5\n"
+    )
+    await job.start()
+    collected = asyncio.ensure_future(job.wait())
+    await asyncio.sleep(0)
+    await asyncio.wait_for(job.cancel(), 30)
+    await asyncio.wait_for(collected, 30)
+    assert job.stopped
+    assert job.limits_record is None
+    assert job.template_vars["limits"] is None
+
+
+class _WeightOnly:
+    """What prepare returns for a run without caps while CPU is weighed.
+
+    It has a container and no record: ``record`` raises, and ``finish``
+    and ``abort`` return a failing record that the run must not keep.
+    """
+
+    recorded = False
+    refused = False
+
+    def __init__(self, order):
+        self.container = object()
+        self.events = []
+        # every weight-only run's events, in the order they happened
+        self.order = order
+
+    def _log(self, event):
+        self.events.append(event)
+        self.order.append((self, event))
+
+    @property
+    def record(self):
+        raise AssertionError("a weight-only run has no limits record")
+
+    def spawn_kwargs(self, kwargs):
+        self._log("spawn_kwargs")
+
+    async def attach(self, pid):
+        self._log(("attach", pid))
+
+    async def kill(self):
+        self._log("kill")
+        return False
+
+    async def finish(self):
+        self._log("finish")
+        return _limits_record(memory_exceeded=True)
+
+    def abort(self):
+        self._log("abort")
+        return _limits_record(refused=True)
+
+
+@pytest.fixture
+def weighted(monkeypatch):
+    """CPU weighting on, with prepare faked; holds its (name, nice, run)."""
+    prepared = []
+    order = []
+
+    async def prepare(caps, name, *, nice=None):
+        assert caps is None, caps
+        run = _WeightOnly(order)
+        prepared.append((name, nice, run))
+        return run
+
+    monkeypatch.setattr(limits, "weighting_active", lambda: True)
+    monkeypatch.setattr(limits, "prepare", prepare)
+    return prepared
+
+
+_IDLE_JOB = _PLAIN_JOB + "    priority: idle\n"
+_NO_LIMITS_ENV = {
+    "CRONSTABLE_LIMITS_ENFORCED": "",
+    "CRONSTABLE_MEMORY_LIMIT_EXCEEDED": "",
+}
+
+
+async def test_a_weighed_run_without_caps_records_no_limits(
+    weighted, monkeypatch
+):
+    _fake_procs(monkeypatch)
+    # the fake pid names no group of this run's
+    monkeypatch.setattr(
+        cronstable.platform, "apply_priority", lambda pid, priority: True
+    )
+    job = _running_job(_IDLE_JOB)
+    stopped = []
+
+    async def job_stopped():
+        stopped.append(job.limits_record)
+
+    await job.start()
+    job.statsd_writer = Mock(job_stopped=job_stopped)
+    await job.wait()
+    ((name, nice, run),) = weighted
+    # the weight follows the run's priority; Windows has its class
+    assert (name, nice) == ("t", None if IS_WINDOWS else 19)
+    assert run.events == ["spawn_kwargs", ("attach", 4242), "finish"]
+    assert job.limits_record is None and stopped == [None]
+    assert job.fail_reason is None
+    assert job.template_vars["limits"] is None
+    assert cronstable.job._limits_env(job) == _NO_LIMITS_ENV
+
+
+async def test_a_weighed_spawn_that_fails_records_no_limits(
+    weighted, monkeypatch
+):
+    async def boom(*args, **kwargs):
+        raise OSError(errno.EACCES, "denied")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    monkeypatch.setattr("asyncio.create_subprocess_shell", boom)
+    job = _running_job(_PLAIN_JOB)
+    await job.start()
+    ((_, _, run),) = weighted
+    assert run.events == ["spawn_kwargs", "abort"]
+    assert job.start_failed and job.limits_record is None
+    await job.wait()
+    assert job.fail_reason == "command exited with code 127"
+
+
+async def test_a_weighed_start_cancelled_during_attach_records_no_limits(
+    weighted, monkeypatch
+):
+    discarded = []
+
+    async def attach(self, pid):
+        raise asyncio.CancelledError
+
+    async def read_job_streams(*, close_output=True):
+        discarded.append(close_output)
+
+    monkeypatch.setattr(_WeightOnly, "attach", attach)
+    _fake_procs(monkeypatch)
+    job = _running_job(_PLAIN_JOB)
+    monkeypatch.setattr(job, "_signal_child", lambda *, force: None)
+    monkeypatch.setattr(job, "_read_job_streams", read_job_streams)
+    with pytest.raises(asyncio.CancelledError):
+        await job.start()
+    ((_, _, run),) = weighted
+    assert run.events == ["spawn_kwargs", "kill", "abort"]
+    assert job.start_discarded and job.limits_record is None
+
+
+async def test_a_weighed_run_settles_after_its_check(weighted, monkeypatch):
+    # only a capped run settles before its check (a memory kill skips the
+    # check); a weighed one ends as an uncapped run does
+    job = _running_job(
+        "jobs:\n  - name: t\n"
+        + yaml_command(cmd_print(out="main"))
+        + "\n    verify:\n"
+        + yaml_command(cmd_print(out="check"), indent=6)
+        + "\n      timeout: 30\n"
+        + '    schedule: "* * * * *"\n'
+    )
+    await job.start()
+    await asyncio.wait_for(job.wait(), 30)
+    (_, _, run), (_, _, check) = weighted
+    assert run.events[-1] == check.events[-1] == "finish"
+    finished = [r for r, event in run.order if event == "finish"]
+    assert finished == [check, run]
+    assert job.verification["outcome"] == "success"
+    assert job.verification["limits"] is None
+    assert job.limits_record is None and job.fail_reason is None
+
+
+async def test_required_caps_the_host_lacks_refuse_the_run(
+    fake_limits, monkeypatch
+):
+    reason = "cgroup /x does not offer the memory controller"
+    fake_limits.cap = Capability(
+        True, "fake-mech", frozenset({"cpu", "processes"}), reason, None
+    )
+    captured = _fake_procs(monkeypatch)
+    job = _running_job(
+        _capped_yaml("      memory: 64M\n      required: true\n")
+    )
+    await job.start()
+    assert captured == []  # never spawned
+    assert fake_limits.created == []  # and nothing was created
+    assert job.proc is None and job.start_failed
+    record = job.limits_record
+    assert record.refused and not record.enforced
+    assert record.unenforced == ("memory",)
+    assert job.fail_reason == _REFUSED.format(reason)
+    await job.wait()
+    assert job.retcode == 127
+    assert job.fail_reason == _REFUSED.format(reason)
+    assert job.template_vars["limits"] == record.to_dict()
+    await job.cancel()  # nothing to signal
+
+
+async def test_caps_the_host_lacks_run_uncapped_and_say_so(
+    fake_limits, monkeypatch
+):
+    reason = "cgroup /x does not offer the memory controller"
+    fake_limits.cap = Capability(
+        True, "fake-mech", frozenset({"cpu", "processes"}), reason, None
+    )
+    captured = _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml("      memory: 64M\n", extra=_NO_CAPTURE))
+    await job.start()
+    await job.wait()
+    assert len(captured) == 1
+    assert fake_limits.created == []  # no cap could apply
+    record = job.limits_record
+    assert not record.enforced and not record.refused
+    assert record.unenforced == ("memory",) and record.reason == reason
+    assert record.mechanism is None
+    assert job.fail_reason is None
+
+
+@pytest.mark.parametrize("demote", [True, False], ids=["demote", "plain"])
+async def test_the_join_runs_before_the_demote_hook(
+    fake_limits, monkeypatch, demote
+):
+    # Linux semantics: the container wraps whatever preexec_fn start() has
+    # put in place, and its join runs first (a demoted child can no longer
+    # write the delegated cgroup.procs).
+    fake_limits.mode = "linux"
+    order = fake_limits.events
+    monkeypatch.setattr(
+        cronstable.job.RunningJob,
+        "_demote",
+        lambda self: order.append("demote"),
+    )
+    captured = _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    if demote:
+        job.config.uid = 1000
+    await job.start()
+    hook = captured[-1][1]["preexec_fn"]
+    hook()
+    assert order == (["join", "demote"] if demote else ["join"])
+
+
+async def test_a_capped_spawn_starts_suspended_with_its_group(
+    fake_limits, monkeypatch
+):
+    # Windows semantics: CREATE_SUSPENDED joins the group flags.
+    fake_limits.mode = "windows"
+    captured = _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    await job.start()
+    kwargs = captured[-1][1]
+    plain = cronstable.platform.new_process_group_kwargs(job.config.priority)
+    assert kwargs["creationflags"] == plain.get("creationflags", 0) | 0x4
+    for key, value in plain.items():
+        if key != "creationflags":
+            assert kwargs[key] == value
+    assert "preexec_fn" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "required, joined",
+    [
+        pytest.param(False, False, id="optional-join-failed"),
+        pytest.param(True, False, id="required-join-failed"),
+        pytest.param(True, True, id="required-spawn-failed"),
+    ],
+)
+async def test_a_failed_spawn_aborts_the_container(
+    fake_limits, monkeypatch, caplog, required, joined
+):
+    async def boom(*args, **kwargs):
+        raise OSError(errno.EACCES, "denied")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    lost = "could not move the job into its cgroup"
+    if not joined:
+        # what a child that failed its join leaves behind
+        fake_limits.abort_loses = {"cpu": lost}
+    refused = required and not joined
+    caps = "      cpu: 1\n" + ("      required: true\n" if required else "")
+    job = _running_job(_capped_yaml(caps))
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await job.start()
+    assert fake_limits.container.calls.count(("abort",)) == 1
+    assert fake_limits.container.calls[-1] == ("abort",)
+    assert job.proc is None and job.start_failed
+    assert job.limits_record.refused is refused
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    if refused:
+        # a refused join is a limits failure, not a launch error
+        assert errors == []
+        assert warnings == [
+            "resource limits could not be applied to a run of capped: "
+            + lost
+            + " (each distinct failure is logged once)"
+        ]
+    else:
+        (error,) = errors
+        assert error.getMessage().startswith(
+            "Error launching subprocess of job capped"
+        )
+    await job.wait()
+    if refused:
+        assert job.fail_reason == _REFUSED.format(lost)
+    else:
+        assert job.fail_reason == "command exited with code 127"
+
+
+async def test_a_cancelled_spawn_aborts_the_container(
+    fake_limits, monkeypatch
+):
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", cancelled)
+    job = _running_job(_capped_yaml())
+    with pytest.raises(asyncio.CancelledError):
+        await job.start()
+    assert fake_limits.container.calls[-1] == ("abort",)
+    assert job.limits_record is not None
+    assert not job.start_failed
+    # no child to discard: proc stays None
+    assert job.proc is None and not job.start_discarded
+
+
+@pytest.mark.parametrize("contained", [True, False])
+async def test_a_start_cancelled_during_attach_leaves_no_process(
+    fake_limits, monkeypatch, contained
+):
+    # Callers register a run only once start() returns, so a start
+    # cancelled after the spawn must end the child itself.
+    entered = threading.Event()
+    gate = threading.Event()
+    real_create = fake_limits.create
+
+    def create(caps, name, **kwargs):
+        container = real_create(caps, name, **kwargs)
+        attach = container.attach
+
+        def blocking_attach(pid, *, required):
+            entered.set()
+            assert gate.wait(10)
+            return attach(pid, required=required)
+
+        def kill():
+            # a container kill reaches the child; one that missed does not
+            container.calls.append(("kill",))
+            if contained:
+                (pid,) = [c[1] for c in container.calls if c[0] == "attach"]
+                os.kill(pid, signal.SIGTERM if IS_WINDOWS else signal.SIGKILL)
+            return contained
+
+        container.attach = blocking_attach
+        container.kill = kill
+        return container
+
+    fake_limits.create = create
+    job = _running_job(
+        _capped_yaml(command=cmd_sleep(30), extra="    captureStdout: true\n")
+    )
+    direct = []
+    real_signal = job._signal_child
+
+    def signal_child(*, force):
+        direct.append(force)
+        real_signal(force=force)
+
+    monkeypatch.setattr(job, "_signal_child", signal_child)
+    starting = asyncio.ensure_future(job.start())
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        starting.cancel()
+        await asyncio.sleep(0.05)
+        # the attach still runs on its thread; the child waits for it
+        assert not starting.done()
+    finally:
+        gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    proc = job.proc
+    assert proc is not None
+    # a 30 s sleeper: it exits this soon only because it was killed
+    await asyncio.wait_for(proc.wait(), 10)
+    calls = fake_limits.container.calls
+    assert calls[-2:] == [("kill",), ("abort",)]
+    # the leader alone is signaled only when the container kill missed it
+    assert direct == ([] if contained else [True])
+    record = job.limits_record
+    assert record is not None and record.enforced and not record.refused
+    # no reader started, and the pipes are closed
+    assert job._stdout_reader is None and job._stderr_reader is None
+    assert proc._transport.is_closing()
+    assert not job.start_failed
+    # callers read this as a launch that never happened
+    assert job.start_discarded
+
+
+async def test_attach_follows_the_spawn_with_no_await_between(
+    fake_limits, monkeypatch
+):
+    # A capped Windows child is suspended until attach resumes it, so
+    # nothing may yield to the loop between the spawn and the attach.
+    events = fake_limits.events
+    loop = asyncio.get_running_loop()
+
+    def spawned():
+        # runs at the first loop turn after the spawn returns
+        loop.call_soon(events.append, "loop turn")
+        events.append("spawned")
+
+    def apply_priority(pid, priority):
+        events.append("priority")
+        return True
+
+    real_attach = limits.RunLimits.attach
+
+    async def attach(self, pid):
+        events.append(("attach", pid))
+        await real_attach(self, pid)
+
+    _fake_procs(monkeypatch, on_spawn=spawned)
+    monkeypatch.setattr(cronstable.platform, "apply_priority", apply_priority)
+    monkeypatch.setattr(limits.RunLimits, "attach", attach)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    await job.start()
+    assert events[:4] == ["spawned", "priority", ("attach", 4242), "loop turn"]
+    assert ("attach", 4242, False) in fake_limits.container.calls
+
+
+async def test_a_child_that_cannot_be_contained_fails_a_required_run(
+    fake_limits, monkeypatch
+):
+    lost = "could not move the job into its cgroup"
+    fake_limits.attach_loses = {"cpu": lost}
+    # the container has killed the child
+    _fake_procs(monkeypatch, returncode=-9)
+    job = _running_job(
+        _capped_yaml("      cpu: 1\n      required: true\n", extra=_NO_CAPTURE)
+    )
+    # a limits failure whatever failsWhen says
+    _set_fails_when(job)
+    await job.start()
+    assert job.proc is not None and not job.start_failed
+    assert job.limits_record.refused
+    await job.wait()
+    assert job.retcode == -9
+    assert job.fail_reason == _REFUSED.format(lost)
+    assert job.limits_record.refused  # the final record keeps it
+    assert fake_limits.container.calls.count(("finish",)) == 1
+
+
+async def test_a_lost_containment_runs_uncapped_and_says_so(
+    fake_limits, monkeypatch
+):
+    lost = "could not move the job into its cgroup"
+    fake_limits.attach_loses = {"cpu": lost}
+    _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    await job.start()
+    assert job.limits_record is None  # set when the run ends
+    await job.wait()
+    record = job.limits_record
+    assert not record.enforced and not record.refused
+    assert record.reason == lost
+    assert job.fail_reason is None
+
+
+@pytest.mark.parametrize("windows", [False, True], ids=["posix", "windows"])
+@pytest.mark.parametrize("contained", [True, False])
+async def test_a_forced_kill_goes_to_the_container_first(
+    fake_limits, monkeypatch, contained, windows
+):
+    fake_limits.kill_result = contained
+    group_kills = []
+
+    async def kill_process_group(pid, *, force):
+        group_kills.append(force)
+        return True
+
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", kill_process_group
+    )
+    _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    await job.start()
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", windows)
+    calls = fake_limits.container.calls
+    # the graceful step is the group's alone
+    assert await job._kill_group(force=False) is True
+    assert group_kills == [False] and ("kill",) not in calls
+    assert await job._kill_group(force=True) is True
+    assert calls.count(("kill",)) == 1
+    # On POSIX the group kill follows, for a process that left the
+    # container but kept the group.  A Job Object kill ends the whole job.
+    assert group_kills == ([False] if contained and windows else [False, True])
+
+
+@pytest.mark.parametrize("contained", [True, False])
+async def test_a_forced_kill_spares_a_reused_leader_pid(
+    fake_limits, monkeypatch, contained
+):
+    fake_limits.kill_result = contained
+    group_kills = []
+
+    async def kill_process_group(pid, *, force):
+        group_kills.append(force)
+        return True
+
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", kill_process_group
+    )
+    _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    await job.start()
+    # the leader is reaped and its pid now names an unrelated process
+    job.proc.returncode = 0
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", False)
+    monkeypatch.setattr(cronstable.platform, "pid_reused", lambda pid: True)
+    assert await job._kill_group(force=True) is contained
+    assert fake_limits.container.calls.count(("kill",)) == 1
+    assert group_kills == []
+
+
+async def test_a_racing_stop_waits_for_the_one_limits_finish(
+    fake_limits, monkeypatch
+):
+    # cancel() and wait() both reach _on_stop; the reaper records the run
+    # when wait() returns, so the second stop must wait for the record
+    gate = threading.Event()
+    fake_limits.finish_gate = gate
+    _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    await job.start()
+    calls = fake_limits.container.calls
+    sampled = asyncio.Event()
+
+    class Monitor:
+        async def stop(self):
+            await sampled.wait()
+
+    job._resource_monitor = Monitor()
+    first = asyncio.ensure_future(job._on_stop())
+    second = asyncio.ensure_future(job._on_stop())
+    try:
+        await asyncio.sleep(0.05)
+        # the monitor's last sample reads the container, so no finish yet
+        assert ("finish",) not in calls
+        sampled.set()
+        await _wait_until(lambda: ("finish",) in calls)
+        await asyncio.sleep(0.05)
+        assert not first.done() and not second.done()
+    finally:
+        sampled.set()
+        gate.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 10)
+    assert calls.count(("finish",)) == 1
+    assert job.limits_record.peak_memory_bytes == 4 * MIB
+
+
+async def test_cancel_racing_wait_finishes_the_limits_once(fake_limits):
+    fake_limits.kill_result = False  # the group kill does the work
+    job = _running_job(
+        _capped_yaml(command=cmd_sleep(30), extra="    killTimeout: 5\n")
+    )
+    await job.start()
+    collected = asyncio.ensure_future(job.wait())
+    await asyncio.sleep(0)
+    await asyncio.wait_for(job.cancel(), 30)
+    await asyncio.wait_for(collected, 30)
+    calls = fake_limits.container.calls
+    assert calls.count(("kill",)) == 1
+    assert calls.count(("finish",)) == 1
+    assert job.limits_record is not None
+
+
+async def test_a_limits_finish_error_never_breaks_completion(
+    fake_limits, monkeypatch, caplog
+):
+    _fake_procs(monkeypatch)
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE))
+    await job.start()
+
+    async def broken():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(job._limits, "finish", broken)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await job.wait()
+    assert job.stopped
+    # the caps view, without the kernel's counters
+    record = job.limits_record
+    assert record == job._limits.record
+    assert record.cpu == 1.0 and record.enforced
+    assert record.peak_memory_bytes is None
+    assert job.template_vars["limits"] == record.to_dict()
+    assert "failed to finalize resource limits" in caplog.text
+
+
+@pytest.mark.parametrize("capped", [False, True], ids=["plain", "capped"])
+async def test_a_monitor_error_never_breaks_completion(
+    fake_limits, monkeypatch, caplog, capped
+):
+    _fake_procs(monkeypatch)
+    yaml = _capped_yaml(extra=_NO_CAPTURE) if capped else _PLAIN_JOB
+    job = _running_job(yaml)
+    await job.start()
+
+    class Monitor:
+        async def stop(self):
+            raise RuntimeError("boom")
+
+    job._resource_monitor = Monitor()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await job.wait()
+    assert job.stopped and job._resource_monitor is None
+    assert job.resource_usage is None
+    assert "failed to finalize resource monitoring" in caplog.text
+    # the limits record is still read
+    assert (job.limits_record is not None) is capped
+
+
+async def test_stop_metrics_see_the_final_limits_record(fake_limits):
+    fake_limits.stats["memory_exceeded"] = True
+    job = _running_job(_capped_yaml("      memory: 64M\n"))
+    await job.start()
+    seen = []
+
+    async def job_stopped():
+        seen.append(job.limits_record)
+
+    job.statsd_writer = Mock(job_stopped=job_stopped)
+    await job.wait()
+    assert seen == [job.limits_record]
+    assert seen[0].memory_exceeded
+    # exit 0, failed anyway
+    assert job.retcode == 0
+    assert job.fail_reason == "memory limit exceeded (64 MiB)"
+
+
+def test_fail_reason_puts_a_limits_failure_first():
+    job = _fresh_job()
+    _set_fails_when(job)
+    job.retcode = 0
+    assert job.fail_reason is None
+    job.limits_record = _limits_record(memory_exceeded=True)
+    assert job.fail_reason == "memory limit exceeded (64 MiB)"
+    # whatever failsWhen and the verification say
+    _set_fails_when(job, always=True, nonzero=True)
+    job.retcode = -9
+    job.verification = {"outcome": "failure", "fail_reason": "check failed"}
+    assert job.fail_reason == "memory limit exceeded (64 MiB)"
+    refused = _limits_record(refused=True, enforced=False, reason="no cgroup")
+    job.limits_record = refused
+    assert job.fail_reason == _REFUSED.format("no cgroup")
+    # a record without a failure leaves the other reasons in place
+    job.limits_record = _limits_record()
+    assert job.fail_reason == "verification failed: check failed"
+
+
+async def test_the_monitor_reads_a_capped_runs_container(
+    fake_limits, monkeypatch
+):
+    made = []
+
+    class Monitor:
+        def __init__(self, pid, **kwargs):
+            made.append(kwargs)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cronstable.job, "ResourceMonitor", Monitor)
+    _fake_procs(monkeypatch)
+    monitored = "    monitorResources: true\n"
+    job = _running_job(_capped_yaml(extra=_NO_CAPTURE + monitored))
+    await job.start()
+    assert made[-1]["container"] is fake_limits.container
+    plain = _running_job(_PLAIN_JOB + monitored)
+    await plain.start()
+    assert made[-1]["container"] is None
+
+
+async def test_a_verify_check_inherits_the_caps_in_its_own_container(
+    fake_limits,
+):
+    job = _running_job(
+        "jobs:\n  - name: capped\n"
+        + yaml_command(cmd_print(out="main"))
+        + "\n    verify:\n"
+        + yaml_command(cmd_print(out="check"), indent=6)
+        + "\n      timeout: 30\n"
+        + '    schedule: "* * * * *"\n'
+        + "    resourceLimits:\n      cpu: 1\n      processes: 8\n"
+    )
+    await job.start()
+    await asyncio.wait_for(job.wait(), 30)
+    assert job.verification["outcome"] == "success"
+    assert len(fake_limits.created) == 2
+    (main_caps, _, main), (check_caps, name, check) = fake_limits.created
+    assert check_caps == main_caps == job.config.resourceLimits
+    assert name == "capped" and check is not main
+    attached = [
+        [c[1] for c in container.calls if c[0] == "attach"]
+        for container in (main, check)
+    ]
+    assert attached[0] == [job.proc.pid]
+    assert len(attached[1]) == 1
+    assert main.calls[-1] == check.calls[-1] == ("finish",)
+
+
+def _verified_capped_yaml():
+    """A memory-capped job whose exit code never fails it, with a check."""
+    return _capped_yaml(
+        "      memory: 64M\n",
+        command=cmd_print(out="main", code=3),
+        extra=(
+            "    failsWhen:\n"
+            "      producesStdout: false\n"
+            "      producesStderr: false\n"
+            "      nonzeroReturn: false\n"
+            "    verify:\n"
+            + yaml_command(cmd_print(out="check"), indent=6)
+            + "\n      timeout: 30\n"
+        ),
+    )
+
+
+@pytest.mark.parametrize("exceeded", [True, False], ids=["hit", "within"])
+async def test_a_capped_run_settles_its_limits_before_its_check(
+    fake_limits, exceeded
+):
+    # a run killed at its memory cap has failed, so its check never runs
+    fake_limits.stats["memory_exceeded"] = exceeded
+    order = []
+    real_create = fake_limits.create
+
+    def create(caps, name, **kwargs):
+        container = real_create(caps, name, **kwargs)
+        order.append("create")
+        real_finish = container.finish
+
+        def finish():
+            order.append("finish")
+            return real_finish()
+
+        container.finish = finish
+        return container
+
+    fake_limits.create = create
+    job = _running_job(_verified_capped_yaml())
+    await job.start()
+    await asyncio.wait_for(job.wait(), 30)
+    assert job.retcode == 3
+    if exceeded:
+        assert order == ["create", "finish"]
+        assert job.verification == {
+            "outcome": "skipped",
+            "fail_reason": "command failed",
+        }
+        assert job.fail_reason == "memory limit exceeded (64 MiB)"
+    else:
+        # the run's container is done before its check's is made
+        assert order == ["create", "finish", "create", "finish"]
+        assert job.verification["outcome"] == "success"
+        assert job.fail_reason is None
+    assert job.stopped
+    main = fake_limits.created[0][2]
+    assert main.calls.count(("finish",)) == 1
+
+
+async def test_a_check_killed_at_its_memory_cap_keeps_its_own_record(
+    fake_limits,
+):
+    # the run's record covers the run alone; the check's rides in the
+    # verification result
+    real_create = fake_limits.create
+
+    def create(caps, name, **kwargs):
+        container = real_create(caps, name, **kwargs)
+        # every container made after the run's is the check's
+        fake_limits.stats["memory_exceeded"] = True
+        return container
+
+    fake_limits.create = create
+    job = _running_job(_verified_capped_yaml())
+    await job.start()
+    await asyncio.wait_for(job.wait(), 30)
+    assert len(fake_limits.created) == 2
+    assert not job.limits_record.memory_exceeded
+    check = job.verification["limits"]
+    assert check["memory_exceeded"] and check["memory_bytes"] == 64 * MIB
+    assert check == LimitsRecord.from_dict(check).to_dict()
+    assert job.verification["outcome"] == "failure"
+    assert job.fail_reason == (
+        "verification failed: memory limit exceeded (64 MiB)"
+    )
+
+
+async def test_an_uncapped_check_has_no_limits_record(monkeypatch):
+    def untouched(*args, **kwargs):
+        raise AssertionError("an uncapped run reached the limits manager")
+
+    monkeypatch.setattr(limits, "get_manager", untouched)
+    monkeypatch.setattr(limits, "prepare", untouched)
+    job = _running_job(
+        "jobs:\n  - name: plain\n"
+        + yaml_command(cmd_print(out="main"))
+        + "\n    verify:\n"
+        + yaml_command(cmd_print(out="check"), indent=6)
+        + "\n      timeout: 30\n"
+        + '    schedule: "* * * * *"\n'
+    )
+    await job.start()
+    await asyncio.wait_for(job.wait(), 30)
+    assert job.verification["outcome"] == "success"
+    assert job.verification["limits"] is None
+
+
+def test_no_nice_rides_to_the_container_on_windows(monkeypatch):
+    # the priority class orders a Windows run
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", True)
+    assert cronstable.job._run_nice("idle") is None
+    assert cronstable.job._run_nice("normal") is None
+
+
+def test_the_container_nice_is_the_absolute_nice_of_the_priority(
+    monkeypatch,
+):
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", False)
+    asked = []
+
+    def getpriority(which, who):
+        asked.append((which, who))
+        return 7  # a daemon started under nice 7
+
+    # Windows has neither
+    prio_process = getattr(os, "PRIO_PROCESS", 0)
+    monkeypatch.setattr(os, "PRIO_PROCESS", prio_process, raising=False)
+    monkeypatch.setattr(os, "getpriority", getpriority, raising=False)
+    nice = cronstable.job._run_nice
+    assert (nice("idle"), nice("below-normal")) == (19, 10)
+    assert (nice("above-normal"), nice("high")) == (-5, -10)
+    assert asked == []
+    # normal is the daemon's own nice, which the run's process inherits
+    assert nice("normal") == 7
+    assert asked == [(prio_process, 0)]
+
+
+async def test_a_cancel_while_the_limits_settle_skips_the_check(
+    fake_limits, monkeypatch
+):
+    async def kill_process_group(pid, *, force):
+        return True
+
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", kill_process_group
+    )
+    gate = threading.Event()
+    fake_limits.finish_gate = gate
+    job = _running_job(_verified_capped_yaml())
+    await job.start()
+    calls = fake_limits.container.calls
+    collected = asyncio.ensure_future(job.wait())
+    try:
+        await _wait_until(lambda: ("finish",) in calls, tries=3000)
+        cancelling = asyncio.ensure_future(job.cancel())
+        await _wait_until(lambda: job._terminated)
+    finally:
+        gate.set()
+    await asyncio.wait_for(asyncio.gather(collected, cancelling), 30)
+    assert job.stopped
+    assert job.verification is None
+    assert len(fake_limits.created) == 1  # no check was prepared
+    assert calls.count(("finish",)) == 1
+    assert job.limits_record is not None
+
+
+async def test_a_leftover_in_the_cgroup_does_not_hold_up_the_check(
+    tmp_path, monkeypatch
+):
+    # The cgroup v2 backend over the kernel model.  A process the run
+    # leaves behind keeps its cgroup busy: the settle before the check
+    # reads the counters and, after one rmdir, queues the cgroup for
+    # collect.
+    from cronstable import _cgroups
+    from tests._fake_cgroupfs import FakeKernel
+
+    kernel = FakeKernel(tmp_path)
+    backend = _cgroups.Backend(kernel)
+    assert backend.setup().available
+    monkeypatch.setattr(limits, "_MANAGER", limits.LimitsManager(backend))
+    paths = []
+    create = backend.create
+
+    def recorded(caps, name, **kwargs):
+        container = create(caps, name, **kwargs)
+        paths.append(container.path)
+        return container
+
+    backend.create = recorded
+    leftover = 900
+    spawned = []
+
+    async def spawn(*args, **kwargs):
+        pid = 500 + len(spawned)
+        # the run's child, and a background process it leaves behind
+        for member in (pid,) if spawned else (pid, leftover):
+            kernel.spawn(member, kernel.own + "/daemon")
+            kernel.join(member, paths[-1])
+        spawned.append((list(kernel.rmdirs), backend.pending))
+        proc = Mock(pid=pid, returncode=None)
+        for name in ("stdout", "stderr"):
+            stream = asyncio.StreamReader()
+            stream.feed_eof()
+            setattr(proc, name, stream)
+
+        async def wait():
+            if proc.returncode is None:
+                kernel.exit(pid)
+                proc.returncode = 0
+            return 0
+
+        proc.wait = wait
+        return proc
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("asyncio.create_subprocess_shell", spawn)
+    job = _running_job(_verified_capped_yaml())
+    await job.start()
+    await asyncio.wait_for(job.wait(), 30)
+    assert job.verification["outcome"] == "success"
+    run, check = paths
+    # before the check spawned, the run's cgroup was queued after one
+    # rmdir from finish and one from each collect pass (the finish's and
+    # the check's prepare)
+    assert spawned == [([], frozenset()), ([run] * 3, {run})]
+    assert job.limits_record.enforced
+    assert backend.pending == {run}
+    assert not os.path.exists(check)
+    kernel.exit(leftover)
+    backend.collect()
+    assert backend.pending == frozenset()
+    assert not os.path.exists(run)
+
+
+@pytest.mark.parametrize(
+    "enforced, exceeded, expected",
+    [
+        (True, False, ("1", "")),
+        (True, True, ("1", "1")),
+        (False, False, ("0", "")),
+    ],
+)
+async def test_report_shell_exports_the_limits_record(
+    monkeypatch, enforced, exceeded, expected
+):
+    record = _limits_record(enforced=enforced, memory_exceeded=exceeded)
+    env = await _capture_shell_reporter_env(
+        monkeypatch, stdout="", stderr="", limits_record=record
+    )
+    assert (
+        env["CRONSTABLE_LIMITS_ENFORCED"],
+        env["CRONSTABLE_MEMORY_LIMIT_EXCEEDED"],
+    ) == expected

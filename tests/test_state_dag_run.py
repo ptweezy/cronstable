@@ -1938,6 +1938,52 @@ async def test_monitored_task_resources_land_in_run_record(tmp_path, dag_cron):
     # and the tolerant parser round-trips what was stored
     stored = body["tasks"]["a"]["resources"]
     assert ResourceUsage.from_dict(stored) == usage
+    # an uncapped task carries no limits record
+    assert "limits" not in body["tasks"]["a"]
+
+
+async def test_capped_task_limits_land_in_run_record(tmp_path, dag_cron):
+    # a finished task's RunningJob.limits_record rides the completion into
+    # its task record, the way verification does.
+    from cronstable.limits import LimitsRecord
+
+    yaml = (
+        "dags:\n  - name: cap\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: b\n        command: 'x'\n"
+        "        dependsOn:\n          - a\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "cap", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "cap", "b", [_PY, "-c", "pass"])
+    run_key = (await cron._dag.trigger("cap"))["runKey"]
+    await _drain_pending(cron)
+    if not any(cron.running_jobs.values()):
+        await cron._dag.advance_one(("cap", run_key))
+        await _drain_pending(cron)
+    (rj,) = [rj for jobs in cron.running_jobs.values() for rj in jobs]
+    await rj.wait()
+    # the template is uncapped (no real manager); stand in for the record
+    # RunningJob would have built
+    record = LimitsRecord(
+        cpu=None,
+        memory_bytes=64 * 1024 * 1024,
+        processes=None,
+        required=False,
+        enforced=True,
+        mechanism="cgroup-v2",
+        unenforced=(),
+        reason=None,
+        peak_memory_bytes=1024,
+    )
+    rj.limits_record = record
+    await cron._handle_finished_job(rj)
+    await _drain_pending(cron)
+    body = await _drive(cron, "cap", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["tasks"]["a"]["limits"] == record.to_dict()
+    assert LimitsRecord.from_dict(body["tasks"]["a"]["limits"]) == record
+    assert "limits" not in body["tasks"]["b"]
 
 
 # --------------------------------------------------------------------------
@@ -2357,6 +2403,117 @@ async def test_cancel_after_the_spawn_keeps_the_registry_key(
     assert ("a", 0, 0) in cron._dag._launched[("cl", run_key)]
     (rj,) = spawned
     await rj.wait()
+
+
+_CAPPED_POOLED = """
+pools:
+  database:
+    slots: 1
+dags:
+  - name: cl
+    tasks:
+      - id: a
+        command: 'x'
+        pool: database
+        resourceLimits:
+          cpu: 1
+"""
+
+
+async def test_a_start_discarded_during_its_attach_is_released(
+    tmp_path, monkeypatch, dag_cron
+):
+    # A capped start cancelled during its limits attach kills its child
+    # (start_discarded): the launch never happened.  Its pool slot goes
+    # back and its registry key with it, so the next advance re-claims the
+    # task with no attempt spent.
+    import os
+    import signal
+    import threading
+
+    from cronstable import limits
+    from cronstable.job import RunningJob
+    from tests.test_job import _FakeLimitsBackend
+
+    backend = _FakeLimitsBackend()
+    monkeypatch.setattr(limits, "_MANAGER", limits.LimitsManager(backend))
+    entered = threading.Event()
+    gate = threading.Event()
+    real_create = backend.create
+
+    def create(caps, name):
+        container = real_create(caps, name)
+        attach = container.attach
+
+        def blocking_attach(pid, *, required):
+            container.pid = pid
+            entered.set()
+            assert gate.wait(10)
+            return attach(pid, required=required)
+
+        def kill():
+            container.calls.append(("kill",))
+            os.kill(
+                container.pid,
+                signal.SIGTERM if sys.platform == "win32" else signal.SIGKILL,
+            )
+            return True
+
+        container.attach = blocking_attach
+        container.kill = kill
+        return container
+
+    backend.create = create
+    cron = await dag_cron(_CAPPED_POOLED)
+    monkeypatch.setattr(cron._pools, "service", lambda: None)
+    _set_cmd(cron, "cl", "a", [_PY, "-c", "import time; time.sleep(30)"])
+    real_start = RunningJob.start
+    launches = []
+
+    async def start(self):
+        launches.append((self, asyncio.current_task()))
+        await real_start(self)
+
+    run_key = None
+    with monkeypatch.context() as patch:
+        patch.setattr(RunningJob, "start", start)
+        trigger = asyncio.ensure_future(cron._dag.trigger("cl"))
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            ((running, launching),) = launches
+            launching.cancel()
+        finally:
+            gate.set()
+        try:
+            run_key = (await trigger)["runKey"]
+        except asyncio.CancelledError:
+            pass  # the launch ran inline in the trigger
+        await _drain_pending(cron)
+    if run_key is None:
+        keys = list((await cron._dag.list_runs("cl", limit=10)) or [])
+        run_key = keys[0]["runKey"]
+    ref = ("cl", run_key)
+    assert running.start_discarded
+    # a 30 s sleeper: it exits this soon only because it was killed
+    await asyncio.wait_for(running.proc.wait(), 10)
+    assert backend.container.calls[-2:] == [("kill",), ("abort",)]
+    body = await cron._dag.get_run("cl", run_key)
+    assert body["tasks"]["a"]["state"] == dag.RUNNING
+    assert body["tasks"]["a"]["proc"] == cron._proc_token
+    assert ref not in cron._dag._launched
+    assert not cron._pools.held
+    (entry,) = (await cron._pools.snapshot())[0]["entries"]
+    assert (entry["state"], entry["reason"]) == (
+        "queued",
+        "launch interrupted",
+    )
+    _set_cmd(cron, "cl", "a", [_PY, "-c", "pass"])
+    await cron._dag.advance_one(ref)
+    await _drain_pending(cron)
+    assert ("a", 0, 0) in cron._dag._launched[ref]
+    body = await _drive(cron, "cl", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["tasks"]["a"]["attempt"] == 0
 
 
 async def test_adopt_scan_prunes_the_registry_of_runs_finished_elsewhere(

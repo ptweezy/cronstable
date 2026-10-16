@@ -94,7 +94,7 @@ string rather than absent, so the arity never changes.
 | 6 | `runId` | the durable run ID, when a `state:` store is configured |
 | 7 | `startedAt` | ISO 8601 start instant |
 | 8 | `schedule` | the job's crontab line |
-| 9 | `detail` | per-outcome extras (SLA numbers, the event name, resource usage) |
+| 9 | `detail` | per-outcome extras (SLA numbers, the event name, resource usage). A run of a job with [`resourceLimits`](Resource-Limits) adds `limits_enforced=1 memory_limit_exceeded=0` after the resource usage, each value `1` or `0`. |
 | 10 | `output` | the run's captured stderr (or stdout when stderr is empty), cut to its first 8000 characters, when `includeOutput` is on |
 
 Field 2 repeats the outcome as text so a consumer that only rule-matches

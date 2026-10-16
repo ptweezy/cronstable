@@ -277,6 +277,27 @@ def test_new_process_group_kwargs_ors_the_priority_class(
     }
 
 
+def test_suspend_at_spawn_ors_create_suspended_into_the_windows_flags():
+    # A capped run's child starts suspended so it joins its Job Object
+    # before it runs.  The flag is OR-ed in, so the group bit and the
+    # priority class survive, and POSIX spawns are left alone.
+    kwargs = platform.new_process_group_kwargs("idle", windows=True)
+    platform.suspend_at_spawn(kwargs, windows=True)
+    assert kwargs == {"creationflags": 0x00000200 | 0x00000040 | 0x00000004}
+    bare = {}
+    platform.suspend_at_spawn(bare, windows=True)
+    assert bare == {"creationflags": 0x00000004}
+    posix = platform.new_process_group_kwargs(windows=False)
+    platform.suspend_at_spawn(posix, windows=False)
+    assert posix == {"start_new_session": True}
+    native = platform.new_process_group_kwargs()
+    platform.suspend_at_spawn(native)
+    if platform.IS_WINDOWS:
+        assert native == {"creationflags": 0x00000200 | 0x00000004}
+    else:
+        assert native == {"start_new_session": True}
+
+
 def test_the_default_level_has_no_posix_nice_of_its_own():
     # DEFAULT_PRIORITY resolves to no number on purpose: it is never applied,
     # and nice 0 would misdescribe it (on a daemon started at nice 10,
@@ -409,11 +430,12 @@ def test_apply_priority_never_raises_on_a_refusal(
 
 def test_creationflags_has_exactly_one_writer():
     # The whole reason new_process_group_kwargs takes a LEVEL rather than
-    # handing callers a flag to OR in themselves: while it is the only place
-    # that writes creationflags, the process-group bit and the priority
-    # class cannot be set independently, so neither can be dropped by a
-    # caller that meant to set the other.  A second writer somewhere in the
-    # package would quietly retire that guarantee.
+    # handing callers a flag to OR in themselves: while platform.py is the
+    # only module that writes creationflags, the process-group bit and the
+    # priority class cannot be set independently, so neither can be dropped
+    # by a caller that meant to set the other.  suspend_at_spawn, in the
+    # same module, only ORs CREATE_SUSPENDED into what that function
+    # returns.  A writer in any other module would void that guarantee.
     package = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "cronstable",

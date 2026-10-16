@@ -784,6 +784,12 @@
   .rchart .ylab, .rchart .xlab { fill: var(--fg-faint); font-size: 10px; font-family: var(--mono); paint-order: stroke; stroke: var(--bg2); stroke-width: 3px; }
   .rchart .rc-x { stroke: var(--fg-faint); stroke-width: 1; stroke-dasharray: 3 3; visibility: hidden; }
   .rchart .rc-dot { visibility: hidden; stroke: var(--bg2); stroke-width: 2; }
+  /* resourceLimits cap: a dashed threshold in text ink, --fail once the run
+     hit it; its label sits at the left, clear of the y labels */
+  .rchart .rc-cap { stroke: var(--fg-dim); stroke-width: 1.25; stroke-dasharray: 5 3; }
+  .rchart .rc-caplab { fill: var(--fg-dim); font-size: 10px; font-family: var(--mono); paint-order: stroke; stroke: var(--bg2); stroke-width: 3px; }
+  .rchart .rc-cap.hit { stroke: var(--fail); }
+  .rchart .rc-caplab.hit { fill: var(--fail); }
   .rc-tip {
     position: absolute; pointer-events: none; visibility: hidden; z-index: 5;
     background: var(--panel2); border: 1px solid var(--border2); border-radius: var(--radius);
@@ -791,6 +797,7 @@
   }
   .rc-tip b { color: var(--fg); font-weight: 700; }
   .rc-tip .t { color: var(--fg-faint); }
+  .rc-tip .cap { color: var(--fg-faint); padding-left: 11px; }
   .res-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
   .res-tools .lbl { font-size: 10px; color: var(--fg-faint); letter-spacing: .5px; text-transform: uppercase; }
   .res-chip {
@@ -803,6 +810,11 @@
   .res-chip .g.cancelled { color: var(--cancelled); } .res-chip .g.unknown { color: var(--unknown); }
   .res-chip .g.live { color: var(--run); }
   .res-note { font-size: 11px; color: var(--fg-faint); margin: -6px 0 14px; }
+  .res-note .hit, .res-limits .hit { color: var(--fail); }
+  .res-note .warn, .res-limits .warn { color: var(--pending); }
+  /* a capped job without monitorResources: its caps over the runs' records */
+  .res-caps { font-size: 11.5px; color: var(--fg-dim); margin-bottom: 10px; }
+  .res-caps b { color: var(--fg); }
   /* per-run trend strips: the run-history barchart idiom, but clickable to
      select that run's series above */
   .res-trend { margin-top: 4px; }
@@ -1436,6 +1448,15 @@
     border: 1px solid color-mix(in srgb, var(--paused) 35%, var(--border)); }
   .ha-chip.overdue { color: var(--fail); background: color-mix(in srgb, var(--fail) 14%, transparent);
     border: 1px solid color-mix(in srgb, var(--fail) 35%, var(--border)); }
+  /* resourceLimits: the drawer's caps chip (configuration, neutral ink) and
+     the per-run markers (a memory kill; caps the host did not apply) */
+  .ha-chip.caps { color: var(--fg-dim); background: var(--bg2); border: 1px solid var(--border2); }
+  .ha-chip.cap-hit { color: var(--fail); background: color-mix(in srgb, var(--fail) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--fail) 35%, var(--border)); }
+  .ha-chip.cap-off { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border)); }
+  .drawer-head .meta .ha-chip { margin-left: 0; font-size: 11px; }
+  .runtable td .ha-chip { margin: 0 6px 0 0; }
 
   /* the 8 DAG task states get their OWN palette so they never overload the
      job-outcome colors. dot + glyph + label share the state's hue. */
@@ -5470,6 +5491,7 @@ var qrcode = function() {
     paramForm: null,           // the open run-parameters dialog: { dag, decl, backfill }
     clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
     clusterSpread: false,      // distribution: spread is active (drives the Owner column)
+    nodeLimits: null,          // /node `limits`: the caps this host can apply; null until known
     palette: { open: false, items: [], cur: 0 },
     lastRowSig: null,          // signature of the last rendered table (skip redundant rebuilds)
     rowNodes: new Map(),       // job name -> its live <tr>            (keyed row diff)
@@ -8103,6 +8125,14 @@ var qrcode = function() {
   //  data loading + notifications
   // ===================================================================
   let refreshing = false;
+  // Set by a token change: the first good /jobs after it opens the hash's
+  // deep link, which a 401 at boot left unopened (a badge's #job/<name>).
+  let hashPending = false;
+  // Polls keep succeeding across a daemon reload that changes the scopes,
+  // web.badges or web.ui, so a good poll re-reads /whoami once this long
+  // has passed since the last read, and after a lost connection.
+  const WHOAMI_REFRESH_MS = 60000;
+  let whoamiAt = 0;   // performance.now() when loadWhoami last read
   // One in-flight request per secondary poll endpoint. Every secondary
   // loader is fired without awaiting, so a daemon slower than the poll
   // interval accumulated one more overlapping request per cycle against
@@ -8157,6 +8187,7 @@ var qrcode = function() {
       }
       const jobs = state.jobs;
       state.respondedAt = performance.now();
+      const recovered = state.connected === false;
       setConnected(true);
       const first = !state.seenFirst;
       maybeNotify(jobs);
@@ -8178,7 +8209,15 @@ var qrcode = function() {
       loadDags();
       loadState();
       loadPools();
+      if (recovered || performance.now() - whoamiAt >= WHOAMI_REFRESH_MS) loadWhoami();
       if (state.drawerJob) { renderDrawerMeta(); maybeReattachDrawerStream(); }
+      if (hashPending) {
+        // an open drawer or the wallboard already owns the hash; any other
+        // overlay holds the link until the first poll after it closes
+        const drawerUp = state.drawerJob || (state.dagDrawer && state.dagDrawer.dag);
+        if (drawerUp || state.wallboard) hashPending = false;
+        else if (!activeSurface()) { hashPending = false; openFromHash(); }
+      }
     } catch (e) {
       if (e.message !== "unauthorized") { setConnected(false); console.warn("loadJobs failed:", e); }
     } finally {
@@ -8194,6 +8233,8 @@ var qrcode = function() {
         const res = await apiFetch("/node");
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
+        // the live cap lines read it; a failed poll keeps the last answer
+        state.nodeLimits = data.limits || null;
         renderNodeMeter(data.resources);
       } catch (e) {
         if (e.message !== "unauthorized") $("nodeMeter").innerHTML = "";
@@ -8413,6 +8454,14 @@ var qrcode = function() {
       }
     }
     if (caps.length) parts.push('<span class="faint">capture: ' + esc(caps.join(", ")) + "</span>");
+    // resourceLimits: present only when the job sets a cap
+    const limText = job.limits ? capsText(job.limits) : "";
+    if (limText) {
+      parts.push('<span class="ha-chip caps" title="' + escAttr(job.limits.required === true
+        ? "resourceLimits.required: a run fails when the host cannot enforce these caps"
+        : "resourceLimits: a run goes ahead uncapped when the host cannot enforce these caps") +
+        '">caps ' + esc(limText) + "</span>");
+    }
     // clusterPolicy is only present in the payload when leader election is on
     if (job.clusterPolicy) {
       var cl = "cluster: <b>" + esc(job.clusterPolicy) + "</b>";
@@ -8464,6 +8513,150 @@ var qrcode = function() {
     }
   }
 
+  // ---- resourceLimits readouts (drawer meta, History, Resources) ----
+  // `limits` is the /jobs caps payload or a run's record; both carry cpu
+  // (CPUs), memory_bytes and processes, null when that cap is unset.
+  const KERNEL_PEAK_TIP = "the most memory the kernel counted against the cap (cgroup memory on Linux, commit charge on Windows)";
+  // a CPU count as Python's "%f" writes it, trailing zeros stripped, so it
+  // matches config's describe() and the TUI: six decimals, exact ties to
+  // even. Ties fall on odd multiples of 1/128, where toFixed rounds up.
+  function fmtCpus(c) {
+    const n = Number(c);
+    if (!isFinite(n)) return "—";
+    let text = n.toFixed(6);
+    if (n * 128 % 2 === 1) {
+      const exact = n.toFixed(7);
+      if (+exact.charAt(exact.length - 2) % 2 === 0) text = exact.slice(0, -1);
+    }
+    return String(+text);
+  }
+  // a size as config.format_size writes it, so a cap matches the daemon's
+  // failure reasons and a kernel peak reads against its cap: one decimal in
+  // the smallest unit (TiB at most) whose rounded value stays below 1024,
+  // no trailing ".0"
+  function fmtCap(n) {
+    const b = n == null ? NaN : Number(n);
+    if (!isFinite(b)) return "—";
+    if (b < 1024) return Math.trunc(b) + " B";
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    for (let i = 0, d = 1024; ; i++, d *= 1024) {
+      const text = capTenths(b, d);
+      if (+text < 1024 || i === units.length - 1) return text.replace(/\.0$/, "") + " " + units[i];
+    }
+  }
+  // n / d to one decimal as Python's "{:.1f}" rounds it, exact ties to even;
+  // d is a power of two, so every step is exact for whole byte counts
+  function capTenths(n, d) {
+    let whole = Math.floor(n / d);
+    const scaled = (n - whole * d) * 10;
+    let tenth = Math.floor(scaled / d);
+    const twice = 2 * (scaled - tenth * d);
+    if (twice > d || (twice === d && tenth % 2 === 1)) tenth++;
+    if (tenth === 10) { whole++; tenth = 0; }
+    return whole + "." + tenth;
+  }
+  // "1.5 CPU · 512 MiB · 64 procs", the set caps only
+  function capsText(lim) {
+    const parts = [];
+    if (lim.cpu != null) parts.push(fmtCpus(lim.cpu) + " CPU");
+    if (lim.memory_bytes != null) parts.push(fmtCap(lim.memory_bytes));
+    if (lim.processes != null) parts.push(lim.processes + (+lim.processes === 1 ? " proc" : " procs"));
+    return parts.join(" · ");
+  }
+  // the caps line over a Resources view: "caps 512 MiB · required"
+  function capsHead(lim) {
+    const text = lim ? capsText(lim) : "";
+    return text
+      ? '<div class="res-caps">caps <b>' + esc(text) + "</b>" + (lim.required === true ? " · required" : "") + "</div>"
+      : "";
+  }
+  function capsOffText(lim) {
+    const which = Array.isArray(lim.unenforced) && lim.unenforced.length ? " (" + lim.unenforced.join(", ") + ")" : "";
+    return "caps not enforced" + which + (lim.reason ? ": " + lim.reason : "");
+  }
+  // History Reason cell markers from a run's limits record and its verify
+  // check's (`check`), the only record a check's memory kill sets
+  function limitsChips(lim, check) {
+    const kill = (rec, text, title) => '<span class="ha-chip cap-hit" title="' + escAttr(title +
+      (rec.memory_bytes != null ? " (" + fmtCap(rec.memory_bytes) + ")" : "")) + '">' + text + "</span>";
+    let out = "";
+    if (lim && lim.memory_exceeded === true) out += kill(lim, "memory cap", "killed at its memory cap");
+    if (check && check.memory_exceeded === true) out += kill(check, "check memory cap", "verify check killed at its memory cap");
+    if (lim && lim.enforced === false) out += '<span class="ha-chip cap-off" title="' + escAttr(capsOffText(lim)) + '">caps not enforced</span>';
+    return out;
+  }
+  // the Resources note line's readout of one run's limits record
+  function limitsNote(lim) {
+    if (!lim) return "";
+    let out = "";
+    if (lim.memory_exceeded === true) out += ' · <span class="hit">memory cap hit</span>';
+    if (lim.enforced === false) out += ' · <span class="warn">' + esc(capsOffText(lim)) + "</span>";
+    if (lim.peak_memory_bytes != null) {
+      out += ' · <span title="' + escAttr(KERNEL_PEAK_TIP) + '">kernel peak ' + esc(fmtCap(lim.peak_memory_bytes)) + "</span>";
+    }
+    if (lim.cpu_throttled_seconds != null) out += " · cpu throttled " + esc(fmtDuration(lim.cpu_throttled_seconds));
+    if (lim.process_limit_hits > 0) out += ' · <span class="warn">process cap hit ' + esc(lim.process_limit_hits) + "×</span>";
+    return out;
+  }
+  // [cpu, memory] chart caps for rcRender; a run's record names the caps
+  // the host did not apply and whether the memory cap was hit
+  function resCapLines(lim) {
+    if (!lim) return [null, null];
+    const off = Array.isArray(lim.unenforced) ? lim.unenforced : [];
+    const tag = (res) => (off.indexOf(res) >= 0 ? " (not enforced)" : "");
+    const hit = lim.memory_exceeded === true;
+    let cpu = null, mem = null;
+    if (lim.cpu != null) {
+      const text = "cap " + fmtPercent(lim.cpu * 100) + tag("cpu");
+      cpu = { v: lim.cpu * 100, label: text, tip: text };
+    }
+    if (lim.memory_bytes != null) {
+      const text = "cap " + fmtCap(lim.memory_bytes);
+      mem = {
+        v: lim.memory_bytes, hit: hit, label: text + (hit ? " · hit" : tag("memory")),
+        // the chart plots sampled RSS; an applied cap counts the kernel's figure
+        tip: text + (tag("memory") || " (kernel-counted, not RSS)"),
+      };
+    }
+    return [cpu, mem];
+  }
+  // the configured caps as a live run gets them: /node `limits` says which
+  // ones this host cannot apply (all of them when it applies none), and an
+  // unknown capability tags none
+  function liveCaps(lim) {
+    const host = state.nodeLimits;
+    if (!lim || !host) return lim;
+    const can = host.available === true && Array.isArray(host.resources) ? host.resources : [];
+    return Object.assign({}, lim, { unenforced: ["cpu", "memory", "processes"].filter((r) => can.indexOf(r) < 0) });
+  }
+  // Resources tab of a capped job without monitorResources: its caps and
+  // the recent runs' limits records stand in for the charts
+  function capsOnlyHtml(lim, runs) {
+    let rows = "";
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const r = runs[i], rec = r.limits, g = outcomeCls(r.outcome);
+      if (!rec) continue;
+      const enforced = rec.enforced === true ? "yes"
+        : '<span class="warn" title="' + escAttr(capsOffText(rec)) + '">' + (rec.refused === true ? "refused" : "no") + "</span>";
+      const hits = (rec.memory_exceeded === true ? '<span class="ha-chip cap-hit">memory</span>' : "") +
+        (rec.process_limit_hits > 0 ? '<span class="ha-chip cap-off">processes ×' + esc(rec.process_limit_hits) + "</span>" : "");
+      rows += "<tr>" +
+        '<td class="nowrap" title="' + escAttr(r.started_at) + '">' + esc(fmtAgo(r.started_at)) + "</td>" +
+        '<td><span class="st ' + g + '"><span class="glyph">' + GLYPH[g] + "</span> " + esc(r.outcome) + "</span></td>" +
+        "<td>" + enforced + "</td>" +
+        "<td>" + esc(fmtCap(rec.peak_memory_bytes)) + "</td>" +
+        "<td>" + esc(fmtDuration(rec.cpu_throttled_seconds)) + "</td>" +
+        "<td>" + (hits || "—") + "</td></tr>";
+    }
+    const table = rows
+      ? '<div class="twrap"><table class="runtable res-limits"><thead><tr><th>Started</th><th>Outcome</th><th>Enforced</th>' +
+        '<th title="' + escAttr(KERNEL_PEAK_TIP) + '">Kernel peak</th><th>CPU throttled</th><th>Cap hits</th></tr></thead><tbody>' +
+        rows + "</tbody></table></div>"
+      : '<div class="term-empty">No capped runs recorded yet.</div>';
+    return capsHead(lim) + table + '<div class="term-empty">Opt in with <span class="chip">monitorResources: true</span> ' +
+      "to chart CPU and memory per run against these caps.</div>";
+  }
+
   // ---- history pane ----
   async function renderHistory(name) {
     const box = $("historyPane");
@@ -8507,7 +8700,7 @@ var qrcode = function() {
         "<td>" + fmtDuration(r.duration) + "</td>" +
         (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
                   "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
-        '<td class="reason">' + esc(r.fail_reason || "") + verificationDetail(r.verification) +
+        '<td class="reason">' + limitsChips(r.limits, r.verification && r.verification.limits) + esc(r.fail_reason || "") + verificationDetail(r.verification) +
           (r.params ? ' <span class="faint runparams" title="' + escAttr(paramsText(r.params)) + '">' + esc(truncStr(paramsText(r.params), 60)) + "</span>" : "") + "</td>" +
       "</tr>";
     }
@@ -8541,7 +8734,8 @@ var qrcode = function() {
   // single-series with its own 0-based y axis (never dual-axis, never a
   // truncated baseline):
   //   charts: [{ label, color, pts: [[t, v], ...] oldest-first epoch-seconds,
-  //              fmt: value formatter, max: optional pinned y ceiling }]
+  //              fmt: value formatter, max: optional pinned y ceiling,
+  //              cap: optional { v, label, tip, hit } dashed reference line }]
   //   opts:   { gapSec: break the line where consecutive samples are further
   //             apart than this (daemon down / paused sampling) }
   function rcNiceCeil(v) {
@@ -8553,9 +8747,11 @@ var qrcode = function() {
   // one y ceiling per chart, shared by the render and the hover: a pinned
   // ceiling (percent-of-total charts) is honored exactly, an auto-scaled one
   // gets ~12% headroom so a flat-at-peak line doesn't ride the frame or the
-  // top label.
+  // top label. A cap folds in like a sample, so its line never clips.
+  function rcCap(c) { return c.cap && c.cap.v > 0 && isFinite(c.cap.v) ? c.cap : null; }
   function rcVmax(c) {
-    let v = 0;
+    const cap = rcCap(c);
+    let v = cap ? +cap.v : 0;
     for (const p of c.pts) { if (p[1] > v) v = p[1]; }
     return c.max != null ? Math.max(c.max, rcNiceCeil(v)) : rcNiceCeil(v * 1.12);
   }
@@ -8604,16 +8800,22 @@ var qrcode = function() {
       }
       flush();
       const last = c.pts.length ? c.pts[c.pts.length - 1][1] : null;
+      // the cap line sits under the data; its label (above the line, or
+      // below it near the top) is drawn over the data with a halo
+      const cap = rcCap(c), capY = cap ? +y(+cap.v).toFixed(1) : 0, hitCls = cap && cap.hit ? " hit" : "";
       html += '<div class="rchart" data-ci="' + ci + '">' +
         '<div class="rc-head"><span class="sw" style="background:' + c.color + '"></span><span><b>' + esc(c.label) + "</b></span>" +
         '<span class="cur">' + (last == null ? "" : "latest " + c.fmt(last)) + "</span></div>" +
-        '<svg viewBox="0 0 ' + W + " " + H + '" height="' + H + '" preserveAspectRatio="none" role="img" aria-label="' + escAttr(c.label + " over time") + '">' +
+        '<svg viewBox="0 0 ' + W + " " + H + '" height="' + H + '" preserveAspectRatio="none" role="img" aria-label="' +
+        escAttr(c.label + " over time" + (cap ? ", " + cap.label : "")) + '">' +
         '<line class="grid" x1="0" y1="' + PT + '" x2="' + W + '" y2="' + PT + '"/>' +
         '<line class="grid" x1="0" y1="' + (PT + plotH / 2) + '" x2="' + W + '" y2="' + (PT + plotH / 2) + '" stroke-dasharray="2 4"/>' +
         '<line class="grid" x1="0" y1="' + baseY + '" x2="' + W + '" y2="' + baseY + '"/>' +
+        (cap ? '<line class="rc-cap' + hitCls + '" x1="0" y1="' + capY + '" x2="' + W + '" y2="' + capY + '"/>' : "") +
         (area ? '<path d="' + area + '" style="fill:' + c.color + ';fill-opacity:.13;stroke:none"/>' : "") +
         (line ? '<path d="' + line + '" style="fill:none;stroke:' + c.color + ';stroke-width:2;stroke-linejoin:round;stroke-linecap:round"/>' : "") +
         (c.pts.length === 1 ? '<circle cx="' + x(c.pts[0][0]) + '" cy="' + y(c.pts[0][1]) + '" r="2.5" style="fill:' + c.color + '"/>' : "") +
+        (cap ? '<text class="rc-caplab' + hitCls + '" x="5" y="' + (capY < PT + 12 ? capY + 11 : capY - 3).toFixed(1) + '">' + esc(cap.label) + "</text>" : "") +
         '<text class="ylab" x="' + (W - 5) + '" y="' + (PT - 1) + '" text-anchor="end" dominant-baseline="auto" dy="9">' + esc(c.fmt(vmax)) + "</text>" +
         '<text class="ylab" x="' + (W - 5) + '" y="' + (PT + plotH / 2 - 3) + '" text-anchor="end">' + esc(c.fmt(vmax / 2)) + "</text>" +
         (ci === charts.length - 1
@@ -8648,15 +8850,16 @@ var qrcode = function() {
         els[ci].xline.setAttribute("x1", px); els[ci].xline.setAttribute("x2", px);
         els[ci].dot.setAttribute("cx", px); els[ci].dot.setAttribute("cy", py);
         els[ci].xline.style.visibility = "visible"; els[ci].dot.style.visibility = "visible";
+        const cap = rcCap(c);
         rows += '<div><span class="sw" style="display:inline-block;width:7px;height:7px;border-radius:2px;background:' + c.color + '"></span> ' +
-          esc(c.label) + " <b>" + c.fmt(p[1]) + "</b></div>";
+          esc(c.label) + " <b>" + c.fmt(p[1]) + "</b>" + (cap && cap.tip ? '<div class="cap">' + esc(cap.tip) + "</div>" : "") + "</div>";
         if (!ci) rows = '<div class="t">' + esc(rcClock(p[0])) + "</div>" + rows;
       });
       tip.innerHTML = rows;
       const hostR = host.getBoundingClientRect();
       const left = ev.clientX - hostR.left, top = ev.clientY - hostR.top;
       tip.style.visibility = "visible";
-      tip.style.left = Math.min(left + 14, hostR.width - tip.offsetWidth - 4) + "px";
+      tip.style.left = Math.max(0, Math.min(left + 14, hostR.width - tip.offsetWidth - 4)) + "px";
       tip.style.top = Math.max(0, top - tip.offsetHeight - 10) + "px";
     };
     els.forEach((e) => {
@@ -8691,17 +8894,35 @@ var qrcode = function() {
     if (seq !== resPane.seq || state.drawerJob !== name || state.tab !== "resources") return;
     resPane.data = data;
     const live = data.live || [], runs = data.runs || [];
-    if (!data.monitored && !live.length && !runs.length) {
-      box.innerHTML = '<div class="term-empty">Resource monitoring is off for this job.<br><br>' +
-        'Opt in with <span class="chip">monitorResources: true</span> (or tune it: ' +
-        '<span class="chip">monitorResources: { interval: 0.5, history: 240 }</span>) to record CPU and memory per run.</div>';
+    // nothing sampled: a capped job lists its runs' limits records instead
+    if (!data.monitored && !live.length && !runs.some((r) => r.resources)) {
+      box.innerHTML = data.limits || runs.some((r) => r.limits)
+        ? capsOnlyHtml(data.limits, runs)
+        : '<div class="term-empty">Resource monitoring is off for this job.<br><br>' +
+          'Opt in with <span class="chip">monitorResources: true</span> (or tune it: ' +
+          '<span class="chip">monitorResources: { interval: 0.5, history: 240 }</span>) to record CPU and memory per run.</div>';
       return;
     }
+    // monitored, with no recorded run and no sampled live instance yet:
+    // keep refetching so the first sampled run shows up
+    if (!live.length && !runs.length) {
+      box.innerHTML = capsHead(data.limits) +
+        '<div class="term-empty">No resource samples yet. A run is charted here once it has been sampled.</div>';
+      resPane.timer = setTimeout(() => renderResources(name), Math.max(500, prefs.resMs || 2000));
+      return;
+    }
+    // indexes of the runs with samples; the rest (refused runs, start
+    // failures, runs from before monitoring) carry only a limits record
+    const sampled = [];
+    runs.forEach((r, i) => { if (r.resources) sampled.push(i); });
     // selection: keep the current one when it still exists, else prefer the
-    // newest live instance, else the newest recorded run
+    // newest live instance, else the newest sampled run, else the newest run
     let sel = resPane.sel;
     const selOk = sel && ((sel.k === "live" && live[sel.i]) || (sel.k === "run" && runs[sel.i]));
-    if (!selOk) sel = live.length ? { k: "live", i: live.length - 1 } : { k: "run", i: runs.length - 1 };
+    if (!selOk) {
+      sel = live.length ? { k: "live", i: live.length - 1 }
+        : { k: "run", i: sampled.length ? sampled[sampled.length - 1] : runs.length - 1 };
+    }
     resPane.sel = sel;
     // ---- selector chips (live instances + recent recorded runs) ----
     let chips = "";
@@ -8712,7 +8933,8 @@ var qrcode = function() {
     for (let i = runs.length - 1; i >= 0; i--) {
       const r = runs[i], g = outcomeCls(r.outcome);
       chips += '<button class="res-chip' + (sel.k === "run" && sel.i === i ? " active" : "") + '" data-sel="run:' + i + '" title="' +
-        escAttr(r.outcome + " · finished " + r.finished_at) + '"><span class="g ' + g + '">' + GLYPH[g] + "</span>" + esc(fmtAgo(r.finished_at)) + "</button>";
+        escAttr(r.outcome + " · finished " + r.finished_at + (r.limits && r.limits.memory_exceeded === true ? " · memory cap hit" : "")) +
+        '"><span class="g ' + g + '">' + GLYPH[g] + "</span>" + esc(fmtAgo(r.finished_at)) + "</button>";
     }
     const liveSel = sel.k === "live";
     const refreshSel = liveSel
@@ -8730,24 +8952,24 @@ var qrcode = function() {
         (r.duration != null ? " · took " + esc(fmtDuration(r.duration)) : "") +
         (u.cpu_total_seconds != null ? " · cpu " + esc(fmtDuration(u.cpu_total_seconds)) : "") +
         (u.max_rss_bytes != null ? " · peak mem " + esc(fmtBytes(u.max_rss_bytes)) : "") +
-        (u.samples ? " · " + esc(u.samples) + " samples" : "") + "</div>";
+        (u.samples ? " · " + esc(u.samples) + " samples" : "") + limitsNote(r.limits) + "</div>";
     } else {
       const cur = live[sel.i].current || {};
       note = '<div class="res-note">sampling every ' + esc(data.interval) + "s" +
         (cur.cpu_seconds != null ? " · cpu so far " + esc(fmtDuration(cur.cpu_seconds)) : "") + "</div>";
     }
-    // ---- per-run trend strips (recorded runs; click a bar to open it) ----
+    // ---- per-run trend strips (sampled runs; click a bar to open it) ----
     let trend = "";
-    if (runs.length > 1) {
-      const cpuVals = runs.map((r) => (r.resources || {}).cpu_total_seconds || 0);
-      const rssVals = runs.map((r) => (r.resources || {}).max_rss_bytes || 0);
+    if (sampled.length > 1) {
+      const cpuVals = sampled.map((i) => runs[i].resources.cpu_total_seconds || 0);
+      const rssVals = sampled.map((i) => runs[i].resources.max_rss_bytes || 0);
       const bars = (vals, fmt, cls) => {
         const mx = Math.max.apply(null, vals.concat([1e-9]));
         return '<div class="barchart ' + cls + '" title="per run, newest right — click a bar to open that run">' +
-          runs.map((r, i) => {
-            const ht = Math.max(2, Math.round((vals[i] / mx) * 54));
+          sampled.map((i, k) => {
+            const r = runs[i], ht = Math.max(2, Math.round((vals[k] / mx) * 54));
             return '<i class="' + outcomeCls(r.outcome) + (sel.k === "run" && sel.i === i ? " sel" : "") + '" data-runsel="' + i +
-              '" style="height:' + ht + 'px" title="' + escAttr(fmtAgo(r.finished_at) + " · " + fmt(vals[i])) + '"></i>';
+              '" style="height:' + ht + 'px" title="' + escAttr(fmtAgo(r.finished_at) + " · " + fmt(vals[k])) + '"></i>';
           }).join("") + "</div>";
       };
       trend = '<div class="res-trend">' +
@@ -8758,10 +8980,12 @@ var qrcode = function() {
     box.innerHTML =
       '<div class="res-tools"><span class="lbl">show</span>' + chips + refreshSel + "</div>" + note +
       '<div id="resCharts"></div>' + trend;
-    // draw + register for resize redraws
+    // draw + register for resize redraws. A recorded run carries the caps
+    // it ran under; a live instance shows the configured ones.
+    const capLines = resCapLines(liveSel ? liveCaps(data.limits) : runs[sel.i].limits);
     const draw = () => rcRender($("resCharts"), [
-      { label: "cpu", color: "var(--run)", fmt: fmtPercent, pts: series.map((p) => [p[0], p[1]]) },
-      { label: "memory (rss)", color: "var(--pending)", fmt: fmtBytes, pts: series.map((p) => [p[0], p[2]]) },
+      { label: "cpu", color: "var(--run)", fmt: fmtPercent, cap: capLines[0], pts: series.map((p) => [p[0], p[1]]) },
+      { label: "memory (rss)", color: "var(--pending)", fmt: fmtBytes, cap: capLines[1], pts: series.map((p) => [p[0], p[2]]) },
     ], { gapSec: gapSec });
     draw();
     rcActive.res = draw;
@@ -9524,6 +9748,7 @@ var qrcode = function() {
     // verb that can only answer 403 is a worse experience than not
     // listing it.
     const ctl = canControl();
+    const badges = badgesServed();
     return [
       { ic: "↻", lbl: "Refresh now", hint: "g", run: loadJobs },
       ...(ctl ? [{ ic: "▶", lbl: "Run all failing jobs", run: runAllFailing }] : []),
@@ -9560,6 +9785,7 @@ var qrcode = function() {
       // mouse-only spans -- the palette keeps both reachable by keyboard
       { ic: "❏", lbl: "Copy version", run: () => { const v = $("ver").textContent; if (v) copyText(v, "version"); } },
       { ic: "❏", lbl: "Copy job-set ID", run: () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job-set ID"); } },
+      ...(badges ? [{ ic: "❏", lbl: "Copy fleet badge Markdown", run: () => copyBadgeMarkdown(null) }] : []),
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
@@ -9569,9 +9795,49 @@ var qrcode = function() {
       { ic: "⌕", lbl: "Focus filter", hint: "/", run: () => { closePalette(); $("search").focus(); } },
     ];
   }
+  // Markdown that embeds a status badge (wiki: Status Badges) and links it
+  // to this dashboard: one job's badge, which opens that job's drawer, or
+  // the fleet's when name is null. A daemon that serves no dashboard
+  // (/whoami's badges.dashboard) gets the bare image. The terminal
+  // dashboard builds the same text (badge.badge_markdown). enc() also
+  // encodes the !'()* that encodeURIComponent leaves, so a ")" in a name
+  // cannot end the link. The alt text turns each of Python's
+  // str.splitlines boundaries into a space (CRLF counts as one; \p{Zl}
+  // and \p{Zp} are U+2028 and U+2029), then escapes the characters that
+  // Markdown reads as syntax there (badge._ALT_SYNTAX). An underscore
+  // between two letters or digits opens no emphasis, so it stays bare.
+  function badgeMarkdown(name) {
+    const enc = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+    const base = location.origin;
+    const word = (c) => /[A-Za-z0-9]/.test(c);
+    const alt = (name == null ? "cronstable" : name)
+      .replace(/\r\n|[\n\v\f\r\x1c-\x1e\x85\p{Zl}\p{Zp}]/gu, " ")
+      .replace(/[\\[\]`*_|<&~^]/g, (c, i, s) => (c === "_" && word(s.charAt(i - 1)) && word(s.charAt(i + 1)) ? c : "\\" + c));
+    const image = name == null ? "/badge.svg" : "/jobs/" + enc(name) + "/badge.svg";
+    const link = name == null ? "/" : "/#job/" + enc(name);
+    const embed = "![" + alt + "](" + base + image + ")";
+    const badges = state.auth && state.auth.badges;
+    if (badges && badges.dashboard === false) return embed;
+    return "[" + embed + "](" + base + link + ")";
+  }
+  // /whoami's badges is null, or absent on an older daemon, while the
+  // daemon serves no badges, so the copy commands would link a 404.
+  function badgesServed() { return !!(state.auth && state.auth.badges); }
+  // No URL reaches the badge of a job named "", "." or ".." (a browser
+  // resolves those segments), or one holding "{" or "}", which the
+  // route's {name} never matches (badge.badge_addressable).
+  function badgeAddressable(name) {
+    return name !== "" && name !== "." && name !== ".." && !/[{}]/.test(name);
+  }
+  function copyBadgeMarkdown(name) {
+    // a page elsewhere shows only public badges, so name the setting
+    const pub = !!(state.auth && state.auth.badges && state.auth.badges.public);
+    copyText(badgeMarkdown(name), pub ? "badge Markdown" : "badge Markdown; embeds need web.badges.public");
+  }
   function jobCommands() {
     const out = [];
     const ctl = canControl();   // same scope rule as the row buttons
+    const badges = badgesServed();
     for (const j of state.jobs) {
       out.push({ ic: GLYPH[health(j).key], lbl: "Logs: " + j.name, sub: "open", run: () => openDrawer(j.name, "logs") });
       if (ctl && j.enabled && !j.running) out.push({ ic: "▶", lbl: "Run: " + j.name, run: () => runJob(j.name) });
@@ -9579,6 +9845,7 @@ var qrcode = function() {
       if (ctl && j.paused) out.push({ ic: "▶", lbl: "Resume: " + j.name, run: () => resumeJob(j.name) });
       else if (ctl) out.push({ ic: "⏸", lbl: "Pause: " + j.name, run: () => pauseJob(j.name) });
       out.push({ ic: "❏", lbl: "Copy command: " + j.name, run: () => copyText(j.command, "command") });
+      if (badges && badgeAddressable(j.name)) out.push({ ic: "❏", lbl: "Copy badge Markdown: " + j.name, run: () => copyBadgeMarkdown(j.name) });
       out.push({ ic: "◴", lbl: "Schedule: " + j.name, run: () => openDrawer(j.name, "schedule") });
       out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "live logs", run: () => openTail([j.name]) });
     }
@@ -9865,6 +10132,7 @@ var qrcode = function() {
     pairSeq++;
     $("pairPayload").textContent = "";
     $("pairQr").textContent = "";
+    hashPending = true;
     updateAuthBtn(); closeModal(); loadWhoami(); loadJobs();
   }
 
@@ -11808,13 +12076,27 @@ var qrcode = function() {
   // Which scopes this browser holds: an anonymous public-view grant, a
   // scoped token, or everything. Resolves before the first jobs render so
   // the first paint already shows the right affordances; re-runs whenever
-  // the stored token changes.
+  // the stored token changes, and loadJobs re-runs it (WHOAMI_REFRESH_MS).
+  // Only a change to the fields the chrome reads repaints, since
+  // applyScopeChrome's DAG card rebuild drops the focus from a button in
+  // the card. Nodes behind one load balancer each send their own
+  // instance and listeners.
+  const scopeKey = (a) => JSON.stringify(a && [a.authenticated, a.allScopes, a.scopes]);
   function loadWhoami() {
     return singleFlight("whoami", async () => {
-      try {
-        const r = await apiFetch("/whoami");
-        if (r.ok) state.auth = await r.json();
-      } catch (_) { /* a 401 already opened the token modal; keep prior scopes */ }
+      whoamiAt = performance.now();
+      const prior = scopeKey(state.auth);
+      // a token saved during the read joins this flight, so read until the
+      // answer is the stored token's
+      let sent;
+      do {
+        sent = token();
+        try {
+          const r = await apiFetch("/whoami");
+          if (r.ok) state.auth = await r.json();
+        } catch (_) { /* a 401 already opened the token modal; keep prior scopes */ }
+      } while (sent !== token());
+      if (scopeKey(state.auth) === prior) return;
       updateAuthBtn();
       applyScopeChrome();
     });

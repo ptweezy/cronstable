@@ -64,6 +64,10 @@ these properties:
     a Linux one still agree.
   * `verify`, and `pool` with `poolSlots` / `queuePriority` / `queueTimeout`,
     when set.
+  * `resourceLimits` when the job has caps: the normalized CPU count, memory
+    in bytes, process count, and `required`, so `memory: 512M` and
+    `memory: 536870912` match, and a map whose caps are all `max` counts as
+    unset.
 
 Deliberately **not** part of the identity:
 

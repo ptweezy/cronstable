@@ -973,7 +973,7 @@ async def test_kubeconfig_election_over_mutual_tls(tmp_path):
     material = _write_tls(tmp_path, cn="kube-ca", suffix="client")
     ctx = server_ssl_context(material, require_client_cert=True)
     async with FakeKubeApiserver(ssl_context=ctx) as api:
-        server = "https://localhost:{}".format(api.port)
+        server = api.url
         with_cert = _write_kubeconfig(
             tmp_path / "with-cert",
             server=server,
@@ -1013,7 +1013,7 @@ async def test_an_apiserver_with_an_untrusted_certificate_is_never_spoken_to(
     async with FakeKubeApiserver(
         ssl_context=server_ssl_context(served)
     ) as api:
-        server = "https://localhost:{}".format(api.port)
+        server = api.url
         path = _write_kubeconfig(
             tmp_path / "kubeconfig",
             server=server,

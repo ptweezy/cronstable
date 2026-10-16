@@ -197,6 +197,31 @@ configs` / `multiple logging configs`.)
 [includes, defaults, and multi-file config](Includes-and-Defaults) and
 [logging configuration](Logging-Configuration).
 
+### An embedded status badge shows a broken image
+
+**Symptom.** A [status badge](Status-Badges) in a README, a wiki page, or a
+home dashboard shows a broken image.
+
+**Cause.** With `web.authToken` or `web.authTokens` configured, the badge
+routes require the bearer token like every other data route, and image
+fetchers, such as GitHub's image proxy and the browsers that render a wiki
+page, can't send one. Unless the badges are public, a badge also carries
+`Cross-Origin-Resource-Policy: same-origin` and `frame-ancestors 'self'`,
+so a browser refuses to load it from the daemon into a page from another
+origin, as an image or in a frame.
+
+**Fix.** Run `curl` on the image URL, with the token if the daemon has one.
+A `404` means that no job has the name in the URL, or that
+`web.badges: false` (or `web.badges.enabled: false`) turned the routes off,
+and `public` has no effect until they are back on. A `200` means that the
+badge itself works. A page that loads the badge straight from the daemon,
+such as a wiki page or a home dashboard, needs `web.badges.public: true`,
+which exempts only the two badge routes from the token and lets pages on
+other origins load them. A badge in a GitHub README needs an address that
+the internet can reach, and it needs `public` only on a daemon that requires
+a token.
+See [making badges public](Status-Badges#make-badges-public).
+
 ## Scheduling
 
 ### A job runs immediately on startup (or never runs at startup)
@@ -410,6 +435,12 @@ kept, inserting a `[.... N lines discarded ...]` marker. See
 `saveLimit >= 0`, `maxLineLength > 0`, `killTimeout >= 0`, `executionTimeout > 0` when
 set, `onFailure.retry.maximumRetries >= -1` (`-1` = retry forever),
 `initialDelay >= 0`, `maximumDelay > 0`, `backoffMultiplier > 0`.
+
+`_validate_resource_limits` checks [`resourceLimits`](Resource-Limits):
+`cpu` between `0.01` and `1000000` CPUs, `memory` at least 1 MiB and below
+8 EiB, and `processes` between `1` and `4194304`. `max` lifts a cap. A value
+that does not parse fails with `Job <name>: resourceLimits.<key>: cannot
+read '<value>' as ...`, followed by the forms the key accepts.
 
 **Fix.** Use values within those ranges. See
 [concurrency and timeouts](Concurrency-and-Timeouts) and
@@ -856,6 +887,13 @@ graceful step becomes the tree kill immediately, and `killTimeout` adds
 nothing. See
 [running on Windows](Running-on-Windows).
 
+**Resource limits note.** For a run with [resource limits](Resource-Limits)
+in place, the forced step goes through the run's container. On Linux it
+writes the run's `cgroup.kill` and then sends the group `SIGKILL`. On
+Windows, `TerminateJobObject` on the run's Job Object replaces the tree
+kill. The container kill also ends descendants that left the process group
+or the process tree.
+
 **Fix.** Raise `executionTimeout`, or give the job's own process more time to shut
 down with `killTimeout` (have it handle `SIGTERM` on POSIX / `SIGBREAK` on Windows
 to use that grace). The grace period lasts while the job's own process runs, which
@@ -933,6 +971,125 @@ nothing for `killTimeout` to bound.
 because an allocated console changes what a job inherits. See
 [Windows service](Windows-Service#--console-and-job-termination).
 
+## Resource limits
+
+### Caps are not enforced
+
+**Symptom.** A job sets [`resourceLimits`](Resource-Limits), and its runs go
+ahead without caps. The log shows a `WARNING` like `resourceLimits is set
+(job nightly-etl), but cronstable cannot enforce it: <reason>. <hint>. Those
+jobs run without caps.` (or `cannot enforce the memory cap: ...` when only
+some caps are missing). The web dashboard marks each run with a
+**caps not enforced** chip and the terminal dashboard with `caps off`. The
+run record's `limits.enforced` is `false`, and
+[`GET /node`](HTTP-API#get-node) reports the same `reason` and `hint` under
+`limits`.
+
+**Cause.** The host cannot give the job's runs a cgroup or a Job Object with
+those caps. The daemon logs the warning once per change of the host's
+capability or of the set of capped jobs, at startup and on a reload, and not
+once per run. The reason names the cause:
+
+| Reason begins with | Cause | Fix |
+| --- | --- | --- |
+| `no cgroup v2 hierarchy is mounted at /sys/fs/cgroup` | The Linux host boots with cgroup v1 or a hybrid layout. | Boot with the unified hierarchy (`systemd.unified_cgroup_hierarchy=1`). |
+| `cannot find this process's cgroup under /sys/fs/cgroup` | `/proc/self/cgroup` cannot be read, or the cgroup path it gives for the daemon is not a directory under `/sys/fs/cgroup`. The cgroupfs mounted there does not match the daemon's cgroup namespace, as with a custom cgroup mount in a container. | Mount the cgroup v2 filesystem at `/sys/fs/cgroup` from cronstable's own cgroup namespace. In a container, keep the runtime's own cgroup mount (see [resource limits in a container](Production-Deployment#resource-limits-in-a-container)). |
+| `cgroup <path> is not delegated to cronstable (<file> is not writable)` | cronstable's cgroup belongs to another user: a unit without `Delegate=`, a daemon started from a login session's shell (its `session-<n>.scope` belongs to root), or the OpenRC service. When `<path>` is `/sys/fs/cgroup`, cronstable runs in a container whose cgroupfs is read-only, as in the published image. | Run cronstable under the packaged systemd unit, which sets `Delegate=memory pids`, or add `Delegate=` to your own unit. From a shell, start it in a delegated scope: `systemd-run --user --scope -p Delegate=yes cronstable -c <path>`. For a container, see [resource limits in a container](Production-Deployment#resource-limits-in-a-container). |
+| `cgroup <path> is not delegated to cronstable (it has no trusted.delegate or user.delegate attribute)` | cronstable runs as root in a cgroup with no delegation mark: systemd did not delegate it, or delegated it without the mark (systemd before 244, or a user manager's `systemd-run --user` scope). Root owns every cgroup that the system manager creates, so for a root daemon the mark is the only sign of delegation. | Add `Delegate=` to the system unit. Only the system manager sets the mark: `trusted.delegate` from systemd 244, and `user.delegate` from systemd 251. On older systemd, run the daemon as a non-root `User=` with `Delegate=`. |
+| `cronstable runs in the root cgroup` | No service manager placed the daemon in a cgroup of its own. | Run it under a systemd unit with `Delegate=`, or in a delegated scope. |
+| `cgroup <path> offers none of the cpu, memory, and pids controllers`, or `does not offer the <name> controller` | The parent cgroup did not delegate those controllers. With some missing, the other caps still apply, and the warning names the missing ones. | `Delegate=memory pids`, as in the packaged unit, delegates memory and pids, and `Delegate=yes` delegates every controller. A `systemd-run --user` scope gets the controllers that `user@.service` has: systemd 252 and later delegate `cpu`, `memory`, and `pids` to it, 238 to 251 leave out `cpu`, and 236 and 237 leave out `memory`. |
+| `the cpu controller is not delegated to cronstable` | cronstable's cgroup has no cpu controller: its unit delegates only memory and pids, as the packaged unit does, or it is a user scope on systemd 238 to 251. Only `cpu` caps go unenforced. | Delegate the cpu controller with `Delegate=yes`. For the packaged unit, run `systemctl edit cronstable`, add `Delegate=yes` under `[Service]`, and restart the service. That makes cronstable a CPU group of its own among the system's services (see [CPU caps and priority](Resource-Limits#cpu-caps-and-priority)). |
+| `could not enable the cpu controller in <path>: <error>` | The kernel refused to turn on the cpu controller, for example with real-time group scheduling (`CONFIG_RT_GROUP_SCHED`). Only `cpu` caps go unenforced. | Fix the error it names. The daemon tries again at the next configuration apply, and the start of a run with a `cpu` cap tries again at most every 30 seconds. |
+| `could not set up cgroup <path>: process <pid> in it could not be moved (it may be exiting)` | A process in cronstable's cgroup stayed there through about 2 seconds of retries, usually one that was exiting. | None, usually. The start of a capped run 30 seconds or more later sets up the cgroup again, as does the next configuration apply. |
+| `could not set up cgroup <path>: <error>` | Creating the `daemon/` and `runs/` child cgroups, moving the processes into `daemon/`, or enabling the controllers failed. | Fix the error it names. The daemon tries again at the next configuration apply, and the start of a capped run tries again at most every 30 seconds. |
+| `this platform has neither cgroup v2 nor Job Objects` | macOS, FreeBSD, OpenBSD, NetBSD, or illumos. Each configuration load also logs a warning that names the capped jobs. | None: caps apply on Linux and Windows only. |
+| `could not load cronstable._cgroups: <error>` (or `cronstable._jobobjects` on Windows) | The module that applies caps on this platform failed to import, so no cap applies. The daemon also logs a `WARNING`, `could not load cronstable._cgroups`, with the traceback. | Reinstall cronstable. If the error persists, report it with the traceback. |
+| `Windows refused the CPU rate cap: ...` with `Dynamic Fair Share Scheduling` | A Remote Desktop Services host blocks CPU rate caps. Only `cpu` goes unenforced. | Drop the `cpu` cap on that host, or turn off Dynamic Fair Share Scheduling there. |
+| `the Job Object watcher stopped: <reason>`, or `Windows could not open the completion port that reports memory-cap hits` | The thread that turns memory-cap hits into kills stopped, or could not start. A watcher that stopped also logged one `ERROR` (`Runs that start from now on get no memory cap until cronstable restarts.`). CPU and process caps still apply. | Restart cronstable. |
+
+A run whose cap fails on its own, although the host offers it, logs
+`resource limits could not be applied to a run of <name>: <reason> (each
+distinct failure is logged once)`. On Linux such a reason reads like `could
+not set memory.max: <error>` or `could not move the job into its cgroup`.
+When the caps apply, the daemon logs `resource limits are enforced with
+cgroup v2` (or `with Windows Job Objects`) at `INFO` instead.
+
+A non-root daemon treats any cgroup that its user owns as delegated,
+including the scope of a desktop terminal, so it logs no warning there and
+moves the terminal's processes into its `daemon/` cgroup. Start it in a scope
+of its own: `systemd-run --user --scope -p Delegate=yes cronstable -c <path>`.
+
+**Fix.** Use the row for the reason. [Linux setup](Resource-Limits#linux-setup)
+lists what cronstable needs from a Linux host. A job that must never run
+uncapped sets `resourceLimits.required: true`, which fails its runs instead
+(see the next entries).
+
+### A run failed with "memory limit exceeded"
+
+**Symptom.** A run fails with the fail reason `memory limit exceeded
+(512 MiB)` and exit code `-9` on Linux or `1` on Windows. The web dashboard
+shows a red **memory cap** chip on the run, the terminal dashboard shows
+`memory cap`, and `cronstable_job_memory_limit_exceeded_total` counts it.
+
+**Cause.** The run's processes together reached the job's
+`resourceLimits.memory`, and the whole run was killed. On Linux the kernel's
+OOM kill takes every process in the run's cgroup (`memory.oom.group`), and,
+where swap accounting is on, swap does not stretch the cap. On Windows the
+daemon ends the run's Job Object. The run fails whatever `failsWhen` says,
+a DAG task's `skipExitCodes` do not apply, and a `verify` check is skipped. The cap counts what the kernel charges to
+the run, which is cgroup memory on Linux and commit charge on Windows. The
+**Resources** chart plots sampled RSS, so a run can hit the cap while its
+chart reads lower. The run record's `limits.peak_memory_bytes` holds the
+kernel's figure.
+
+When the fail reason reads `verification failed: memory limit exceeded
+(512 MiB)`, the cap killed the run's verify check, and the run itself stayed
+within its cap. The check's own record is `verification.limits`, and the
+dashboards show a **check memory cap** chip or marker. The run's
+**memory cap** chip and the counter count only kills of the run itself (see
+[verify checks and DAG tasks](Resource-Limits#verify-checks-and-dag-tasks)).
+
+An OOM kill that the run's own cap did not cause, such as one from a
+container's memory limit or from host-wide memory pressure, is not a
+memory-cap hit. That run fails on its signal exit code.
+
+**Fix.** Raise `resourceLimits.memory`, or make the job use less memory.
+
+### A job with `resourceLimits.required` fails at start
+
+**Symptom.** Every run of the job fails at once with `resource limits could
+not be enforced: <reason> (resourceLimits.required is set)`. When a cap
+cannot apply before the spawn, no process starts: the run gets exit code
+`127`, and `cronstable_job_start_failures_total` counts it.
+
+**Cause.** `required: true` refuses a run when any configured cap cannot
+apply. The reason is the one in
+[caps are not enforced](#caps-are-not-enforced). A run is also refused when
+its process could not be put in its cgroup or Job Object. On Linux that
+process never starts the command, so the run is a start failure with exit
+code `127`. On Windows cronstable ends the process, so the run reports exit
+code `1` and does not count as a start failure. The same goes for a Linux
+process that joins its cgroup but leaves it before cronstable confirms the
+join, with exit code `-9`.
+
+**Fix.** Fix the cause that the reason names, or remove `required` so the
+runs go ahead uncapped.
+
+### A `processes` cap breaks a multi-threaded program on Linux
+
+**Symptom.** On Linux, a job with `resourceLimits.processes` fails with
+errors such as `Resource temporarily unavailable` from `fork` or
+`pthread_create`, `can't start new thread` from Python, or `unable to create
+native thread` from Java, although it starts few processes. The same cap
+works on Windows.
+
+**Cause.** Linux enforces `processes` with the `pids` controller, which
+counts threads as well as processes. A thread pool or a JVM can need dozens
+of them. The run record's `limits.process_limit_hits` counts the refused
+forks and thread starts.
+
+**Fix.** Raise `processes` to cover the threads, or set it to `max`.
+
 ## Reference: exit codes used internally
 
 | Code   | Meaning                                                                    |
@@ -942,12 +1099,20 @@ because an allocated console changes what a job inherits. See
 
 A missing `workingDirectory` gets the same `127` as a missing executable, and
 the path it tried shows up only inside the `kwargs=` repr of the spawn log
-line. See [workingDirectory](Commands-and-Environment#workingdirectory).
+line. See [workingDirectory](Commands-and-Environment#workingdirectory). A
+run that `resourceLimits.required` refuses before it starts also gets `127`,
+with the fail reason `resource limits could not be enforced: ...`.
+
+A run killed at its [memory cap](Resource-Limits) reports the kill's code:
+`-9` on Linux (the SIGKILL of the cgroup's OOM kill) and `1` on Windows
+(`TerminateJobObject`). Its fail reason, `memory limit exceeded (<cap>)`,
+tells it apart from any other exit with that code.
 
 Two Windows codes worth recognizing in run history:
 
-- `1` is what `taskkill /F` leaves behind. A run reaped by the forced tree kill
-  reports it, indistinguishable from a job's own `exit 1`.
+- `1` is what `taskkill /F` leaves behind, and what `TerminateJobObject`
+  leaves for a capped run's forced stop or memory-cap kill. A run reaped by
+  a forced stop reports it, indistinguishable from a job's own `exit 1`.
 - `3221225786` (`0xC000013A`, `STATUS_CONTROL_C_EXIT`) means the process was ended
   by a console control event, typically a job that received the graceful break and
   did not trap it.

@@ -89,9 +89,9 @@ in use.
 Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
 `workingDirectory`, `priority`, `failsWhen`, run-scoped `secrets`,
-`monitorResources`, and the rest of the shared launch keys. The
-[configuration reference](Configuration-Reference#dags) has the complete list,
-with types and defaults.
+`monitorResources`, `resourceLimits`, and the rest of the shared launch keys.
+The [configuration reference](Configuration-Reference#dags) has the complete
+list, with types and defaults.
 
 Because a task **is** a job invocation, its launch fields inherit the file's
 [`defaults:` block](Includes-and-Defaults#the-defaults-section) the same way a
@@ -118,6 +118,12 @@ A monitored task instance's sampled CPU time and peak resident set size (RSS)
 land in the `resources` object of its task record in the `dag_run` document,
 and in the task's statsd sink if one is configured. Task instances do not
 appear in the per-job Prometheus families.
+
+Each instance of a task with [`resourceLimits`](Resource-Limits) runs in a
+cgroup or Job Object of its own under the task's caps, and the instance's
+`limits` record lands in its task record in the `dag_run` document. An
+approval gate runs no process: setting `resourceLimits` on one is a
+configuration error, and a gate ignores caps from `defaults:`.
 
 Per-task **retries** are DAG-owned (independent of a job's `onFailure.retry`):
 
@@ -388,7 +394,10 @@ How a skip interacts with the rest of a task:
 - The skip is decided ahead of `failsWhen`. A command that exits with a
   listed code ends the task `skipped`, whatever `failsWhen` says.
 - Only a command that started and exited by itself can skip. A run stopped by
-  `executionTimeout` or a cancel is never a skip.
+  `executionTimeout` or a cancel is never a skip, and neither is a run that
+  goes over its [memory cap](Resource-Limits#memory) or that
+  `resourceLimits.required` refuses. On Windows, a memory-cap kill exits with
+  code `1`, and the task fails even when `1` is listed.
 - A skip runs no `verify` step and fires neither `onFailure` nor `onSuccess`.
 - A skip is terminal and uses no attempt. A task that failed twice and then
   exits with a listed code ends `skipped`.
@@ -759,9 +768,12 @@ that claim, because the record has no entry for it, releases the task back
 to `pending` (a sensor back to its idle shape between pokes) and re-claims it
 at once. Nothing ran, so the task's attempt count is unchanged. A launch the
 owner cancels before its subprocess starts (a `state` section reload while
-the task waits behind the spawn gate) is released the same way. The record
-forgets a run once the store shows it finished or collected, whichever node
-finished it.
+the task waits behind the spawn gate) is released the same way. So is the
+launch of a task with [`resourceLimits`](Resource-Limits) that is canceled
+while its process joins its cgroup or Job Object, once cronstable has killed
+that process. Either way, a pooled task gives back its pool slot. The
+record forgets a run once the store shows it finished or collected,
+whichever node finished it.
 
 If a node crashes, its lease lapses and a peer adopts the run, reconciling from
 the durable state:

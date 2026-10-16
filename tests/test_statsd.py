@@ -1,11 +1,14 @@
 """Tests for the statsd metric emitters.
 
 Exercise the UDP client protocol's datagram/error callbacks and the
-resource-usage arm of the per-job metric writer.
+resource-usage and resource-limit arms of the per-job metric writer.
 """
 
 import logging
 
+import pytest
+
+from cronstable.limits import LimitsRecord
 from cronstable.statsd import StatsdClientProtocol, StatsdJobMetricWriter
 
 
@@ -42,9 +45,10 @@ class _FakeUsage:
 
 
 class _FakeJob:
-    def __init__(self, failed=False, resource_usage=None):
+    def __init__(self, failed=False, resource_usage=None, limits_record=None):
         self.failed = failed
         self.resource_usage = resource_usage
+        self.limits_record = limits_record
 
 
 class _SendRecorder:
@@ -91,6 +95,53 @@ async def test_job_stopped_omits_usage_and_marks_failure(monkeypatch):
     message = recorder.calls[-1][2]
     assert "app.job.success:0|g" in message  # failed -> 0
     assert "cpu" not in message and "max_rss" not in message
+
+
+def _limits_record(memory_exceeded):
+    return LimitsRecord(
+        cpu=None,
+        memory_bytes=64 * 1024 * 1024,
+        processes=None,
+        required=False,
+        enforced=True,
+        mechanism="cgroup-v2",
+        unenforced=(),
+        reason=None,
+        memory_exceeded=memory_exceeded,
+    )
+
+
+async def test_job_stopped_counts_a_memory_limit_kill(monkeypatch):
+    recorder = _SendRecorder()
+    monkeypatch.setattr("cronstable.statsd.send_to_statsd", recorder)
+    writer = StatsdJobMetricWriter(
+        "host",
+        8125,
+        "app.job",
+        _FakeJob(failed=True, limits_record=_limits_record(True)),
+    )
+    await writer.job_started()
+    await writer.job_stopped()
+
+    message = recorder.calls[-1][2]
+    assert message.endswith("app.job.memory_limit_exceeded:1|c\n")
+    assert "app.job.success:0|g" in message
+
+
+@pytest.mark.parametrize(
+    "record",
+    [None, _limits_record(False)],
+    ids=["uncapped", "within-cap"],
+)
+async def test_job_stopped_omits_the_memory_limit_counter(monkeypatch, record):
+    recorder = _SendRecorder()
+    monkeypatch.setattr("cronstable.statsd.send_to_statsd", recorder)
+    writer = StatsdJobMetricWriter(
+        "host", 8125, "app.job", _FakeJob(limits_record=record)
+    )
+    await writer.job_started()
+    await writer.job_stopped()
+    assert "memory_limit_exceeded" not in recorder.calls[-1][2]
 
 
 async def test_job_stopped_is_a_noop_before_started(monkeypatch):

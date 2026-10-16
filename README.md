@@ -90,6 +90,8 @@ terminal, and iOS.
   and workflows, and monitor the cluster.
 * **HTTP API**: read job status and history, and start, cancel, or pause jobs
   (see [HTTP API](#http-api)).
+* **Status badges**: show a job's live status in a README or wiki with an SVG
+  badge (see [status badges](#status-badges)).
 * **Runtime pause and resume**: pause scheduled runs for maintenance without
   editing configuration (see
   [pausing jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)).
@@ -97,6 +99,9 @@ terminal, and iOS.
   cluster health (see [metrics](#metrics)).
 * **Per-job resource monitoring**: track CPU time and peak memory across each
   job's process tree (see [resource monitoring](#resource-monitoring)).
+* **Per-job resource limits**: cap each run's CPU, memory, and process count
+  with cgroup v2 on Linux and Job Objects on Windows (see
+  [resource limits](#resource-limits)).
 * **Built-in TLS**: serve the API over HTTPS, optionally require client
   certificates, and rotate certificates without a restart (see
   [TLS and client certificates](#tls-and-client-certificates)).
@@ -1344,10 +1349,48 @@ templates, so a failure alert can show how large the run was. With a
 survive restarts.
 
 Resource monitoring only observes: it never changes whether a run succeeds or
-fails. It's off by default and adds no overhead when it's off. Because the
-numbers are sampled, figures for short runs are approximate. To tune the
-sampling interval and chart history, or to monitor DAG tasks and whole nodes,
-see [resource monitoring](https://github.com/ptweezy/cronstable/wiki/Resource-Monitoring).
+fails. To cap a job's CPU, memory, or process count, see
+[resource limits](#resource-limits). Monitoring is off by default and adds no
+overhead when it's off. Because the numbers are sampled, figures for short runs
+are approximate. To tune the sampling interval and chart history, or to monitor
+DAG tasks and whole nodes, see
+[resource monitoring](https://github.com/ptweezy/cronstable/wiki/Resource-Monitoring).
+
+### Resource limits
+
+To bound what each run of a job can use, set `resourceLimits` on the job, as in
+the following example, or under `defaults:` to cap every job:
+
+```yaml
+jobs:
+  - name: nightly-model-refresh
+    command: python -m models.refresh
+    schedule: "0 4 * * *"
+    resourceLimits:
+      cpu: 1.5        # CPUs, like docker run --cpus
+      memory: 512M    # powers of 1024
+      processes: 64
+```
+
+The kernel enforces the caps across the run's whole process tree. A run at its
+CPU cap runs more slowly, and a run at its process cap cannot start more
+processes. A run that goes over its memory cap is killed with every process it
+started and fails with `memory limit exceeded (512 MiB)`. The dashboards, the
+run history, and Prometheus metrics show each job's caps and whether its runs
+hit them.
+
+On Linux, each capped run gets its own cgroup (cgroup v2), which needs a cgroup
+delegated to cronstable. The packaged systemd unit sets `Delegate=memory pids`
+and `OOMPolicy=continue`, so memory and process caps work with no setup, and
+CPU caps need `Delegate=yes` in a drop-in. In a container, cronstable needs
+root and a writable cgroupfs, in the container's own cgroup namespace or in a
+container cgroup that the runtime delegated; the published images run as a
+non-root user, so capped jobs run uncapped there. On Windows, each capped run
+gets its own Job Object, with no setup. macOS, the BSDs, and illumos cannot
+enforce caps. Where the host cannot enforce a cap, the run goes ahead without
+it, the daemon logs a warning, and the run record says so. With
+`required: true`, the run fails instead. For details, see
+[resource limits](https://github.com/ptweezy/cronstable/wiki/Resource-Limits).
 
 ## Reporting and metrics
 
@@ -1502,6 +1545,32 @@ my.cron.jobs.prefix.test01.duration:3|ms
 For details, see
 [metrics with statsd](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Statsd).
 
+### Status badges
+
+The [HTTP API](#http-api) serves a live SVG badge for each job, and one for
+the whole job set, in the style of the build badges on many README files:
+
+![nightly-backup: passing](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/badge-passing.svg)
+![cronstable: 12 passing](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/badge-fleet.svg)
+
+Embed a badge with Markdown that links it to the job in the dashboard:
+
+```markdown
+[![nightly-backup](https://cron.example.com/jobs/nightly-backup/badge.svg)](https://cron.example.com/#job/nightly-backup)
+```
+
+A job's badge shows a verdict such as `passing`, `failing`, `overdue`, or
+`paused`, and the fleet badge at `/badge.svg` counts the jobs in the most
+urgent state, such as `2 failing`. The command palettes of the web and
+terminal dashboards copy this Markdown. A daemon that requires a token
+serves the badges only with it, and GitHub's image proxy can't send one. A
+browser also refuses to load a badge from the daemon into a page from
+another origin. Set `web.badges.public: true` to lift both limits; it
+exempts only the two badge routes from the token. For every verdict, the
+query parameters, and caching, see
+[status badges](https://github.com/ptweezy/cronstable/wiki/Status-Badges) in
+the wiki.
+
 ## HTTP API
 
 To control cronstable remotely, add a `web` section with one or more listeners:
@@ -1529,6 +1598,7 @@ The API covers these areas:
 * Push device pairing
 * The cluster and fleet views
 * An iCal feed of upcoming runs
+* SVG status badges for a README or wiki
 
 For example, the following HTTPie command pauses a job for a two-hour
 maintenance window:

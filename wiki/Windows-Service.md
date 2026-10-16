@@ -277,6 +277,22 @@ The scheduler drains running jobs on stop, and the SCM is told the stop is
 still in progress for as long as that takes. A job that runs for an hour
 therefore does not make the service look unresponsive.
 
+## Resource limits under the service
+
+[Resource limits](Resource-Limits) apply under the service: each run of a
+job with `resourceLimits` gets a Job Object of its own. Without `--console`,
+two details differ from a run in the foreground:
+
+- The run has no console to inherit, so Windows starts a conhost.exe inside
+  the run's job. That conhost.exe counts toward the run's memory cap and
+  appears in a monitored run's process tree. The process cap does not count
+  it.
+- Stopping the run begins with the immediate tree kill described in
+  [`--console` and job termination](#--console-and-job-termination), and
+  `TerminateJobObject` then ends any process left in the run's job.
+
+See [resource limits on Windows](Running-on-Windows#resource-limits).
+
 ## Related pages
 
 - [Running on Windows](Running-on-Windows) for the rest of the platform

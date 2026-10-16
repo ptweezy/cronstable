@@ -395,6 +395,35 @@ def test_cgroup_reader_namespaced_root(tmp_path):
     assert reader.memory_used() == 200 * MIB  # no memory.stat -> raw figure
 
 
+def test_cgroup_reader_resolves_the_limits_layout_to_its_base(tmp_path):
+    # cronstable.limits moves the daemon into <base>/daemon next to
+    # <base>/runs; the node view keeps describing the whole of <base>.
+    root, d, proc = _fake_cgroup(tmp_path, rel="box/daemon")
+    (root / "box" / "runs").mkdir()
+    (root / "box" / "memory.current").write_text(f"{300 * MIB}\n")
+    (d / "memory.current").write_text(f"{10 * MIB}\n")
+    reader = _reader(root, proc)
+    assert reader._dir == str(root / "box")
+    assert reader.memory_used() == 300 * MIB
+
+
+def test_cgroup_reader_keeps_a_daemon_leaf_without_runs(tmp_path):
+    root, d, proc = _fake_cgroup(tmp_path, rel="box/daemon")
+    assert _reader(root, proc)._dir == str(d)
+
+
+def test_cgroup_reader_never_climbs_above_the_mount(tmp_path):
+    # a namespaced mount root that happens to be named "daemon", beside a
+    # "runs" directory outside the mount
+    root = tmp_path / "daemon"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("cpu memory\n")
+    (tmp_path / "runs").mkdir()
+    proc = tmp_path / "proc_self_cgroup"
+    proc.write_text("0::/\n")
+    assert _reader(root, proc)._dir == str(root)
+
+
 @pytest.mark.parametrize(
     "rel, files, method, expected",
     [
@@ -1035,6 +1064,133 @@ def test_sample_locked_children_walk_hard_error_is_inert():
     monitor._proc = root
     monitor._sample_locked()
     assert monitor._samples == 0
+
+
+# ---- ResourceMonitor with a container (resourceLimits) ---------------------
+
+
+class _Container:
+    """A run's cgroup / Job Object as the monitor sees it."""
+
+    def __init__(self, pids, times=(0.0, 0.0)):
+        self.pids = pids
+        self.times = times
+        self.members_error = None
+        self.times_error = None
+
+    def members(self):
+        if self.members_error is not None:
+            raise self.members_error
+        return None if self.pids is None else list(self.pids)
+
+    def cpu_times(self):
+        if self.times_error is not None:
+            raise self.times_error
+        return self.times
+
+
+def _contained(monkeypatch, container, extra=None):
+    root = _FakeProc(pid=100, create_time=1000.0, user=1.0, rss=1000)
+    table = {200: _FakeProc(pid=200, create_time=1001.0, user=2.0, rss=2000)}
+    table.update(extra or {})
+    _patch_process_table(monkeypatch, table)
+    monitor = ResourceMonitor(
+        100, interval=1.0, history=0, container=container
+    )
+    monitor._proc = root
+    return monitor, root
+
+
+def _escapee():
+    return _FakeProc(pid=300, create_time=1002.0, user=4.0, rss=4000)
+
+
+def test_container_members_replace_the_tree_walk(monkeypatch):
+    # an escapee outside the ppid tree (300) is still a member, a pid that
+    # exited since the listing (400) is skipped, and a ppid descendant that
+    # is not a member (500) is not counted.
+    other = _FakeProc(pid=500, create_time=1003.0, user=8.0, rss=8000)
+    container = _Container([100, 200, 300, 400], times=None)
+    monitor, _ = _contained(
+        monkeypatch, container, {300: _escapee(), 500: other}
+    )
+    monitor._sample_locked({100: [200, 500]})
+    assert monitor._samples == 1
+    assert monitor._max_rss == 1000 + 2000 + 4000
+    assert monitor._cpu_user == pytest.approx(1.0 + 2.0 + 4.0)
+
+
+def test_container_cpu_totals_replace_member_sums(monkeypatch):
+    container = _Container([100, 200, 300], times=(30.0, 3.0))
+    monitor, _ = _contained(monkeypatch, container, {300: _escapee()})
+    monitor._sample_locked()
+    # exact kernel totals, short-lived children included, not 1 + 2 + 4
+    assert monitor._cpu_user == 30.0
+    assert monitor._cpu_system == 3.0
+    # RSS is still the members' psutil sum
+    assert monitor._max_rss == 1000 + 2000 + 4000
+
+
+def test_container_totals_never_run_backwards(monkeypatch):
+    container = _Container([100], times=(5.0, 1.0))
+    monitor, _ = _contained(monkeypatch, container)
+    monitor._sample_locked()
+    container.times = (4.0, 0.5)
+    monitor._sample_locked()
+    assert (monitor._cpu_user, monitor._cpu_system) == (5.0, 1.0)
+
+
+@pytest.mark.parametrize("broken", ["none", "error"])
+def test_without_container_totals_members_are_summed(monkeypatch, broken):
+    container = _Container([100, 200])
+    if broken == "none":
+        container.times = None
+    else:
+        container.times_error = OSError("cpu.stat gone")
+    monitor, _ = _contained(monkeypatch, container)
+    monitor._sample_locked()
+    assert monitor._cpu_user == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("broken", ["none", "error"])
+def test_without_container_members_the_tree_is_walked(monkeypatch, broken):
+    container = _Container(None, times=(9.0, 0.0))
+    if broken == "error":
+        container.pids = [100]
+        container.members_error = OSError("cgroup.procs gone")
+    monitor, root = _contained(monkeypatch, container)
+    root.children_list = [resources.psutil.Process(200)]
+    monitor._sample_locked()
+    assert monitor._max_rss == 1000 + 2000
+    assert monitor._cpu_user == 9.0
+
+
+async def test_an_emptied_container_still_reports_its_totals(monkeypatch):
+    # every member exited before the final reading: the kernel's totals
+    # still cover them.
+    container = _Container([100, 200], times=(2.0, 1.0))
+    monitor, _ = _contained(monkeypatch, container)
+    monitor._sample_locked()
+    container.pids = []
+    container.times = (7.5, 2.5)
+    usage = await monitor.stop()
+    assert usage is not None
+    assert usage.samples == 1
+    assert usage.cpu_user_seconds == 7.5
+    assert usage.cpu_system_seconds == 2.5
+
+
+def test_an_empty_container_without_totals_is_skipped(monkeypatch):
+    container = _Container([], times=None)
+    monitor, _ = _contained(monkeypatch, container)
+    monitor._sample_locked()
+    assert monitor._samples == 0
+    assert monitor._cpu_user == 0.0
+
+
+def test_monitor_without_a_container_has_no_exact_totals():
+    monitor = ResourceMonitor(100, interval=1.0, history=0)
+    assert monitor._fold_exact_cpu() is False
 
 
 # ---- NodeResourceSampler init / snapshot / overlay / history ---------------

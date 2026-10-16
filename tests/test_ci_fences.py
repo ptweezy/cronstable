@@ -5,6 +5,7 @@ must show results with no unexpected skips. These checks verify that both
 steps select the same existing matrix cell and inspect the JUnit counts.
 """
 
+import ast
 import fnmatch
 import os
 import re
@@ -747,6 +748,226 @@ def test_apk_packages_are_built_from_the_musl_binaries():
     assert not recipe.get("overrides"), (
         "the apk recipe carries format overrides it cannot use"
     )
+
+
+def _unit_settings(path):
+    """``{section: {key: [values]}}`` of a systemd unit file."""
+    settings = {}
+    section = None
+    with open(path, encoding="utf-8") as fobj:
+        for line in fobj.read().splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = settings.setdefault(line[1:-1], {})
+                continue
+            key, _, value = line.partition("=")
+            section.setdefault(key.strip(), []).append(value.strip())
+    return settings
+
+
+def test_the_systemd_unit_delegates_its_cgroup_and_survives_job_oom_kills():
+    # resourceLimits needs the unit's cgroup, chowned to the User= the daemon
+    # runs as. The unit delegates memory and pids only: Delegate=yes would
+    # turn on the cpu controller in system.slice, which makes every service
+    # a CPU group of its own, so a job's priority would order it only
+    # against cronstable's own processes. A job killed at its own memory cap
+    # must not stop the service (OOMPolicy=continue), and KillMode=mixed lets
+    # the daemon drain its jobs on stop. A value listed twice is a later
+    # override.
+    unit = "packaging/systemd/cronstable.service"
+    service = _unit_settings(os.path.join(ROOT, *unit.split("/")))["Service"]
+    expected = {
+        "Delegate": ["memory pids"],
+        "OOMPolicy": ["continue"],
+        "KillMode": ["mixed"],
+        "User": ["cronstable"],
+    }
+    assert {key: service.get(key) for key in expected} == expected
+    # the fenced file is the one the .deb and .rpm install
+    with open(
+        os.path.join(ROOT, "packaging", "nfpm", "nfpm.yaml"), encoding="utf-8"
+    ) as fobj:
+        recipe = _yaml_load(fobj.read())
+    (entry,) = [
+        item
+        for item in recipe["contents"]
+        if item["dst"] == "/usr/lib/systemd/system/cronstable.service"
+    ]
+    assert entry["src"] == "./" + unit
+
+
+# --------------------------------------------------------------------------
+# Frozen builds: the cap backends must reach every bundle
+# --------------------------------------------------------------------------
+
+_CRONSTABLE_MODULE = re.compile(r"cronstable(?:\.\w+)+")
+
+
+def _select_backend():
+    """The ``limits._select_backend`` function definition."""
+    with open(
+        os.path.join(ROOT, "cronstable", "limits.py"), encoding="utf-8"
+    ) as fobj:
+        tree = ast.parse(fobj.read())
+    (func,) = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_select_backend"
+    ]
+    return func
+
+
+def _cap_backend_modules(func):
+    """Every module ``_select_backend`` can load.
+
+    That is each ``cronstable.*`` name the function spells out, plus each
+    top-level module defining the ``Backend`` class it instantiates, so a
+    backend whose name is computed is counted too.
+    """
+    named = {
+        node.value
+        for node in ast.walk(func)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and _CRONSTABLE_MODULE.fullmatch(node.value)
+    }
+    package = os.path.join(ROOT, "cronstable")
+    for name in sorted(os.listdir(package)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(package, name), encoding="utf-8") as fobj:
+            if re.search(r"^class Backend\b", fobj.read(), re.MULTILINE):
+                named.add("cronstable." + name[: -len(".py")])
+    return named
+
+
+def _static_imports(func):
+    """Module names the import statements inside ``func`` load."""
+    names = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            # limits.py sits in the cronstable package itself
+            parts = ["cronstable"] if node.level else []
+            base = ".".join(parts + ([node.module] if node.module else []))
+            names.add(base)
+            names.update(base + "." + alias.name for alias in node.names)
+    return names
+
+
+def _spec_hiddenimports():
+    """The spec's unconditional ``hiddenimports`` entries.
+
+    Only top-level statements count: an entry inside ``try:`` or ``if``
+    depends on the build env, and a backend belongs in every bundle.
+    """
+    with open(
+        os.path.join(ROOT, "pyinstaller", "cronstable.spec"), encoding="utf-8"
+    ) as fobj:
+        tree = ast.parse(fobj.read())
+
+    def names_hiddenimports(node):
+        return isinstance(node, ast.Name) and node.id == "hiddenimports"
+
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            names_hiddenimports(target) for target in node.targets
+        ):
+            value = node.value
+        elif isinstance(node, ast.AugAssign) and names_hiddenimports(
+            node.target
+        ):
+            value = node.value
+        elif (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr in ("append", "extend")
+            and names_hiddenimports(node.value.func.value)
+        ):
+            value = node.value
+        else:
+            continue
+        names.update(
+            item.value
+            for item in ast.walk(value)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        )
+    return names
+
+
+def test_every_cap_backend_is_visible_to_the_frozen_build():
+    # limits._select_backend loads the cap backend inside a function.
+    # PyInstaller's analysis follows an import statement there and misses an
+    # importlib call on a computed name, and a bundle without the backend
+    # leaves every cap on its platform unenforced and refuses every run of
+    # a resourceLimits.required job. So each backend is imported statically
+    # in _select_backend or listed in the spec's hiddenimports.
+    func = _select_backend()
+    backends = _cap_backend_modules(func)
+    # the fence must find the backends it guards
+    assert {"cronstable._cgroups", "cronstable._jobobjects"} <= backends, (
+        backends
+    )
+    visible = _static_imports(func) | _spec_hiddenimports()
+    missing = sorted(backends - visible)
+    assert not missing, (
+        "frozen builds ship without these cap backends: limits."
+        "_select_backend has no static import of them and the spec's "
+        "hiddenimports does not list them: {}".format(", ".join(missing))
+    )
+
+
+def test_the_bundle_check_names_every_cap_backend():
+    # pyinstaller/check_bundle.sh proves the built bundle holds what the
+    # fence above proves the analysis can see. A backend it does not name
+    # goes unchecked in the artifacts.
+    script = os.path.join(ROOT, "pyinstaller", "check_bundle.sh")
+    with open(script, encoding="utf-8") as fobj:
+        match = re.search(r'^modules="([^"]*)"$', fobj.read(), re.MULTILINE)
+    assert match, 'check_bundle.sh no longer sets modules="..."'
+    assert set(match.group(1).split()) == _cap_backend_modules(
+        _select_backend()
+    )
+
+
+def test_every_frozen_build_checks_its_bundle():
+    # Every lane that freezes a binary runs check_bundle.sh on it, through
+    # smoke_frozen.sh on the POSIX lanes or directly on Windows, for each
+    # layout it ships.
+    with open(
+        os.path.join(ROOT, "pyinstaller", "smoke_frozen.sh"), encoding="utf-8"
+    ) as fobj:
+        assert 'sh pyinstaller/check_bundle.sh "$bin"' in fobj.read()
+    freezing = {}
+    for name, job in _workflow()["jobs"].items():
+        runs = "\n".join(
+            step["run"]
+            for step in job.get("steps", [])
+            if isinstance(step.get("run"), str)
+        )
+        if "pyinstaller/cronstable.spec" in runs:
+            freezing[name] = runs
+    # the fence must find the binary lanes
+    assert "binaries" in freezing and "binaries-windows" in freezing
+    unchecked = sorted(
+        name
+        for name, runs in freezing.items()
+        if "pyinstaller/smoke_frozen.sh" not in runs
+        and "pyinstaller/check_bundle.sh" not in runs
+    )
+    assert not unchecked, (
+        "these jobs freeze a binary without checking its bundle: {}".format(
+            unchecked
+        )
+    )
+    windows = freezing["binaries-windows"]
+    for exe in ("dist/cronstable.exe", "dist/cronstable/cronstable.exe"):
+        assert "sh pyinstaller/check_bundle.sh " + exe in windows, exe
 
 
 def _single_quoted_scripts():

@@ -587,6 +587,57 @@ def test_priority_enters_identity_only_when_set():
     assert _id(job_yaml("a", extra="    priority: normal\n")) == _id(plain)
 
 
+def _limits_yaml(body):
+    return job_yaml("a", extra="    resourceLimits:\n" + body)
+
+
+def test_resource_limits_enter_identity_only_when_set():
+    # Caps are host-independent and change how the job runs, so replicas
+    # that disagree on them show as drift, like priority.
+    plain = job_yaml("a")
+    capped = _limits_yaml("      cpu: 1.5\n      memory: 512M\n")
+    (job,) = _jobs(capped)
+    assert canonical_job(job)["resourceLimits"] == {
+        "cpu": 1.5,
+        "memory": 512 * 1024 * 1024,
+        "processes": None,
+        "required": False,
+    }
+    (plain_job,) = _jobs(plain)
+    assert "resourceLimits" not in canonical_job(plain_job)
+    assert _id(capped) != _id(plain)
+    # every cap and the required flag is identity
+    for variant in (
+        "      cpu: 2\n      memory: 512M\n",
+        "      cpu: 1.5\n      memory: 1G\n",
+        "      cpu: 1.5\n      memory: 512M\n      processes: 8\n",
+        "      cpu: 1.5\n      memory: 512M\n      required: true\n",
+    ):
+        assert _id(_limits_yaml(variant)) != _id(capped)
+
+    # A map with no cap normalizes to no limits, so it hashes as unset.
+    assert _id(_limits_yaml("      cpu: max\n      required: true\n")) == (
+        _id(plain)
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("      cpu: 1.0\n      memory: 512MiB\n", id="float-mib"),
+        pytest.param('      cpu: "1"\n      memory: 536870912\n', id="bytes"),
+        pytest.param(
+            "      cpu: 1\n      memory: 0.5g\n      processes: max\n",
+            id="decimal-unit-and-max",
+        ),
+    ],
+)
+def test_equivalent_resource_limit_spellings_share_an_identity(body):
+    assert _id(_limits_yaml(body)) == _id(
+        _limits_yaml("      cpu: 1\n      memory: 512M\n")
+    )
+
+
 _IDENTITY_BASE = job_yaml(
     "a",
     extra=(

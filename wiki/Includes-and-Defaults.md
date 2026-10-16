@@ -115,9 +115,10 @@ bypass the shell entirely (see [running on Windows](Running-on-Windows)).
 A [DAG task](Orchestration-and-DAGs) is a job invocation, so its launch fields
 inherit the `defaults:` block the same way a job's do. A global `shell`,
 `environment`, `env_file`, `workingDirectory`, `priority`,
-`captureStdout`/`captureStderr`, `monitorResources`, run-scoped `secrets`, or
-reporter (`onFailure`/`onSuccess`/…) block covers DAG tasks too, with the
-task's own value winning on any key it sets.
+`captureStdout`/`captureStderr`, `monitorResources`, `resourceLimits`,
+run-scoped `secrets`, or reporter (`onFailure`/`onSuccess`/…) block covers DAG
+tasks too, with the task's own value winning on any key it sets. Approval gates
+ignore an inherited `resourceLimits`, because they run no process.
 
 The DAG-node fields that shape the graph (`dependsOn`, `triggerRule`,
 `skipExitCodes`, `when`, `retries`, `expand`, `onReject`, the poke settings)
@@ -172,6 +173,11 @@ supported on Windows`); see [running on Windows](Running-on-Windows). The merged
 | Otherwise (scalars, type mismatch) | Take `dict2`'s value. |
 | Key only in `dict1` | Keep `dict1`'s value. |
 | Key only in `dict2` | Keep `dict2`'s value. |
+
+A job's `resourceLimits` map merges into the inherited one key by key, as the
+first row says. A bare `resourceLimits:` is a schema error, so it cannot clear
+an inherited map; to lift an inherited cap, set it to `max` (see
+[resource limits](Resource-Limits#inheriting-and-lifting-caps)).
 
 ### `environment` merges by key
 

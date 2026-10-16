@@ -86,6 +86,7 @@ These variables are available when rendering any report template:
 | `cpu_seconds` | float or None | Total CPU time (user + system) of the run's process tree, or `None` when the job is not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `cpu_user_seconds` / `cpu_system_seconds` | float or None | The user- and system-mode components of `cpu_seconds`. |
 | `max_rss_bytes` | int or None | Peak resident-set size (bytes) observed during the run, or `None` when unmonitored. |
+| `limits` | dict or None | The run's [resource-limits](Resource-Limits) record, the same object as `limits` in [`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns), with keys such as `enforced`, `memory_exceeded`, and `peak_memory_bytes`. `None` when the job sets no caps, and on `onLate` and `notify:` dispatches. |
 | `verification` | dict or None | The [`verify`](Result-Verification) check's record (outcome, fail reason, redacted output), or `None` when the job has no `verify`. |
 
 An [`onLate`](Late-Run-Detection) dispatch renders the same variable set with
@@ -335,6 +336,8 @@ following variables describing the job outcome:
 | `CRONSTABLE_STDOUT_TRUNCATED` | `"1"` if `CRONSTABLE_STDOUT` was truncated, `"0"` otherwise. |
 | `CRONSTABLE_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job is not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `CRONSTABLE_MAX_RSS_BYTES` | Peak resident-set size in bytes, or empty string when unmonitored. |
+| `CRONSTABLE_LIMITS_ENFORCED` | `"1"` when every configured [resource limit](Resource-Limits) applied for the run, `"0"` when one did not (including a run that `resourceLimits.required` refused), or empty string when the job sets no caps, and on `onLate` and `notify:` dispatches. |
+| `CRONSTABLE_MEMORY_LIMIT_EXCEEDED` | `"1"` when the run was killed at its memory cap, otherwise empty string. |
 | `CRONSTABLE_HOST` | The daemon's host name: which node ran the job. Always set. |
 | `CRONSTABLE_RUN_ID` | The run's id in the [durable run ledger](Durable-State), or empty string when no `state:` store is configured, and on an `onLate` dispatch, which has no run. |
 | `CRONSTABLE_STARTED_AT` | ISO-8601 instant the run started, or empty string on an `onLate` dispatch, which describes a run that did not happen. |

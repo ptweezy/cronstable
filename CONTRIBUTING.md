@@ -339,6 +339,32 @@ local run needs none of them. The `backends-live` CI job provisions all three
 configurations and sets `CRONSTABLE_LIVE_REQUIRED=1`, which turns a skip into
 a failure.
 
+`tests/test_limits_live.py` and `tests/test_cgroups_live.py` test resource
+caps against the Linux kernel. Their setup moves the test process into a
+`daemon` leaf of its cgroup, so on Linux they run only when
+`CRONSTABLE_LIMITS_LIVE=1` is set, inside a delegated cgroup v2. A systemd
+user scope provides one without root:
+
+```sh
+systemd-run --user --scope -p Delegate=yes --quiet \
+    env CRONSTABLE_LIMITS_LIVE=1 python -m pytest \
+    tests/test_limits_live.py tests/test_cgroups_live.py
+```
+
+A test skips when the cgroup can't enforce the caps it needs. For example,
+the tests that need the `cpu` controller skip in a `Delegate=memory pids`
+scope, the packaged unit's setting, and in a user scope on systemd 238 to
+251, which lacks that controller. See
+[Linux setup](https://github.com/ptweezy/cronstable/wiki/Resource-Limits#linux-setup).
+The `cgroups-live` CI job runs both files in a `Delegate=yes` cgroup and sets
+`CRONSTABLE_LIVE_REQUIRED=1`, so a test that would skip fails instead. A
+second step runs them again under `Delegate=memory pids`, in a slice of its
+own and without `CRONSTABLE_LIVE_REQUIRED`, and fails when a test skips for
+any reason other than the missing `cpu` controller. Job Objects need no
+privileges, so on Windows the live tests in `tests/test_limits_live.py` and
+`tests/test_jobobjects.py` always run, including in the ordinary Windows CI
+cells.
+
 The scheduled `nightly` workflow runs only on `main`. It runs the `deep`
 environment, the suite with `PYTHONDEVMODE=1`, and mutation tests for modules
 with no timing-dependent behavior, such as the cron expression parser.

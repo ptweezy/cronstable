@@ -29,7 +29,8 @@
 #                   workingDirectory, priority, captureStdout/Stderr toggles,
 #                   streamPrefix templating + empty prefix, maxLineLength,
 #                   executionTimeout + killTimeout, user/group privilege drop,
-#                   enabled:false, saveLimit
+#                   resourceLimits CPU/memory/process caps, enabled:false,
+#                   saveLimit
 #   Failure/report  failsWhen (stderr / stdout / always), onFailure /
 #                   onPermanentFailure / onSuccess, retry with backoff (finite
 #                   AND retry-forever), and ALL FIVE reporters: mail (-> Mailpit,
@@ -512,6 +513,27 @@ jobs:
       sleep 20
     schedule: "*/2 * * * *"
     clusterPolicy: Leader
+
+  # [feature: resourceLimits] per-run caps on CPU, memory and process count,
+  # enforced by the kernel: a cgroup v2 on Linux (the packaged systemd unit
+  # delegates one to the daemon) or a Job Object on Windows. Where they hold,
+  # this hasher gets half a core in total, and a run that outgrows 256 MiB is
+  # killed and fails with "memory limit exceeded (256 MiB)". The grand tour
+  # runs as uid 65534 with a read-only /sys/fs/cgroup, so here the caps are
+  # CONFIG ONLY: the job runs uncapped, each node logs one warning naming it,
+  # and every run record says the caps were not enforced. `required: true`
+  # would fail those runs instead.
+  - name: ledger-checksum
+    command: |
+      echo "ledger-checksum hashing ~20s on $HOSTNAME"
+      timeout 20 sh -c 'yes | sha256sum >/dev/null' || true
+      echo "ledger-checksum done on $HOSTNAME"
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+    resourceLimits:
+      cpu: 0.5
+      memory: 256M
+      processes: 32
 
   # =====================================================================
   #  4. Billing  (once per key; finite AND infinite retries)

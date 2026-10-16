@@ -27,8 +27,10 @@ The HTML document is returned with defense-in-depth security headers, including
 a strict `Content-Security-Policy` (`default-src 'self'`, `connect-src 'self'`,
 `frame-ancestors 'none'`, anti-clickjacking `X-Frame-Options: DENY`, and
 `X-Content-Type-Options: nosniff`). The daemon merges any header you set under
-`web.headers` on top of these defaults, so you can relax or extend them
-deliberately (`Content-Type` excepted: the page is always `text/html`).
+`web.headers` on top of these defaults, in any letter case, so you can relax
+or extend them deliberately. A `web.headers` entry can't set the page's
+`Content-Type`, `Content-Encoding`, `ETag`, `Cache-Control`, or `Vary`; the
+page sets those itself.
 
 To expose only the REST API and **not** the dashboard, set `ui: false`:
 
@@ -128,7 +130,13 @@ them took. The
 drawer header repeats the job's status, its schedule (with the plain-English
 reading), the running PID(s), and a one-click button to copy the command. For a
 running job with [resource monitoring](Resource-Monitoring) on, the header adds
-the job's live CPU and memory.
+the job's live CPU and memory. A job with [resource limits](Resource-Limits)
+gets a chip that lists the caps it sets, such as
+`caps 1.5 CPU · 512 MiB · 64 procs`: CPU as a number of CPUs, to as many as
+six decimals (`cpu: 0.0125` reads `0.0125 CPU`), memory in binary units, and
+processes as `N procs` (`1 proc`). Its tooltip says what happens when
+the host cannot enforce the caps: a run fails under
+`resourceLimits.required`, and otherwise goes ahead uncapped.
 
 When [leader election](Clustering-and-Leader-Election#per-job-policy) is
 enabled, the header also shows the job's active **`clusterPolicy`** (`Leader`,
@@ -169,7 +177,7 @@ The History tab summarizes the job's retained run history:
 
 - a **stats grid**: total runs, **success rate**, OK / fail counts, and average / min / max duration. The success rate is computed over runs that ran to completion, so deliberate **cancellations are excluded**;
 - a **duration bar chart**, one bar per run (newest on the right), colored by outcome;
-- a **run table**: outcome, exit code, when it finished, how long it took, and a reason for any run that carries one (failed runs, and runs cancelled from the dashboard).
+- a **run table**: outcome, exit code, when it finished, how long it took, and a reason for any run that carries one (failed runs, and runs cancelled from the dashboard). For a job with [resource limits](Resource-Limits), the Reason cell adds a red **memory cap** chip when the run was killed at its memory cap (tooltip: `killed at its memory cap (512 MiB)`), a red **check memory cap** chip when the cap killed the run's verify check (tooltip: `verify check killed at its memory cap (512 MiB)`), and an amber **caps not enforced** chip when a configured cap did not apply, refused runs included (tooltip: `caps not enforced (<resources>): <reason>`). A run whose caps all applied shows no chip.
 
 History is held **in memory**, up to the most recent 50 runs per job, and
 normally resets when cronstable restarts. With a
@@ -195,14 +203,52 @@ tab, never on the poll loop:
 - a summary line gives a recorded run's outcome, duration, total CPU time,
   peak memory, and sample count, or, for a live instance, the sampling
   interval and the CPU used so far;
-- with more than one recorded run, **trend strips** chart CPU time and peak
-  memory per run (newest on the right, colored by outcome); clicking a bar
-  opens that run;
+- with more than one sampled run, **trend strips** chart CPU time and peak
+  memory for each sampled run (newest on the right, colored by outcome);
+  clicking a bar opens that run. A recorded run with no samples, such as a
+  refused run or a start failure, has a selector chip but no bar, and opens
+  to `no samples yet` with its summary line, limits included;
+- a monitored job with no recorded or sampled run shows its caps line, when
+  it sets caps, and `No resource samples yet. A run is charted here once it
+  has been sampled.` The tab keeps refetching and charts the first run once
+  it has been sampled;
 - the live view keeps refetching while the tab stays open, at a selectable
   **1s / 2s / 5s / 10s** pace.
 
-For a job that never opted in, the pane says so and shows the
-`monitorResources` line to add. Monitored jobs also surface outside the
+For a job with [resource limits](Resource-Limits), the charts also draw its
+caps:
+
+- a dashed **cap line** on the CPU chart at the CPU cap times 100%, labeled
+  like `cap 150%`, and on the memory chart at the memory cap, labeled like
+  `cap 512 MiB`. The y axis always extends past the cap, so the line stays in
+  view;
+- after a memory kill, the memory cap line turns red and reads
+  `cap 512 MiB · hit`. A cap that the host did not apply reads like
+  `cap 150% (not enforced)`;
+- each cap line belongs to the run it is drawn for: a recorded run shows the
+  caps it ran under, and a live run shows the configured caps;
+- the hover tooltip lists each cap under its series, `cap 150%` and
+  `cap 512 MiB (kernel-counted, not RSS)`. The memory chart plots sampled
+  RSS, while the cap counts the kernel's figure (cgroup memory on Linux,
+  commit charge on Windows), so the two can differ;
+- the summary line of a recorded capped run can add `memory cap hit`,
+  `caps not enforced (<resources>): <reason>`, `kernel peak <size>` (the
+  most memory the kernel counted for the run, in the cap's size format),
+  `cpu throttled <duration>` (Linux only), and `process cap hit N×`. A
+  run's selector chip tooltip ends in `· memory cap hit` after a memory
+  kill.
+
+For an uncapped job that never opted in, the pane reads
+`Resource monitoring is off for this job.` and shows the `monitorResources`
+line to add. A capped job without monitoring shows its
+caps instead (`caps <caps>`, followed by `· required` under
+`resourceLimits.required`) above a table of its recent capped runs, with
+the columns **Started**, **Outcome**, **Enforced** (yes, no, or refused, with
+the reason in a tooltip), **Kernel peak**, **CPU throttled**, and **Cap hits**
+(`memory`, `processes ×N`, or `—`). With no capped run recorded yet, the
+pane reads `No capped runs recorded yet.` in place of the table. The hint
+below reads `Opt in with monitorResources: true to chart CPU and memory per
+run against these caps.` Monitored jobs also surface outside the
 drawer: a running job's row carries a live CPU%/memory chip in its status
 cell, and the drawer header repeats the live readings while the job runs.
 
@@ -647,6 +693,14 @@ reduce motion, open settings, set the access token…) and a per-job action for 
 (open its logs, run it, cancel it, copy its command, view its schedule). Type to
 filter, arrow keys to move, `Enter` to run.
 
+**Copy badge Markdown** (per job) and **Copy fleet badge Markdown** copy
+Markdown that embeds a [status badge](Status-Badges) and links it back to
+this dashboard, ready to paste into a README or a wiki page. The palette
+lists them while the daemon serves badges, and it follows a configuration
+reload within about a minute (see [scope-aware chrome](#scope-aware-chrome)).
+It leaves out the per-job command for a job whose badge no URL reaches, such
+as one named `..` (see [embed a badge](Status-Badges#embed-a-badge)).
+
 The palette opens on top of a job drawer, a DAG drawer, the
 [live logs panel](#live-logs), or the [wallboard](#wallboard--tv-mode), and
 `Esc` closes the palette first. Seven panels cover the palette, so the
@@ -800,12 +854,20 @@ while the [command palette](#command-palette) is open, the dashboard closes
 the palette, and the prompt takes the keys: `Enter` saves the token, and `Esc`
 closes the prompt.
 
+A `#job/<name>` or `#dag/<name>` link, such as the one on a
+[status badge](Status-Badges#embed-a-badge), opens the token prompt first,
+and the link's drawer opens after you save the token.
+
 ### Scope-aware chrome
 
 On load the dashboard asks [`GET /whoami`](HTTP-API#get-whoami) what it is
 allowed to do, and draws only the controls that scope covers. With every scope,
 or against a daemon with no authentication configured, it draws the full
-interface.
+interface. It asks again on the first good poll after a lost connection and
+on the first good poll a minute or more after the last read, and redraws
+only when the scopes changed. A daemon reload or restart that changes
+the token's scopes or the [badge settings](Status-Badges#configuration)
+therefore reaches an open page within about a minute, without a page reload.
 
 Without `control`, the dashboard omits the Run, Stop, Pause, and Resume
 buttons, the DAG Trigger and Backfill buttons, "run failing", and the mitigate
@@ -858,6 +920,7 @@ process.
 - [Orchestration and DAGs](Orchestration-and-DAGs): the `dags:` semantics behind the [DAG card and drawer](#dag-orchestration).
 - [Durable State](Durable-State): the store the [state inspector](#durable-state-inspector) inventories, and what rehydrates run history across restarts.
 - [Resource Monitoring](Resource-Monitoring): `monitorResources` and the node endpoints behind the [Resources tab](#resources-cpu-and-memory-per-run-and-live) and the header's node meter.
+- [Resource Limits](Resource-Limits): the `resourceLimits` caps behind the caps chip, the cap lines, and the History tab's cap chips.
 - [Output Capturing](Output-Capturing): `captureStdout` / `captureStderr`, which control what the Logs tab can show.
 - [Schedules and Timezones](Schedules-and-Timezones): the schedule strings and time zones the Schedule tab explains and previews.
 - [Production and Container Deployment](Production-Deployment): running the interface under a hardened, read-only-root-filesystem deployment.

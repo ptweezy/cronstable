@@ -156,6 +156,19 @@ observe tools report the resulting `paused` and `sla` state on every job
 payload. Semantics: [pausing jobs](Pausing-Jobs) and
 [late-run detection](Late-Run-Detection).
 
+`cron_get_job_resources` returns the object that
+[`GET /jobs/{name}/resources`](HTTP-API#get-jobsnameresources) serves. For a
+job with [resource limits](Resource-Limits), that object includes the
+configured caps under `limits`, and each capped run's `limits` record, which
+says whether the caps applied and whether the run hit its memory cap.
+`cron_list_jobs` and `cron_get_job` carry a capped job's `limits` as
+[`GET /jobs`](HTTP-API#get-jobs) does. `cron_list_runs` and the
+`cronstable://jobs/{name}/runs` resource carry each capped run's `limits`
+record, as [`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns) does, and
+`cron_get_node` carries the host's `limits` capability, as
+[`GET /node`](HTTP-API#get-node) does, so an agent can tell whether this host
+enforces caps at all.
+
 `cron_list_pools` inspects shared capacity and waiting work.
 `cron_cancel_queued` cancels a waiting entry using its `pool` and `id`.
 `cron_preview_recovery` previews selected tasks or failed dates;

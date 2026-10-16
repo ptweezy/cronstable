@@ -357,9 +357,10 @@ def new_process_group_kwargs(
     POSIX has no such split, because :func:`apply_priority` renices the
     whole group and anything forked later inherits the nice value.
 
-    It is a parameter rather than a caller-assembled flag so that this
-    stays the only function in the tree that writes ``creationflags`` (a
-    test holds that), which is what makes it impossible for a caller setting
+    It is a parameter rather than a caller-assembled flag so that
+    platform.py stays the only module that writes ``creationflags`` (a test
+    holds that; :func:`suspend_at_spawn` ORs ``CREATE_SUSPENDED`` into what
+    this returns), which is what makes it impossible for a caller setting
     one of the two bits to drop the other.  POSIX has no spawn-time
     equivalent and is served by :func:`apply_priority` just after the spawn.
 
@@ -375,6 +376,32 @@ def new_process_group_kwargs(
             | _WINDOWS_PRIORITY_CLASS[priority]
         }
     return {"start_new_session": True}
+
+
+#: ``CREATE_SUSPENDED``, a literal for the reason _CREATE_NEW_PROCESS_GROUP
+#: is one.
+_CREATE_SUSPENDED = 0x00000004
+
+
+def suspend_at_spawn(
+    kwargs: dict[str, Any], *, windows: bool | None = None
+) -> None:
+    """OR ``CREATE_SUSPENDED`` into the spawn ``kwargs``, on Windows.
+
+    A capped run's child starts suspended so that it joins its Job Object
+    before it runs any code; :mod:`cronstable._jobobjects` assigns it and
+    resumes it.  The flag is added to what :func:`new_process_group_kwargs`
+    returned, so the group bit and the priority class stay.  POSIX has no
+    such flag, and this is a no-op there.
+
+    ``windows`` overrides the platform detection, as it does above.
+    """
+    if windows is None:
+        windows = IS_WINDOWS
+    if windows:
+        kwargs["creationflags"] = (
+            kwargs.get("creationflags", 0) | _CREATE_SUSPENDED
+        )
 
 
 def apply_priority(

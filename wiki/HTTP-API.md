@@ -110,6 +110,7 @@ section. `listen` is required; the rest are optional (strictyaml `Opt(...)`).
 | `tls` | map (`cert`/`key`/`clientCa`) | (none) | Certificate and key served by every `https://` listen address, plus an optional CA that makes those listeners require a client certificate (mutual TLS). `cert` and `key` are required together. The config loader validates the block and the `https://` addresses against each other at load. See [listener TLS](Listener-TLS). |
 | `ui` | bool | `true` | Serve the [web dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)). `ui: false` exposes only the REST endpoints. |
 | `metrics` | bool or map | `true` | Serve the Prometheus exposition at `/metrics`. The map form tunes buckets or exempts the endpoint from `authToken` (see [`GET /metrics`](#get-metrics)). |
+| `badges` | bool or map | `true` | Serve the SVG status badges at `/badge.svg` and `/jobs/{name}/badge.svg`. The map form's `public: true` exempts the two badge routes from `authToken` and lets pages on other origins load the badges (see [`GET /badge.svg`](#get-badgesvg-and-get-jobsnamebadgesvg) and [status badges](Status-Badges)). |
 | `nodeHistory` | bool or map | `true` | Background node CPU/memory sampling that feeds [`GET /node/history`](#get-nodehistory). The map form tunes cadence and window size (see [`web.nodeHistory`](Configuration-Reference#web)). |
 | `bonjour` | bool or map | `false` | Advertise the API over mDNS; see [LAN discovery](LAN-Discovery). |
 
@@ -404,6 +405,37 @@ curl "http://localhost:8080/calendar.ics?days=30"
 curl http://localhost:8080/jobs/nightly-backup/calendar.ics
 ```
 
+### `GET /badge.svg` and `GET /jobs/{name}/badge.svg`
+
+SVG status badges to embed in a README, a wiki, or a dashboard,
+`Content-Type: image/svg+xml`. The per-job badge shows the job's name and a
+verdict such as `passing`, `failing`, `overdue`, or `paused`, and an unknown
+job name is a `404`. The fleet badge shows `cronstable` and counts the jobs
+in the most urgent state, such as `2 failing`.
+
+The optional `label` query parameter replaces the left-hand text (1 to 64
+characters, with no control characters or line breaks), and `style` picks
+`flat` (the default) or `flat-square`. An empty `style` takes the default,
+and any other value of either is a `400`. Each badge image carries an
+`ETag` and `Cache-Control: no-cache`, and a request whose `If-None-Match`
+matches gets `304 Not Modified`. The image and the `304` both carry
+`Cross-Origin-Resource-Policy: same-origin`, `X-Frame-Options: SAMEORIGIN`,
+and a `Content-Security-Policy` with `frame-ancestors 'self'`, so a browser
+refuses to load a badge into a page from another origin, as an image or in
+a frame.
+
+The `web.badges` option turns the routes off (`badges: false`) or, with
+`badges.public: true`, exempts them from the bearer token and sends
+`Cross-Origin-Resource-Policy: cross-origin` with no frame limits, so that
+an image proxy can fetch them without a token and pages on any origin can
+load them. For the verdict table, the fleet count, embedding, and the exact
+headers, see [status badges](Status-Badges).
+
+```shell
+curl http://localhost:8080/jobs/nightly-backup/badge.svg
+curl "http://localhost:8080/badge.svg?label=prod&style=flat-square"
+```
+
 ### `GET /cluster`
 
 Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
@@ -569,9 +601,9 @@ any run/skip decision, and a malformed or hostile peer payload degrades to
 
 The serving node's **live** CPU and memory, sampled fresh per request (this
 drives the dashboard header's node meter). Returns the node identity
-(`node_name`) and a `resources` object with `cpu_percent`, `cpu_count`,
+(`node_name`), a `resources` object with `cpu_percent`, `cpu_count`,
 `mem_percent`, `mem_used_bytes`, `mem_total_bytes`, `proc_rss_bytes`, and
-`proc_cpu_percent`.
+`proc_cpu_percent`, and a `limits` object.
 
 `node_name` is the cluster node name when clustered, else the hostname.
 `cpu_percent` / `mem_percent` are whole-host usage. `proc_rss_bytes` /
@@ -593,6 +625,24 @@ Memory and CPU switch over independently: a container with only a memory limit
 still reports host-wide CPU. Unlimited cgroups, cgroup v1 hosts, and non-Linux
 platforms report whole-host numbers as before, and the response shape never
 changes.
+
+**Resource limits.** `limits` says whether this host can enforce
+[`resourceLimits`](Resource-Limits), and is always present:
+
+| Field | Meaning |
+| --- | --- |
+| `available` | `true` when the host can cap runs. |
+| `mechanism` | `cgroup-v2` (Linux), `job-object` (Windows), or `null`. |
+| `resources` | The caps the host can apply, in `cpu`, `memory`, `processes` order. A host that lacks a controller lists fewer. |
+| `reason` | Why caps are unavailable or partial, or `null`. |
+| `hint` | What to change on the host, or `null`. |
+
+Until a configuration with caps is applied, `limits` is a cached read-only
+probe. After that, it is the result of the daemon's setup. On Windows,
+`memory` leaves `resources` once the Job Object watcher thread stops (see
+[Windows behavior](Resource-Limits#windows-behavior)). The fields match the
+warning the daemon logs (see
+[caps are not enforced](Troubleshooting#caps-are-not-enforced)).
 
 ### `POST /jobs/{name}/start`
 
@@ -746,7 +796,7 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own time zone. |
 | `params` | The [run parameters](Commands-and-Environment#params) the job declares, in the shape `GET /dags` uses for a DAG's declaration. Present only on a job that declares them. `last_run` and each run of `GET /jobs/{name}/runs` carry the values that run took under `params`. |
 | `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
-| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`, `skip_reason`, `resources`, and the run instant keys that [`GET /jobs/{name}/runs`](#get-jobsnameruns) describes), or `null` if the job has not run yet. One exception: a run in progress when this host crashed is reported here as `unknown` even though it never finished. It stands at the instant it started, so a run that finished while it was still going can carry a later `finished_at`. The crash stays visible instead of hidden behind whatever outlived it. |
+| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`, `skip_reason`, `resources`, `limits` on a run that had caps, and the run instant keys, as [`GET /jobs/{name}/runs`](#get-jobsnameruns) describes them), or `null` if the job has not run yet. One exception: a run in progress when this host crashed is reported here as `unknown` even though it never finished. It stands at the instant it started, so a run that finished while it was still going can carry a later `finished_at`. The crash stays visible instead of hidden behind whatever outlived it. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`, whose ordering note covers this tail too. |
 | `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
 | `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
@@ -754,6 +804,7 @@ the endpoint the [web dashboard](Web-Dashboard) polls.
 | `rebootPending` | Present (as `true`) only for a deferred `@reboot` one-shot awaiting its boot run (the cluster had not elected an owner at boot, or a pause is holding it), so a client can tell "pending boot run" from "already ran". |
 | `concurrencyScope`, `slot` | Present only for `concurrencyScope: cluster` jobs: the literal scope, and `slot` as `{held, holder, refs}`: whether this node holds the job's [cluster-wide concurrency slot](Clustering-and-Leader-Election) lease, the holding node's name (`null` when unheld), and how many live instances reference it. |
 | `priority` | Present only when the job sets a non-default [scheduling priority](Commands-and-Environment#priority): one of `idle`, `below-normal`, `above-normal`, `high`. A job at the default level (`normal`, the one level never applied) carries no key. |
+| `limits` | Present only when the job sets [`resourceLimits`](Resource-Limits): `{cpu, memory_bytes, processes, required}`, the configured caps, with `cpu` in CPUs and `memory_bytes` in bytes. An unset cap, or one set to `max`, is `null`. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that owns the job (`null` when there is no quorum). |
 | `verification` | Present only when the job configures [result verification](Result-Verification): `{configured, running}`, where `running` says whether verification of a running instance is in progress. |
 | `pool` | Present only when the job belongs to a [resource pool](Resource-Pools): `{name, slots, priority}`, plus `queued` (the job's waiting entries, in queue order). When pool state cannot be read or written (the cases where `GET /pools` answers `503`; see [Enabling the API](#enabling-the-api)), the response is still a `200`, and the `pool` object of each pooled job carries `queueUnavailable: true` and no `queued` list. |
@@ -836,6 +887,32 @@ is `null` unless the job opted into
 [`monitorResources`](Resource-Monitoring), in which case it is
 `{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
 samples}` for that run.
+
+A run of a job with [`resourceLimits`](Resource-Limits) also carries
+`limits`: the caps it ran under and what the kernel recorded. A run without
+caps has no `limits` key.
+
+| `limits` field | Meaning |
+| --- | --- |
+| `cpu`, `memory_bytes`, `processes`, `required` | The caps the run was configured with; an unset cap is `null`. |
+| `enforced` | `true` when every configured cap applied for the whole run. |
+| `mechanism` | `cgroup-v2`, `job-object`, or `null` when no cap applied. A cap lost partway through the run counts as not applied. |
+| `unenforced`, `reason` | The caps that did not apply (`cpu`, `memory`, `processes`) and why, or `[]` and `null`. |
+| `refused` | `true` when `resourceLimits.required` refused the run: the command never started, or cronstable ended its process because the process could not be moved into its cgroup or Job Object. A Linux process that cannot join its cgroup never starts the command, so its run reports the start failure's `127`. A run whose process cronstable ended reports the kill's exit code instead: `1` on Windows, `-9` on Linux. |
+| `memory_exceeded` | `true` when the run reached its memory cap and was killed. |
+| `peak_memory_bytes` | The most memory the kernel counted for the run, the figure a memory cap is measured on: the cgroup's `memory.peak` on Linux 5.19 and later, and the job's peak commit charge on Windows. Reported for every run whose process got into its cgroup or Job Object, with or without a memory cap; with a memory cap on Windows, it is at most the cap. This figure is not RSS. |
+| `cpu_throttled_seconds` | Linux, with a CPU cap: the time the cap held the run back (`throttled_usec` in `cpu.stat`). `null` on Windows. |
+| `process_limit_hits` | With a process cap: how many process starts the cap refused (on Linux, thread starts too). Before Linux 6.11, or with the `pids_localevents` mount option, it can also count starts that a limit above the run refused (see [what each cap does](Resource-Limits#what-each-cap-does)). |
+
+A counter is `null` where the kernel does not report it. If the daemon
+cannot read the kernel's counters when the run ends, the record still
+carries the caps and `enforced`, `memory_exceeded` is `false`, and the three
+counters are `null`.
+
+The run's `limits` record covers only the run's own processes. A
+`verification` result whose check ran carries the check's own record as
+`limits`, or `null` when the job has no `resourceLimits` (see
+[verify checks and DAG tasks](Resource-Limits#verify-checks-and-dag-tasks)).
 
 For a run that the daemon records as `success`, `failure`, or `cancelled`,
 `finished_at` is the instant the run ended: when the daemon had collected
@@ -921,6 +998,7 @@ Content-Type: application/json; charset=utf-8
     "name": "test-01",
     "monitored": true,
     "interval": 1.0,
+    "limits": null,
     "live": [
         {
             "started_at": "2026-07-07T12:00:00+00:00",
@@ -958,17 +1036,24 @@ RSS per merged bucket, so spikes survive), so a series is bounded no matter
 how long the run.
 
 `live` carries the run-so-far series of each currently-running monitored
-instance plus its `current` instantaneous readings; `runs` the recorded series
-of recent finished **monitored** runs (oldest first, unmonitored runs are
+instance plus its `current` instantaneous readings; `runs` the recent
+finished runs that were **monitored or capped** (oldest first, other runs are
 omitted; the ordering note on
 [`GET /jobs/{name}/runs`](#get-jobsnameruns) applies to this array too),
 capped by the `limit` query parameter (default 20, clamped to the retained
 history; `runs` is its legacy alias, read when `limit` is absent).
 
+`limits` is the job's [`resourceLimits`](Resource-Limits) caps, the same
+object as `limits` on [`GET /jobs`](#get-jobs), or `null` when the job sets
+none. A capped run keeps its `limits` record in `runs`, so a client can mark
+cap hits on the charts. A capped job without `monitorResources` still lists
+its capped runs, each with `resources: null`.
+
 With a [durable state store](Durable-State), run series survive restarts
-inside the run ledger records. `monitored: false` with empty lists means the
-job never opted into `monitorResources` (distinguishable from "monitored but
-no data yet").
+inside the run ledger records. `monitored` is the job's `monitorResources`
+setting. `monitored: false`, `limits: null`, and empty lists mean the job set
+neither `monitorResources` nor `resourceLimits` (distinguishable from
+"monitored but no data yet").
 
 ### `GET /node/history`
 
@@ -1335,6 +1420,19 @@ cluster peer transport, which are separate listeners.
 `instance` and `listeners` to check whether another address reaches the same
 daemon.
 
+`badges` is `null` while the daemon serves no
+[status badges](Status-Badges) (`web.badges: false`). Otherwise it's an
+object with two fields. `public` is the `web.badges.public` setting, which
+lets an image proxy fetch the badges without a token and lets pages from
+other origins load them (see
+[make badges public](Status-Badges#make-badges-public)). While it's
+`false`, the dashboards add "embeds need web.badges.public" to the copy
+confirmation. `dashboard` is `false` under `web.ui: false`, where the copied
+Markdown has no dashboard page to link to. The dashboards list their
+copy-badge commands only when `badges` is an object, and they read
+`/whoami` again about once a minute, so the commands follow a configuration
+reload.
+
 A companion app uses it to show what it may do. The dashboard uses it to warn
 when its pairing QR would hand a phone a token that passes every route's
 check: one that holds `view`, `control`, and `approve`, with or without
@@ -1515,9 +1613,12 @@ Serves the single-page [web dashboard](Web-Dashboard). Set `ui: false` in the
 `web` section to disable the page and expose only the REST endpoints. The page
 is served with secure default headers (a strict Content-Security-Policy,
 anti-clickjacking, and nosniff) with any operator `web.headers` merged on top,
-so a deliberately-set operator header wins. The page carries an `ETag`, and a
-request whose `If-None-Match` header matches it gets `304 Not Modified`. A
-client that accepts gzip receives the page compressed.
+so an operator header replaces the default of the same name in any letter
+case. An operator header can't set the page's `Content-Type`,
+`Content-Encoding`, `ETag`, `Cache-Control`, or `Vary`; the page sets those
+itself. A request whose `If-None-Match` header
+matches the page's `ETag` gets `304 Not Modified`. A client that accepts
+gzip receives the page compressed.
 
 When `web.authToken` is enabled, the page itself loads without a token (it
 holds no data). It prompts for the token in the browser and authenticates
@@ -1562,7 +1663,13 @@ responses, which are raised without the configured headers. One key is exempt
 everywhere: a `Content-Type` in this map (in any spelling) is ignored, because
 every endpoint owns its own content type. The SSE log routes also fix
 `Cache-Control` and `X-Accel-Buffering`, so the map cannot override those two
-on a live stream. Example:
+on a live stream. `/jobs`, `/fleet`, `/dags`, and `/activity` set their own
+`ETag` and `Vary`, and `/cluster` and `/metrics` set their own `Vary`; an
+entry can't replace those. On the dashboard page, an entry for
+`Content-Encoding`, `ETag`, `Cache-Control`, or `Vary`, in any letter case,
+has no effect, and on the status badges an entry for `ETag` or
+`Cache-Control` has none.
+Example:
 
 ```yaml
 web:
@@ -1618,14 +1725,18 @@ When `authToken` is set, an aiohttp middleware (`_make_auth_middleware`) require
   `WWW-Authenticate: Bearer realm="cronstable"`. Browsers show no sign-in
   dialog for the `Bearer` scheme.
 
-Two settings relax that. `web.metrics.public: true` exempts `/metrics` (and
+Three settings relax that. `web.metrics.public: true` exempts `/metrics` (and
 only `/metrics`) from the bearer token, for scrapers that cannot send
-credentials (see [`GET /metrics`](#get-metrics)). `web.anonymousScopes`
+credentials (see [`GET /metrics`](#get-metrics)). `web.badges.public: true`
+exempts the two status badge routes, `/badge.svg` and
+`/jobs/{name}/badge.svg`, for pages that embed the images (see
+[status badges](Status-Badges)). `web.anonymousScopes`
 grants named scopes (`view` only) to callers presenting no credential,
 which is how a public read-only board is served. A wrong token is still
 `401`, and everything outside the grant is `403` (see
 [public read-only access](#public-read-only-access-webanonymousscopes)).
-Without either, every route stays gated.
+Without any of them, every route but the dashboard page at `/` requires the
+token.
 
 One built-in carve-out: paths ending in `.ics` (the
 [calendar feeds](Calendar-Export)) also accept the same token as a `token`
@@ -1889,7 +2000,11 @@ The rule, per request:
 `GET`/`HEAD`/`OPTIONS` are never gated (no read here mutates, and the
 browser's same-origin policy already hides their responses cross-site), and
 `/mcp` is exempt because it enforces its own `mcp.allowedOrigins` list with
-CORS preflight support (see [MCP](MCP)).
+CORS preflight support (see [MCP](MCP)). A page on another origin could
+load a status badge as an image or in a frame and read the verdict from its
+size, so unless `web.badges.public` is true, the badges carry
+`Cross-Origin-Resource-Policy: same-origin` and `frame-ancestors 'self'`
+(see [security headers](Status-Badges#security-headers)).
 
 Two overrides for deliberate cross-origin deployments: a specific
 origin in a `web.headers` `Access-Control-Allow-Origin` header is treated as

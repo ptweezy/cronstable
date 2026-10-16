@@ -148,7 +148,8 @@ window.CRONSTABLE_BRAND = "cronstable demo";
 
   // ---- job roster --------------------------------------------------
   // J(name, schedule, {p:policy, o:owner, run:seconds, mem:MiB, cpu:%, mon,
-  //                     fail:profile, cap0, tz, disabled, sub, manual, cmd})
+  //                     fail:profile, cap0, tz, disabled, sub, manual, cmd,
+  //                     lim:{cpu, mem:MiB, procs, hit} resourceLimits, see limRecord})
   function J(name, schedule, o) { o = o || {}; o.name = name; o.schedule = schedule; return o; }
   function sched(j) { return j.resolved || j.schedule; }   // H jobs carry their hashed plain form
   var EN = "EveryNode", LD = "Leader", PL = "PreferLeader";
@@ -165,7 +166,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     J("inventory-sync", "*/2 * * * *", { p: EN, run: 90, cmd: 'cronstable slot hold inventory --scope cluster; sleep 90' }),
     J("payments-reconcile", "*/5 * * * *", { p: LD, o: "meridian-d", cmd: 'echo "payments-reconcile matched settlements on ' + host + '"' }),
     // transform
-    J("etl-build-facts", "* * * * *", { p: EN, run: 4, cmd: 'echo "building fact tables"; sleep 4  # statsd meridian.etl.build_facts' }),
+    J("etl-build-facts", "* * * * *", { p: EN, run: 4, mem: 700, lim: { cpu: 2, mem: 1024, procs: 32, hit: 9 }, cmd: 'echo "building fact tables"; sleep 4  # statsd meridian.etl.build_facts' }),
     J("etl-dim-refresh", "*/5 * * * *", { p: LD, o: "meridian-e", run: 4, cmd: 'echo "dim-refresh rebuilding dimensions on ' + host + '"; sleep 4' }),
     J("dedup-orders", "*/4 * * * *", { p: LD, o: "meridian-f", cmd: 'cronstable cursor read high_water --scope orders-domain' }),
     J("config-lint", "*/2 * * * *", { p: EN, fail: "stderrwin", cmd: 'cronstable lint --strict "validating pipeline configs on ' + host + '"' }),
@@ -180,7 +181,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     J("risk-model-recompute", "* * * * *", { p: EN, run: 30, mon: 1, cpu: 101, cmd: 'echo "risk-model-recompute burning one core ~30s on ' + host + '" timeout 30 sh -c \'while :; do :; done\'' }),
     J("fraud-graph-scan", "* * * * *", { p: LD, o: "meridian-h", run: 40, mon: 1, cpu: 98, cmd: 'yes | timeout 40 sha256sum' }),
     J("catalog-build-inmemory", "* * * * *", { p: EN, run: 25, mon: 1, cpu: 22, mem: 256, cmd: 'echo "catalog-build-inmemory allocating ~256MB on ' + host + '" & keep 25s' }),
-    J("report-render-buffer", "*/2 * * * *", { p: LD, o: "meridian-i", run: 20, mon: 1, cpu: 18, mem: 400, cmd: 'echo "report-render-buffer holding ~400MB resident ~20s"' }),
+    J("report-render-buffer", "*/2 * * * *", { p: LD, o: "meridian-i", run: 20, mon: 1, cpu: 18, mem: 400, lim: { cpu: 0.5, mem: 512, hit: 10 }, cmd: 'echo "report-render-buffer holding ~400MB resident ~20s"' }),
     // billing
     J("charge-subscriptions", "0 * * * *", { p: EN, cmd: 'key="charge-$(date -u +%Y-%m-%dT%H)"; if cronstable idempotent "$key"; then echo charged; fi' }),
     J("webhook-dispatch", "* * * * *", { p: EN, fail: "every5", cmd: 'if [ $(( $(date -u +%M) % 5 )) -eq 0 ]; then echo "upstream 503 from hooks.meridian.io" >&2; exit 7; fi; echo delivered' }),
@@ -239,9 +240,35 @@ window.CRONSTABLE_BRAND = "cronstable demo";
   ];
   var BYNAME = {}; ROSTER.forEach(function (j) { BYNAME[j.name] = j; });
 
+  // ---- resource limits ---------------------------------------------
+  // A run whose fire minute is a multiple of lim.hit is killed at its memory
+  // cap. This host enforces every cap (buildNode reports the capability).
+  var LIMITS_CAPABILITY = { available: true, mechanism: "cgroup-v2", resources: ["cpu", "memory", "processes"], reason: null, hint: null };
+  function limPayload(job) {
+    var l = job.lim; if (!l) return null;
+    return { cpu: l.cpu != null ? l.cpu : null, memory_bytes: l.mem != null ? l.mem * 1048576 : null,
+      processes: l.procs != null ? l.procs : null, required: false };
+  }
+  function memHit(job, t) { return !!(job.lim && job.lim.hit) && Math.floor(t / 60000) % job.lim.hit === 0; }
+  function capSize(mib) { return mib >= 1024 ? +(mib / 1024).toFixed(1) + " GiB" : mib + " MiB"; }
+  // sampled peak RSS of one run: a memory kill comes just under the cap
+  function peakRss(job, t) { return Math.round((memHit(job, t) ? job.lim.mem * 0.97 : (job.mem || 60)) * 1048576); }
+  function limRecord(job, t, du) {
+    var p = limPayload(job); if (!p) return null;
+    var hit = memHit(job, t);
+    return { cpu: p.cpu, memory_bytes: p.memory_bytes, processes: p.processes, required: false,
+      enforced: true, mechanism: "cgroup-v2", unenforced: [], reason: null,
+      refused: false, memory_exceeded: hit, process_limit_hits: p.processes != null ? 0 : null,
+      // memory.peak: the kernel's count includes page cache, so it runs above RSS
+      peak_memory_bytes: hit ? p.memory_bytes : Math.round((job.mem || 60) * 1048576 * jitter(job.name + "pk" + t, 1.05, 1.2)),
+      cpu_throttled_seconds: p.cpu != null ? +(du * jitter(job.name + "th" + t, 0.01, 0.08)).toFixed(2) : null };
+  }
+
   // ---- fail profiles: fire-ms -> outcome/exit/reason ---------------
   function outcomeFor(job, t) {
     var min = new Date(t).getUTCMinutes(), bucket = Math.floor(t / 60000);
+    // the cgroup's OOM kill: SIGKILL, whatever the profile says
+    if (memHit(job, t)) return { outcome: "failure", exit_code: -9, fail_reason: "memory limit exceeded (" + capSize(job.lim.mem) + ")" };
     switch (job.fail) {
       case "always": return { outcome: "failure", exit_code: 1, fail_reason: "self-test tripwire (failsWhen.always)" };
       case "db69": return (bucket % 5 === 0) ? { outcome: "failure", exit_code: 69, fail_reason: "connection refused (EX_UNAVAILABLE)" } : ok();
@@ -262,6 +289,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     function ok() { return { outcome: "success", exit_code: 0, fail_reason: null }; }
   }
   function runDur(job, t) {
+    if (memHit(job, t)) return +((job.run || 2) * jitter(job.name + t, 0.5, 0.7)).toFixed(2);   // killed partway
     if (job.run) return +(job.run + jitter(job.name + t, -0.4, 0.6)).toFixed(2);
     return +jitter(job.name + t, 0.2, 2.4).toFixed(3);
   }
@@ -284,6 +312,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     if (job.late) d.sla = { thresholds: { maxTimeSinceSuccessSeconds: 900 }, state: "late",
       breaches: [{ check: "maxTimeSinceSuccess", since: iso(now - 2100000), observed_seconds: 3000, threshold_seconds: 900 }] };
     if (job.resolved) d.schedule_resolved = job.resolved;
+    if (job.lim) d.limits = limPayload(job);
     if (job.disabled) { d.history = []; return d; }
     if (job.p && job.p !== EN) d.clusterPolicy = job.p;
     if (job.o) d.clusterOwner = job.o;
@@ -325,10 +354,11 @@ window.CRONSTABLE_BRAND = "cronstable demo";
       var lt = fires[0], loc = outcomeFor(job, lt), ldu = runDur(job, lt);
       var res = null;
       if (job.mon) res = { cpu_user_seconds: +(ldu * 0.8).toFixed(2), cpu_system_seconds: +(ldu * 0.2).toFixed(2),
-        cpu_total_seconds: +ldu.toFixed(2), max_rss_bytes: Math.round((job.mem || 60) * 1048576), samples: Math.max(2, Math.round(ldu / 2)) };
+        cpu_total_seconds: +ldu.toFixed(2), max_rss_bytes: peakRss(job, lt), samples: Math.max(2, Math.round(ldu / 2)) };
       d.last_run = { outcome: loc.outcome, exit_code: loc.exit_code, started_at: iso(lt),
         finished_at: iso(lt + ldu * 1000), duration: loc.outcome === "cancelled" ? +jitter("c" + lt, 5, 40).toFixed(1) : +ldu.toFixed(3),
         fail_reason: loc.fail_reason, resources: res };
+      if (job.lim) d.last_run.limits = limRecord(job, lt, ldu);
     }
     // an armed retry ladder on a currently-failing frequent job
     if (d.last_run && d.last_run.outcome === "failure" && (job.fail === "every5" || job.fail === "selfheal")) {
@@ -392,7 +422,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     return { enabled: true, backend: "gossip", node_name: SELF, distribution: "spread", elect_leader: true, interval: 10.0, nodes: nodes };
   }
 
-  function buildNode() { return { node_name: SELF, resources: nodeStats(SELF, nowMs()) }; }
+  function buildNode() { return { node_name: SELF, resources: nodeStats(SELF, nowMs()), limits: LIMITS_CAPABILITY }; }
   function buildNodeHistory() {
     var now = nowMs(), pts = [], iv = 10;
     for (var i = 60; i >= 0; i--) { var t = now - i * iv * 1000, s = nodeStats(SELF, t); pts.push([+(t / 1000).toFixed(2), s.cpu_percent, s.mem_percent]); }
@@ -410,8 +440,10 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     var job = BYNAME[name]; if (!job) return null;
     var now = nowMs(), fires = prevFires(sched(job), now, 40, T0).reverse(), runs = [];
     fires.forEach(function (t) { var oc = outcomeFor(job, t), du = runDur(job, t);
-      var res = job.mon ? { cpu_user_seconds: +(du * 0.8).toFixed(2), cpu_system_seconds: +(du * 0.2).toFixed(2), cpu_total_seconds: +du.toFixed(2), max_rss_bytes: Math.round((job.mem || 60) * 1048576), samples: Math.max(2, Math.round(du / 2)) } : null;
-      runs.push({ outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason, resources: res }); });
+      var res = job.mon ? { cpu_user_seconds: +(du * 0.8).toFixed(2), cpu_system_seconds: +(du * 0.2).toFixed(2), cpu_total_seconds: +du.toFixed(2), max_rss_bytes: peakRss(job, t), samples: Math.max(2, Math.round(du / 2)) } : null;
+      var run = { outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason, resources: res };
+      if (job.lim) run.limits = limRecord(job, t, du);
+      runs.push(run); });
     return { name: name, runs: runs, stats: statsOf(runs) };
   }
   function buildActivity() { var jobs = {}; ROSTER.forEach(function (j) { var r = buildJobRuns(j.name); if (r) jobs[j.name] = r.runs.map(function (x) { return { started_at: x.started_at, finished_at: x.finished_at, outcome: x.outcome }; }); }); return { jobs: jobs }; }
@@ -429,17 +461,24 @@ window.CRONSTABLE_BRAND = "cronstable demo";
   }
   function buildResources(name) {
     var job = BYNAME[name]; if (!job) return null;
-    if (!job.mon) return { name: name, monitored: false, interval: null, live: [], runs: [] };
+    if (!job.mon) {
+      // unmonitored: only capped runs are listed (resources: null)
+      var capped = job.lim ? buildJobRuns(name).runs.slice(-12) : [];
+      return { name: name, monitored: false, interval: null, limits: limPayload(job), live: [], runs: capped };
+    }
     var now = nowMs(), jd = jobDict(job, now), live = [];
     if (jd.running && jd.running_resources) { var rr = jd.running_resources, series = [], st = now - jd.running_resources.cpu_seconds / (rr.cpu_percent / 100) * 1000;
       for (var k = 0; k <= 8; k++) { var tt = k * 2; series.push([tt, +(rr.cpu_percent * (0.7 + 0.4 * hash(name + k))).toFixed(1), Math.round(rr.rss_bytes * (0.5 + 0.06 * k))]); }
       live.push({ started_at: iso(now - 10000), pid: jd.pids[0], current: { cpu_seconds: rr.cpu_seconds, cpu_percent: rr.cpu_percent, rss_bytes: rr.rss_bytes }, series: series }); }
     var fires = prevFires(sched(job), now, 12, T0).reverse(), runs = [];
-    fires.forEach(function (t) { var du = runDur(job, t), oc = outcomeFor(job, t), series = [];
-      for (var k = 0; k * 2 <= du; k++) series.push([k * 2, +((job.cpu || 30) * (0.5 + 0.6 * hash(name + t + k))).toFixed(1), Math.round((job.mem || 60) * 1048576 * (0.4 + 0.5 * Math.min(1, k * 2 / du)))]);
-      runs.push({ outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason,
-        resources: { cpu_user_seconds: +(du * 0.8).toFixed(2), cpu_system_seconds: +(du * 0.2).toFixed(2), cpu_total_seconds: +du.toFixed(2), max_rss_bytes: Math.round((job.mem || 60) * 1048576), samples: series.length, series: series } }); });
-    return { name: name, monitored: true, interval: 2.0, live: live, runs: runs };
+    fires.forEach(function (t) { var du = runDur(job, t), oc = outcomeFor(job, t), series = [], peak = peakRss(job, t);
+      // RSS climbs to the run's peak (a memory kill: just under the cap)
+      for (var k = 0; k * 2 <= du; k++) series.push([k * 2, +((job.cpu || 30) * (0.5 + 0.6 * hash(name + t + k))).toFixed(1), Math.round(peak * (0.45 + 0.55 * Math.min(1, k * 2 / du)))]);
+      var run = { outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason,
+        resources: { cpu_user_seconds: +(du * 0.8).toFixed(2), cpu_system_seconds: +(du * 0.2).toFixed(2), cpu_total_seconds: +du.toFixed(2), max_rss_bytes: peak, samples: series.length, series: series } };
+      if (job.lim) run.limits = limRecord(job, t, du);
+      runs.push(run); });
+    return { name: name, monitored: true, interval: 2.0, limits: limPayload(job), live: live, runs: runs };
   }
   function buildTrends(name) {
     var r = buildJobRuns(name); if (!r) return null; var now = nowMs();
@@ -932,7 +971,7 @@ window.CRONSTABLE_BRAND = "cronstable demo";
     if ((m = /^\/dags\/([^/]+)\/trigger$/.exec(url)) && method === "POST") { var dg = decodeURIComponent(m[1]); if (!DAGS[dg]) return E(404); var tb; try { tb = JSON.parse(opts && opts.body || "{}"); } catch (e) { tb = {}; } var rp = resolveParams(DAGS[dg], tb.params); var k = "manual-" + Math.floor(hash(dg + nowMs()) * 0xffffffffff).toString(16).slice(0, 12); OVERLAY.dagRuns.push(makeManualRun(dg, k, nowMs(), DAGS[dg].tasks.some(function (t) { return t.type === "approval"; }) ? "awaiting" : "run", rp)); var tr = { dag: dg, name: dg, runKey: k, created: true }; if (rp) tr.params = rp; return J200(tr); }
     if ((m = /^\/dags\/([^/]+)\/backfill$/.exec(url)) && method === "POST") { var db = decodeURIComponent(m[1]); if (!DAGS[db] || !DAGS[db].schedule) return E(400, "unschedulable dag"); var b; try { b = JSON.parse(opts && opts.body || "{}"); } catch (e) { b = {}; } if (typeof b.from !== "string" || typeof b.to !== "string") return E(400, "from/to required"); var created = prevFires(DAGS[db].schedule, Date.parse(b.to), 200, Date.parse(b.from)).length; return J200({ ok: true, created: created, existing: 0 }); }
 
-    if (url === "/whoami") return J200({ authenticated: true, label: "authToken", scopes: ["view", "control", "approve", "params"], allScopes: true });
+    if (url === "/whoami") return J200({ authenticated: true, label: "authToken", scopes: ["view", "control", "approve", "params"], allScopes: true, badges: { public: true } });
     if (url === "/push/devices" && method === "GET") return J200({ devices: [{ id: "a1b2c3d4e5f60718", name: "Parker's iPhone", platform: "ios", publicKey: "(demo)", pushToken: "…4Q9zXk", createdAt: "2026-07-20T14:02:11+00:00", createdBy: "authToken" }] });
     if (url === "/push/devices" && method === "POST") { var dv; try { dv = JSON.parse(opts && opts.body || "{}"); } catch (e) { dv = {}; } return J200({ device: { id: "ffeeddccbbaa9988", name: dv.name || "device", platform: dv.platform || "ios", publicKey: "(demo)", pushToken: "…demo42", createdAt: "2026-07-23T00:00:00+00:00", createdBy: "authToken" }, created: true }); }
     if ((m = /^\/push\/devices\/([^/]+)\/test$/.exec(url)) && method === "POST") return J200({ device: decodeURIComponent(m[1]), status: 200, error: null });

@@ -833,7 +833,13 @@ def test_palette_entries_follow_job_state(browser, tmp_path):
                     if lbl.endswith(": " + name)
                 )
 
-            base = ["Copy command", "Logs", "Schedule", "Tail"]
+            base = [
+                "Copy badge Markdown",
+                "Copy command",
+                "Logs",
+                "Schedule",
+                "Tail",
+            ]
             assert verbs("gamma-slow") == sorted(base + ["Cancel", "Pause"])
             assert verbs("alpha-ok") == sorted(base + ["Resume", "Run"])
             assert verbs("delta-off") == sorted(base + ["Pause"])

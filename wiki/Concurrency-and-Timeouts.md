@@ -51,6 +51,13 @@ See [running on Windows](Running-on-Windows), including the one degradation
 (a daemon with no console cannot deliver the break, so the graceful step
 becomes the tree kill immediately).
 
+A run of a job with [resource limits](Resource-Limits) that is inside its own
+cgroup (Linux) or Job Object (Windows) takes the same graceful step. Its
+forced step kills that container, which also reaches descendants that left
+the process group or the process tree. On Linux the group `SIGKILL` follows
+the cgroup kill, so a process that left the cgroup but kept the group ends
+too. On Windows the Job Object kill takes the place of the tree kill.
+
 ## Option summary
 
 | Option | Type | Default | Description |
@@ -58,7 +65,7 @@ becomes the tree kill immediately).
 | `concurrencyPolicy` | enum: `Allow`, `Forbid`, `Replace` | `Allow` | Behavior when a launch is requested while another instance of the same job is still running. |
 | `concurrencyScope` | enum: `node`, `cluster` | `node` | How far `concurrencyPolicy` reaches. With `node`, only this process's running instances count. With `cluster`, `Forbid` and `Replace` also exclude instances on other nodes sharing the [`state` store](Durable-State). See [concurrency across a cluster](#concurrency-across-a-cluster). |
 | `executionTimeout` | float (seconds, `> 0` when set) | none (`null`) | Maximum wall-clock duration of a single run. On expiry the run is cancelled and assigned return code `-100`. |
-| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is canceled, the longest the daemon waits for the job's own process to exit after the graceful process-group signal (SIGTERM on POSIX, `CTRL_BREAK_EVENT` on Windows). The unconditional kill (process-group SIGKILL on POSIX, `taskkill /F /T` tree kill on Windows) follows when that process exits or the wait ends. See [cancellation and killTimeout](#cancellation-and-killtimeout) and [running on Windows](Running-on-Windows). |
+| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is canceled, the longest the daemon waits for the job's own process to exit after the graceful process-group signal (SIGTERM on POSIX, `CTRL_BREAK_EVENT` on Windows). The unconditional kill (process-group SIGKILL on POSIX, `taskkill /F /T` tree kill on Windows; for a run with [resource limits](Resource-Limits) in place, a kill of its cgroup ahead of the group SIGKILL on Linux, or of its Job Object in place of the tree kill on Windows) follows when that process exits or the wait ends. See [cancellation and killTimeout](#cancellation-and-killtimeout) and [running on Windows](Running-on-Windows). |
 
 Types come from the strictyaml schema: `concurrencyPolicy` is
 `Enum(["Allow", "Forbid", "Replace"])`, `concurrencyScope` is
@@ -486,7 +493,13 @@ time, so descendants are reached through the live process tree instead
    nothing about descendants sharing its group, and those are what hold the
    job's stdout/stderr pipes open. A group that is already empty makes this a
    no-op. Where the group cannot be signaled, fall back to `proc.kill()` on
-   the direct child.
+   the direct child. For a run inside its own cgroup
+   ([resource limits](Resource-Limits)), this step first writes `1` to the
+   cgroup's `cgroup.kill`, and the kernel sends SIGKILL to every process in
+   the cgroup, including a descendant that called `setsid`. The group
+   SIGKILL then follows as for any run, so a process that left the cgroup
+   but kept the group ends too. A kernel before 5.14 has no `cgroup.kill`:
+   the daemon then sends SIGKILL to each process listed in the cgroup.
 
 The operating system can refuse the daemon's signal to a job's own process,
 for example with `EPERM` for a process that another user owns, such as a
@@ -531,7 +544,10 @@ request the job can handle (`signal.SIGBREAK` in Python,
 `SetConsoleCtrlHandler` natively) to flush and exit. Step 3 shells out to
 `taskkill /F /T`, which force-kills the live parent/child process tree (the
 `taskkill` run itself is bounded at 10 seconds; on failure the fallback is
-`proc.kill()` on the direct child).
+`proc.kill()` on the direct child). For a run inside its own Job Object
+([resource limits](Resource-Limits)), step 3 calls `TerminateJobObject`
+instead. That ends every process in the job with exit code `1`, including
+one in a process group of its own and one whose parent has exited.
 
 One degradation: delivering a break needs a console shared with the daemon,
 so where there is none (a service context) step 1 becomes the tree kill
@@ -551,9 +567,11 @@ is a list, and the shell when `command` is a string. The wait ends when that
 process exits, and the forced step follows within about 0.25 seconds,
 whatever remains of `killTimeout`. On POSIX the forced step ends every
 process that is left in the group. On Windows the tree kill finds no process
-once the job's own process has exited. Raise `killTimeout` for a job whose
-own process needs longer to shut down, and lower it for a job that may
-ignore the graceful signal and must be force-killed quickly.
+once the job's own process has exited. For a run with resource limits in
+place, the forced step ends every process left in its cgroup or Job Object,
+on both platforms. Raise `killTimeout` for a job whose own process needs
+longer to shut down, and lower it for a job that may ignore the graceful
+signal and must be force-killed quickly.
 
 On POSIX the SIGTERM reaches the shell and the programs that it started at
 the same moment. A shell that sets no trap for SIGTERM exits at once, and
@@ -586,7 +604,8 @@ running until the program that it is running exits, so a workload under a
 string `command` has the whole `killTimeout`. A program that the command
 launches with `start` and does not wait for is the exception: once cmd.exe
 has exited, the tree kill does not reach that program, and it keeps running.
-When the interrupted program exits, cmd.exe goes on to the next step of a
+In a run's own Job Object, the forced step ends that program too. When the
+interrupted program exits, cmd.exe goes on to the next step of a
 command joined with `&`. That step starts after the break, so it runs until
 it exits or until `killTimeout` ends and the tree kill stops it. A step
 joined with `&&` starts only when the interrupted program exits with
@@ -600,7 +619,8 @@ the tree) cannot strand the run either. A killed run's wait for its
 stdout/stderr streams to reach EOF is bounded at 30 seconds, a fixed constant
 deliberately independent of `killTimeout`, which is legitimately `0` for jobs
 that must be force-killed at once but whose already-captured output should
-not be discarded.
+not be discarded. For a run with resource limits in place, the container kill
+reaches such a descendant as well.
 
 When that bound expires, cronstable keeps the output captured so far, closes
 its end of the job's pipes, logs a warning, and records the run. The run
@@ -655,9 +675,11 @@ check's streams have closed or their bounds have expired.
 
 An instance that the daemon has finished canceling has ended (see
 [concurrency policy](#concurrency-policy)), even when one of its processes is
-still alive: a descendant that left the process group or the process tree,
-or a process that outlives the forced kill, as when the operating system
-refuses the daemon's signal. A `concurrencyPolicy: Forbid` job's next fire
+still alive: a descendant that left the process group or the process tree
+(for a run with resource limits in place, one outside its container, which
+on Linux must also have left the process group), or a
+process that outlives the forced kill, as when the operating system refuses
+the daemon's signal. A `concurrencyPolicy: Forbid` job's next fire
 then starts a new instance beside that process, and a `Replace` launch
 starts the replacement beside it. A job that only ignores the graceful
 signal causes no such overlap, because its fires are dropped for the whole
@@ -720,6 +742,15 @@ including the no-console case where the graceful step cannot be delivered.
   the per-node behavior documented earlier. The local check runs first, and
   the [cluster gate](#concurrency-across-a-cluster) is an additional gate
   behind it.
+- **Resource limits.** A run that reaches its
+  [memory cap](Resource-Limits) is killed whole, with no graceful step and no
+  `killTimeout` wait: by the kernel's OOM kill of its cgroup on Linux, and by
+  a `TerminateJobObject` call on Windows. It fails with
+  `memory limit exceeded (<cap>)` and the kill's exit code, `-9` on Linux and
+  `1` on Windows. A cancellation or an `executionTimeout` of a capped run
+  follows the sequence on this page, and its forced step kills the run's
+  cgroup, followed by the process group, on Linux, or its Job Object on
+  Windows.
 - **startup failures vs. timeouts.** A `-100` return code specifically denotes
   a timeout-induced cancellation. A command that could not be launched at all
   (not found, for example) is assigned `127` instead, on the normal failure

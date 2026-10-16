@@ -18,7 +18,10 @@ try {
         throw 'Microsoft Defender is unavailable; refusing an unscanned submission.'
     }
     function Get-DefenderScanner {
+        # Use the newest version-named folder (for example, 4.18.26080.4-0)
+        # and skip other names, such as CurrentVersion.
         $command = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name.Split('-')[0] -as [version] } |
             Sort-Object { [version]$_.Directory.Name.Split('-')[0] } -Descending |
             Select-Object -First 1
         if (-not $command) {

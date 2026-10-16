@@ -271,9 +271,12 @@ def test_kill_with_retry_pending_rearms_the_same_deadline(daemon):
 
     def pending():
         job = daemon.request("/jobs/retry")
-        return (job.get("last_run") or {}).get("exit_code") == 23 and (
-            job.get("retry")
-        )
+        if (job.get("last_run") or {}).get("exit_code") != 23:
+            return None
+        # the daemon counts the attempt first; the task that sleeps out the
+        # delay sets the deadline when it starts, an event-loop turn later.
+        retry = job.get("retry")
+        return retry if retry and retry["nextRetryAt"] else None
 
     before = daemon.wait("arming the retry", pending)
     assert before["attempt"] == 1

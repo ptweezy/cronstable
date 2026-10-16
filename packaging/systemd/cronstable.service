@@ -26,6 +26,22 @@ RestartSec=5s
 KillMode=mixed
 TimeoutStopSec=90
 
+# Delegate= hands cronstable this unit's cgroup, chowned to User=, so it can
+# give each run of a job with resourceLimits a cgroup of its own. cronstable
+# moves itself into a daemon/ leaf of that cgroup once a job sets caps. The
+# list delegates only the memory and pids controllers, so memory and process
+# caps work and the host's CPU scheduling is unchanged. CPU caps need a drop-in
+# with Delegate=yes (see Resource Limits in the wiki). systemd before 236
+# reads only yes or no here and leaves delegation off; on such a host, use
+# Delegate=yes in a drop-in.
+Delegate=memory pids
+# OOMPolicy=continue keeps the service running when a job is OOM-killed at its
+# own memory cap. systemd 243 and later already default a delegated unit to
+# it; the line states that for readers and holds if a drop-in changes
+# Delegate=. systemd before 243 does not act on OOM kills; it logs a warning
+# for the unknown key and ignores the line.
+OOMPolicy=continue
+
 # /var/lib/cronstable, created on first start and owned by the service user.
 # It is the `state.path` the shipped configuration points at.
 StateDirectory=cronstable

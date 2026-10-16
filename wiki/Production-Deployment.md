@@ -25,6 +25,10 @@ requires the daemon to run as root. It is **unavailable** in the non-root
 published image. If you do not use that feature, drop root entirely. See
 [commands and environment](Commands-and-Environment) for the feature itself.
 
+Per-run [resource limits](Resource-Limits) (`resourceLimits`) also need more
+than the published image grants: root and a cgroup that cronstable can
+write. See [resource limits in a container](#resource-limits-in-a-container).
+
 ## The published image
 
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
@@ -89,8 +93,9 @@ COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 The published image satisfies a fully restricted pod security context:
 
 * **`runAsNonRoot` / non-root UID**: the daemon needs no privileges, so it runs
-  as an unprivileged UID (`65534`). Only per-job `user`/`group` switching needs
-  root, and that feature is not available here.
+  as an unprivileged UID (`65534`). Only per-job `user`/`group` switching and
+  per-run [resource limits](#resource-limits-in-a-container) need root, and
+  neither is available here.
 * **`RuntimeDefault` seccomp**: cronstable makes no exotic syscalls, so the default
   seccomp profile (or an equivalently strict custom one) works.
 * **`readOnlyRootFilesystem`**: neither the image nor a `pip`/`pipx` install
@@ -336,6 +341,46 @@ timing ordering (`leaseDurationSeconds > renewDeadlineSeconds`,
 RFC1123 `leaseName`/`leaseNamespace` shapes, the etcd endpoint/TLS rules, and
 the `electLeader` 2-node rejection. See
 [command-line reference](CLI-Reference).
+
+## Resource limits in a container
+
+In the published image, `resourceLimits` caps do not apply. The image runs
+as uid 65534, and container runtimes mount `/sys/fs/cgroup` read-only by
+default, so cronstable cannot give a run a cgroup of its own. A capped job
+runs uncapped, the daemon logs one warning naming the capped jobs, and each
+run's record says its caps were not enforced. A job with
+`resourceLimits.required: true` fails each run instead. The container's own
+limits, such as a pod's `resources.limits` or `docker run --memory` and
+`--cpus`, still bound cronstable and all of its jobs together.
+
+For per-run caps, the container needs:
+
+* cronstable running as root inside it, from an image of your own;
+* a writable cgroupfs, in the container's own cgroup namespace or in a
+  container cgroup that the runtime delegated. On a cgroup v2 host, Docker
+  and Podman give each container its own cgroup namespace by default, and
+  `--privileged` or, on Docker Engine 28 and later,
+  `--security-opt writable-cgroups=true` makes the cgroupfs writable.
+
+Kubernetes has no pod setting for this. In a privileged pod, which shares
+the host's cgroup namespace, whether caps apply depends on whether the
+runtime delegates the container's cgroup; check `limits` on
+[`GET /node`](HTTP-API#get-node). An unprivileged pod gets a writable
+cgroupfs only from a node-level runtime setting, such as containerd's
+`cgroup_writable` option.
+
+When the caps can apply, cronstable moves every process in the container's
+cgroup, its own included, into a `daemon/` child cgroup, and gives each
+capped run a cgroup under `runs/`. A `docker exec` shell joins the `daemon/`
+cgroup, so a second cronstable started that way shares the first daemon's
+`daemon/` and `runs/`, and its cpu controller too: either daemon's config
+apply can turn cpu control on or off for both, and neither turns it off
+while a run of either one holds a cpu cap. For independent cpu control, run
+a second capped daemon in a cgroup of its own (see
+[the cgroup layout](Resource-Limits#the-cgroup-layout)). A job that runs as
+root, as jobs do in such a container unless they set `user`, can write its
+own cgroup's files, so the caps there do not sandbox it (see
+[security](Resource-Limits#security)).
 
 ## Writable-path exceptions
 

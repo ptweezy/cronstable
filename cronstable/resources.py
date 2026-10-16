@@ -31,7 +31,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
-from cronstable.config import MONITOR_HISTORY_DEFAULT, SAMPLE_INTERVAL
+from cronstable.config import (
+    MONITOR_HISTORY_DEFAULT,
+    SAMPLE_INTERVAL,
+    resolve_web_toggle,
+)
 
 try:
     import psutil
@@ -452,6 +456,10 @@ class ResourceMonitor:
     One instance monitors one run.  It is created and driven entirely on the
     scheduler's event loop; the sample lock below only serialises the worker
     threads the samples themselves run on.
+
+    ``container`` is the run's cgroup or Job Object when it has resource
+    limits: its ``members()`` lists the tree and its ``cpu_times()`` gives
+    the CPU totals, children that exited between samples included.
     """
 
     def __init__(
@@ -460,9 +468,12 @@ class ResourceMonitor:
         *,
         interval: float = SAMPLE_INTERVAL,
         history: int = MONITOR_HISTORY_DEFAULT,
+        container: Any = None,
     ) -> None:
         self._pid = pid
         self._interval = interval
+        # the run's cgroup or Job Object (cronstable.limits), or None
+        self._container = container
         # bounded chart series of the run's samples (see _SeriesRecorder);
         # history <= 0 keeps the summary numbers only.
         self._recorder = _SeriesRecorder(history) if history > 0 else None
@@ -606,23 +617,85 @@ class ResourceMonitor:
                 pending.append(child_pid)
         return tree
 
+    def _tree_from_container(self, proc: Any) -> list[Any] | None:
+        """The container's members as Process objects, or ``None``.
+
+        ``None`` when the container cannot list them; the caller then
+        walks the process tree instead.
+        """
+        try:
+            pids = self._container.members()
+        except Exception:  # noqa: BLE001 - never let sampling raise
+            return None
+        if pids is None:
+            return None
+        tree = []
+        for pid in pids:
+            if pid == proc.pid:
+                tree.append(proc)
+                continue
+            try:
+                tree.append(psutil.Process(pid))
+            except Exception:  # noqa: BLE001 - exited since the listing
+                continue
+        return tree
+
+    def _read_tree(
+        self, proc: Any, index: dict[int, list[int]] | None
+    ) -> list[Any] | None:
+        """This sample's tree members, or ``None`` to skip the sample."""
+        if self._container is not None:
+            tree = self._tree_from_container(proc)
+            if tree is not None:
+                return tree
+        if index is not None:
+            return self._tree_from_index(proc, index)
+        try:
+            return [proc, *proc.children(recursive=True)]
+        except _TRANSIENT_ERRORS:
+            # the root is gone; still try to read it alone (it may be a
+            # zombie whose cpu_times is readable on some platforms).
+            return [proc]
+        except Exception:  # noqa: BLE001 - never let sampling raise
+            return None
+
+    def _fold_exact_cpu(self) -> bool:
+        """Fold the container's CPU totals in; False when it has none."""
+        if self._container is None:
+            return False
+        try:
+            exact = self._container.cpu_times()
+        except Exception:  # noqa: BLE001 - never let sampling raise
+            return False
+        if exact is None:
+            return False
+        self._cpu_user = max(self._cpu_user, exact[0])
+        self._cpu_system = max(self._cpu_system, exact[1])
+        return True
+
     def _sample_locked(
         self, index: dict[int, list[int]] | None = None
     ) -> None:
         proc = self._proc
         if proc is None:
             return
-        if index is not None:
-            tree = self._tree_from_index(proc, index)
-        else:
-            try:
-                tree = [proc] + proc.children(recursive=True)
-            except _TRANSIENT_ERRORS:
-                # the root is gone; still try to read it alone below (it may
-                # be a zombie whose cpu_times is readable on some platforms).
-                tree = [proc]
-            except Exception:  # noqa: BLE001 - never let sampling raise
-                return
+        tree = self._read_tree(proc, index)
+        if tree is None:
+            return
+        live, tree_pids, rss = self._read_members(tree)
+        if not live:
+            # the kernel's totals still cover members that have exited.
+            self._fold_exact_cpu()
+            return
+        self._samples += 1
+        self._bank_departed(live, tree_pids)
+        self._fold_totals(live, rss)
+
+    @staticmethod
+    def _read_members(
+        tree: list[Any],
+    ) -> tuple[dict[tuple, tuple], set[int], int]:
+        """Per-member CPU readings, the listed pids, and the summed RSS."""
         live: dict[tuple, tuple] = {}
         tree_pids = set()
         rss = 0
@@ -642,9 +715,12 @@ class ResourceMonitor:
                 continue
             live[key] = (times.user, times.system)
             rss += mem.rss
-        if not live:
-            return
-        self._samples += 1
+        return live, tree_pids, rss
+
+    def _bank_departed(
+        self, live: dict[tuple, tuple], tree_pids: set[int]
+    ) -> None:
+        """Bank departed members' CPU; carry listed-but-unread ones."""
         # Per-process CPU time is monotonic, but tree membership changes: a
         # member missing from this sample has exited, so bank its last-seen
         # reading in the departed accumulators before forgetting it.  The
@@ -667,19 +743,25 @@ class ResourceMonitor:
             self._departed_user += user
             self._departed_system += system
         self._members = live
+
+    def _fold_totals(self, live: dict[tuple, tuple], rss: int) -> None:
+        """Update the totals, live readings and series from one sample."""
         # Totals are departed + live, so sequential children (`sh -c 'a; b'`)
         # accumulate instead of plateauing at the largest instantaneous tree
         # sum.  The max() only guards against per-sample jitter in the
-        # readings ever nudging a total backward.
-        live_user = 0.0
-        live_system = 0.0
-        for user, system in live.values():
-            live_user += user
-            live_system += system
-        cpu_user = self._departed_user + live_user
-        cpu_system = self._departed_system + live_system
-        self._cpu_user = max(self._cpu_user, cpu_user)
-        self._cpu_system = max(self._cpu_system, cpu_system)
+        # readings ever nudging a total backward.  A container's kernel
+        # totals replace the per-member sum: they also count children that
+        # lived between samples.
+        if not self._fold_exact_cpu():
+            live_user = 0.0
+            live_system = 0.0
+            for user, system in live.values():
+                live_user += user
+                live_system += system
+            cpu_user = self._departed_user + live_user
+            cpu_system = self._departed_system + live_system
+            self._cpu_user = max(self._cpu_user, cpu_user)
+            self._cpu_system = max(self._cpu_system, cpu_system)
         self._max_rss = max(self._max_rss, rss)
         # live readings: current tree RSS + CPU% since the previous sample.
         self._live_rss = rss
@@ -741,6 +823,13 @@ class ResourceMonitor:
 # distribution.  Overridable in the reader's constructor purely for tests.
 CGROUP_ROOT = "/sys/fs/cgroup"
 
+# The layout cronstable.limits builds under the daemon's delegated cgroup:
+# the daemon's processes in DAEMON_LEAF, one cgroup per capped run (and,
+# while cpu weighting is on, per uncapped run) under RUNS_DIR.  A process
+# in <base>/DAEMON_LEAF with a <base>/RUNS_DIR sibling belongs to <base>.
+DAEMON_LEAF = "daemon"
+RUNS_DIR = "runs"
+
 
 class _CgroupV2Reader:
     """Best-effort reader of this process's cgroup v2 slice.
@@ -796,6 +885,8 @@ class _CgroupV2Reader:
         with cgroup namespaces (the container default) that path is ``/`` and
         the mount root *is* our slice.  Without namespaces the host-side path
         may not exist under our mount, in which case the reader stays inert.
+        A :data:`DAEMON_LEAF` with a :data:`RUNS_DIR` sibling resolves to
+        its parent, so the slice includes the capped runs.
         """
         if not os.path.isfile(os.path.join(root, "cgroup.controllers")):
             return None
@@ -814,6 +905,13 @@ class _CgroupV2Reader:
         path = os.path.normpath(os.path.join(root, rel)) if rel else root
         if not os.path.isdir(path):
             return None
+        parent = os.path.dirname(path)
+        if (
+            path != root
+            and os.path.basename(path) == DAEMON_LEAF
+            and os.path.isdir(os.path.join(parent, RUNS_DIR))
+        ):
+            return parent
         return path
 
     @property
@@ -1153,15 +1251,10 @@ def resolve_node_history_config(
 
     Returns ``None`` when disabled, else ``{"interval", "points"}``.  Enabled
     by default whenever the web API is on; ``nodeHistory: false`` /
-    ``nodeHistory: true`` are shorthands for the map form (mirroring how
-    ``web.metrics`` resolves in cronstable.prometheus).
+    ``nodeHistory: true`` are shorthands for the map form.
     """
-    raw = web_config.get("nodeHistory")
-    if raw is False:
-        return None
-    if raw is None or raw is True:
-        raw = {}
-    if not raw.get("enabled", True):
+    raw = resolve_web_toggle(web_config, "nodeHistory")
+    if raw is None:
         return None
     return {
         "interval": float(raw.get("interval", NODE_HISTORY_INTERVAL)),

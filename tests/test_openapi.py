@@ -165,3 +165,45 @@ def test_every_error_response_declares_the_json_envelope():
         "structure it walks has moved (a renamed `paths` key, or statuses "
         "that stopped being plain integers)"
     )
+
+
+def _schema_props(spec, ref_or_schema):
+    """The ``properties`` of a schema, following one ``$ref``/``allOf``."""
+    schema = ref_or_schema
+    if "allOf" in schema:
+        (schema,) = schema["allOf"]
+    if "$ref" in schema:
+        schema = spec["components"]["schemas"][schema["$ref"].split("/")[-1]]
+    return schema["properties"]
+
+
+def test_limits_objects_match_the_payloads_they_describe():
+    # resourceLimits rides five payloads; each declared object must name
+    # exactly the keys the code serves, so a renamed field fails here.
+    from cronstable.config import ResourceLimits
+    from cronstable.limits import Capability, LimitsRecord
+
+    spec = YAML(typ="safe").load(_SPEC_PATH.read_text(encoding="utf-8"))
+    schemas = spec["components"]["schemas"]
+    resources = spec["paths"]["/jobs/{name}/resources"]["get"]["responses"]
+    resources = resources["200"]["content"]["application/json"]["schema"]
+    caps = ResourceLimits(cpu=1.0).to_payload()
+    record = LimitsRecord(
+        cpu=1.0,
+        memory_bytes=None,
+        processes=None,
+        required=False,
+        enforced=True,
+        mechanism="cgroup-v2",
+        unenforced=(),
+        reason=None,
+    ).to_dict()
+    capability = Capability(True, "job-object", frozenset(), None, None)
+    for holder, expected in (
+        (schemas["Job"]["properties"]["limits"], caps),
+        (resources["properties"]["limits"], caps),
+        (schemas["JobRun"]["properties"]["limits"], record),
+        (schemas["VerificationResult"]["properties"]["limits"], record),
+        (schemas["NodeView"]["properties"]["limits"], capability.to_dict()),
+    ):
+        assert set(_schema_props(spec, holder)) == set(expected)

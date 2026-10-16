@@ -393,6 +393,15 @@ def canonical_job(
             "priority": job.queuePriority,
             "timeout": job.queueTimeout,
         }
+    caps = job.resourceLimits
+    if caps is not None:
+        # normalized values, so `512M` and 536870912 hash alike
+        out["resourceLimits"] = {
+            "cpu": caps.cpu,
+            "memory": caps.memory,
+            "processes": caps.processes,
+            "required": caps.required,
+        }
     if job.params:
         # The declaration decides which values a run can take, so replicas
         # that disagree on it must show as drift, and a pool entry queued

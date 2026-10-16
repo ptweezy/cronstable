@@ -10,6 +10,9 @@ import configparser
 import itertools
 import os
 import re
+import sys
+import types
+import xml.etree.ElementTree as ET
 
 import pytest
 from strictyaml.ruamel import YAML
@@ -112,6 +115,149 @@ def test_the_live_backend_lane_cannot_pass_hollow():
     assert switches <= set(env)
     assert "tests/test_backend_live.py" in run["run"]
     assert 'totals["skipped"] == 0' in run["run"]
+
+
+def _cgroup_lane_step(name):
+    """The ``run`` script of the cgroups-live step called ``name``."""
+    job = _load_workflow("release.yml")["jobs"]["cgroups-live"]
+    assert job["runs-on"].startswith("ubuntu-")
+    return next(
+        step["run"] for step in job["steps"] if step.get("name") == name
+    )
+
+
+def _live_readers():
+    """Every test file that names the CRONSTABLE_LIMITS_LIVE switch."""
+    tests = os.path.join(ROOT, "tests")
+    myself = os.path.basename(__file__)  # this file names the switch
+    readers = []
+    for name in sorted(os.listdir(tests)):
+        if not name.endswith(".py") or name == myself:
+            continue
+        with open(os.path.join(tests, name), encoding="utf-8") as fobj:
+            source = fobj.read()
+        if re.search(r"[\"']CRONSTABLE_LIMITS_LIVE[\"']", source):
+            readers.append("tests/" + name)
+    assert len(readers) >= 2, "the live-switch detector went stale"
+    return readers
+
+
+def test_the_live_cgroup_lane_cannot_pass_hollow():
+    run = _cgroup_lane_step(
+        "Run the live resource limit tests in a delegated cgroup"
+    )
+    # the tests run as a transient service in a cgroup delegated to the
+    # runner user, and systemd-run hands that service none of the step's
+    # environment, so both switches ride on its command line
+    command = " ".join(run.split("\\\n"))
+    assert re.search(r"\bsudo systemd-run\b", command)
+    for flag in ("--wait", "--pipe", "-p Delegate=yes", "--uid=", "--gid="):
+        assert flag in command, flag
+    for switch in ("CRONSTABLE_LIMITS_LIVE", "CRONSTABLE_LIVE_REQUIRED"):
+        assert "--setenv={}=1".format(switch) in command, switch
+    # every test file that names the switch runs in the lane
+    for path in _live_readers():
+        assert path in command, path
+    assert "--junitxml=" in command
+    assert 'totals["skipped"] == 0' in run
+
+
+def _cpu_skips(tmp_path, monkeypatch):
+    """The live files' skip messages where only cpu is not delegated."""
+    from cronstable import limits
+    from cronstable._cgroups import _CPU_NOT_DELEGATED
+    from tests import test_cgroups_live, test_limits_live
+
+    cap = limits.Capability(
+        True,
+        "cgroup-v2",
+        frozenset({"memory", "processes"}),
+        _CPU_NOT_DELEGATED,
+        None,
+    )
+    (tmp_path / "cgroup.controllers").write_text("memory pids\n")
+    manager = types.SimpleNamespace(
+        setup=lambda retry=False: cap,
+        backend=types.SimpleNamespace(_base=str(tmp_path)),
+    )
+    messages = []
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "platform", "linux")
+        patch.setattr(test_limits_live, "IS_WINDOWS", False)
+        for module in (test_cgroups_live, test_limits_live):
+            patch.setattr(module, "_LIVE", True)
+            patch.setattr(module, "_REQUIRED", False)
+            patch.setitem(module._STATE, "manager", manager)
+        for needs_cpu in (
+            test_cgroups_live._cpu_manager,
+            lambda: next(test_limits_live._installed(test_limits_live._ALL)),
+        ):
+            with pytest.raises(pytest.skip.Exception) as caught:
+                needs_cpu()
+            messages.append(caught.value.msg)
+    return messages
+
+
+def _junit(path, cases):
+    """Write ``cases``, (name, outcome, message) each, as pytest does."""
+    counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    tags = {"failures": "failure", "errors": "error", "skipped": "skipped"}
+    suite = ET.Element("testsuite", name="pytest")
+    for name, outcome, message in cases:
+        counts["tests"] += 1
+        case = ET.SubElement(suite, "testcase", classname="tests", name=name)
+        if outcome != "passed":
+            counts[outcome] += 1
+            tag = ET.SubElement(case, tags[outcome], message=message)
+            tag.text = "tests/test_live.py:1: " + message
+    for key, value in counts.items():
+        suite.set(key, str(value))
+    root = ET.Element("testsuites", name="pytest tests")
+    root.append(suite)
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def test_the_memory_pids_lane_skips_only_the_tests_that_need_cpu(
+    tmp_path, monkeypatch
+):
+    run = _cgroup_lane_step(
+        "Run the live resource limit tests with Delegate=memory pids"
+    )
+    # the packaged unit's delegation, in a slice that no Delegate=yes
+    # sibling shares, so cpu is not offered
+    command = " ".join(run.split("\\\n"))
+    assert re.search(r"\bsudo systemd-run\b", command)
+    for flag in ("--wait", "--pipe", '-p "Delegate=memory pids"', "--uid="):
+        assert flag in command, flag
+    assert re.search(r"--slice=(?!system\.slice)\S+\.slice\s", command)
+    assert "--setenv=CRONSTABLE_LIMITS_LIVE=1" in command
+    assert "CRONSTABLE_LIVE_REQUIRED" not in command  # the cpu tests skip
+    for path in _live_readers():
+        assert path in command, path
+    junit = re.search(r"--junitxml=(\S+)", command).group(1)
+    checker = compile(
+        run.split("<<'EOF'\n", 1)[1].split("\nEOF", 1)[0], "check", "exec"
+    )
+    skips = _cpu_skips(tmp_path, monkeypatch)
+    cpu = [("test_cpu", "skipped", message) for message in skips]
+    passed = ("test_memory", "passed", None)
+    monkeypatch.chdir(tmp_path)
+
+    def check(*cases):
+        _junit(junit, cases)
+        exec(checker, {})
+
+    check(passed, *cpu)
+    check(passed)
+    for hollow in (
+        (),
+        tuple(cpu),
+        (passed, ("test_scope", "skipped", "no user scope: no bus")),
+        (passed, ("test_hog", "failures", "the hog lived")),
+        (passed, ("test_hog", "errors", "no fixture")),
+    ):
+        with pytest.raises(AssertionError):
+            check(*hollow)
 
 
 def _expand(pattern):

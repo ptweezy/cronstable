@@ -19,6 +19,7 @@ payload must remain visible as text.
 """
 
 import copy
+import datetime
 import json
 import re
 import urllib.parse
@@ -27,6 +28,11 @@ import pytest
 
 pytest.importorskip("playwright.sync_api")
 
+from cronstable import limits  # noqa: E402
+from cronstable.cron import JobRunInfo  # noqa: E402
+from cronstable.job import JobOutputStream  # noqa: E402
+from cronstable.limits import Capability, LimitsRecord  # noqa: E402
+from cronstable.resources import ResourceUsage  # noqa: E402
 from tests import _web_e2e as e2e  # noqa: E402
 
 # Breaks out of element text, a "double-quoted" and a 'single-quoted'
@@ -426,6 +432,131 @@ def test_hostile_stream_names_and_sse_payload_shapes(browser, tmp_path):
             assert_clean(page, "scripted tail stream")
 
 
+class _FakeLimitsManager:
+    """Stands in for cgroups and Job Objects: no capped job launches."""
+
+    def converge(self, capped):
+        pass
+
+    def capability(self):
+        return Capability(True, "cgroup-v2", frozenset(), None, None)
+
+
+async def _record_hostile_limits(cron):
+    start = datetime.datetime.now(datetime.timezone.utc)
+    t0 = start.timestamp()
+    series = [[t0 + k, 50.0, (k + 1) * 2**20] for k in range(5)]
+    for name, usage in (
+        ("charted", ResourceUsage(1.0, 0.5, 5 * 2**20, 5, series=series)),
+        ("tabled", None),
+    ):
+        record = LimitsRecord(
+            cpu=1.0,
+            memory_bytes=64 * 2**20,
+            processes=8,
+            required=False,
+            enforced=False,
+            mechanism=PAYLOAD,
+            unenforced=(PAYLOAD,),
+            reason=PAYLOAD,
+            memory_exceeded=True,
+            peak_memory_bytes=64 * 2**20,
+        )
+        cron._record_run(
+            name,
+            JobRunInfo(
+                outcome="failure",
+                exit_code=-9,
+                started_at=start,
+                finished_at=start + datetime.timedelta(seconds=5),
+                fail_reason=PAYLOAD,
+                output=JobOutputStream(),
+                resource_usage=usage,
+                limits=record,
+            ),
+        )
+
+
+def _hostile_caps(body):
+    """``body``'s caps as strings, the way a hostile peer could send them."""
+    caps = {
+        "cpu": PAYLOAD,
+        "memory_bytes": PAYLOAD,
+        "processes": PAYLOAD,
+        "required": True,
+    }
+    for job in body if isinstance(body, list) else [body]:
+        if "limits" in job:
+            job["limits"] = dict(caps)
+        for run in job.get("runs") or []:
+            (run.get("limits") or {}).update(
+                caps,
+                peak_memory_bytes=PAYLOAD,
+                cpu_throttled_seconds=PAYLOAD,
+                process_limit_hits=PAYLOAD,
+            )
+    return body
+
+
+def test_hostile_resource_limits_render_literally(browser, tmp_path):
+    """Limits reasons and caps reach the drawer, History and Resources tabs
+    as text: the daemon records hostile reasons, and a rewrite turns the
+    numeric caps into hostile strings."""
+    jobs = [
+        e2e.job(
+            "charted",
+            "echo never",
+            monitorResources=True,
+            resourceLimits={"cpu": 1, "memory": "64M", "processes": 8},
+        ),
+        e2e.job("tabled", "echo never", resourceLimits={"memory": "64M"}),
+    ]
+    previous = limits._MANAGER
+    limits.set_manager(_FakeLimitsManager())
+    try:
+        with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
+            daemon.call(_record_hostile_limits(daemon.cron))
+
+            def routes(page):
+                page.faults.rewrite(r"/jobs", _hostile_caps)
+                page.faults.rewrite(r"/jobs/[^/]+/runs", _hostile_caps)
+                page.faults.rewrite(r"/jobs/[^/]+/resources", _hostile_caps)
+
+            with e2e.open_page(
+                browser, daemon.url, before_goto=routes
+            ) as page:
+                for name in ("charted", "tabled"):
+                    _click(page, '#rows [data-logs="{}"]'.format(name))
+                    page.wait_for_selector('#drawer[aria-hidden="false"]')
+                    chip = page.wait_for_selector("#dMeta .ha-chip.caps")
+                    assert PAYLOAD in chip.text_content()
+                    assert_clean(page, name + " caps chip")
+                    _click(page, '#dTabs button[data-tab="history"]')
+                    page.wait_for_selector("#historyPane .ha-chip.cap-off")
+                    assert PAYLOAD in page.get_attribute(
+                        "#historyPane .ha-chip.cap-off", "title"
+                    )
+                    # the run's cap arrived as a string
+                    hit = page.get_attribute(
+                        "#historyPane .ha-chip.cap-hit", "title"
+                    )
+                    assert hit == "killed at its memory cap (—)"
+                    assert_clean(page, name + " history limits")
+                    _click(page, '#dTabs button[data-tab="resources"]')
+                    page.wait_for_selector("#resourcesPane .warn")
+                    pane = page.evaluate(
+                        "() => { const w = document.querySelector("
+                        "'#resourcesPane .warn');"
+                        " return w.textContent + ' ' + w.title; }"
+                    )
+                    assert PAYLOAD in pane
+                    assert_clean(page, name + " resources limits")
+                    page.keyboard.press("Escape")
+                    page.wait_for_selector('#drawer[aria-hidden="true"]')
+    finally:
+        limits.set_manager(previous)
+
+
 # --------------------------------------------------------------------------
 # 2. poisoned API responses (a hostile server or peer)
 # --------------------------------------------------------------------------
@@ -523,6 +654,104 @@ def _poison(value, *, numbers=False, keep=frozenset(), key=None):
     return value
 
 
+_ZOO_CAPS = {
+    "cpu": 0.5,
+    "memory_bytes": 64 * 2**20,
+    "processes": 8,
+    "required": True,
+}
+# capped zoo jobs: one charted (a live instance, sampled runs and a
+# refused run), one tabled (no monitoring: the caps-only view)
+_ZOO_CAPPED = ("zoo-caps-charted", "zoo-caps-tabled")
+
+
+def _zoo_limits(**over):
+    """A run's limits record that sets every marker: a memory kill, caps
+    the host left off, and a hostile reason."""
+    record = dict(
+        _ZOO_CAPS,
+        enforced=False,
+        mechanism="cgroup-v2",
+        unenforced=["cpu", "processes"],
+        reason=PAYLOAD,
+        refused=False,
+        memory_exceeded=True,
+        process_limit_hits=2,
+        peak_memory_bytes=64 * 2**20,
+        cpu_throttled_seconds=1.5,
+    )
+    record.update(over)
+    return record
+
+
+def _zoo_detail(path):
+    """A capped zoo job's ``/runs`` or ``/resources`` answer, else None."""
+    match = re.fullmatch(r"/jobs/([^/]+)/(runs|resources)", path)
+    if match is None or match.group(1) not in _ZOO_CAPPED:
+        return None
+    name, what = match.groups()
+    t0 = 1767225600.0  # 2026-01-01T00:00:00Z
+    series = [[t0 + k, 40.0 + k, (k + 1) * 2**20] for k in range(5)]
+    run = {
+        "outcome": "failure",
+        "exit_code": -9,
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T00:00:05+00:00",
+        "duration": 5.0,
+        "fail_reason": PAYLOAD,
+        "skip_reason": None,
+        "resources": None,
+        "limits": _zoo_limits(),
+    }
+    refused = dict(
+        run,
+        exit_code=None,
+        limits=_zoo_limits(refused=True, memory_exceeded=False),
+    )
+    charted = name == _ZOO_CAPPED[0]
+    if charted:
+        usage = {
+            "cpu_total_seconds": 1.5,
+            "cpu_user_seconds": 1.0,
+            "cpu_system_seconds": 0.5,
+            "max_rss_bytes": 5 * 2**20,
+            "samples": len(series),
+            "series": series,
+        }
+        runs = [
+            dict(run, resources=usage),
+            dict(
+                run,
+                resources=usage,
+                limits=_zoo_limits(
+                    enforced=True,
+                    unenforced=[],
+                    reason=None,
+                    memory_exceeded=False,
+                ),
+            ),
+            refused,
+        ]
+    else:
+        runs = [run, refused]
+    if what == "runs":
+        return {"name": name, "runs": runs, "stats": {"total": len(runs)}}
+    live = {
+        "started_at": run["started_at"],
+        "pid": 7,
+        "current": {"cpu_seconds": 1.0, "cpu_percent": 40.0, "rss_bytes": 1},
+        "series": series,
+    }
+    return {
+        "name": name,
+        "monitored": charted,
+        "interval": 1.0 if charted else None,
+        "limits": dict(_ZOO_CAPS),
+        "live": [live] if charted else [],
+        "runs": runs,
+    }
+
+
 def _zoo(jobs):
     """Append synthetic jobs covering every row chip and drawer branch."""
     base = copy.deepcopy(jobs[0])
@@ -551,6 +780,8 @@ def _zoo(jobs):
 
     unknown = copy.deepcopy(last)
     unknown["outcome"] = "unknown"
+    capped = copy.deepcopy(last)
+    capped["limits"] = _zoo_limits()
     return jobs + [
         variant(
             "zoo-running",
@@ -590,6 +821,15 @@ def _zoo(jobs):
             },
         ),
         variant("zoo-tz", timezone="Europe/Berlin", utc=False),
+        *(
+            variant(
+                name,
+                limits=dict(_ZOO_CAPS),
+                last_run=capped,
+                history=[capped],
+            )
+            for name in _ZOO_CAPPED
+        ),
     ]
 
 
@@ -701,7 +941,8 @@ class _Poisoner:
     ``mode`` is ``"everything"`` or ``"branches"`` (enum-like keys kept);
     ``numbers`` names the one endpoint prefix whose numbers are poisoned
     as well. Requests carrying a poisoned identity have the payload
-    stripped before they reach the daemon, so drill-downs still answer.
+    stripped before they reach the daemon, so drill-downs still answer;
+    the capped zoo jobs' drill-downs come from :func:`_zoo_detail`.
     """
 
     def __init__(self, page, mode, numbers=None, cluster=None):
@@ -725,6 +966,9 @@ class _Poisoner:
             return self._fulfill(route, path, copy.deepcopy(self.cluster))
         if path == "/fleet" and self.cluster is not None:
             return self._fulfill(route, path, _fleet(self.jobs))
+        detail = _zoo_detail(path)
+        if detail is not None:
+            return self._fulfill(route, path, detail)
         response = route.fetch(url=url)
         ctype = response.headers.get("content-type", "")
         if "json" not in ctype or request.method != "GET":
@@ -789,6 +1033,48 @@ _POISON_NOISE = (
 )
 
 
+def _tour_capped_zoo(page, where):
+    """The capped zoo jobs' drawers: the caps chip, the History limit
+    chips, and every Resources selection or the caps-only table."""
+    for name in _ZOO_CAPPED:
+        page.evaluate(
+            """(name) => [...document.querySelectorAll('#rows tr[data-job]')]
+              .find((r) => r.getAttribute('data-job').startsWith(name))
+              .querySelector('[data-logs]').click()""",
+            name,
+        )
+        page.wait_for_selector('#drawer[aria-hidden="false"]')
+        page.wait_for_selector("#dMeta .ha-chip.caps")
+        assert_clean(page, "{} {} meta".format(where, name))
+        for tab in ("history", "resources"):
+            _click(page, '#dTabs button[data-tab="{}"]'.format(tab))
+            page.wait_for_selector('.pane.active[data-pane="{}"]'.format(tab))
+            page.wait_for_function(
+                "(id) => !document.getElementById(id).textContent"
+                ".includes('loading')",
+                arg=tab + "Pane",
+            )
+            assert_clean(page, "{} {} {}".format(where, name, tab))
+        chips = page.evaluate(
+            "document.querySelectorAll('#resourcesPane [data-sel]').length"
+        )
+        for index in range(chips):
+            page.evaluate(
+                "(i) => document.querySelectorAll("
+                "'#resourcesPane [data-sel]')[i].click()",
+                index,
+            )
+            page.wait_for_function(
+                "(i) => { const b = document.querySelectorAll("
+                "'#resourcesPane [data-sel]')[i];"
+                " return !!b && b.classList.contains('active'); }",
+                arg=index,
+            )
+            assert_clean(page, "{} {} selection {}".format(where, name, index))
+        page.keyboard.press("Escape")
+        page.wait_for_selector('#drawer[aria-hidden="true"]')
+
+
 def _poison_tour(page, where):
     page.wait_for_selector("#rows tr[data-job]")
     page.wait_for_selector("#dagRows tr[data-dag]")
@@ -806,6 +1092,7 @@ def _poison_tour(page, where):
             assert_clean(page, "{} job drawer {}".format(where, tab))
         page.keyboard.press("Escape")
         page.wait_for_selector('#drawer[aria-hidden="true"]')
+    _tour_capped_zoo(page, where)
     # DAG drawers: every tab, for the gated and the failed run
     count = page.evaluate(
         "document.querySelectorAll('#dagRows [data-dagopen]').length"

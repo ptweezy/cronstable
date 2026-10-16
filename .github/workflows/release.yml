@@ -521,6 +521,7 @@ jobs:
             tests/test_web_prefs_e2e.py \
             tests/test_web_surfaces_e2e.py \
             tests/test_web_e2e_helper.py \
+            tests/test_web_limits_e2e.py \
             -v -rs --junitxml=parity-enforce.xml
           .tox/py-posix/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET
@@ -684,6 +685,89 @@ jobs:
         run: |
           docker logs etcd-plain || true
           docker logs etcd-auth || true
+    needs:
+      - version
+      - tox-static
+
+  # Runs the resourceLimits tests against the runner's kernel, in a transient
+  # service whose cgroup systemd delegates to the runner user, as the packaged
+  # unit does for the daemon. systemd-run passes the service none of the
+  # step's environment, so the switches ride on its command line.
+  # CRONSTABLE_LIVE_REQUIRED turns a skip for a missing controller into a
+  # failure.
+  cgroups-live:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install the package and development dependencies
+        run: pip install -e '.[dev]'
+      - name: Run the live resource limit tests in a delegated cgroup
+        run: |
+          set -euo pipefail
+          sudo systemd-run --wait --pipe --collect --same-dir \
+            -p Delegate=yes --uid="$(id -u)" --gid="$(id -g)" \
+            --setenv=CRONSTABLE_LIMITS_LIVE=1 \
+            --setenv=CRONSTABLE_LIVE_REQUIRED=1 \
+            --setenv=PATH="$PATH" \
+            --setenv=HOME="$HOME" \
+            --setenv=LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
+            "$(command -v python)" -m pytest \
+            tests/test_limits_live.py tests/test_cgroups_live.py \
+            -v -rs -p no:randomly --junitxml=cgroups-live.xml
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for suite in ET.parse("cgroups-live.xml").getroot().iter("testsuite"):
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          print("live cgroups:", totals)
+          assert totals["tests"] >= 1, "no live test was collected"
+          assert totals["failures"] == 0 and totals["errors"] == 0
+          assert totals["skipped"] == 0, "a live test skipped"
+          EOF
+      # The packaged unit's delegation, in a slice of its own: in
+      # system.slice, a Delegate=yes sibling such as Docker's has systemd
+      # offer the cpu controller to every service. Memory and process caps
+      # apply here, and only the tests that need the cpu controller may skip.
+      - name: Run the live resource limit tests with Delegate=memory pids
+        run: |
+          set -euo pipefail
+          sudo systemd-run --wait --pipe --collect --same-dir \
+            --slice=cronstable_live_memory_pids.slice \
+            -p "Delegate=memory pids" --uid="$(id -u)" --gid="$(id -g)" \
+            --setenv=CRONSTABLE_LIMITS_LIVE=1 \
+            --setenv=PATH="$PATH" \
+            --setenv=HOME="$HOME" \
+            --setenv=LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
+            "$(command -v python)" -m pytest \
+            tests/test_limits_live.py tests/test_cgroups_live.py \
+            -v -rs -p no:randomly --junitxml=cgroups-live-memory-pids.xml
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          # the skip messages of the live tests that need the cpu controller
+          cpu = {
+              "no delegated cgroup v2 that caps cpu, memory, processes: "
+              "the cpu controller is not delegated to cronstable",
+              "the cgroup does not offer the cpu controller",
+          }
+          root = ET.parse("cgroups-live-memory-pids.xml").getroot()
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for suite in root.iter("testsuite"):
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          print("live cgroups, Delegate=memory pids:", totals)
+          assert totals["tests"] >= 1, "no live test was collected"
+          assert totals["failures"] == 0 and totals["errors"] == 0
+          assert totals["skipped"] < totals["tests"], "every live test skipped"
+          for case in root.iter("testcase"):
+              for skipped in case.iter("skipped"):
+                  message = skipped.get("message")
+                  assert message in cpu, (case.get("name"), message)
+          EOF
     needs:
       - version
       - tox-static
@@ -1065,6 +1149,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
       # The container writes these as root with mode 0600, which the
       # runner-user tar in the cache save cannot read.
       - name: Make the pip cache readable by the cache save
@@ -1359,6 +1444,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
@@ -1993,6 +2079,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
       - name: Rename binary
         run: |-
           mv dist/cronstable "dist/cronstable-${{ matrix.asset }}"
@@ -2680,6 +2767,8 @@ jobs:
             sh pyinstaller/install_extra.sh zeroconf "zeroconf==${{ needs.preflight.outputs.zeroconf }}" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
+          # The cap backends survived the freeze (see check_bundle.sh).
+          PY="uv run python" sh pyinstaller/check_bundle.sh dist/cronstable.exe
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
           # fail closed at config validation when they cannot import).
           ./dist/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
@@ -2738,6 +2827,7 @@ jobs:
         run: |
           set -euo pipefail
           ./dist/cronstable/cronstable.exe --version
+          PY="uv run python" sh pyinstaller/check_bundle.sh dist/cronstable/cronstable.exe
           ./dist/cronstable/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
           uv run python -m pytest -c acceptance/pytest.ini acceptance \
             --cronstable-bin dist/cronstable/cronstable.exe \
@@ -2932,6 +3022,7 @@ jobs:
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
 
   # cryptography wheels, built once per (libc, arch) for image platforms
   # without PyPI wheels (one QEMU compile takes an hour or more). Docker jobs
@@ -3932,6 +4023,7 @@ jobs:
       - tox
       - tox-mindeps
       - backends-live
+      - cgroups-live
       - tox-static
       - licenses
       - release-prepare

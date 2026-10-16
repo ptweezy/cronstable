@@ -108,17 +108,29 @@ All metrics are prefixed `cronstable_`. Per-job metrics carry the job name in a 
 | `cronstable_job_peak_rss_bytes{job_name}` | gauge | Highest resident-set size (bytes) observed across all the job's monitored runs. Absent until the first monitored run. |
 | `cronstable_job_last_run_cpu_seconds{job_name}` | gauge | Total CPU time of the most recent monitored run. Absent unless that run had `monitorResources` on. |
 | `cronstable_job_last_run_max_rss_bytes{job_name}` | gauge | Peak resident-set size (bytes) of the most recent monitored run. Absent unless that run had `monitorResources` on. |
+| `cronstable_job_cpu_limit_cpus{job_name}` | gauge | The job's [`resourceLimits.cpu`](Resource-Limits) cap in CPUs. Absent unless the job sets a CPU cap. |
+| `cronstable_job_memory_limit_bytes{job_name}` | gauge | The job's memory cap in bytes. Absent unless the job sets a memory cap. |
+| `cronstable_job_process_limit{job_name}` | gauge | The job's process-count cap. Absent unless the job sets a process cap. |
+| `cronstable_job_memory_limit_exceeded_total{job_name}` | counter | Recorded runs that were killed at the job's memory cap; a [verify check](Resource-Limits#verify-checks-and-dag-tasks) killed at the cap does not count. Zero-filled for every job with a memory cap, and absent for the others. |
+| `cronstable_job_last_run_limits_enforced{job_name}` | gauge | `1` when every cap of the job's most recent run applied, `0` when one did not, including a run that `resourceLimits.required` refused. Absent unless the job sets caps and its most recent run had them. |
 | `cronstable_job_paused{job_name}` | gauge | `1` while the job is [paused at runtime](Pausing-Jobs), else `0`. |
 | `cronstable_job_late{job_name, check}` | gauge | `1` while the job's [SLA check](Late-Run-Detection) is breached, per `check` (`maxTimeSinceSuccess` / `lateAfter` / `maxRuntime`). Emitted from the monitor's first evaluation, only for checks the job configures in its `sla:` block. Paused jobs are exempt. |
 | `cronstable_job_sla_breaches_total{job_name, check}` | counter | [SLA breaches](Late-Run-Detection) latched for the job, per `check`. Increments once per breach, not per evaluation. Emitted alongside `cronstable_job_late`, zero-filled from the first evaluation. |
 
-The four preceding resource families require the job to opt into
+The four CPU and RSS families require the job to opt into
 [`monitorResources`](Configuration-Reference#metrics). They are sampled and
 best-effort: see [resource monitoring](Resource-Monitoring) for the sampling
 model and every other surface the numbers reach. Like the run counters,
 `cronstable_job_cpu_seconds_total` and `cronstable_job_peak_rss_bytes` are made
 restart-durable by a `state:` store (see
 [semantics and guarantees](#semantics-and-guarantees)).
+
+The five limit families appear only for jobs that set
+[`resourceLimits`](Resource-Limits), never for DAG tasks.
+`cronstable_job_memory_limit_exceeded_total` is restart-durable with a
+`state:` store, like the run counters. `cronstable_job_last_run_limits_enforced`
+reads `0` when a job's most recent run went without some of its caps, which
+makes it an alert signal (see [example alerts](#example-alerts)).
 
 `cronstable_job_duration_seconds` and the `cronstable_job_last_run_*` gauges
 read the run record, whose `finished_at` is the instant the run ended (see
@@ -176,7 +188,7 @@ If a backend read fails during a scrape, the cluster block degrades to `cronstab
 - **Counters agree with the API.** `cronstable_job_runs_total` increments at the exact point a run enters the run history (`GET /jobs/{name}/runs`), so the two surfaces can never disagree on outcomes.
 - **Counters survive reloads. With durable state, they survive restarts.** The accumulators live on the daemon, not the web app, so even a configuration reload that restarts the web server or the cluster manager keeps them. Without a `state:` section, a process restart resets them, which is normal for Prometheus counters. With a [durable state store](Durable-State) configured, the per-job counters are snapshotted durably and seeded back on boot for the jobs still in the configuration:
 
-  - Counters covered: runs by outcome, retries, permanent and start failures, the duration histogram, the last success/failure timestamps, and the SLA breach counters.
+  - Counters covered: runs by outcome, retries, permanent and start failures, the duration histogram, the last success/failure timestamps, the SLA breach counters, and the memory-cap kill counter.
   - Cadence: at most one write per 15 seconds while running, plus a final snapshot on clean shutdown.
   - Histograms: seeded only if the `durationBuckets` bounds are unchanged.
 
@@ -201,6 +213,9 @@ groups:
       - alert: CronstableConfigBroken
         expr: cronstable_config_last_reload_successful == 0
         for: 10m
+      # a capped job's most recent run went without some of its caps
+      - alert: CronstableCapsNotEnforced
+        expr: cronstable_job_last_run_limits_enforced == 0
       # this node has lost quorum (gossip) or cannot reach the lease store;
       # its Leader jobs are standing down
       - alert: CronstableClusterNotQuorate
@@ -221,6 +236,7 @@ The preceding staleness rule (`CronstableJobStale`) is the external backstop to 
 - [HTTP Control API](HTTP-API): the web server `/metrics` is part of: listeners, `authToken`, headers, and reload behavior.
 - [Metrics with statsd](Metrics-with-Statsd): the push-side alternative; both can be enabled at once.
 - [Resource Monitoring](Resource-Monitoring): the `monitorResources` sampling behind the per-job CPU/RSS families.
+- [Resource Limits](Resource-Limits): the `resourceLimits` caps behind the limit families.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): what the cluster gauges mean and when they change.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): how run outcomes, retries, and permanent failures are determined.
 - [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind `cronstable_job_late` and the breach counter.

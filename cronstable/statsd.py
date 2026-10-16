@@ -240,4 +240,10 @@ class StatsdJobMetricWriter:
                 cpu=int(round(usage.cpu_total_seconds * 1000)),
                 rss=usage.max_rss_bytes,
             )
+        # A run killed at its memory cap (cronstable.limits).
+        record = getattr(self.job, "limits_record", None)
+        if record is not None and record.memory_exceeded:
+            message += "{prefix}.memory_limit_exceeded:1|c\n".format(
+                prefix=self.prefix
+            )
         await send_to_statsd(self.host, self.port, message)

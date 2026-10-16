@@ -291,14 +291,20 @@ Every finished run is appended to the job's `runs/<job>` stream (outcome,
 timestamps, duration, exit code: the same shape as `GET /jobs/{name}/runs`),
 pruned to `maxRunsPerJob`. This ledger is the substrate everything else on
 this page reads: the catch-up watermark, the depends-on-past gate, and the
-trends endpoint.
+trends endpoint. A run of a job with [`resourceLimits`](Resource-Limits)
+also carries its `limits` record (the caps, whether they applied, and the
+kernel's counters), so the dashboards still mark cap hits after a restart.
 
 On the first successful backend start of a process, the in-memory run history
 is **rehydrated** from the ledger once: the [web dashboard](Web-Dashboard)'s
 history drawer, sparklines, and `GET /jobs/{name}/runs` show runs from before
 the restart, immediately, instead of starting blank. Rehydration is read-only
 and bounded (with a slow store the daemon skips it with a warning; history
-then fills in as jobs run, exactly as with no rehydration).
+then fills in as jobs run, exactly as with no rehydration). When a job's
+newest records are all slots that a pause skipped, the daemon finds the last
+run for the job's [status badge](Status-Badges#what-a-jobs-badge-says) with
+a deeper read in the background after rehydration. It makes these reads one
+job at a time and stops at the first one that times out.
 
 A job's *latest* run is the one with the newest finish time, not the last
 record in the stream. A run's finish time is the instant the run

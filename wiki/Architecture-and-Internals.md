@@ -10,9 +10,12 @@ name rather than repeating the option reference. For option semantics, see the
 ## Module map
 
 cronstable is an asyncio Python daemon that runs natively on Linux, macOS, and
-Windows. `cronstable/platform.py` isolates all OS-specific behavior
+Windows. `cronstable/platform.py` isolates the OS-specific behavior of the core
 (`DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`,
-`install_shutdown_handlers`, plus the `IS_WINDOWS` flag). `grp`/`pwd` and per-job
+`install_shutdown_handlers`, plus the `IS_WINDOWS` flag). The other per-OS
+code is the pair of [resource-limit](Resource-Limits) backends,
+`cronstable/_cgroups.py` (Linux) and `cronstable/_jobobjects.py` (Windows),
+which `cronstable/limits.py` selects at run time. `grp`/`pwd` and per-job
 user/group switching remain POSIX-only and are runtime-gated on `IS_WINDOWS`
 rather than blocking import. For the operator-facing walkthrough, see
 [running on Windows](Running-on-Windows).
@@ -24,7 +27,7 @@ and the modules behind individual features.
 | Module | Responsibility |
 | --- | --- |
 | `cronstable/__main__.py` | CLI entry point. Argument parsing, basic logging setup, event-loop creation, shutdown-handler registration (delegated to `platform.install_shutdown_handlers`), and process exit codes. |
-| `cronstable/platform.py` | The single home for all per-OS branches: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, and the `IS_WINDOWS` flag. The rest of the codebase reads the same on every platform. |
+| `cronstable/platform.py` | The home for the per-OS branches outside the resource-limit backends: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, `suspend_at_spawn` (the `CREATE_SUSPENDED` start of a capped Windows run), and the `IS_WINDOWS` flag. The rest of the codebase, apart from `_cgroups` and `_jobobjects`, reads the same on every platform. |
 | `cronstable/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`. Configuration loading from a file or directory. Include handling and dict merging (`mergedicts`). `JobConfig` parsing/validation. `CronstableConfig` dataclass. |
 | `cronstable/cronexpr.py` | The built-in cron expression engine: `CronTab` parsing (5/6/7-field dialect, names, `L` forms, `@`-nicknames), `next()` (strictly-future, DST-correct, 2099 horizon), and `test()`. A stdlib-only leaf module, behavior-compatible with the parse-crontab library it replaced, enforced by the golden vectors in `tests/data/cron_golden.json`. See [schedules and time zones](Schedules-and-Timezones). |
 | `cronstable/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`reload_config` / `update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
@@ -46,6 +49,9 @@ and the modules behind individual features.
 | `cronstable/pools.py` | Durable admission queues shared by jobs and DAG tasks. |
 | `cronstable/croninfo.py` | Schedule descriptions and analysis (including the advisory schedule lint) shared by the CLI, API, and dashboards. |
 | `cronstable/resources.py` | CPU and memory sampling for job subprocesses (`monitorResources`). |
+| `cronstable/limits.py` | Per-run caps (`resourceLimits`): `prepare`, which makes each capped run's container (and each run's, while `weighting_active()` says the Linux cpu controller is on), the `RunLimits` handle that `RunningJob` drives, the `LimitsRecord` a run records, the host `Capability`, and the process-wide `LimitsManager` (backend selection, one-time setup, cpu control, and the convergence warning). It runs every backend call off the event loop. See [resource limits](Resource-Limits). |
+| `cronstable/_cgroups.py` | The Linux backend of `limits`: the delegated cgroup v2 probe and layout (`daemon/` and `runs/` under the daemon's cgroup), the cpu controller switch (`set_cpu`), one cgroup per capped run (per run while the cpu controller is on), and the `_ChildJoin` `preexec_fn`. All file access goes through `CgroupFS`, which tests replace with a model of the kernel. |
+| `cronstable/_jobobjects.py` | The Windows backend of `limits`: one Job Object per capped run, the kernel32 seam (`Kernel32`, with full ctypes prototypes), and the completion-port watcher thread. |
 | `cronstable/push.py` | The engine behind the end-to-end encrypted `push` reporter. |
 | `cronstable/mcp.py` | The Model Context Protocol (MCP) server. |
 | `cronstable/tui.py` | The terminal dashboard for a running daemon. |
@@ -66,11 +72,24 @@ depend on `config`, `leadership`, and `backends._common`;
 `backends.filesystem` also depends on `state` and `platform`, because it
 embeds a private `FilesystemStateBackend` as its lease store. `config.py` has no dependency on `cron.py` or `job.py`.
 
-`prometheus.py` imports only `cronstable.version` and `cronstable.cronexpr` at
-module scope, `cron.py` imports it, and its renderer late-imports
+`prometheus.py` imports `cronstable.version`, `cronstable.config`, and
+`cronstable.cronexpr` at module scope, `cron.py` imports it, and its renderer
+late-imports
 `cronstable.cron` helpers at scrape time to break the cycle.
 `platform.py` is a leaf module with no cronstable dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
+
+`limits.py` depends on `platform` and `config` (where `ResourceLimits` and
+`format_size` live, so that building a job loads no runtime code), and `cron`
+and `job` import it. It imports a backend the first time it needs one:
+`_jobobjects` on Windows, `_cgroups` on Linux, and none on other platforms.
+The imports are static `from cronstable import` statements inside
+`_select_backend`, so PyInstaller bundles both backends, and inside a
+function because each backend imports `limits`. `_cgroups` depends on
+`config`, `limits`, and `resources` (for the cgroup reader and the
+`DAEMON_LEAF` and `RUNS_DIR` names). `_jobobjects` imports `platform` at
+module scope, and `ctypes`, `config`, and `limits` inside the functions that
+use them.
 
 `state.py` depends on `config`, `platform`, and `_json`. `cron.py` imports it
 and builds the backend with `make_state_backend` inside `start_stop_state` (only
@@ -167,6 +186,26 @@ often.
    calls `self.job_set_id` each round), so only a change to the cluster section
    itself needs a restart. (See "Cluster manager" and
    [clustering and leader election](Clustering-and-Leader-Election).)
+
+   Next, once per applied configuration, `_converge_limits` passes every job
+   and DAG task template that sets `resourceLimits` to
+   `limits.get_manager().converge` on a worker thread. That probes the host,
+   builds the Linux cgroup layout on first use, turns the cpu controller on
+   while one of them sets `cpu` and off otherwise, and logs whether the caps
+   can be enforced. It runs after the election gate is updated and before
+   `_service_slots`, so the pass that applies a configuration launches no
+   capped run before the layout exists. With no capped job, it only turns
+   the cpu controller off when `limits.weighting_active()` says it is on.
+   Off waits while a cgroup under `runs/` has a `cpu.max` other than `max`:
+   one of this daemon's live runs, or a cgroup that it did not make, which
+   may be another daemon's run. Such a cgroup counts while it holds
+   processes, and for 60 seconds after this daemon first sees it, which
+   covers a new run that waits for its child to join. This daemon's cgroups
+   that wait for `collect` do not count. The `finish` of the last such run,
+   or a later `collect`, then turns cpu off. A cpu-capped `prepare` while
+   cpu is off, such as a verify check under an older config, calls the
+   backend's `need_cpu`, which turns cpu on without changing what the
+   config wants.
 
    The same `try` block then reconciles the observability overlay
    (`start_stop_observability`), the state backend (`start_stop_state`), and
@@ -822,9 +861,11 @@ calls `await running_job.start()`, and registers the instance with
    The job's `priority` reaches the spawn through the same two-platform split.
    On Windows the Ctrl-C/`CTRL_BREAK` creation flags also carry it as a
    priority class, OR-ed in by `new_process_group_kwargs` itself. That is why
-   the helper is the only writer of `creationflags` in the tree:
+   `platform.py` is the only writer of `creationflags` in the tree:
    `CreateProcess` is the only race-free moment to set a class, and a caller
-   assembling the flags itself could drop one of the two bits.
+   assembling the flags itself could drop one of the bits. Besides the
+   helper, only `platform.suspend_at_spawn` writes them: for a capped run, it
+   ORs `CREATE_SUSPENDED` into the flags the helper returned.
 
    POSIX has no spawn-time equivalent, so `platform.apply_priority` renices the
    job's process group (`setpriority` with `PRIO_PGRP`) as the first thing after
@@ -835,6 +876,53 @@ calls `await running_job.start()`, and registers the instance with
    it goes on to launch, for the `CreateProcess` reason set out in
    [priority](Commands-and-Environment#priority). See
    [running on Windows](Running-on-Windows).
+
+   A job with `resourceLimits` gets its caps at spawn. Once the kwargs and
+   any `_demote` hook are in place, `_prepare_limits` awaits
+   `limits.prepare(caps, name, nice=...)`, which makes the run's container on
+   a worker thread: a cgroup under `<base>/runs/` with its cap files written
+   on Linux, or a Job Object on Windows. `nice` is the absolute nice of the
+   run's `priority` (the daemon's own for `normal`, `None` on Windows), which
+   becomes the cgroup's `cpu.weight.nice` while the cpu controller is on. The
+   backend keeps each live run's nice and writes it when the controller
+   turns on during the run. While the controller is on,
+   `limits.weighting_active()` is true, and an uncapped Linux run goes
+   through the same path with `caps=None`: it gets a cgroup that holds
+   only its weight, and `RunLimits.recorded` is false, so `_keep_record`
+   gives it no `limits_record`. A run whose caps cannot all apply while the
+   job sets `resourceLimits.required` comes back refused: `start()` sets
+   `start_failed` and returns without spawning, and the limits failure is the
+   run's `fail_reason`. Otherwise `RunLimits.spawn_kwargs` fits the spawn to
+   the container. On Linux it installs `_ChildJoin` as the `preexec_fn`,
+   wrapping `_demote`: between fork and exec the child writes `0` to its
+   cgroup's `cgroup.procs` through a descriptor the parent opened, which
+   moves the child in, and only then runs `_demote`, because the demoted user
+   could not write that file. On Windows `platform.suspend_at_spawn` adds
+   `CREATE_SUSPENDED`. Only runs with a container get either change, so any
+   other spawn stays as described earlier. Right after `apply_priority`, with
+   no other `await` in between, `RunLimits.attach` confirms the Linux child's
+   membership from `/proc/<pid>/cgroup` (its run's cgroup or one below it),
+   or assigns the suspended Windows child to its Job Object, resumes it, and
+   then clears the job's `KILL_ON_JOB_CLOSE`, which until then ends the child
+   if the daemon dies. When Windows refuses the clear, the run keeps running
+   with its caps and the limit on, and `Backend._guard_stuck` logs a
+   `WARNING` once per distinct error. When a required Linux child cannot
+   write `cgroup.procs`, `_ChildJoin` raises, so the spawn fails: `start()`
+   aborts the container, `RunLimits.abort` marks the run refused and logs
+   the failure through `note_failures` in place of the launch-error
+   traceback, and the run is a start failure. When `attach` finds a required
+   child outside its container, or cannot assign or resume it on Windows,
+   the container kills it and `attach` marks the run refused, so `wait()`
+   collects the kill's exit code and the limits failure is the run's
+   `fail_reason`; `start_failed` stays unset. Every failed spawn releases
+   the container through `RunLimits.abort`. A start canceled during the attach
+   goes through `_discard_child`, which kills the child (through the
+   container first, `proc.kill()` when that misses), aborts the container, and
+   sets `start_discarded`. The caller never registered the run, so it treats
+   the launch as never made: `dagrun` frees the task's pool slot and drops
+   its launch record, so the next advance releases and re-claims the task.
+   The `ResourceMonitor` of a monitored capped run receives the container,
+   so it reads members and exact CPU totals from the kernel.
 
 2. **`_demote()`** runs in the child (still privileged) and drops privileges in
    the security-critical order: supplementary groups first
@@ -879,6 +967,29 @@ calls `await running_job.start()`, and registers the instance with
    forced call shells out to `taskkill /F /T`, which walks the live process tree
    (the `taskkill` run is bounded at 10s).
 
+   The forced step of a run with a container goes to the container first:
+   `_kill_group` awaits `RunLimits.kill()`, which writes `1` to the run's
+   `cgroup.kill` on Linux or calls `TerminateJobObject` on Windows, and so
+   reaches descendants that left the process group or the tree. On POSIX the
+   `kill_process_group` call follows, behind the same pid-reuse check, and
+   reaches a process that left the cgroup but kept the group. On Windows a
+   container kill that returns `True` is the whole forced step: it ends every
+   process in the Job Object, and `taskkill /T` finds descendants only
+   through live parents, which that kill ended. It returns `False` when the
+   child never got into its container, and on a Linux kernel before 5.14,
+   where each listed pid gets SIGKILL in place of `cgroup.kill`. The
+   graceful step is the same for every run.
+   After the monitor's final reading, `_on_stop` awaits `RunLimits.finish()`,
+   which reads the kernel's counters into `limits_record` and releases the
+   container. A Linux cgroup gets one `rmdir` there. A cgroup that is still
+   busy, because leftover processes hold it or the kernel reports `EBUSY`
+   just after its last process exits, is queued for the `collect` that the
+   `prepare` and `finish` of each later run with a container call. A capped run with `verify`
+   settles its limits before its check starts, so a run killed at its memory
+   cap skips the check. The check is a `RunningJob` of its own with the same
+   caps, and `_verify_result` copies its record into the verification dict
+   as `limits`; the run's own record covers only the run.
+
    On POSIX, once asyncio has reaped the direct child, `cancel()` checks
    before each group signal whether a process exists under the child's pid
    (`platform.pid_reused`, a signal 0 probe). POSIX keeps a pid out of use
@@ -905,7 +1016,10 @@ calls `await running_job.start()`, and registers the instance with
 5. **Failure classification.** `fail_reason` is a property evaluated against
    `failsWhen`: `always`, then `nonzeroReturn` (`retcode != 0`), then
    `producesStdout`/`producesStderr` (true when captured output is nonempty
-   *or* lines were discarded). `failed` is `fail_reason is not None`.
+   *or* lines were discarded). `failed` is `fail_reason is not None`. Ahead of
+   all of these comes `limits_record.failure`: a run refused under
+   `resourceLimits.required`, or killed at its memory cap, fails with that
+   reason whatever `failsWhen` and `verify` say.
 
 6. **Reporting.** `report_failure`, `report_permanent_failure`, and
    `report_success` each delegate to `_report_common`, which calls
@@ -1103,7 +1217,8 @@ sends `{prefix}.stop:1|g`, `{prefix}.success:{0|1}|g`, and
 `{prefix}.duration:{ms}|ms`, where success is `0 if self.job.failed else 1`
 and duration is wall time between start and stop in milliseconds. For a
 monitored run the stop datagram also carries `{prefix}.cpu:{ms}|ms` and
-`{prefix}.max_rss:{bytes}|g`.
+`{prefix}.max_rss:{bytes}|g`, and for a run killed at its memory cap,
+`{prefix}.memory_limit_exceeded:1|c`.
 
 Each `send_to_statsd` call is one fire-and-forget UDP datagram, so there are two
 datagrams per run: `job_started` sends the single `.start` line, and
@@ -1124,11 +1239,12 @@ reloads (they reset only on process restart; `_apply_reload` prunes series for
 jobs removed from the config).
 
 Synchronous in-memory hooks in `cron.py` record cumulative state: `_record_run`
-(run outcomes and the duration histogram), `schedule_retry_job` (retries
-actually launched), the permanent-failure branches, `reload_config` and
-`update_config` (reload success/failure), and the leadership- and
-quorum-transition latches. Gauges are not stored at all: `Cron._web_metrics` calls the renderer, which computes them
-at scrape time from `cron_jobs`, `running_jobs`, `last_run`, and
+(run outcomes, the duration histogram, and memory-cap kills),
+`schedule_retry_job` (retries actually launched), the permanent-failure
+branches, `reload_config` and `update_config` (reload success/failure), and
+the leadership- and quorum-transition latches. Gauges are not stored at all:
+`Cron._web_metrics` calls the renderer, which computes them at scrape time
+from `cron_jobs`, `running_jobs`, `last_run`, and
 `cluster_manager.view_dict()`. If a backend read fails during a scrape, the
 cluster block degrades to `cronstable_cluster_enabled` and the transition
 counters instead of failing the whole scrape. See [metrics with Prometheus](Metrics-with-Prometheus).
@@ -1143,6 +1259,12 @@ counters instead of failing the whole scrape. See [metrics with Prometheus](Metr
 - One short-lived `wait()` task per running job, plus one
   `schedule_retry_job` task per armed-and-pending retry.
 - Reporters run concurrently per job but failures are isolated.
+- On Windows, once a job sets `resourceLimits`, one daemon thread drains the
+  completion port shared by every capped run's Job Object. It turns
+  memory-cap messages into `TerminateJobObject` kills and counts process-cap
+  hits, and about once a second it checks each memory-capped job's peak
+  commit in case Windows dropped a message. It never touches the event loop.
+  The backends' per-run calls run on the default thread pool.
 - Shutdown is cooperative: a signal sets `_stop_event`, the scheduler stops
   spawning, pending retries are canceled, and the reaper drains in-flight jobs
   before the process exits. The trigger is platform-specific:

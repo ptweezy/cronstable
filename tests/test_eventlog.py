@@ -36,6 +36,7 @@ from cronstable.job import (
     eventlog_start_refused_strings,
     retire_event_log_writers,
 )
+from cronstable.limits import LimitsRecord
 
 
 class _FakeLog:
@@ -380,6 +381,62 @@ jobs:
         eventlog:
           enabled: true
 """
+
+
+def _detail(ctx, outcome="failure"):
+    strings = eventlog_event_strings(ctx, outcome, include_output=False)
+    return strings[EVENTLOG_STRING_FIELDS.index("detail")]
+
+
+@pytest.mark.parametrize(
+    "record, expected",
+    [
+        (
+            {"enforced": True, "memory_exceeded": True},
+            "limits_enforced=1 memory_limit_exceeded=1",
+        ),
+        (
+            {"enforced": False, "memory_exceeded": False},
+            "limits_enforced=0 memory_limit_exceeded=0",
+        ),
+    ],
+)
+def test_eventlog_detail_appends_the_limits_of_a_capped_run(record, expected):
+    # appended after the usage keys, so their positions stay put
+    ctx = _ctx(
+        _job_config(),
+        template_vars={
+            "cpu_seconds": 1.5,
+            "max_rss_bytes": 2048,
+            "limits": record,
+        },
+    )
+    assert _detail(ctx) == "cpu_seconds=1.5 max_rss_bytes=2048 " + expected
+
+
+def test_eventlog_detail_leaves_an_uncapped_run_alone():
+    ctx = _ctx(_job_config(), template_vars={"cpu_seconds": 1.5})
+    assert _detail(ctx) == "cpu_seconds=1.5"
+    job = cronstable.job.RunningJob(_job_config(), None)
+    assert job.template_vars["limits"] is None
+    assert _detail(job, "success") == ""
+
+
+def test_eventlog_detail_reads_the_record_of_a_running_job():
+    job = cronstable.job.RunningJob(_job_config(), None)
+    job.limits_record = LimitsRecord(
+        cpu=1.0,
+        memory_bytes=None,
+        processes=None,
+        required=False,
+        enforced=True,
+        mechanism="job-object",
+        unenforced=(),
+        reason=None,
+    )
+    assert _detail(job, "success") == (
+        "limits_enforced=1 memory_limit_exceeded=0"
+    )
 
 
 async def test_eventlog_reporter_reports_a_notify_event_by_severity(

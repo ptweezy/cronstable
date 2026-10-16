@@ -2652,8 +2652,9 @@ def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
     the single transform takes: ``taskkey``, ``success``, ``exit_code``,
     ``fail_reason``, ``task`` (the :class:`TaskSpec`), ``jitter``, and the
     ``expected_proc`` / ``expected_attempt`` / ``expected_poke`` fences, plus
-    an optional serialised ``resources`` dict and an optional ``skipped``
-    flag.
+    optional serialised ``resources``, ``verification`` and ``limits``
+    dicts (the last two enter the task entry only when present) and an
+    optional ``skipped`` flag.
 
     Batching is safe for exactly the reason :func:`set_task_pids` is: every
     mark is fenced and applied against ONLY its own task's entry, so applying
@@ -2729,6 +2730,8 @@ def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
                 )
             if mark.get("verification") is not None:
                 entry["verification"] = mark["verification"]
+            if mark.get("limits") is not None:
+                entry["limits"] = mark["limits"]
             applied.append(taskkey)
         if not applied:
             return _DOC_KEEP, []
