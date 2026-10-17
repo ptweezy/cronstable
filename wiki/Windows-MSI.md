@@ -151,5 +151,5 @@ with a publisher rule.
 GPO, Intune, and SCCM deployments do not involve SmartScreen. It can still
 appear on a browser-downloaded MSI's first run while the signing identity's
 reputation accrues (choose **More info**, then **Run anyway**).
-When your policy calls for it, verify a download against the release's
-`SHA256SUMS`.
+When your policy calls for it,
+[verify the download](Installation#verify-a-download).

@@ -29,8 +29,8 @@ name: CI
 # Publication starts only after every build and test job succeeds: PyPI via
 # Trusted Publishing (skip-existing, so a retry is a no-op), then the tag
 # (RELEASE_TOKEN if set, else GITHUB_TOKEN) and a GitHub Release with every
-# binary and one SHA256SUMS, then Docker images, Homebrew and winget. PyPI
-# goes first so a failed upload leaves no orphan tag.
+# binary, one SHA256SUMS and their build provenance, then Docker images,
+# Homebrew and winget. PyPI goes first so a failed upload leaves no orphan tag.
 
 on:
   push:
@@ -4031,8 +4031,9 @@ jobs:
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-26.04
     permissions:
-      contents: write   # push the tag and create the GitHub Release
-      id-token: write   # PyPI Trusted Publishing (OIDC)
+      contents: write       # push the tag and create the GitHub Release
+      id-token: write       # PyPI Trusted Publishing and the provenance signature (OIDC)
+      attestations: write   # store the build provenance attestation
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -4047,6 +4048,22 @@ jobs:
           path: .
       - name: Verify prepared artifact checksums
         run: python3 .github/scripts/verify_release_checksums.py
+
+      # SLSA build provenance naming every file in SHA256SUMS, stored in the
+      # attestations API and attached to the Release. Scorecard's
+      # Signed-Releases check finds it by the .intoto.jsonl suffix.
+      - name: Attest build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: SHA256SUMS
+      - name: Save the provenance bundle
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          NEW: ${{ needs.version.outputs.new }}
+        # One line per bundle, as JSON Lines requires.
+        run: jq -c . "$BUNDLE" > "cronstable-$NEW.intoto.jsonl"
+
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
@@ -4100,6 +4117,7 @@ jobs:
           # Release. An unmatched entry, as under perf=ignore, is skipped.
           files: |
             SHA256SUMS
+            cronstable-${{ needs.version.outputs.new }}.intoto.jsonl
             scoop/cronstable.json
             perf/perf-summary.md
             perf/perf-results.json

@@ -374,8 +374,8 @@ apk add --allow-untrusted ./cronstable-linux-amd64v3.apk
 ```
 
 `--allow-untrusted` is required: these packages are not signed with a key in
-`/etc/apk/keys`, so apk declines them otherwise. Verify the download against the
-release's `SHA256SUMS` if your policy calls for it.
+`/etc/apk/keys`, so apk declines them otherwise. If your policy calls for it,
+[verify the download](#verify-a-download) first.
 
 Installing creates the `cronstable` service account and leaves the service
 stopped, because the shipped configuration schedules no jobs and no Alpine
@@ -720,7 +720,7 @@ The Windows binaries carry a version resource and are Authenticode-signed
 with Azure Artifact Signing. While the signing identity's reputation accrues,
 the first run of a browser-downloaded copy can still be blocked by SmartScreen.
 Choose **More info**, then **Run anyway**. If your policy calls for it,
-verify the download against the release's `SHA256SUMS`.
+[verify the download](#verify-a-download).
 
 The WinGet release workflow submits signed setup executables that embed the
 MSI and its one-directory payload, using the compatibility build on x64. See the
@@ -798,6 +798,48 @@ On Windows the self-extracting `.exe` uses the standard Windows temp directory
 read-only-rootfs and `noexec` caveats are Linux-container concerns only. The
 Windows zip and MSI installs keep their files on disk beside `cronstable.exe`
 and never unpack at startup, so this requirement does not apply to them at all.
+
+## Verify a download
+
+The release workflow signs build provenance for every file in a release's
+`SHA256SUMS`. To check a downloaded file against it, use the
+[GitHub CLI](https://cli.github.com):
+
+```shell
+gh attestation verify cronstable-linux-amd64v3 --repo ptweezy/cronstable \
+  --signer-workflow ptweezy/cronstable/.github/workflows/release.yml
+```
+
+The provenance is a [SLSA](https://slsa.dev/spec/v1.0/provenance) attestation
+that records each file's digest and the commit and workflow run that built it.
+The command finds the attestation by the file's digest, then checks its
+Sigstore signature, repository, and signing workflow. A wheel or sdist
+downloaded from PyPI verifies the same way, because PyPI publishes the same
+files.
+
+Each release also attaches the attestation as
+`cronstable-<version>.intoto.jsonl`. To verify against that file instead of
+the GitHub attestations API, pass it with `--bundle`:
+
+```shell
+gh attestation verify cronstable-linux-amd64v3 --repo ptweezy/cronstable \
+  --signer-workflow ptweezy/cronstable/.github/workflows/release.yml \
+  --bundle cronstable-1.2.69.intoto.jsonl
+```
+
+Releases are immutable, and GitHub signs a release attestation that lists
+the digest of every asset. To check that a file belongs to a given release:
+
+```shell
+gh release verify-asset 1.2.69 cronstable-linux-amd64v3 --repo ptweezy/cronstable
+```
+
+To compare checksums only, download `SHA256SUMS` into the directory that holds
+your files and run:
+
+```shell
+sha256sum --check --ignore-missing SHA256SUMS
+```
 
 ## After installation
 

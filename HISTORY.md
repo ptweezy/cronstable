@@ -1,5 +1,12 @@
 # History
 
+## 1.2.69
+
+- Each release attaches signed SLSA build provenance for every file in
+  `SHA256SUMS` as `cronstable-<version>.intoto.jsonl`. To check a download,
+  run `gh attestation verify <file> --repo ptweezy/cronstable`, or see
+  "Verify a download" on the Installation wiki page.
+
 ## 1.2.68
 
 - A job's `resourceLimits` caps the CPU, memory, and process count of each of
