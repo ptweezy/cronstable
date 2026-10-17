@@ -78,9 +78,10 @@ needs the `params` scope unless every stored value is the current declared
 default:
 
 - Values compare as the run stores them, so a stored `1` differs from a
-  default written `1.0`. A browser writes `1.0` as `1`, which is what a run
-  started from the dashboard's parameter dialog stores under that default.
-  Recovering that run needs `params`.
+  default written `1.0`. A JavaScript client reads `1.0` as `1`. A run it
+  starts by sending that value stores `1`, and recovering that run needs
+  `params`. The dashboard's parameter dialog leaves out a value equal to its
+  default, so a run it starts stores the default as declared.
 - A `required` parameter has no default, so recovering a run of a workflow
   that declares one always needs `params`.
 - Without `params`, the request answers `403` with the token's label and the

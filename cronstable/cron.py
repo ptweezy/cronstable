@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import asyncio.subprocess
+import contextlib
 import copy
 import datetime
 import errno
@@ -27,6 +28,7 @@ import time
 import zlib
 from collections import defaultdict, deque
 from collections.abc import (
+    AsyncIterator,
     Awaitable,
     Callable,
     Collection,
@@ -2375,6 +2377,8 @@ class Cron:
         # launch appends, so unserialized entries could double-launch.
         # Pruned on reload, never while held.
         self._launch_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # name -> the task that holds its launch lock (see _launch_lock)
+        self._launch_lock_holders: dict[str, asyncio.Task[Any]] = {}
         # name -> last launched slot, status/introspection only: the
         # forward-only next-fire index is what de-duplicates launches.
         self._last_run_slot: dict[str, datetime.datetime] = {}
@@ -11937,6 +11941,26 @@ class Cron:
         self.retry_state[job.name] = ladder
         return ladder
 
+    @contextlib.asynccontextmanager
+    async def _launch_lock(self, name: str) -> AsyncIterator[None]:
+        """Hold the per-job launch lock of ``name``.
+
+        Reentrant within the holding task: a due retry launches through
+        :meth:`maybe_launch_job` while it holds the lock (see
+        _retry_launch_lock).
+        """
+        task = asyncio.current_task()
+        if task is not None and self._launch_lock_holders.get(name) is task:
+            yield
+            return
+        async with self._launch_locks[name]:
+            if task is not None:
+                self._launch_lock_holders[name] = task
+            try:
+                yield
+            finally:
+                self._launch_lock_holders.pop(name, None)
+
     async def maybe_launch_job(
         self,
         job: JobConfig,
@@ -11971,7 +11995,7 @@ class Cron:
                 params=params,
             )
             return True
-        async with self._launch_locks[job.name]:
+        async with self._launch_lock(job.name):
             if pool_ticket is not None:
                 catchup_after = _parse_iso_utc(
                     pool_ticket.payload.get("catchupAfter")
@@ -12624,10 +12648,11 @@ class Cron:
         request from a previous incarnation is inert. The holder's renew
         task observes it within one renew period. The launch is the one
         that _spawn_slot_pursuit holds for the job when the slot frees,
-        and it goes back through every normal gate. A pursuit that holds
-        none (a pooled job, whose queue entry re-attempts itself) only
-        asks. Bounded: a holder that never yields forfeits this launch
-        (no-run over double-run).
+        and it goes back through every normal gate. Supplied values that
+        the job's current declaration refuses forfeit the launch. A
+        pursuit that holds none (a pooled job, whose queue entry
+        re-attempts itself) only asks. Bounded: a holder that never yields
+        forfeits this launch (no-run over double-run).
         """
         backend = self.state_backend
         name = job.name
@@ -12688,15 +12713,29 @@ class Cron:
                 )
                 return
         launch = self._slot_pursuit_launch.pop(name, None)
-        # launch the job's current configuration: the held launch can be
-        # newer than this task, with values checked against a declaration
-        # that a reload changed
+        # launch the job's current configuration (the held launch can be
+        # newer than this task). Supplied values run as they are, and a
+        # reload can change the declaration they were checked against, so
+        # they must fit the current one with no default filled in.
         configured = self.cron_jobs.get(name)
-        if (
-            launch is not None
-            and configured is not None
-            and await self.maybe_launch_job(configured, **launch)
-        ):
+        if launch is None or configured is None:
+            return
+        supplied = launch.get("params")
+        if supplied is not None:
+            refused = run_params.check_stored(
+                getattr(configured, "params", ()), supplied
+            )
+            if refused:
+                # names only: the daemon never logs parameter values
+                logger.warning(
+                    "Job %s: not launching the manual start that waited for "
+                    "the cluster slot: its values do not fit the current "
+                    "params declaration (%s)",
+                    name,
+                    ", ".join(sorted(refused)),
+                )
+                return
+        if await self.maybe_launch_job(configured, **launch):
             logger.info(
                 "Job %s: launched after the previous cluster slot holder "
                 "yielded (concurrencyPolicy: Replace)",
@@ -15132,10 +15171,46 @@ class Cron:
                 self.retry_state.pop(job_name, None)
                 self._persist_retry_settled(job_name, "job-removed", retry_num)
                 return
-            # A held retry DEFERS: the attempt fires once the hold lifts,
-            # never consumed by it (see _retry_hold_reason). Covers
-            # boot-rehydrated ladders too (they re-arm through here).
-            hold = self._retry_hold_reason(job)
+            decision = "defer"
+            async with self._retry_launch_lock(job):
+                # A held retry DEFERS: the attempt fires once the hold
+                # lifts, never consumed by it (see _retry_hold_reason).
+                # Covers boot-rehydrated ladders too (they re-arm through
+                # here).
+                hold = self._retry_hold_reason(job)
+                # Re-check the leadership gate before relaunching: a retry
+                # can outlive the leadership it started under, and
+                # maybe_launch_job does NOT gate; relaunching
+                # unconditionally would double-run a Leader job against
+                # the new owner.
+                allowed = hold is None and self._cluster_allows(job)
+                if allowed:
+                    # Settle the durable pending record BEFORE launching
+                    # (record-before-run, like the @reboot marker): a crash
+                    # after the launch must not re-arm the attempt that
+                    # ran. fail-closed defers on an unsettleable record;
+                    # degrade launches anyway. With cross-node retry resume
+                    # active, the decision serializes on the claim lease
+                    # and re-checks the newest ladder record is still OUR
+                    # OWN pending; a peer's claim ends it here ("abort")
+                    # without settling.
+                    decision = await self._retry_consume_decision(
+                        job, retry_num, quiet=deferrals > 0
+                    )
+                    if decision == "launch":
+                        # counted on the launch result (not where the retry
+                        # is armed) so the counter reports retries actually
+                        # launched, net of cancellations, abandonments, and
+                        # a concurrencyPolicy=Forbid skip. Pool admission
+                        # already happened in _retry_consume_ok. Its
+                        # durable receipt replaces the consume-before-spawn
+                        # record; the dispatcher counts the retry only when
+                        # it actually starts a process.
+                        if job.pool is None and await self.maybe_launch_job(
+                            job
+                        ):
+                            self.metrics.job_retry_launched(job_name)
+                        return
             if hold is not None:
                 state = self.retry_state.get(job_name)
                 if (
@@ -15157,39 +15232,20 @@ class Cron:
                 )
                 await asyncio.sleep(recheck)
                 continue
-            # Re-check the leadership gate before relaunching: a retry
-            # can outlive the leadership it started under, and
-            # maybe_launch_job does NOT gate; relaunching unconditionally
-            # would double-run a Leader job against the new owner.
-            if self._cluster_allows(job):
-                # Settle the durable pending record BEFORE launching
-                # (record-before-run, like the @reboot marker): a crash
-                # after the launch must not re-arm the attempt that ran.
-                # fail-closed defers on an unsettleable record; degrade
-                # launches anyway. With cross-node retry resume active,
-                # the decision serializes on the claim lease and
-                # re-checks the newest ladder record is still OUR OWN
-                # pending; a peer's claim ends it here ("abort") without
-                # settling.
-                decision = await self._retry_consume_decision(
-                    job, retry_num, quiet=deferrals > 0
+            if decision == "abort":
+                state = self.retry_state.get(job_name)
+                if state is not None:
+                    state.cancelled = True
+                self.retry_state.pop(job_name, None)
+                logger.warning(
+                    "Cron job %s retry (#%i) dropped: another node "
+                    "claimed this retry ladder (cross-node retry "
+                    "resume); it fires there",
+                    job_name,
+                    retry_num,
                 )
-                if decision == "launch":
-                    break
-                if decision == "abort":
-                    state = self.retry_state.get(job_name)
-                    if state is not None:
-                        state.cancelled = True
-                    self.retry_state.pop(job_name, None)
-                    logger.warning(
-                        "Cron job %s retry (#%i) dropped: another node "
-                        "claimed this retry ladder (cross-node retry "
-                        "resume); it fires there",
-                        job_name,
-                        retry_num,
-                    )
-                    return
-            elif self._cluster_owner_moved(job):
+                return
+            if not allowed and self._cluster_owner_moved(job):
                 # ownership genuinely moved: end this node's retry
                 # sequence (hand-off or forfeit; see _abandon_retry).
                 self._abandon_retry(job, retry_num)
@@ -15218,14 +15274,22 @@ class Cron:
                 recheck,
             )
             await asyncio.sleep(recheck)
-        # counted on the launch result (not where the retry is armed) so the
-        # counter reports retries actually launched, net of cancellations,
-        # abandonments, and a concurrencyPolicy=Forbid skip.
-        # Pool admission already happened in _retry_consume_ok. Its durable
-        # receipt replaces the consume-before-spawn record; the dispatcher
-        # counts the retry only when it actually starts a process.
-        if job.pool is None and await self.maybe_launch_job(job):
-            self.metrics.job_retry_launched(job_name)
+
+    def _retry_launch_lock(
+        self, job: JobConfig
+    ) -> contextlib.AbstractAsyncContextManager[None]:
+        """The lock a due retry of ``job`` holds from hold check to launch.
+
+        Under concurrencyPolicy: Forbid it is the job's launch lock. A start
+        with supplied values that is still spawning holds the retry back.
+        One that arrives while the retry settles waits, and Forbid refuses
+        it if the retry launched. Without the lock, Forbid could refuse a
+        retry whose record the consume already settled, which loses the
+        attempt. A pooled retry waits in its queue entry.
+        """
+        if job.pool is None and job.concurrencyPolicy == "Forbid":
+            return self._launch_lock(job.name)
+        return contextlib.nullcontext()
 
     def _retry_hold_reason(self, job: JobConfig) -> str | None:
         """Why ``job``'s due retry has to wait, or ``None`` when it may go.

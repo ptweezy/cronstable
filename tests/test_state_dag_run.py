@@ -4637,6 +4637,102 @@ async def test_durable_watermark_counts_scheduled_and_catchup_runs(
     assert await cron._dag._durable_watermark(dagcfg) == later
 
 
+_HOURLY_RETAIN_3 = (
+    "dags:\n  - name: cu\n    schedule: '0 * * * *'\n"
+    "    onMissed: run-all\n    retainRuns: 3\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+)
+
+
+async def _finish_at(cron, run_key, created_at):
+    """Finish run ``run_key`` of dag ``cu`` with the given ``createdAt``."""
+
+    def _done(current):
+        current["state"] = dag.SUCCESS
+        current["createdAt"] = created_at
+        return current, None
+
+    await cron._dag._mutate("cu", run_key, _done)
+    await cron._dag._release(("cu", run_key))
+
+
+async def test_gc_keeps_the_catch_up_reference_behind_a_backfill(
+    tmp_path, dag_cron
+):
+    # The backfill's runs are the newest by createdAt, so retention's
+    # excess holds every scheduled run, the reference among them.
+    cron = await dag_cron(_HOURLY_RETAIN_3)
+    d = cron._dag
+    backend = cron.state_backend
+    dagcfg = cron.cron_dags["cu"]
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    for i, hours in enumerate((-2, -1, 0)):
+        when = base + datetime.timedelta(hours=hours)
+        ref, _ = await d._create_run(dagcfg, when, "scheduled")
+        await _finish_at(cron, ref[1], 1000.0 + i)
+    result = await d.backfill(
+        "cu", "2025-12-01T01:00:00+00:00", "2025-12-01T03:00:00+00:00"
+    )
+    assert result["created"] == 3
+    for i, run_key in enumerate(result["runKeys"]):
+        await _finish_at(cron, run_key, 2000.0 + i)
+    await d._gc_one_dag(backend, "cu", dagcfg)
+    docs = await backend.list_documents("dagrun/cu")
+    # one run past retainRuns: the reference
+    assert sorted((b["kind"], b["logicalDate"]) for b in docs) == [
+        ("backfill", "2025-12-01T01:00:00+00:00"),
+        ("backfill", "2025-12-01T02:00:00+00:00"),
+        ("backfill", "2025-12-01T03:00:00+00:00"),
+        ("scheduled", base.isoformat()),
+    ]
+    assert await d._durable_watermark(dagcfg) == base
+    # a restart at 03:30 owes 01:00, 02:00, and 03:00
+    d._seeded.pop("cu", None)
+    await d._seed_dag(dagcfg, base + datetime.timedelta(hours=3, minutes=30))
+    docs = await backend.list_documents("dagrun/cu")
+    catchups = sorted(b["logicalDate"] for b in docs if b["kind"] == "catchup")
+    assert catchups == [
+        (base + datetime.timedelta(hours=h)).isoformat() for h in (1, 2, 3)
+    ]
+
+
+async def test_gc_reference_is_the_latest_logical_date(tmp_path, dag_cron):
+    cron = await dag_cron(_HOURLY_RETAIN_3)
+    d = cron._dag
+    backend = cron.state_backend
+    dagcfg = cron.cron_dags["cu"]
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    # in creation order; s04 has the latest logical date of the
+    # schedule's runs and the second oldest createdAt
+    runs = (
+        ("s00", 0, "scheduled"),
+        ("s04", 4, "scheduled"),
+        ("c01", 1, "catchup"),
+        ("c02", 2, "catchup"),
+        ("c03", 3, "catchup"),
+        ("m24", 24, "manual"),
+    )
+    for i, (run_key, hours, kind) in enumerate(runs):
+        when = base + datetime.timedelta(hours=hours)
+        await d._create_doc(dagcfg, run_key, when.isoformat(), kind)
+        await _finish_at(cron, run_key, 1000.0 + i)
+    # the excess is s00, s04, and c01; ordinary retention takes the
+    # other two
+    await d._gc_one_dag(backend, "cu", dagcfg)
+    docs = await backend.list_documents("dagrun/cu")
+    assert sorted(b["runKey"] for b in docs) == ["c02", "c03", "m24", "s04"]
+    assert await d._durable_watermark(dagcfg) == base + datetime.timedelta(
+        hours=4
+    )
+    # the newest three by createdAt plus the reference are all that remain
+    await d._gc_one_dag(backend, "cu", dagcfg)
+    assert len(await backend.list_documents("dagrun/cu")) == 4
+    # a DAG gone from the configuration keeps no reference
+    cron.cron_dags.clear()
+    await d.gc_removed_dags(backend, {"cu"}, 0.0)
+    assert await backend.list_documents("dagrun/cu") == []
+
+
 async def test_create_run_naive_datetime_is_read_as_utc(tmp_path, dag_cron):
     cron = await dag_cron(_HOURLY)
     _set_cmd(cron, "cu", "a", [_PY, "-c", "pass"])

@@ -437,7 +437,7 @@ Per-DAG keys:
 | `catchupJitterSeconds` | `Int` | `0` | Spread boot-time catch-up. |
 | `clusterPolicy` | `Leader` / `PreferLeader` / `EveryNode` | `Leader` | Which node schedules the DAG under leader election. |
 | `enabled` | `Bool` | `true` | Disable without deleting. |
-| `retainRuns` | `Int` | `50` | Keep the newest N terminal runs (must be ≥ 1). On a [rate-limited or slow store](Durable-State#rate-limiting-maxopspersecond), a busy DAG can hold more between retention passes. |
+| `retainRuns` | `Int` | `50` | Keep the newest N terminal runs (must be ≥ 1). Retention also keeps the scheduled or catch-up run with the latest logical date, which [catch-up](Orchestration-and-DAGs#scheduling-catch-up-and-backfill) counts from. On a [rate-limited or slow store](Durable-State#rate-limiting-maxopspersecond), a busy DAG can hold more between retention passes. |
 | `params` | `Seq(Map)` | none | The [run parameters](Orchestration-and-DAGs#run-parameters) a caller can supply when it starts a run. At most 32. |
 
 Per-parameter keys, under `params`:

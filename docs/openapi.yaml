@@ -443,7 +443,9 @@ paths:
                       job's slot. This node asks it to yield, and the run
                       starts when the slot frees. A newer launch of the job
                       takes its place, and this node skips the run if the
-                      holder keeps the slot for twice `slotTtlSeconds`.
+                      holder keeps the slot for twice `slotTtlSeconds` or
+                      if a reload leaves the job with a `params`
+                      declaration that the values in `params` do not fit.
                 required: [started]
         "202":
           description: Accepted into a resource pool queue.

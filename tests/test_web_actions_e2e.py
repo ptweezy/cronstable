@@ -17,6 +17,7 @@ pool entry cancellation.
 """
 
 import json
+import sys
 
 import pytest
 
@@ -1138,7 +1139,8 @@ def test_run_opens_a_form_for_a_job_with_params(browser, tmp_path):
                       .textContent.includes('at least 1')"""
             )
             assert page.is_visible("#paramWrap .modal")
-            # corrected values start the run and close the dialog
+            # corrected values start the run and close the dialog; `dry`,
+            # still at its default, stays out of the request
             page.fill("#paramF1", "5")
             page.select_option("#paramF0", "us")
             page.click("#paramGo")
@@ -1149,12 +1151,60 @@ def test_run_opens_a_form_for_a_job_with_params(browser, tmp_path):
             )
             assert _job_posts(page)[-1] == (
                 "/jobs/report/start",
-                {"params": {"region": "us", "rows": 5, "dry": False}},
+                {"params": {"region": "us", "rows": 5}},
             )
             e2e.wait_row_status(page, "report", "OK")
         last = daemon.jobs()["report"]["last_run"]
         assert last["outcome"] == "success"
         assert last["params"] == {"region": "us", "rows": 5, "dry": False}
+
+
+def test_an_unchanged_job_param_form_starts_without_values(browser, tmp_path):
+    with e2e.Daemon(tmp_path, jobs=[_param_job()]) as daemon:
+        prefs = {"pollMs": 1000}
+        with e2e.open_page(browser, daemon.url, prefs=prefs) as page:
+            page.faults.record()
+            _click(page, '#rows [data-run="report"]')
+            page.wait_for_selector("#paramWrap.open")
+            # a value typed back to the default counts as unchanged
+            page.fill("#paramF1", "100")
+            page.click("#paramGo")
+            e2e.wait_toast(page, "▶ started report")
+            page.wait_for_function(
+                "!document.getElementById('paramWrap').classList"
+                ".contains('open')"
+            )
+            # no body: the start a click without the dialog makes
+            assert _job_posts(page)[-1] == ("/jobs/report/start", None)
+            e2e.wait_row_status(page, "report", "OK")
+        last = daemon.jobs()["report"]["last_run"]
+        assert last["params"] == {"region": "eu", "rows": 100, "dry": False}
+
+
+def test_a_param_form_sends_a_default_a_reload_replaced(browser, tmp_path):
+    with e2e.Daemon(tmp_path, jobs=[_param_job()]) as daemon:
+        prefs = {"pollMs": 1000}
+        with e2e.open_page(browser, daemon.url, prefs=prefs) as page:
+            page.faults.record()
+            _click(page, '#rows [data-run="report"]')
+            page.wait_for_selector("#paramWrap.open")
+            job = _param_job()
+            job["params"][1]["default"] = 200
+            marker = e2e.job("marker", [sys.executable, "-c", "pass"])
+            daemon.reload(jobs=[job, marker])
+            # the poll that lists `marker` carries the new default
+            e2e.wait_until(lambda: "marker" in e2e.row_names(page), page)
+            assert page.input_value("#paramF1") == "100"
+            page.click("#paramGo")
+            e2e.wait_toast(page, "▶ started report")
+            # the run takes the value the dialog shows
+            assert _job_posts(page)[-1] == (
+                "/jobs/report/start",
+                {"params": {"rows": 100}},
+            )
+            e2e.wait_row_status(page, "report", "OK")
+        last = daemon.jobs()["report"]["last_run"]
+        assert last["params"] == {"region": "eu", "rows": 100, "dry": False}
 
 
 def test_job_param_form_is_hidden_without_the_params_scope(browser, tmp_path):

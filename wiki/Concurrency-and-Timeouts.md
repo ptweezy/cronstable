@@ -305,12 +305,19 @@ the holder to yield instead of canceling it directly:
    (concurrencyPolicy: Replace)` on success. The pursuit makes the launch
    as it was requested, so a manual start runs with the values it supplied.
    Until then, the API answers that start with `pending` (see
-   [`POST /jobs/{name}/start`](HTTP-API#post-jobsnamestart)). If the slot
-   claim refuses more launches while the pursuit waits, the pursuit makes
-   the newest one. A run of the job that starts on this node first stands
-   the pursuit down. The queue entry of a job in a
-   [resource pool](Resource-Pools) re-attempts itself, so its pursuit only
-   asks the holder to yield.
+   [`POST /jobs/{name}/start`](HTTP-API#post-jobsnamestart)). The values in
+   that answer, including the defaults the start filled in, have to fit the
+   job's current [`params`](Commands-and-Environment#params) declaration
+   when the slot frees. If a reload adds, renames, or removes a parameter,
+   or changes a rule so that it refuses one of those values, the pursuit
+   skips the launch and logs `Job <name>: not launching the manual start
+   that waited for the cluster slot: its values do not fit the current
+   params declaration (<parameters>)`. The message lists parameter names
+   without their values. If the slot claim refuses more launches while the
+   pursuit waits, the pursuit makes the newest one. A run of the job that
+   starts on this node first stands the pursuit down. The queue entry of a
+   job in a [resource pool](Resource-Pools) re-attempts itself, so its
+   pursuit only asks the holder to yield.
 4. The pursuit is bounded at **twice the slot TTL**. If the holder never
    yields, the requester abandons this launch: `Job <name>: the foreign
    holder (<node>) did not yield its cluster concurrency slot within <N>s;

@@ -293,6 +293,25 @@ def _recovery_references(
     return referenced
 
 
+def _schedule_reference(
+    runs: Iterable[dict[str, Any]],
+) -> tuple[datetime.datetime, dict[str, Any]] | None:
+    """The latest logical date among the scheduled and catch-up runs of
+    ``runs``, with the first run that carries it.
+
+    Catch-up counts missed slots from this date, so retention keeps the run.
+    """
+    latest: tuple[datetime.datetime, dict[str, Any]] | None = None
+    for body in runs:
+        if body.get("kind") not in ("scheduled", "catchup"):
+            continue
+        iso = body.get("logicalDate")
+        when = _parse_iso(iso) if isinstance(iso, str) else None
+        if when is not None and (latest is None or when > latest[0]):
+            latest = (when, body)
+    return latest
+
+
 @dataclass(slots=True)
 class _DagRef:
     """The marker a launched DAG-task :class:`RunningJob` carries.
@@ -1036,15 +1055,8 @@ class DagScheduler:
             backend.list_documents(self._ns(dagcfg.name)),
             timeout=STATE_OP_TIMEOUT,
         )
-        latest: datetime.datetime | None = None
-        for body in docs:
-            if body.get("kind") not in ("scheduled", "catchup"):
-                continue
-            iso = body.get("logicalDate")
-            when = _parse_iso(iso) if isinstance(iso, str) else None
-            if when is not None and (latest is None or when > latest):
-                latest = when
-        return latest
+        reference = _schedule_reference(docs)
+        return reference[0] if reference is not None else None
 
     @staticmethod
     def _catchup_stream(dag_name: str) -> str:
@@ -4248,6 +4260,14 @@ class DagScheduler:
         # A first cut that spares the leases of the runs it names.
         # _delete_run_batch reads the references again under the leases.
         protected = _recovery_references(docs, kept, now)
+        # Catch-up counts from this run. Only a run created after this
+        # listing can take its place, and this pass cannot delete that run,
+        # so the check needs no second read under the leases.
+        reference = _schedule_reference(docs)
+        if reference is not None and isinstance(
+            reference[1].get("runKey"), str
+        ):
+            protected.add(reference[1]["runKey"])
         terminal = [b for b in docs if dag.is_terminal_run(b)]
         # this pass parsed every body anyway: rebuild the adopt scan's
         # terminal-key cache from truth (its periodic self-heal).

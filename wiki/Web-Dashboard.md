@@ -84,7 +84,7 @@ Each row shows:
 | **Took** | The last run's duration. |
 | **Next** | A live countdown to the next scheduled run (`—` while running, paused, or disabled). |
 | **Trend** | A **sparkline** of recent runs: one bar per run, height by duration, colored by outcome (pause-skipped slots paint neutral, not green). |
-| **Actions** | One-click **Run** (or **Stop**, for a running job), **Pause** (or **Resume**, for a paused job), and **Logs**. For a job that declares [run parameters](Commands-and-Environment#params), **Run** opens a dialog with a field for each parameter, set to its default, when your token can choose values. Without the `params` scope, **Run** starts the job with its defaults. |
+| **Actions** | One-click **Run** (or **Stop**, for a running job), **Pause** (or **Resume**, for a paused job), and **Logs**. For a job that declares [run parameters](Commands-and-Environment#params), **Run** opens a dialog with a field for each parameter, set to its default, when your token can choose values. The dialog sends only the values that differ from the defaults, so submitting it unchanged is a start without values. Without the `params` scope, **Run** starts the job with its defaults. |
 
 Use **⊞ cols** in the table header to show or hide columns. The choice is saved
 per browser. The table widens as needed and scrolls horizontally if it exceeds
@@ -324,8 +324,11 @@ of sending the request at once:
   parameter with `allowed` values, a checkbox for a `boolean`, and a text
   box otherwise. The field shows the parameter's description and
   constraints.
-- **Run** sends the values in their declared types. When the daemon refuses
-  them, each reason appears under its field and the dialog stays open.
+- **Run** sends each required parameter and each value that differs from
+  its declared default, in the declared type. For a workflow without
+  required parameters, a dialog submitted unchanged sends no values, and the
+  run stores the defaults. When the daemon refuses a value, its reason
+  appears under its field and the dialog stays open.
 - A workflow with no parameters keeps its one-click trigger.
 
 A selected run lists the values it stores in a **parameters** row under the

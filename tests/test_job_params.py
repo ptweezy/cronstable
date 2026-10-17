@@ -16,6 +16,7 @@ import asyncio
 import datetime
 import json
 import sys
+import time
 
 import pytest
 
@@ -714,6 +715,124 @@ async def test_forbid_holds_a_due_retry_behind_a_start_with_values(
     assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
     assert reports == [("failure", "eu"), ("success", "us")]
     await _stop_run(cron, retry)
+
+
+def _slow_start(cron, monkeypatch, seconds=0.6):
+    """Delay a start with supplied values by ``seconds`` before it spawns,
+    while it holds the job's launch lock."""
+    real = cron._prepare_job_api_run
+
+    async def prepare(job, retry_state, **kwargs):
+        if kwargs["params"]["region"] == "us":
+            await asyncio.sleep(seconds)
+        return await real(job, retry_state, **kwargs)
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", prepare)
+
+
+@pytest.mark.parametrize("state", [True, False])
+async def test_forbid_holds_a_retry_that_comes_due_while_a_start_spawns(
+    dag_cron, tmp_path, monkeypatch, state
+):
+    yaml = _ladder_yaml(policy="Forbid", delay=0.3, once=tmp_path / "once")
+    if state:
+        cron = await dag_cron(yaml)
+        ladder = await _arm_ladder(cron)
+    else:
+        cron = Cron(None, config_yaml=yaml)
+        await cron.launch_scheduled_job(cron.cron_jobs["report"])
+        await _settle(cron)
+        ladder = cron.retry_state["report"]
+        assert ladder.count == 1 and not ladder.task.done()
+    _slow_start(cron, monkeypatch)
+    # the retry comes due while the start is still launching, and waits for
+    # it to spawn
+    await cron.start_job("report", {"region": "us", "act": "linger"})
+    (one_off,) = cron.running_jobs["report"]
+    await asyncio.sleep(0.1)
+    # then waits behind it, unspent
+    assert cron.running_jobs["report"] == [one_off]
+    assert not ladder.task.done()
+    if state:
+        assert (await _retry_records(cron))[-1] == ("pending", None, 1)
+    await _settle(cron)
+    assert cron.last_run["report"].outcome == "success"
+    await _wait_until(lambda: cron.running_jobs.get("report"), tries=500)
+    (retry,) = cron.running_jobs["report"]
+    assert retry.retry_state is ladder and not retry.supplied_params
+    if state:
+        await _drain_pending(cron)
+        assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    await _stop_run(cron, retry)
+
+
+@pytest.mark.parametrize("slow", ["store", "consume"])
+async def test_forbid_refuses_a_start_with_values_while_a_retry_settles(
+    dag_cron, tmp_path, monkeypatch, slow
+):
+    cron = await dag_cron(
+        _ladder_yaml(policy="Forbid", delay=0.3, once=tmp_path / "once")
+    )
+    ladder = await _arm_ladder(cron)
+    settling = []
+    if slow == "store":
+        # the store writes the record on a worker thread
+        backend = cron.state_backend
+        real_append = backend._append_sync
+
+        def append(stream, data, *rest):
+            if data.get("reason") == "launched":
+                settling.append(stream)
+                time.sleep(0.4)
+            return real_append(stream, data, *rest)
+
+        monkeypatch.setattr(backend, "_append_sync", append)
+    else:
+        real_consume = cron._retry_consume_ok
+
+        async def consume(*args, **kwargs):
+            settling.append(args)
+            await asyncio.sleep(0.4)
+            return await real_consume(*args, **kwargs)
+
+        monkeypatch.setattr(cron, "_retry_consume_ok", consume)
+    await _wait_until(lambda: settling, tries=500)
+    # the retry came due first: it launches, and Forbid refuses the start
+    with pytest.raises(ApiActionError) as err:
+        await cron.start_job("report", {"region": "us", "act": "linger"})
+    assert err.value.status == 409
+    (retry,) = cron.running_jobs["report"]
+    assert retry.retry_state is ladder and not retry.supplied_params
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    await _stop_run(cron, retry)
+
+
+async def test_a_restart_re_arms_a_retry_held_behind_a_start_with_values(
+    dag_cron, tmp_path, monkeypatch
+):
+    yaml = _ladder_yaml(policy="Forbid", delay=0.3, once=tmp_path / "once")
+    cron = await dag_cron(yaml)
+    ladder = await _arm_ladder(cron)
+    _slow_start(cron, monkeypatch)
+    await cron.start_job("report", {"region": "us", "act": "hold"})
+    (one_off,) = cron.running_jobs["report"]
+    await asyncio.sleep(0.1)
+    assert not ladder.task.done()
+    # the daemon stops while the retry waits, and the one-off dies with it
+    await _stop_ladder(cron)
+    one_off.proc.kill()
+    await one_off.wait()
+    cron._remove_running_instance(one_off)
+    await cron._job_api.finish_run(one_off.state_token)
+    restarted = await dag_cron(yaml)
+    await _drain_pending(restarted)
+    assert (await _retry_records(restarted))[-2:] == [
+        ("pending", None, 1),
+        ("pending", None, 1),
+    ]
+    assert restarted.retry_state["report"].count == 1
+    await _stop_ladder(restarted)
 
 
 @pytest.mark.parametrize("policy", ["Allow", "Replace"])
@@ -1647,6 +1766,84 @@ async def test_http_start_that_waits_for_the_cluster_slot(dag_cron):
     await _settle(cron)
     assert _printed(cron, "s") == {"CRONSTABLE_PARAM_REGION": "us"}
     assert cron.retry_state.pop("s") is ladder
+
+
+def _reload_slot(cron, tmp_path, yaml):
+    """Reload ``cron`` with ``yaml`` under ``_slot_cron``'s state section."""
+    cfg = parse_config_string(
+        "state:\n  path: {}\n  slotTtlSeconds: 6\n".format(tmp_path) + yaml, ""
+    )
+    for job in cfg.jobs:
+        job.command = _ECHO
+    cron._apply_reload(cfg)
+
+
+@pytest.mark.parametrize(
+    "old, new, refused",
+    [
+        pytest.param(
+            "        default: eu\n",
+            "        default: eu\n        allowed:\n          - eu\n",
+            "region",
+            id="value-narrowed-out",
+        ),
+        pytest.param(
+            "name: region", "name: target", "region, target", id="renamed"
+        ),
+        pytest.param(
+            "        default: eu\n",
+            "        default: eu\n"
+            "      - name: rows\n        type: integer\n        default: 5\n",
+            "rows",
+            id="added",
+        ),
+        pytest.param(
+            "    params:\n      - name: region\n        default: eu\n",
+            "",
+            "region",
+            id="all-removed",
+        ),
+    ],
+)
+async def test_a_start_that_waits_for_the_cluster_slot_meets_a_reload(
+    dag_cron, tmp_path, caplog, old, new, refused
+):
+    cron, foreign = await _slot_cron(dag_cron)
+    assert (await cron.start_job("s", {"region": "zz-9"}))["pending"] is True
+    pursuit = cron._slot_pursuits["s"]
+    assert old in _SLOT
+    _reload_slot(cron, tmp_path, _SLOT.replace(old, new))
+    with caplog.at_level("INFO", logger="cronstable"):
+        await cron.state_backend.release_lease(foreign)  # the holder yields
+        await asyncio.wait_for(pursuit, timeout=30)
+    # the values run as they are, and the current declaration refuses them
+    assert not cron.running_jobs.get("s")
+    assert "s" not in cron._slot_pursuit_launch
+    (skipped,) = [r for r in caplog.records if "not launching" in r.message]
+    assert skipped.levelname == "WARNING"
+    assert skipped.getMessage() == (
+        "Job s: not launching the manual start that waited for the cluster "
+        "slot: its values do not fit the current params declaration "
+        "({})".format(refused)
+    )
+    # the log names parameters, never a value
+    assert "zz-9" not in caplog.text
+
+
+async def test_a_start_that_waits_for_the_cluster_slot_keeps_fitting_values(
+    dag_cron, tmp_path
+):
+    cron, foreign = await _slot_cron(dag_cron)
+    assert (await cron.start_job("s", {"region": "us"}))["pending"] is True
+    pursuit = cron._slot_pursuits["s"]
+    # a reload that changes no rule of the declaration
+    _reload_slot(cron, tmp_path, _SLOT + "        description: Region\n")
+    await cron.state_backend.release_lease(foreign)  # the holder yields
+    await asyncio.wait_for(pursuit, timeout=30)
+    (running,) = cron.running_jobs["s"]
+    assert running.params == {"region": "us"} and running.supplied_params
+    await _settle(cron)
+    assert _printed(cron, "s") == {"CRONSTABLE_PARAM_REGION": "us"}
 
 
 async def test_http_start_answers_503_when_the_slot_claim_gets_no_answer(

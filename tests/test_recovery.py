@@ -1278,7 +1278,12 @@ async def test_retention_keeps_a_recovery_run_that_is_accepted_again(
     monkeypatch.setattr(backend, "list_documents", then_accept_again)
     await cron._dag._gc_one_dag(backend, "flow", config)
     monkeypatch.undo()
-    assert await backend.list_document_keys("dagrun/flow") == ["newer", key]
+    # date-1 stays as catch-up's reference run
+    assert await backend.list_document_keys("dagrun/flow") == [
+        "date-1",
+        "newer",
+        key,
+    ]
     body = await cron._dag._read("flow", key)
     assert (body["runId"], body["createdAt"]) == (token, 5060.0)
     assert await jobstate.artifact_get(backend, scope, "extract/data")

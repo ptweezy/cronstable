@@ -718,8 +718,9 @@ missed logical dates a restart replays, capped like a job's catch-up.
 Catch-up counts the missed dates from the latest logical date among the runs
 the schedule created, which are its scheduled runs and its catch-up runs. A
 manual run, a backfill, and a recovery leave that reference point where it is,
-whatever logical date they carry. A DAG with no retained scheduled or catch-up
-run has no reference point, so it schedules forward.
+whatever logical date they carry. [Retention](#retention-and-gc) always keeps
+the run that holds it. A DAG with no scheduled or catch-up run has no
+reference point, so it schedules forward.
 
 `catchupJitterSeconds` spreads the replays, with the same checkpointed
 at-least-once resume the job engine has. The owed watermark goes into a
@@ -838,7 +839,10 @@ that needs a higher level.
 A dag_run document is durable and, while its DAG is configured, is **not**
 swept by the record garbage collector (GC). Instead each DAG keeps its newest
 `retainRuns` **terminal** runs (default 50) and prunes the rest, along with
-their XCom, on a periodic DAG-owned pass.
+their XCom, on a periodic DAG-owned pass. The pass always keeps the scheduled
+or catch-up run with the latest logical date, because
+[catch-up](#scheduling-catch-up-and-backfill) counts missed dates from it.
+That run can add one terminal run beyond `retainRuns`.
 
 Each node runs the pass hourly and at daemon start. It deletes runs in
 batches of up to 32, each run under its own lease, and keeps a run that a

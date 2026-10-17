@@ -8321,9 +8321,9 @@ var qrcode = function() {
     await postJobStart(name, null);
   }
   // POST the start. Resolves true on success, null after a failure it has
-  // already reported, and the error body for refused parameters, which the
-  // dialog shows under its fields.
-  async function postJobStart(name, params) {
+  // already reported, and the error body of a 400 or 403 when `fromForm` is
+  // set, for the dialog to show under its fields.
+  async function postJobStart(name, params, fromForm) {
     try {
       const opts = { method: "POST" };
       if (params) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify({ params: params }); }
@@ -8339,7 +8339,7 @@ var qrcode = function() {
         setTimeout(loadJobs, 300);
         return true;
       }
-      if (params && (res.status === 400 || res.status === 403)) return await errorBody(res);
+      if (fromForm && (res.status === 400 || res.status === 403)) return await errorBody(res);
       if (res.status === 409) { const error = await res.json(); toast("err", error.error || "Job could not be queued"); }
       else { toast("err", "could not start (HTTP " + res.status + ")"); }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "could not start " + name); }
@@ -11277,18 +11277,27 @@ var qrcode = function() {
     }
     $("paramError").textContent = [message].concat(rest).filter(Boolean).join(" · ");
   }
+  // Sends required parameters and values that differ from the declared
+  // defaults, so an unchanged dialog starts the same run as a click without
+  // the dialog. Defaults come from the latest poll, so a field left at a
+  // default that a reload replaced is still sent.
   async function submitParamForm() {
     const form = state.paramForm;
     if (!form) return;
-    const params = {}, errors = {};
+    const latest = new Map((form.job ? jobParamDecl(form.dag) : dagParamDecl(form.dag)).map((p) => [p.name, p]));
+    const chosen = {}, errors = {};
     form.decl.forEach((p, i) => {
-      try { const v = paramFieldValue(p, i); if (v !== undefined) params[p.name] = v; }
-      catch (e) { errors[p.name] = e.message; }
+      try {
+        const v = paramFieldValue(p, i);
+        const d = latest.get(p.name) || p;
+        if (v !== undefined && (d.required || v !== d.default)) chosen[p.name] = v;
+      } catch (e) { errors[p.name] = e.message; }
     });
     if (Object.keys(errors).length) { showParamErrors(errors, ""); return; }
+    const params = Object.keys(chosen).length ? chosen : null;
     $("paramGo").disabled = true;
     const result = form.job
-      ? await postJobStart(form.dag, params)
+      ? await postJobStart(form.dag, params, true)
       : form.backfill
         ? await postBackfill(form.dag, form.backfill.from, form.backfill.to, params)
         : await postTrigger(form.dag, params);

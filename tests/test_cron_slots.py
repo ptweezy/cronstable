@@ -663,9 +663,12 @@ async def test_slotlease_pursue_replace_relaunches_when_slot_frees(
     held = {"with_retries": False, "params": {"region": "us"}}
     cron._slot_pursuit_launch["s"] = held
     # a reload lands while the pursuit waits, and the pursuit launches the
-    # job's current configuration
+    # job's current configuration, whose declaration the values fit
+    from cronstable.params import ParamSpec
+
     stale = cron.cron_jobs["s"]
     current = cron.cron_jobs["s"] = copy.copy(stale)
+    current.params = (ParamSpec("region", default="eu"),)
     await cron._pursue_replace_slot(stale, _slotlease_lease())
     ((launched, kwargs),) = relaunched
     assert launched is current and kwargs == held

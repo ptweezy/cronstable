@@ -1230,18 +1230,20 @@ def test_param_form_tells_the_empty_choice_from_the_placeholder(
             _click(page, trigger)
             page.wait_for_selector("#paramWrap.open")
             # the option after `choose…` is the declared "", and the dialog
-            # sends it
+            # sends it; `suffix` stays at its default and out of the request
             page.select_option("#paramF1", index=1)
             page.click("#paramGo")
             e2e.wait_toast(page, "triggered deploy")
             _param_form_closed(page)
-            values = {"suffix": "-beta", "ticket": ""}
             assert _posts(page)[-1] == (
                 "/dags/deploy/trigger",
-                {"params": values},
+                {"params": {"ticket": ""}},
             )
             run = daemon.api("GET", "/dags/deploy/runs")[1]["runs"][0]
-            assert daemon.dag_run("deploy", run["runKey"])["params"] == values
+            assert daemon.dag_run("deploy", run["runKey"])["params"] == {
+                "suffix": "-beta",
+                "ticket": "",
+            }
             # the two options have different labels, and `choose…`, which a
             # required list opens on, leaves the parameter out
             _click(page, trigger)
@@ -1256,11 +1258,53 @@ def test_param_form_tells_the_empty_choice_from_the_placeholder(
                 "document.getElementById('paramError').textContent"
             )
             assert _param_errors(page) == {"ticket": "ticket is required"}
-            assert _posts(page)[-1] == (
-                "/dags/deploy/trigger",
-                {"params": {"suffix": "-beta"}},
-            )
+            assert _posts(page)[-1] == ("/dags/deploy/trigger", None)
             assert len(daemon.api("GET", "/dags/deploy/runs")[1]["runs"]) == 1
+
+
+def test_an_unchanged_param_form_sends_no_values(browser, tmp_path):
+    scale = {
+        "name": "scale",
+        "schedule": "0 0 1 1 *",
+        "params": [
+            {"name": "ratio", "type": "number", "default": 1.0},
+            {"name": "label", "default": "base"},
+        ],
+        "tasks": [{"id": "resize", "command": _py("pass")}],
+    }
+    with e2e.Daemon(tmp_path, dags=[scale]) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            page.faults.record()
+            page.wait_for_selector('#dagRows [data-dagtrigger="scale"]')
+            _click(page, '#dagRows [data-dagtrigger="scale"]')
+            page.wait_for_selector("#paramWrap.open")
+            # JSON.parse reads the default 1.0 as 1, and "1.0" equals it
+            assert page.input_value("#paramF0") == "1"
+            page.fill("#paramF0", "1.0")
+            page.click("#paramGo")
+            e2e.wait_toast(page, "triggered scale")
+            _param_form_closed(page)
+            assert _posts(page)[-1] == ("/dags/scale/trigger", None)
+            # an unchanged backfill dialog sends no `params` key either
+            _open_dag(page, "scale")
+            page.click("#dgBackfillBtn")
+            page.fill("#dgBfFrom", "2025-12-30")
+            page.fill("#dgBfTo", "2026-01-02")
+            page.click("#dgBfGo")
+            page.wait_for_selector("#paramWrap.open")
+            page.click("#paramGo")
+            assert "ok" in e2e.wait_toast(page, "▦ backfill queued (1 run)")
+            assert _posts(page)[-1] == (
+                "/dags/scale/backfill",
+                {"from": "2025-12-30", "to": "2026-01-02"},
+            )
+        runs = daemon.api("GET", "/dags/scale/runs")[1]["runs"]
+        assert len(runs) == 2
+        for run in runs:
+            stored = daemon.dag_run("scale", run["runKey"])["params"]
+            # the declared 1.0, which a control-only token can recover
+            assert stored == {"ratio": 1.0, "label": "base"}
+            assert type(stored["ratio"]) is float
 
 
 def test_backfill_sends_the_form_values(browser, tmp_path):
@@ -1284,17 +1328,17 @@ def test_backfill_sends_the_form_values(browser, tmp_path):
                 {
                     "from": "2025-12-30",
                     "to": "2026-01-02",
-                    "params": {
-                        "target": "prod",
-                        "batch_size": 500,
-                        "dry": False,
-                        "note": "none",
-                    },
+                    "params": {"target": "prod"},
                 },
             )
         run = daemon.api("GET", "/dags/nightly/runs")[1]["runs"][0]
         stored = daemon.dag_run("nightly", run["runKey"])
-        assert stored["params"]["target"] == "prod"
+        assert stored["params"] == {
+            "target": "prod",
+            "batch_size": 500,
+            "dry": False,
+            "note": "none",
+        }
 
 
 def test_param_form_is_hidden_without_the_params_scope(browser, tmp_path):

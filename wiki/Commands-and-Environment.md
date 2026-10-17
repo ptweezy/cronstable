@@ -287,6 +287,8 @@ How a run gets its values:
 - A manual start supplies values through `POST /jobs/{name}/start` with a
   body such as `{"params": {"index": "orders"}}`, the dashboard's **Run**
   dialog, the terminal dashboard's run row, or the MCP tool `cron_run_job`.
+  The **Run** dialog sends only the values that differ from the declared
+  defaults, so submitting it unchanged is a start without values.
   cronstable checks each value against the declaration and coerces nothing,
   and a refused request starts nothing. With
   [scoped tokens](HTTP-API#scoped-tokens-webauthtokens), supplying values

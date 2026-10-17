@@ -693,8 +693,10 @@ When another node holds the job's
 
 Nothing runs yet. This node asks the holder to yield, and the run starts with
 the values in the answer when the slot frees. The pending run does not start
-if a newer launch of the job comes first, or if the holder keeps the slot for
-twice `slotTtlSeconds`. If the state store cannot answer for the slot and
+if a newer launch of the job comes first, if the holder keeps the slot for
+twice `slotTtlSeconds`, or if a reload leaves the job with a `params`
+declaration that the values in the answer do not fit. If the state store
+cannot answer for the slot and
 [`onStoreUnavailable`](Durable-State#when-the-store-is-unavailable-onstoreunavailable)
 is `fail-closed`, the request starts nothing and answers `503`. A `200`
 without `pending` means that a run started. See
