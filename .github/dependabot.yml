@@ -5,8 +5,9 @@
 # with what the pipeline uses.
 version: 2
 updates:
-  # Actions are exact-pinned (actions/checkout@v7.0.0) so Dependabot sees the
-  # minor and patch drift that a moving major tag would hide.
+  # Actions are pinned to commit SHAs with a trailing version comment
+  # (actions/checkout@<sha> # v7.0.1). Dependabot updates the comment only
+  # when it ends with the version, so put other notes on the line above.
   - package-ecosystem: github-actions
     directories:
       - "/" # scans .github/workflows/ and root action.yml only

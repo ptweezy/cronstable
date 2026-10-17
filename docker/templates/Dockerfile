@@ -65,7 +65,7 @@ FROM @@runtime@@
 LABEL org.opencontainers.image.title="cronstable" \
       org.opencontainers.image.description="@@description@@" \
       org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
-@@extra_labels@@
+# @@extra_labels@@
       org.opencontainers.image.licenses="MIT"
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

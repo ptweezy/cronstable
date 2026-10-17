@@ -33,10 +33,10 @@ jobs:
       cryptography: ${{ steps.inputs.outputs.cryptography }}
       crypto-sha: ${{ steps.inputs.outputs.crypto-sha }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Select the latest stable release
@@ -47,7 +47,7 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: python .github/scripts/docker_refresh.py select
       - name: Check out the released source
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.release.outputs.revision }}
           path: source
@@ -69,7 +69,7 @@ jobs:
           mkdir -p release-inputs/refresh-tools
           cp ../.github/scripts/refresh_runtime.py ../.github/scripts/scan_gate.py \
             release-inputs/refresh-tools/
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-inputs
           path: source/release-inputs/
@@ -90,14 +90,14 @@ jobs:
       PIP_RETRIES: '10'
       PIP_TIMEOUT: '60'
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           persist-credentials: false
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-inputs
           path: release-inputs
@@ -182,13 +182,13 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-${{ matrix.distro }}-linux-*
           path: images
@@ -208,7 +208,7 @@ jobs:
           retry 5 sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
           retry 5 sudo apt-get -o Acquire::Retries=5 install -y skopeo
           skopeo copy --all --preserve-digests oci-archive:image.tar:release oci:verified:release
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-refresh-${{ matrix.distro }}
           path: |
@@ -239,7 +239,7 @@ jobs:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Assemble uploads this artifact as its last step, so the artifact
@@ -249,7 +249,7 @@ jobs:
         env:
           ARTIFACT: docker-refresh-${{ matrix.distro }}
         run: python3 .github/scripts/docker_refresh.py ready
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: steps.ready.outputs.ready == 'true'
         with:
           name: docker-refresh-${{ matrix.distro }}
@@ -268,14 +268,14 @@ jobs:
         run: python3 .github/scripts/docker_refresh.py check
       - name: Log in to GHCR
         if: steps.current.outputs.current == 'true'
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Log in to Docker Hub
         if: steps.current.outputs.current == 'true' && env.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

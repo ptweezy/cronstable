@@ -255,6 +255,8 @@ The single `release.yml` pipeline builds and publishes the official images from 
 
 BuildKit caches are scoped per distro/platform and written only on trunk. Release dependency layers refresh on each run. Optional cryptography builders always resolve fresh sources and reuse compiler work keyed by the source, base image and installed toolchain. The compiler and source-wheel caches save only entries below 512 MiB; best-effort maintenance limits these cache families on trunk to 2 GiB. Cache loss affects speed, while release publication uses immutable run artifacts. Platform OCI artifacts expire after two days for CI and seven days for releases.
 
+Every base image in `docker/images.toml` names a tag and the digest of its multi-arch index, so CI and release builds keep the same base layers until a reviewed change updates the digest. Container refreshes drop the digests and pull the current tags, which brings base image fixes into the rebuilt release.
+
 The image build passes the computed version with `--build-arg VERSION=X.Y.Z`. A plain local `docker build .` leaves it empty, and `setuptools_scm` reads the version from `.git`. See [production and container deployment](Production-Deployment).
 
 ## The PyInstaller build
@@ -265,7 +267,7 @@ Installing the package under `SETUPTOOLS_SCM_PRETEND_VERSION` before running PyI
 
 ### Building a binary locally
 
-`pyinstaller/Dockerfile` builds a glibc binary reproducibly on `ubuntu:26.04`. It installs build deps, uses `pyenv` to install CPython `3.14.8` (the release the CI lanes freeze) with `--enable-shared`, creates a venv, installs PyInstaller from `pyinstaller/build-requirements.txt` and the package with **uv** (copied in with `COPY --from=ghcr.io/astral-sh/uv`), runs the entry script (`python pyinstaller/cronstable --version`), runs `pyinstaller pyinstaller/cronstable.spec`, and smoke-tests `dist/cronstable --version`. This amd64-only local build makes the image-copy pattern arch-safe here, unlike the multi-arch release `Dockerfile`.
+`pyinstaller/Dockerfile` builds a glibc binary reproducibly on a digest-pinned `ubuntu:26.04`. It installs build deps, uses a commit-pinned `pyenv` to install CPython `3.14.8` (the release the CI lanes freeze) with `--enable-shared`, creates a venv, installs PyInstaller from `pyinstaller/build-requirements.txt` and the package with **uv** (copied in with `COPY --from=ghcr.io/astral-sh/uv`), runs the entry script (`python pyinstaller/cronstable --version`), runs `pyinstaller pyinstaller/cronstable.spec`, and smoke-tests `dist/cronstable --version`. This amd64-only local build makes the image-copy pattern arch-safe here, unlike the multi-arch release `Dockerfile`.
 
 `pyinstaller/Makefile` wraps that: `make` (target `all`) builds the image, copies `dist/cronstable` out of the container, and runs `dist/cronstable --version`.
 

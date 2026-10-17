@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -646,8 +647,10 @@ def test_runtime_refresh_uses_tools_from_the_workflow_checkout():
 def test_runtime_refresh_preserves_the_released_recipe_and_user(row):
     source = (ROOT / row["dockerfile"]).read_text()
     rendered = load("refresh_runtime").recipe(source, row["distro"])
-    assert rendered.startswith(source.rstrip() + "\n")
-    added = rendered[len(source.rstrip()) :]
+    # Everything but the base image digests carries over.
+    unpinned = re.sub(r"@sha256:[0-9a-f]{64}", "", source)
+    assert rendered.startswith(unpinned.rstrip() + "\n")
+    added = rendered[len(unpinned.rstrip()) :]
     lines = added.strip().splitlines()
     assert lines[0] == "USER 0:0"
     assert lines[2] == "USER 65534:65534"
@@ -662,6 +665,20 @@ def test_runtime_refresh_preserves_the_released_recipe_and_user(row):
     assert "COPY --from=dependency-sources" in lines[3]
     assert "ENTRYPOINT" not in added
     assert "CMD" not in added
+
+
+def test_runtime_refresh_pulls_current_base_images():
+    digest = "@sha256:" + "0" * 64
+    source = (
+        f"FROM --platform=$BUILDPLATFORM python:3.14-slim{digest} AS builder\n"
+        f"FROM gcr.io/distroless/python3-debian13:latest{digest}\n"
+        "USER 65534:65534\n"
+    )
+    rendered = load("refresh_runtime").recipe(source, "distroless")
+    assert rendered.startswith(
+        "FROM --platform=$BUILDPLATFORM python:3.14-slim AS builder\n"
+        "FROM gcr.io/distroless/python3-debian13:latest\n"
+    )
 
 
 def test_runtime_refresh_preserves_a_custom_runtime_user():

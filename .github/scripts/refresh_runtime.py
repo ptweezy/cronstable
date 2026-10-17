@@ -50,12 +50,17 @@ PACKAGING = (
     "wheel-*.dist-info",
 )
 SCRIPTS = ("pip", "pip3", "pip3.*", "easy_install", "easy_install-*", "wheel")
+# A refresh rebuilds on current base images, so it drops the release's pins.
+BASE_DIGEST = re.compile(
+    r"(?im)^(FROM\s+(?:--\S+\s+)*[^\s@]+)@sha256:[0-9a-f]{64}"
+)
 
 
 def recipe(source, distro):
     distro = distro.removesuffix("-amd64v3")
     if distro not in UPDATES:
         raise ValueError(f"Unsupported refresh distro: {distro}")
+    source = BASE_DIGEST.sub(r"\1", source)
     final_stage = re.split(r"(?im)^FROM\s+", source)[-1]
     users = re.findall(r"(?im)^USER\s+([^\r\n]+)", final_stage)
     if not users:

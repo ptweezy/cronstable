@@ -37,7 +37,7 @@ jobs:
     steps:
       # Runner setup comes from the workflow revision, even when refreshing
       # a release whose source tree predates the shared compatibility action.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-docker
@@ -52,20 +52,20 @@ jobs:
         run: python3 .github/scripts/docker_refresh.py validate-ref
       - name: Check out the application revision
         if: inputs.ref != ''
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.source.outputs.revision }}
           persist-credentials: false
       - name: Fetch this platform's optional wheel
         if: matrix.wheel != ''
         continue-on-error: ${{ !inputs.refresh }}
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ matrix.wheel }}
           path: docker/wheelhouse/${{ matrix.wheel_group }}
       - name: Download dependency sources for the refreshed image
         if: inputs.refresh
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-inputs
           path: ${{ runner.temp }}/release-inputs
@@ -78,14 +78,14 @@ jobs:
           set -euo pipefail
           python3 "$RUNNER_TEMP/release-inputs/refresh-tools/refresh_runtime.py" recipe \
             --dockerfile "$DOCKERFILE" --distro "$DISTRO" --output "$RUNNER_TEMP/Dockerfile.refresh"
-      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         if: matrix.qemu
-      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build the platform once
         id: build
         # A refresh gets one more attempt below. Release builds fail at once.
         continue-on-error: ${{ inputs.refresh }}
-        uses: docker/build-push-action@v7.4.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with: &build
           context: .
           file: ${{ inputs.refresh && format('{0}/Dockerfile.refresh', runner.temp) || matrix.dockerfile }}
@@ -116,7 +116,7 @@ jobs:
         run: sleep 300
       - name: Rebuild the platform after a failure
         if: inputs.refresh && steps.build.outcome == 'failure'
-        uses: docker/build-push-action@v7.4.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with: *build
       - name: Test the refreshed runtime
         if: inputs.refresh
@@ -208,7 +208,7 @@ jobs:
             --platform "$PLATFORM" --cache-dir "$GITHUB_WORKSPACE/.cache/trivy"
       - name: Upload vulnerability reports
         if: ${{ always() && inputs.refresh }}
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vulnerabilities-${{ matrix.distro }}-${{ matrix.platform_id }}
           path: |
@@ -216,7 +216,7 @@ jobs:
             ${{ runner.temp }}/vulnerabilities-published.json
           if-no-files-found: warn
           retention-days: 30
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.distro }}-${{ matrix.platform_id }}
           path: ${{ runner.temp }}/image.tar

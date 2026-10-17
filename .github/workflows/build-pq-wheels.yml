@@ -25,7 +25,7 @@ jobs:
     steps:
       # Runner setup comes from the workflow revision, even when refreshing
       # a release whose source tree predates the shared compatibility action.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-docker
@@ -40,25 +40,25 @@ jobs:
         run: python3 .github/scripts/docker_refresh.py validate-ref
       - name: Check out the application revision
         if: inputs.ref != ''
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.source.outputs.revision }}
           persist-credentials: false
       - name: Download resolved cryptography source
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-inputs
           path: release-inputs
       - name: Restore the OpenSSL build (manylinux rows)
         if: ${{ matrix.manylinux && !inputs.refresh }}
         id: openssl-cache
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .openssl-${{ matrix.arch }}
           key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
         continue-on-error: true
       - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4.4.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -68,7 +68,7 @@ jobs:
         id: image
       - name: Restore compiler work
         if: ${{ !inputs.refresh }}
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pq-cache
           key: pq-work-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}
@@ -168,7 +168,7 @@ jobs:
           python3 .github/scripts/cache_size.py .pq-cache
         id: cache-size
       - name: Save compiler work (trunk only)
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pq-cache
           key: pq-work-${{ matrix.libc }}-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ inputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/build-pq-wheels.yml') }}
@@ -176,12 +176,12 @@ jobs:
         continue-on-error: true
       - name: Save the OpenSSL build (manylinux rows, trunk only)
         if: ${{ !inputs.refresh && matrix.manylinux && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .openssl-${{ matrix.arch }}
           key: openssl-pqwheel-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
         continue-on-error: true
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pq-wheel-${{ matrix.libc }}-${{ matrix.arch }}
           path: wheelhouse/cryptography-*.whl

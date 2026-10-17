@@ -37,7 +37,7 @@ runs:
     - name: Sign ${{ inputs.label }}
       id: sign1
       continue-on-error: true
-      uses: azure/artifact-signing-action@v2.0.0
+      uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
       with:
         endpoint: ${{ inputs.endpoint }}
         signing-account-name: ${{ inputs.signing-account-name }}
@@ -61,7 +61,7 @@ runs:
       id: sign2
       if: steps.sign1.outcome == 'failure'
       continue-on-error: true
-      uses: azure/artifact-signing-action@v2.0.0
+      uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
       with:
         endpoint: ${{ inputs.endpoint }}
         signing-account-name: ${{ inputs.signing-account-name }}
@@ -86,7 +86,7 @@ runs:
     - name: Sign ${{ inputs.label }} (last attempt)
       id: sign3
       if: steps.sign2.outcome == 'failure'
-      uses: azure/artifact-signing-action@v2.0.0
+      uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
       with:
         endpoint: ${{ inputs.endpoint }}
         signing-account-name: ${{ inputs.signing-account-name }}

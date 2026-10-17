@@ -109,13 +109,13 @@ jobs:
       pq-glibc: ${{ steps.distros.outputs.pq-glibc }}
       pq-musl: ${{ steps.distros.outputs.pq-musl }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # full history + tags: the marker scan walks BEFORE..AFTER and setuptools_scm / tag math resolve
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Decide release
@@ -268,8 +268,8 @@ jobs:
       cryptography: ${{ steps.inputs.outputs.cryptography }}
       crypto-sha: ${{ steps.inputs.outputs.crypto-sha }}
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Check release credentials and version
@@ -296,14 +296,14 @@ jobs:
         run: python .github/scripts/release_preflight.py
       - name: Check Azure signing login
         if: needs.version.outputs.release == 'true'
-        uses: azure/login@v3.1.0
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Check optional Docker Hub login
         if: needs.version.outputs.release == 'true' && env.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -326,7 +326,7 @@ jobs:
           bash packaging/homebrew/render-formula.sh 1.2.3 "$work/SHA256SUMS" packaging/homebrew/cronstable.rb.tmpl > "$work/cronstable.rb"
           ruby -c "$work/cronstable.rb"
           python .github/scripts/render_scoop.py 1.2.3 "$work/SHA256SUMS" "$work/cronstable.json"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-inputs
           path: release-inputs/
@@ -338,7 +338,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # This step runs the actionlint release binary, pinned by digest.
       # Docker Hub can rate-limit a pull of the image for longer than any
       # retry lasts, and a failure here skips every test job, because they
@@ -372,7 +372,7 @@ jobs:
             echo "$crlf"
             exit 1
           fi
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Check generated build files
@@ -392,11 +392,11 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Install runtime + distributable extras
@@ -441,8 +441,8 @@ jobs:
     # headroom for a degraded runner VM; 20 is too tight.
     timeout-minutes: 30
     steps: &tox-steps
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
       - run: |-
@@ -548,7 +548,7 @@ jobs:
       # so a Codecov outage or a fork PR without a token cannot fail the build.
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v7.1.1
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
@@ -584,8 +584,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.10'
       - run: pip install tox tox-uv
@@ -603,8 +603,8 @@ jobs:
     env:
       ETCD_IMAGE: gcr.io/etcd-development/etcd:v3.5.21
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Install the package, development dependencies, and Kubernetes client
@@ -657,7 +657,7 @@ jobs:
           docker logs etcd-plain
           exit 1
       - name: Start a kind cluster
-        uses: helm/kind-action@v1.15.1
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
       - name: Run the live backend tests
         env:
           CRONSTABLE_LIVE_REQUIRED: '1'
@@ -699,8 +699,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Install the package and development dependencies
@@ -782,11 +782,11 @@ jobs:
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version,
       # and the setuptools_scm file finder needs only the checked-out tree.
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Build distributions
@@ -820,7 +820,7 @@ jobs:
           exit "$status"
       - name: Smoke-test the installed wheel
         run: python .github/scripts/smoke_dist.py
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: |
@@ -844,8 +844,8 @@ jobs:
     continue-on-error: true
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: cachix/install-nix-action@v31.11.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -971,13 +971,13 @@ jobs:
     timeout-minutes: 300
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # pip keeps the wheels it builds from sdists here, so QEMU compiles run
       # once per dependency bump. Keyed on the image too: a source-built wheel
       # carries a plain linux_<arch> tag whatever base built it.
       - name: Restore pip cache (QEMU-built wheels)
         id: pip-cache
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: pip-manylinux-${{ matrix.arch }}-${{ matrix.image }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
@@ -989,13 +989,13 @@ jobs:
       - name: Restore the OpenSSL build (pq_src rows)
         if: ${{ matrix.pq_src }}
         id: openssl-cache
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .openssl-${{ matrix.arch }}
           key: openssl-manylinux-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
         continue-on-error: true
       - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4.4.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       # Its own step, so a registry blip never re-runs the build. Plain retry,
       # not pull_base: its mirror failover rewrites images into the Docker Hub
       # library/ namespace, which these quay.io images are not in.
@@ -1143,7 +1143,7 @@ jobs:
             '
       - name: Upload binary acceptance evidence
         if: ${{ always() && matrix.native == '1' }}
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: acceptance-linux-${{ matrix.arch }}
           path: acceptance-results/
@@ -1164,14 +1164,14 @@ jobs:
       # branch would evict the docker layer cache. Branches restore from main.
       - name: Save pip cache (trunk only)
         if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: pip-manylinux-${{ matrix.arch }}-${{ matrix.image }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
         continue-on-error: true
       - name: Save the OpenSSL build (pq_src rows, trunk only)
         if: ${{ matrix.pq_src && steps.openssl-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .openssl-${{ matrix.arch }}
           key: openssl-manylinux-${{ matrix.arch }}-${{ hashFiles('pyinstaller/build_openssl.sh') }}-${{ matrix.image }}
@@ -1179,7 +1179,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
@@ -1286,12 +1286,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The pip wheel cache (see binaries), keyed on libc and arch: glibc and
       # musl source builds share the plain linux_<arch> tag.
       - name: Restore pip cache (QEMU-built wheels)
         id: pip-cache
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
@@ -1302,7 +1302,7 @@ jobs:
         if: matrix.platform == 'linux/386'
       # binfmt/QEMU for the foreign-arch rows.
       - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4.4.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       # Its own step, as in binaries; pull_base adds mirror failover.
       - name: Pull the build image
         run: |
@@ -1428,7 +1428,7 @@ jobs:
       # Trunk only, for the cache pool reason given in binaries.
       - name: Save pip cache (trunk only)
         if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
@@ -1438,14 +1438,14 @@ jobs:
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}"
       - name: Upload binary acceptance evidence
         if: ${{ always() && !matrix.qemu }}
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: acceptance-linux-${{ matrix.arch }}${{ matrix.suffix }}
           path: acceptance-results/
           if-no-files-found: warn
           retention-days: 7
         continue-on-error: true
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
           path: dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
@@ -1480,8 +1480,8 @@ jobs:
     timeout-minutes: 300
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
-      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -1492,7 +1492,7 @@ jobs:
         id: image
       # Persist source wheels with an image/recipe key and a bounded cache.
       - name: Restore source wheels
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: slow-pip-binaries-mips-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
@@ -1558,7 +1558,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
@@ -1571,7 +1571,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" .pip-cache
           python3 .github/scripts/cache_size.py .pip-cache
       - name: Save source wheels (trunk only)
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: slow-pip-binaries-mips-${{ matrix.arch }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
@@ -1619,17 +1619,17 @@ jobs:
     # Shared with binaries-armel.
     steps: &legacy-arm-steps
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The armv6 cryptography wheel, built in its own job because the compile
       # takes hours under emulation. Without it the row stays on x25519.
       - name: Fetch the ARMv6 post-quantum wheel
         if: ${{ matrix.arch == 'armv6' }}
         continue-on-error: true
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pq-wheel-glibc-armv6
           path: pq-wheels
-      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -1702,7 +1702,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
@@ -1783,9 +1783,9 @@ jobs:
     timeout-minutes: 300
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The default binfmt install includes loong64.
-      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -1796,7 +1796,7 @@ jobs:
         id: image
       # Persist source wheels with an image/recipe key and a bounded cache.
       - name: Restore source wheels
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: slow-pip-binaries-loong64-${{ matrix.libc }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
@@ -1854,7 +1854,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-linux-loong64${{ matrix.suffix }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-linux-loong64${{ matrix.suffix }}
           path: dist/cronstable-linux-loong64${{ matrix.suffix }}
@@ -1867,7 +1867,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" .pip-cache
           python3 .github/scripts/cache_size.py .pip-cache
       - name: Save source wheels (trunk only)
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pip-cache
           key: slow-pip-binaries-loong64-${{ matrix.libc }}-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyproject.toml', 'pyinstaller/*.sh', 'pyinstaller/build-requirements.txt', '.github/workflows/release.yml') }}
@@ -1911,11 +1911,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps: &macos-steps
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Prepare macOS signing credentials
@@ -2073,7 +2073,7 @@ jobs:
             --junitxml acceptance-results/junit.xml
       - name: Upload binary acceptance evidence
         if: always()
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: acceptance-${{ matrix.asset }}
           path: acceptance-results/
@@ -2086,7 +2086,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-${{ matrix.asset }}
           path: dist/cronstable-${{ matrix.asset }}
@@ -2170,9 +2170,9 @@ jobs:
     timeout-minutes: 360
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (FreeBSD ${{ matrix.vmarch }})
-        uses: vmactions/freebsd-vm@v1.5.9
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2291,7 +2291,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-freebsd-${{ matrix.arch }}" "dist/cronstable-freebsd-${{ matrix.arch }}.pkg"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-freebsd-${{ matrix.arch }}
           path: |
@@ -2318,9 +2318,9 @@ jobs:
     timeout-minutes: 240
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (OpenBSD 7.9 amd64)
-        uses: vmactions/openbsd-vm@v1.4.8
+        uses: vmactions/openbsd-vm@5f7b2c933b8846a138361d6843c52af4bef5d945 # v1.4.8
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2395,7 +2395,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-openbsd-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-openbsd-${{ matrix.arch }}
           path: dist/cronstable-openbsd-${{ matrix.arch }}
@@ -2418,9 +2418,9 @@ jobs:
     timeout-minutes: 240
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (NetBSD 11.0 amd64)
-        uses: vmactions/netbsd-vm@v1.5.2
+        uses: vmactions/netbsd-vm@c8a0d7ddb84619a7a8cc4e652efa7950b3fd9f92 # v1.5.2
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2503,7 +2503,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-netbsd-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-netbsd-${{ matrix.arch }}
           path: dist/cronstable-netbsd-${{ matrix.arch }}
@@ -2529,9 +2529,9 @@ jobs:
     timeout-minutes: 180
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (OmniOS r151054 amd64)
-        uses: vmactions/omnios-vm@v1.3.7
+        uses: vmactions/omnios-vm@9576f0b6d15e7696548409baa533bc0a339caf42 # v1.3.7
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2607,7 +2607,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python3 .github/scripts/check_artifacts.py "dist/cronstable-illumos-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-illumos-${{ matrix.arch }}
           path: dist/cronstable-illumos-${{ matrix.arch }}
@@ -2680,13 +2680,13 @@ jobs:
         shell: bash
     steps:
       # Shallow checkout; see the dist job.
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         id: py
         with:
           python-version: '3.14'
           architecture: ${{ matrix.pyarch }}
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Build amd64v3 Python
@@ -2816,7 +2816,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python .github/scripts/check_artifacts.py "dist/cronstable-windows-${{ matrix.arch }}.exe"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-windows-${{ matrix.arch }}
           path: dist/cronstable-windows-${{ matrix.arch }}.exe
@@ -2850,7 +2850,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python .github/scripts/check_artifacts.py "dist/cronstable-windows-${{ matrix.arch }}.zip"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-windows-${{ matrix.arch }}-zip
           path: dist/cronstable-windows-${{ matrix.arch }}.zip
@@ -2995,7 +2995,7 @@ jobs:
           pwsh -NoProfile -File .github/scripts/smoke_windows_setup.ps1 \
             -Setup "dist/cronstable-windows-${ARCH}-setup.exe" \
             -PreviousMsi "dist/cronstable-windows-${ARCH}.msi" -UpgradeSetup upgrade-setup.exe
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.arch != 'i686'
         with:
           name: cronstable-windows-${{ matrix.arch }}-setup
@@ -3006,7 +3006,7 @@ jobs:
       - name: Check every declared binary artifact
         shell: bash
         run: python .github/scripts/check_artifacts.py "dist/cronstable-windows-${{ matrix.arch }}.msi"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cronstable-windows-${{ matrix.arch }}-msi
           path: dist/cronstable-windows-${{ matrix.arch }}.msi
@@ -3016,7 +3016,7 @@ jobs:
 
       - name: Upload binary acceptance evidence
         if: always()
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: acceptance-windows-${{ matrix.arch }}
           path: acceptance-results/
@@ -3058,13 +3058,13 @@ jobs:
     continue-on-error: true
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download resolved cryptography source
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-inputs
           path: release-inputs
-      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Pull the build image
         run: |
           set -euo pipefail
@@ -3074,7 +3074,7 @@ jobs:
           echo "digest=$(docker image inspect --format '{{.Id}}' tianon/raspbian:bookworm-slim)" >> "$GITHUB_OUTPUT"
         id: image
       - name: Restore ARMv6 compiler work
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pq-cache
           key: armv6-work-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}
@@ -3160,13 +3160,13 @@ jobs:
           python3 .github/scripts/cache_size.py .pq-cache
         id: cache-size
       - name: Save ARMv6 compiler work (trunk only)
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .pq-cache
           key: armv6-work-${{ steps.image.outputs.digest }}-${{ needs.preflight.outputs.crypto-sha }}-${{ hashFiles('pyinstaller/build_openssl.sh', '.github/scripts/compiler_fingerprint.py', '.github/workflows/release.yml') }}
         if: github.ref == 'refs/heads/main' && steps.cache-size.outputs.fits == 'true'
         continue-on-error: true
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pq-wheel-glibc-armv6
           path: wheelhouse/cryptography-*.whl
@@ -3184,7 +3184,7 @@ jobs:
       contents: read
       actions: write
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Bound compiler cache storage
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3230,11 +3230,11 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.version.outputs.docker-matrix) }}
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-${{ matrix.distro }}-linux-*
           path: images
@@ -3252,7 +3252,7 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update
           sudo apt-get -o Acquire::Retries=5 install -y skopeo
           skopeo copy --all --preserve-digests oci-archive:image.tar:release oci:verified:release
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: needs.version.outputs.release == 'true'
         with:
           name: docker-release-${{ matrix.distro }}
@@ -3275,13 +3275,13 @@ jobs:
     # A timeout here is NOT a perf regression.
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # full history + tags: the baseline is the latest release tag
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Install current and baseline environments
@@ -3411,7 +3411,7 @@ jobs:
             mv perf/perf-summary.stamped.md perf/perf-summary.md
           fi
       # Upload even when the gate failed; the report explains the red X.
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: perf-report
@@ -3427,7 +3427,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # the full PR commit range must be walkable
       - name: Verify Signed-off-by on every PR commit
@@ -3475,8 +3475,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7.0.1    # for packaging/msi/cronstable.wxs
-      - uses: actions/setup-python@v7.0.0
+      # For packaging/msi/cronstable.wxs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Require the signing secrets
@@ -3507,13 +3508,13 @@ jobs:
           fi
       # Rebuild the MSI and setup artifacts from the signed payloads.
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: cronstable-windows-*
           merge-multiple: true
           path: signdir
       - name: Log in to Azure (OIDC)
-        uses: azure/login@v3.1.0
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -3737,7 +3738,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
       - name: Preserve winget validation evidence
         if: always() && steps.signing_secrets.outcome == 'success'
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: winget-validation
           path: |
@@ -3748,7 +3749,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: Upload the signed set
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Keep outside the cronstable-* glob that release-prepare merges
           # into one directory, or signed and unsigned copies race on
@@ -3778,8 +3779,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: cronstable-linux-*
           merge-multiple: true
@@ -3792,7 +3793,7 @@ jobs:
           bash .github/scripts/build_packages.sh "$package_version" binaries
         env:
           VERSION: ${{ needs.version.outputs.new }}
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-packages
           path: |
@@ -3826,19 +3827,19 @@ jobs:
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       # Publish the exact wheel and sdist that `dist` built and checked.
       - name: Download distributions
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist
 
       - name: Download release binaries
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: binaries
           pattern: cronstable-*
@@ -3848,14 +3849,14 @@ jobs:
       # them, so SHA256SUMS, the Release and the winget manifests describe the
       # signed bytes. test_ci_fences pins the position.
       - name: Overlay the signed Windows artifacts
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: signed-windows
           path: binaries
 
       # Prebuilt by `packages`; hash and attach these exact files.
       - name: Download Linux packages
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: linux-packages
           path: binaries
@@ -3929,7 +3930,7 @@ jobs:
 
       # Perf gate output for this run: summary, raw results and chart.
       - name: Download performance report
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         # Under perf=ignore the perf job may have died before uploading; the
         # notes step below then says so instead of failing the release.
         continue-on-error: ${{ needs.version.outputs.perf == 'ignore' }}
@@ -3980,7 +3981,7 @@ jobs:
       # zeroconf LGPL-2.1 source offer: attach its sdist, resolved in this run,
       # and the notices file to the Release. See the licenses job.
       - name: Download resolved source archives
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-inputs
           path: release-inputs
@@ -3993,7 +3994,7 @@ jobs:
             packaging/homebrew/cronstable.rb.tmpl > homebrew/cronstable.rb
           ruby -c homebrew/cronstable.rb
       - name: Preserve prepared release
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: prepared-release
           path: |
@@ -4009,7 +4010,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: Preserve validated Homebrew formula
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: homebrew-formula
           path: homebrew/cronstable.rb
@@ -4034,21 +4035,21 @@ jobs:
       contents: write   # push the tag and create the GitHub Release
       id-token: write   # PyPI Trusted Publishing (OIDC)
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       # release-prepare assembled and hashed the wheel, sdist and binaries:
       # publish those exact bytes rather than rebuilding.
       - name: Download prepared release
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: prepared-release
           path: .
       - name: Verify prepared artifact checksums
         run: python3 .github/scripts/verify_release_checksums.py
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           # Runs before the tag and Release, so a retry after a later failure
           # finds the files on PyPI; skip-existing lets it finish the release.
@@ -4087,7 +4088,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3.0.3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.version.outputs.new }}
           name: ${{ needs.version.outputs.new }}
@@ -4233,7 +4234,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v6.2.0
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ steps.registries.outputs.images }}
           # The distro suffix (e.g. `-alpine`) is appended to every tag; it is
@@ -4250,7 +4251,7 @@ jobs:
             type=raw,value=latest-debian,enable=${{ startsWith(matrix.distro, 'debian') }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -4258,13 +4259,13 @@ jobs:
 
       - name: Log in to Docker Hub
         if: steps.registries.outputs.dockerhub == 'true'
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Download validated OCI image
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: docker-release-${{ matrix.distro }}
           path: .
@@ -4288,10 +4289,11 @@ jobs:
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7.0.1    # for the formula template + render script
+      # For the formula template + render script.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download validated Homebrew formula
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: homebrew-formula
           path: prepared
@@ -4346,8 +4348,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Download signed winget installers
@@ -4363,7 +4365,7 @@ jobs:
             --pattern cronstable-windows-amd64-setup.exe \
             --pattern cronstable-windows-arm64-setup.exe
       - name: Download validated winget manifests
-        uses: actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: winget-validation
           path: .
@@ -4420,8 +4422,10 @@ jobs:
       # repository is written.
       contents: write
     steps:
-      - uses: actions/checkout@v7.0.1    # for the wiki/ page sources
-      - uses: actions/checkout@v7.0.1    # the wiki is its own repo; its default branch is always master
+      # For the wiki/ page sources.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The wiki is its own repo; its default branch is always master.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository }}.wiki
           path: .wiki
