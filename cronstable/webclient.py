@@ -73,12 +73,36 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     http_error_307 = http_error_308 = http_error_302
 
 
+class _DeferredHTTPSHandler(urllib.request.HTTPSHandler):
+    """The stock HTTPSHandler, initialized by its first HTTPS request.
+
+    On Python 3.12 and later, the HTTPSHandler constructor builds the
+    default TLS context, which loads the system CA store and takes about
+    30 ms. The shared opener is built at import, and most of its traffic is
+    plain HTTP to the daemon's loopback endpoint, so this handler runs the
+    stock constructor when the first HTTPS request arrives. From then on it
+    behaves as the stock handler does.
+    """
+
+    def __init__(self) -> None:
+        urllib.request.AbstractHTTPHandler.__init__(self)
+        self._initialized = False
+
+    def https_open(
+        self, req: urllib.request.Request
+    ) -> http.client.HTTPResponse:
+        if not self._initialized:
+            urllib.request.HTTPSHandler.__init__(self)
+            self._initialized = True
+        return super().https_open(req)
+
+
 # Loopback/control traffic must never be proxied: the daemon's endpoint is
 # usually 127.0.0.1, which an external proxy cannot reach, and urllib's
 # default opener would send the bearer token to the proxy that
 # http_proxy/HTTP_PROXY names.
 OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), NoRedirect()
+    urllib.request.ProxyHandler({}), NoRedirect(), _DeferredHTTPSHandler()
 )
 
 
