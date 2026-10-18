@@ -39,12 +39,15 @@ updates:
   # scripts/generate_build_files.py writes /Dockerfile and docker/Dockerfile.*
   # from docker/images.toml: apply a base-image bump there and rerun it. A uv
   # bump in pyinstaller/Dockerfile also moves SETUP_UV_VERSION in release.yml.
+  # .clusterfuzzlite/Dockerfile pins the OSS-Fuzz builder's moving v1 tag by
+  # digest, so its updates are digest bumps.
   # Review, do not automerge: a new base image can change the default Python.
   - package-ecosystem: docker
     directories:
       - "/"
       - "/docker"
       - "/pyinstaller"
+      - "/.clusterfuzzlite"
     schedule:
       interval: daily
     open-pull-requests-limit: 10

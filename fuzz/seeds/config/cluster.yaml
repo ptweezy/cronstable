@@ -1,0 +1,27 @@
+web:
+  listen:
+    - http://127.0.0.1:8080
+cluster:
+  listen: "0.0.0.0:8443"
+  tls:
+    ca: /certs/ca.pem
+    cert: /certs/node-a.pem
+    key: /certs/node-a.key
+  peers:
+    - host: node-b:8443
+    - host: node-c:8443
+  nodeName: node-a
+  electLeader: true
+  interval: 10
+  driftAfter: 2
+  observability:
+    shareNodeStats: true
+jobs:
+  - name: leader-only
+    command: echo leader
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader
+  - name: every-node
+    command: echo node
+    schedule: "H * * * *"
+    clusterPolicy: EveryNode

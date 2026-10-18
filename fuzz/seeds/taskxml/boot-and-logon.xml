@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\Startup\Warm cache</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Delay>PT30S</Delay>
+      <Repetition>
+        <Interval>PT1H</Interval>
+      </Repetition>
+    </BootTrigger>
+    <LogonTrigger>
+      <UserId>CONTOSO\alice</UserId>
+    </LogonTrigger>
+    <EventTrigger>
+      <Subscription>&lt;QueryList&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+    <IdleTrigger />
+  </Triggers>
+  <Settings>
+    <RunOnlyIfIdle>true</RunOnlyIfIdle>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+  </Settings>
+  <Actions>
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c echo warm &amp;&amp; exit 0</Arguments>
+    </Exec>
+    <Exec>
+      <Command>C:\Tools\second.exe</Command>
+    </Exec>
+  </Actions>
+</Task>

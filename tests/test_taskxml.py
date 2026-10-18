@@ -19,7 +19,7 @@ import types
 import pytest
 
 from cronstable import taskxml
-from cronstable.config import parse_config_string
+from cronstable.config import ConfigError, parse_config_string
 from cronstable.taskxml import (
     TaskXmlError,
     convert_task,
@@ -1057,3 +1057,78 @@ def test_a_real_export_converts_and_loads(tmp_path):
     out = tmp_path / "jobs.yaml"
     assert taskxml.dispatch(_args([str(export)], output=str(out))) == 0
     parse_config_string(out.read_text(encoding="utf-8"), "")
+
+
+# ---------------------------------------------------------------------------
+# fuzz/fuzz_taskxml.py findings: values a converted file cannot hold
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("week", ["Laso", "0", "5"])
+def test_a_week_outside_the_schema_blocks_the_trigger(week):
+    converted = _convert(
+        _task(
+            triggers="<CalendarTrigger><StartBoundary>2026-08-10T02:30:00"
+            "</StartBoundary><ScheduleByMonthDayOfWeek><Weeks><Week>2</Week>"
+            "<Week>{}</Week></Weeks><DaysOfWeek><Friday/></DaysOfWeek>"
+            "</ScheduleByMonthDayOfWeek></CalendarTrigger>".format(week)
+        )
+    )
+    assert converted.jobs == []
+    assert "as a week of the month" in _reasons(converted)
+
+
+@pytest.mark.parametrize("day", ['15"', "0", "32"])
+def test_a_day_outside_the_schema_blocks_the_trigger(day):
+    converted = _convert(
+        _task(
+            triggers="<CalendarTrigger><StartBoundary>2026-08-10T02:30:00"
+            "</StartBoundary><ScheduleByMonth><DaysOfMonth><Day>1</Day>"
+            "<Day>{}</Day></DaysOfMonth></ScheduleByMonth>"
+            "</CalendarTrigger>".format(day)
+        )
+    )
+    assert converted.jobs == []
+    assert "as a day of the month" in _reasons(converted)
+
+
+def test_a_one_shot_before_the_engines_first_year_is_refused():
+    converted = _convert(
+        _task(
+            triggers="<TimeTrigger><StartBoundary>1025-06-01T12:30:00"
+            "</StartBoundary></TimeTrigger>"
+        )
+    )
+    assert converted.jobs == []
+    assert "before the first year" in _reasons(converted)
+
+
+def test_a_schedule_reaches_the_loader_intact_inside_its_quotes():
+    # The day 15" ends a double-quoted scalar unless the quote is escaped.
+    task = taskxml.ConvertedTask(
+        "t",
+        [{"name": "x", "command": ["c"], "schedule": '0 0 15" * *'}],
+        [],
+        False,
+    )
+    with pytest.raises(ConfigError, match="invalid schedule") as exc:
+        parse_config_string(render_yaml([task], sources=["t.xml"]), "")
+    assert '15"' in str(exc.value)
+
+
+def test_characters_yaml_cannot_hold_are_escaped():
+    # XML character references can put a line break or a C1 control in a
+    # task's URI, which lands in a comment, and DEL in its command.
+    converted = _convert(
+        _task(
+            uri="\\Backu&#x91;s\\Nightly&#10;backup",
+            triggers=_DAILY,
+            actions="<Exec><Command>C:\\To&#x7f;ls\\backup.exe</Command>"
+            "</Exec>",
+        )
+    )
+    document = render_yaml([converted], sources=["t.xml"])
+    conf = parse_config_string(document, "")
+    assert [job.name for job in conf.jobs] == [converted.jobs[0]["name"]]
+    assert conf.jobs[0].command == converted.jobs[0]["command"]
+    assert "\\x91" in document and "\\x0A" in document

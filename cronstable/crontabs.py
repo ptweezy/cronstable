@@ -349,10 +349,11 @@ def _unquote(value: str) -> str:
 
 
 def _check_timezone(value: str, where: str) -> None:
-    # Mirrors JobConfig._resolve_timezone's acceptance rule.
+    # Mirrors JobConfig._resolve_timezone's acceptance rule, OSError
+    # included: a name too long for the zone file lookup raises it.
     try:
         ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError) as ex:
+    except (ZoneInfoNotFoundError, ValueError, OSError) as ex:
         raise CrontabError(
             "{}: CRON_TZ: unknown timezone {!r}".format(where, value)
         ) from ex

@@ -454,3 +454,25 @@ def test_control_characters_in_live_lines_are_refused_with_file_line():
     # tab remains a perfectly good field separator
     jobs = crontabs.parse_crontab("0 3 * * *\t/usr/bin/backup\n", "t.cron")
     assert jobs[0]["command"] == "/usr/bin/backup"
+
+
+@pytest.mark.parametrize(
+    "zone",
+    [
+        # fuzz/fuzz_crontab.py's input: too long for a Linux file name
+        "U" + "\N{REPLACEMENT CHARACTER}" * 131 + "TC",
+        # too long for a Windows one
+        "A" * 300,
+    ],
+    ids=["fuzzer-input", "ascii"],
+)
+def test_an_over_long_cron_tz_is_an_unknown_timezone(zone):
+    # The zone file lookup raises OSError for these, and they get the
+    # same file:line error as any unknown zone.
+    data = "CRON_TZ=" + zone + "\n* * * * * true\n"
+    with pytest.raises(
+        crontabs.CrontabError, match="legacy.crontab:1: CRON_TZ: unknown"
+    ):
+        crontabs.parse_crontab(data, "legacy.crontab")
+    with pytest.raises(ConfigError, match="unknown timezone"):
+        config.parse_crontab_string(data, "legacy.crontab")

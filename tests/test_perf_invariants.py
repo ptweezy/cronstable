@@ -2421,14 +2421,11 @@ def test_direct_key_lookup_reports_the_same_error_as_the_scan(case):
     finally:
         YAMLPointer._individual_get = installed
     assert failure() == expected
-    # A complex key trips strictyaml's own assertion that a key is a
-    # string before any lookup runs; every other case is a ConfigError
-    # with a message.
-    if case == "complex key":
-        assert expected[0] == "AssertionError"
-    else:
-        assert expected[0] == "ConfigError"
-        assert expected[1].strip(), case
+    # Every case is a ConfigError with a message, the complex key included:
+    # it trips strictyaml's own assertion that a key is a string before any
+    # lookup runs, and parse_config_string reports that as a ConfigError.
+    assert expected[0] == "ConfigError"
+    assert expected[1].strip(), case
     # and the raw strictyaml outcome, exception type included
     upstream_outcome, direct_outcome = _configcli_both_outcomes(text)
     assert upstream_outcome[0] == "error", case

@@ -1,5 +1,22 @@
 # History
 
+## 1.2.69
+
+- Secret redaction treats a quoted value as ended only when whitespace, a
+  delimiter, or a shell metacharacter follows its closing quote. A value
+  such as `KEY="part1"part2`, which the shell reads as one word, is
+  redacted whole.
+- `import-taskscheduler` reports, and does not convert, a trigger that
+  names a week other than 1 to 4 or `Last`, a day of the month other than
+  1 to 31 or `Last`, or a one-shot start before 1970. The file it writes
+  escapes characters YAML cannot hold as written, such as a line break in
+  a task's URI or a control character in its command.
+- A classic crontab's `CRON_TZ` with a name too long for the zone file
+  lookup is reported as an unknown timezone with its file and line.
+- A configuration file that uses a sequence as a mapping key fails to load
+  with a configuration error naming the file, like any other malformed
+  file.
+
 ## 1.2.68
 
 - A job's `resourceLimits` caps the CPU, memory, and process count of each of

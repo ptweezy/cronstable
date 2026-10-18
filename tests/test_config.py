@@ -4299,6 +4299,25 @@ def test_control_character_in_config_is_config_error_not_attributeerror():
     # any other exception type propagates and fails the test
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # fuzz/fuzz_config.py's inputs: strictyaml's constructor raises
+        # TypeError for a sequence used as a mapping key, and for a comment
+        # it cannot place.
+        "web:\n  listen:\n    - http://126d\n  ? - http://254: 0\n",
+        "web:\neprocessesw= eb:\neprocessesw= :\nbe:\n    #:\n  :\nbe:\n"
+        "    #:\n    - Pp:aee\n",
+        # the same key at the top level trips an assert instead
+        "? - a\n: b\n",
+    ],
+    ids=["complex-key", "comment", "top-level-complex-key"],
+)
+def test_strictyaml_constructor_errors_are_config_errors(text):
+    with pytest.raises(ConfigError):
+        parse_config_string(text, "t.yaml")
+
+
 # ---------------------------------------------------------------------------
 # sla + onLate (per-job SLA thresholds and the late-report hook)
 # ---------------------------------------------------------------------------

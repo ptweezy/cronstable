@@ -1,0 +1,22 @@
+cluster:
+  backend: etcd
+  etcd:
+    endpoints:
+      - http://etcd:2379
+    electionName: cronstable/leader
+    ttl: 15
+    username: root
+    password:
+      value: example-password
+jobs:
+  - name: charge-cards
+    command: echo "charging cards"
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader
+  - name: refresh-cache
+    command: echo "refreshing cache"
+    schedule: "*/1 * * * *"
+    clusterPolicy: PreferLeader
+web:
+  listen:
+    - http://0.0.0.0:8080

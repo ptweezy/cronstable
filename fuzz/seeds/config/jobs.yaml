@@ -1,0 +1,34 @@
+defaults:
+  shell: /bin/sh
+  utc: true
+  captureStderr: true
+  onFailure:
+    retry:
+      maximumRetries: 2
+      initialDelay: 1
+      maximumDelay: 30
+      backoffMultiplier: 2
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "*/5 * * * *"
+    captureStdout: true
+    concurrencyPolicy: Forbid
+    executionTimeout: 300
+    killTimeout: 10
+    environment:
+      - key: GREETING
+        value: hello
+  - name: beta
+    command:
+      - echo
+      - beta
+    schedule:
+      minute: "0"
+      hour: "3"
+      dayOfWeek: "mon-fri"
+    timezone: Europe/Berlin
+  - name: gamma
+    command: echo boot
+    schedule: "@reboot"
+    enabled: false
