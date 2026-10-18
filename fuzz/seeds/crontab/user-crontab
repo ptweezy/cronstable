@@ -1,0 +1,13 @@
+# m h dom mon dow  command
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+GREETING="hello  world"
+QUOTED = 'single quoted'
+* * * * *  echo "$GREETING"
+*/2 * * * *  echo "today is $(date -u +\%F)"
+CRON_TZ=Europe/Berlin
+0 6 * * mon-fri  echo "good morning"
+30 4 1,15 jan-jun *  /usr/local/bin/report --monthly
+@reboot  echo "up"
+@midnight  rotate-logs
+@hourly  true

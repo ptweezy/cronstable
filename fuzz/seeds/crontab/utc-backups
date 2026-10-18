@@ -1,0 +1,6 @@
+CRON_TZ=UTC
+MAILTO=""
+*/7 * * * *   echo "backup at $(date -u +\%H:\%M) (\% is escaped)"
+30 4 * * 1-5  echo "weekday report"
+0 0 L * *  echo "month end"
+@daily        echo "rotate"

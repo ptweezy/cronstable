@@ -1,0 +1,1 @@
+{"cpu": 1.5, "memory_bytes": 536870912, "processes": 64, "required": true, "enforced": false, "mechanism": "cgroup", "unenforced": ["cpu"], "reason": "no cpu controller", "refused": false, "memory_exceeded": false, "process_limit_hits": 0, "peak_memory_bytes": 104857600, "cpu_throttled_seconds": 0.25}

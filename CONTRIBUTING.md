@@ -331,6 +331,11 @@ regression test in the same module. Set
 `CRONSTABLE_HYPOTHESIS_PROFILE=thorough` to generate about 30 times as many
 examples.
 
+Coverage-guided fuzz targets for the same parsers are in `fuzz/`. The `fuzz`
+workflow runs them with ClusterFuzzLite on every pull request and daily on
+`main`. [fuzz/README.md](fuzz/README.md) lists what each target checks and
+shows how to run one locally.
+
 `tests/test_backend_live.py` runs the etcd and Kubernetes backends against
 real servers. Configure the servers with `CRONSTABLE_LIVE_ETCD`,
 `CRONSTABLE_LIVE_ETCD_AUTH`, or `CRONSTABLE_LIVE_K8S`; the module docstring

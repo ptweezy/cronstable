@@ -358,3 +358,46 @@ def test_url_userinfo_pattern_is_linear_not_quadratic():
     assert "s3cret" not in out and "user:" + REDACTED + "@db" in out
     out = redact_secrets("x redis://:SuperSecret123@cache:6379")
     assert "SuperSecret123" not in out
+
+
+# ---------------------------------------------------------------------------
+# fuzz/fuzz_redact.py findings: a closing quote that does not end the value
+# ---------------------------------------------------------------------------
+
+
+def test_text_after_a_closing_quote_does_not_leak():
+    # The shell joins "not-"-real-secret-123" into one word, so the value
+    # runs past the first closing quote. The first line is the fuzzer's.
+    for line, tail in [
+        ('AWS_SECRET_ACCESS_KEY="not-"-real-secret-123"', "real-secret"),
+        ('{"use, "token":  "token": \'single\'}', "single"),
+        ('KEY=1 password="part1"part2 next', "part2"),
+        ("password='part1'\"part2\"", "part2"),
+    ]:
+        out = redact_secrets(line)
+        assert tail not in out, (line, out)
+    # a delimiter or shell metacharacter after the quote still ends it
+    assert (
+        redact_secrets("SET password = 'x'; SELECT 1")
+        == "SET password = " + REDACTED + "; SELECT 1"
+    )
+    assert (
+        redact_secrets('connect(password="x") ok')
+        == "connect(password=" + REDACTED + ") ok"
+    )
+
+
+def test_a_second_pass_leaves_redacted_lines_unchanged():
+    # a redacted quoted value followed by more text: the marker is not a
+    # new bare value that runs to end of line
+    for line in [
+        'password="x" token="y"',
+        'password: "abc" and more text',
+        '{"api_key": "abc123", "user": "bob"}',
+    ]:
+        once = redact_secrets(line)
+        assert redact_secrets(once) == once, (line, once)
+    assert (
+        redact_secrets('password: "abc" and more text')
+        == "password: " + REDACTED + " and more text"
+    )

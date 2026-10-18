@@ -1,11 +1,15 @@
-FROM ubuntu:26.04
+FROM ubuntu:26.04@sha256:2e27ff302056b2b96df4a524ce48e72c595abfe3fd7a3d923adf8e782e16896f
 
 RUN apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && DEBIAN_FRONTEND=noninteractive \
 	apt-get install -y -q \
 		curl git ca-certificates build-essential zlib1g-dev \
 		libbz2-dev libssl-dev libreadline-dev libffi-dev \
 		liblzma-dev libsqlite3-dev tk-dev
-RUN curl https://pyenv.run | bash
+# pyenv v2.8.10, fetched by commit. Its python-build must define the CPython
+# release installed below.
+RUN git init -q /root/.pyenv \
+	&& git -C /root/.pyenv fetch -q --depth 1 https://github.com/pyenv/pyenv.git 288b3e19879613f0389bd614c7bb0f02d5f52f04 \
+	&& git -C /root/.pyenv checkout -q FETCH_HEAD
 
 ENV PATH="/root/.pyenv/bin:$PATH"
 

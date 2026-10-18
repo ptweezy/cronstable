@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2025-01-02T03:04:05</Date>
+    <Author>CONTOSO\admin</Author>
+    <URI>\Backups\Nightly backup</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <Repetition>
+        <Interval>PT15M</Interval>
+        <Duration>PT4H</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2025-01-02T01:00:00</StartBoundary>
+      <EndBoundary>2030-01-01T00:00:00</EndBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+    <TimeTrigger>
+      <StartBoundary>2025-06-01T12:30:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <Enabled>true</Enabled>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT5M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Tools\backup.exe</Command>
+      <Arguments>--target "D:\Backups" /full</Arguments>
+      <WorkingDirectory>C:\Tools</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

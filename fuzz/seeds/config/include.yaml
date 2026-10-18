@@ -1,0 +1,7 @@
+jobs:
+  - name: with-env-file
+    command: echo "$GREETING"
+    schedule: "0 * * * *"
+    env_file: greeting.env
+include:
+  - shared.yaml

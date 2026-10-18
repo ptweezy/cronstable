@@ -1,0 +1,86 @@
+# ClusterFuzzLite fuzzing of the parsers in fuzz/; see fuzz/README.md.
+# A pull request fuzzes for five minutes. The daily batch run fuzzes for an
+# hour, keeps each target's corpus as an Actions artifact for the next run,
+# then prunes it. A crash fails the run and uploads its input as an artifact.
+
+name: fuzz
+
+on:
+  pull_request:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.event_name == 'pull_request' && github.ref || 'batch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # to download the corpus the batch run stored
+      actions: read
+    steps:
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mode: code-change
+          fuzz-seconds: 300
+
+  batch:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mode: batch
+          fuzz-seconds: 3600
+
+  # Batch fuzzing only grows the corpus; pruning drops the inputs that add
+  # no coverage.
+  prune:
+    needs: batch
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prune the corpus
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: python
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mode: prune
+          fuzz-seconds: 600

@@ -4793,12 +4793,13 @@ def parse_config_string(
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
         raise ConfigError(str(ex)) from ex
-    except (ValueError, AttributeError) as ex:
-        # strictyaml's scalar validators raise BARE ValueError for values
-        # like '' or '.' on any Float()/Int() key, and its reader raises
-        # AttributeError for a control character or lone surrogate.  Config
-        # parsing must only ever raise ConfigError: without this, one bad
-        # file aborts a whole config-directory load with a raw traceback.
+    except Exception as ex:  # noqa: BLE001 - every load error is ConfigError
+        # strictyaml raises bare built-in errors on malformed input, among
+        # them ValueError for '' or '.' on a Float()/Int() key,
+        # AttributeError for a control character or lone surrogate, and
+        # TypeError or AssertionError for a sequence used as a mapping key.
+        # Config parsing must only ever raise ConfigError: without this, one
+        # bad file aborts a whole config-directory load with a raw traceback.
         raise ConfigError("{}: {}".format(path, ex)) from ex
     finally:
         _STRICTYAML_KEY_LOOKUP.direct = direct

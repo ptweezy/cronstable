@@ -1,0 +1,7 @@
+DB_PASSWORD=hunter2hunter2
+export AWS_SECRET_ACCESS_KEY="not-a-real-secret-0123456789"
+api_key: 0123456789abcdef
+PGPASSWORD=s3cret MYSQLPWD=other
+{"user": "app", "password": "p@ss \"quoted\" word", "token": 'single'}
+REDISCLI_AUTH=redispass
+oauth: on

@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Tasks>
+  <!-- \Reports\Weekly -->
+  <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+    <RegistrationInfo>
+      <URI>\Reports\Weekly</URI>
+    </RegistrationInfo>
+    <Triggers>
+      <CalendarTrigger>
+        <StartBoundary>2025-03-03T06:00:00</StartBoundary>
+        <ScheduleByWeek>
+          <WeeksInterval>2</WeeksInterval>
+          <DaysOfWeek>
+            <Monday />
+            <Thursday />
+          </DaysOfWeek>
+        </ScheduleByWeek>
+      </CalendarTrigger>
+    </Triggers>
+    <Actions>
+      <Exec>
+        <Command>powershell.exe</Command>
+        <Arguments>-NoProfile -File "C:\Reports\weekly.ps1"</Arguments>
+      </Exec>
+    </Actions>
+  </Task>
+  <!-- \Reports\Monthly -->
+  <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+    <RegistrationInfo>
+      <URI>\Reports\Monthly</URI>
+    </RegistrationInfo>
+    <Triggers>
+      <CalendarTrigger>
+        <StartBoundary>2025-01-01T23:00:00</StartBoundary>
+        <ScheduleByMonth>
+          <DaysOfMonth>
+            <Day>1</Day>
+            <Day>15</Day>
+            <Day>Last</Day>
+          </DaysOfMonth>
+          <Months>
+            <January />
+            <April />
+            <July />
+            <October />
+          </Months>
+        </ScheduleByMonth>
+      </CalendarTrigger>
+      <CalendarTrigger>
+        <StartBoundary>2025-01-01T08:00:00</StartBoundary>
+        <ScheduleByMonthDayOfWeek>
+          <Weeks>
+            <Week>2</Week>
+            <Week>Last</Week>
+          </Weeks>
+          <DaysOfWeek>
+            <Friday />
+          </DaysOfWeek>
+          <Months>
+            <March />
+            <June />
+            <September />
+            <December />
+          </Months>
+        </ScheduleByMonthDayOfWeek>
+      </CalendarTrigger>
+    </Triggers>
+    <Settings>
+      <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
+    </Settings>
+    <Actions>
+      <Exec>
+        <Command>"C:\Program Files\Report\report.exe"</Command>
+      </Exec>
+    </Actions>
+  </Task>
+</Tasks>

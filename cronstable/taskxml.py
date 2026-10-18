@@ -52,6 +52,9 @@ MAX_DOCUMENT_BYTES = 32 * 1024 * 1024
 #: be refused at config load, so it is refused here instead, where the
 #: message can name the task.
 _YEAR_HORIZON = 2099
+#: The first year the cron engine's year column accepts, refused below for
+#: the same reason.
+_YEAR_FLOOR = 1970
 
 
 class TaskXmlError(ValueError):
@@ -399,6 +402,9 @@ _WEEKDAYS = (
     ("Sunday", "sun"),
 )
 
+#: A ``DaysOfMonth/Day`` value the schema allows, besides ``Last``.
+_DAY_OF_MONTH = re.compile(r"[1-9]|[12][0-9]|3[01]")
+
 _MONTHS = (
     "January",
     "February",
@@ -534,6 +540,17 @@ def _lower_time_trigger(
                 True,
             )
         ]
+    if boundary.when.year < _YEAR_FLOOR:
+        return None, [
+            Note(
+                task,
+                "TimeTrigger",
+                "its start is in {}, before the first year the cron engine "
+                "accepts".format(boundary.when.year),
+                "",
+                True,
+            )
+        ]
     notes.append(
         Note(
             task,
@@ -650,7 +667,21 @@ def _lower_schedule_by_month(
             value = (day.text or "").strip()
             # "Last" is the schema's own spelling of the month's last day,
             # and the cron dialect spells it L.
-            days.append("L" if value.lower() == "last" else value)
+            if value.lower() == "last":
+                days.append("L")
+            elif _DAY_OF_MONTH.fullmatch(value):
+                days.append(value)
+            else:
+                return None, [
+                    Note(
+                        task,
+                        "CalendarTrigger/ScheduleByMonth",
+                        "it names {!r} as a day of the month, which is "
+                        "neither 1 to 31 nor Last".format(value),
+                        "",
+                        True,
+                    )
+                ]
     if not days:
         return None, [
             Note(
@@ -692,6 +723,18 @@ def _lower_schedule_by_month_dow(
                 True,
             )
         ]
+    for week in weeks:
+        if week not in ("1", "2", "3", "4") and week.lower() != "last":
+            return None, [
+                Note(
+                    task,
+                    "CalendarTrigger/ScheduleByMonthDayOfWeek",
+                    "it names {!r} as a week of the month, which is "
+                    "neither 1 to 4 nor Last".format(week),
+                    "",
+                    True,
+                )
+            ]
     items = []
     for week in weeks:
         for index, (_name, short) in enumerate(_WEEKDAYS):
@@ -1358,12 +1401,59 @@ _PLAIN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*$")
 _UNINTERPOLATED = frozenset({"command", "shell"})
 
 
+def _verbatim(char: str) -> bool:
+    """Whether YAML holds ``char`` as written in a quoted scalar or comment.
+
+    YAML's printable set less its line breaks: a break ends a comment, and
+    a quoted scalar folds it into a space.  XML allows the C1 controls, DEL
+    and every break as character references, so an export can carry them.
+    """
+    code = ord(char)
+    return (
+        code == 0x09
+        or 0x20 <= code <= 0x7E
+        or (0xA0 <= code <= 0xD7FF and code not in (0x2028, 0x2029))
+        or 0xE000 <= code <= 0xFFFD
+        or code >= 0x10000
+    )
+
+
+def _escape(char: str) -> str:
+    code = ord(char)
+    if code < 0x100:
+        return "\\x{:02X}".format(code)
+    if code < 0x10000:
+        return "\\u{:04X}".format(code)
+    return "\\U{:08X}".format(code)
+
+
+def _comment(text: str) -> str:
+    """``text`` for a ``#`` comment, escaping what YAML cannot hold there."""
+    return "".join(char if _verbatim(char) else _escape(char) for char in text)
+
+
+def _double_quoted(text: str) -> str:
+    """``text`` as a double-quoted YAML scalar, the one style with escapes."""
+    return '"{}"'.format(
+        "".join(
+            "\\" + char
+            if char in '\\"'
+            else char
+            if _verbatim(char)
+            else _escape(char)
+            for char in text
+        )
+    )
+
+
 def _scalar(value: Any, *, interpolated: bool = True) -> str:
     """One YAML scalar, quoted the way a Windows path survives.
 
     Single quotes rather than double, matching what the starter config
     already tells users: in a double-quoted YAML string a backslash starts
-    an escape sequence, and every path here is full of them.
+    an escape sequence, and every path here is full of them.  A value with
+    a character YAML cannot hold as written is double-quoted instead,
+    because only that style has escapes.
 
     Hand-rolled rather than handed to strictyaml, which cannot interleave
     the comments this emitter depends on.  What makes hand-rolling safe is
@@ -1378,6 +1468,8 @@ def _scalar(value: Any, *, interpolated: bool = True) -> str:
     text = str(value)
     if interpolated:
         text = text.replace("$", "$$")
+    if not all(map(_verbatim, text)):
+        return _double_quoted(text)
     if _PLAIN.match(text) and not text.endswith("."):
         return text
     return "'" + text.replace("'", "''") + "'"
@@ -1401,7 +1493,13 @@ def _render_job(job: dict[str, Any], *, commented: bool) -> list[str]:
                 )
             continue
         if key == "schedule":
-            lines.append('{}{}: "{}"'.format(prefix, key, str(value)))
+            # Double-quoted like every cron schedule in this project's YAML.
+            # The loader expands ${VAR} here, so a $ is doubled.
+            lines.append(
+                "{}{}: {}".format(
+                    prefix, key, _double_quoted(str(value).replace("$", "$$"))
+                )
+            )
             continue
         lines.append(
             "{}{}: {}".format(
@@ -1434,7 +1532,7 @@ def render_yaml(tasks: list[ConvertedTask], *, sources: list[str]) -> str:
     live = [task for task in tasks if task.jobs and not task.commented]
     if not live:
         return ""
-    names = ", ".join(sorted({os.path.basename(s) for s in sources}))
+    names = _comment(", ".join(sorted({os.path.basename(s) for s in sources})))
     out = [
         "# Converted from {} by `cronstable import-taskscheduler`.".format(
             names
@@ -1446,7 +1544,7 @@ def render_yaml(tasks: list[ConvertedTask], *, sources: list[str]) -> str:
     for task in tasks:
         if not task.jobs:
             continue
-        out.append("  # {}".format(task.label))
+        out.append("  # {}".format(_comment(task.label)))
         if task.commented:
             out.append("  # NOT CONVERTED, see the report; left here to edit:")
         for job in task.jobs:

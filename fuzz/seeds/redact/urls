@@ -1,0 +1,5 @@
+connecting to postgres://app:s3cretpass@db.example:5432/app
+redis://:onlypassword@cache:6379/0
+https://user:pa55word@example.com/path?q=1
+mongodb+srv://admin:hunter2@cluster0.example.net/db
+plain https://example.com:8443/no/credentials

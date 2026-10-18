@@ -1,0 +1,39 @@
+state:
+  path: ./cronstable-state
+  jobApi:
+    enabled: true
+dags:
+  - name: nightly-etl
+    schedule: "0 2 * * *"
+    onMissed: run-once
+    startingDeadlineSeconds: 43200
+    retainRuns: 30
+    tasks:
+      - id: list-partitions
+        command: echo '["eu", "us"]' | cronstable xcom push --key partitions
+      - id: load-partition
+        dependsOn:
+          - list-partitions
+        expand:
+          fromTask: list-partitions
+          key: partitions
+        retries: 2
+        retryDelaySeconds: 30
+        executionTimeout: 3600
+        command: echo "loading $CRONSTABLE_DAG_MAP_ITEM"
+      - id: wait-for-feed
+        type: sensor
+        dependsOn:
+          - load-partition
+        pokeIntervalSeconds: 60
+        pokeTimeoutSeconds: 7200
+        command: "test -f /data/feed.ready"
+      - id: publish-gate
+        type: approval
+        dependsOn:
+          - wait-for-feed
+        onReject: skip
+      - id: publish
+        dependsOn:
+          - publish-gate
+        command: "echo publishing"
