@@ -17,6 +17,7 @@ import types
 import jsonschema
 import pytest
 
+from cronstable import _json
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
 from cronstable.cron import (
@@ -128,10 +129,15 @@ def _run_info(outcome, *, dur=1.0, exit_code=0):
 
 
 def test_dumps_falls_back_for_nonportable_values():
-    # a non-finite float fails the fleet-portability gate of _json but must
-    # not 500 a transient MCP response: the stdlib fallback encodes it.
-    assert mcp_mod._dumps(float("inf")) == b"Infinity"
+    # A transient MCP response encodes trusted, as a REST response does, and
+    # a value the encoder refuses must not 500 it. orjson writes a
+    # non-finite float as null; the stdlib flavour refuses one, and the
+    # stdlib fallback writes it as Infinity.
+    expected = b"Infinity" if _json.orjson is None else b"null"
+    assert mcp_mod._dumps(float("inf")) == expected
     assert mcp_mod._dumps({"v": 1}) == b'{"v":1}'
+    # neither encoder takes a set, so the fallback writes its str()
+    assert json.loads(mcp_mod._dumps({"v": {1, 2}})) == {"v": "{1, 2}"}
 
 
 _EXPO = """\
