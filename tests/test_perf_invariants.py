@@ -2740,6 +2740,60 @@ def test_unchanged_warm_load_reparses_no_file(tmp_path, monkeypatch, files):
     assert [os.path.basename(path) for path in parsed] == ["job-0500.yaml"]
 
 
+# --- a warm directory load merges no defaults ------------------------------
+#
+# Each file's `defaults:` block applies to that file's own jobs when the
+# file is parsed, and the only reader of a config's job_defaults is the
+# include merge, which names a file.  So the directory loader keeps no
+# defaults of its own, and an unchanged warm load of a directory calls
+# mergedicts zero times.  Folding every file's full default tree into one
+# would cost a recursive merge per file on every load, cache hits included.
+
+
+def test_unchanged_warm_load_merges_no_defaults(tmp_path, monkeypatch):
+    from collections import OrderedDict
+
+    from cronstable import config
+
+    monkeypatch.setattr(config, "_DIR_FILE_CACHE", OrderedDict())
+    defaults = config.JobDefaults(config.mergedicts(config.DEFAULT_CONFIG, {}))
+
+    def stand_in(path, _seen=None, _sources=None):
+        # parse_config_file's bookkeeping, returning the full default tree
+        # that a real parse returns for each file
+        abspath = os.path.abspath(path)
+        if _sources is not None:
+            _sources.add(abspath)
+        if _seen is not None:
+            _seen.add(abspath)
+        return config.CronstableConfig(
+            jobs=[],
+            web_config=None,
+            job_defaults=defaults,
+            logging_config=None,
+        )
+
+    monkeypatch.setattr(config, "parse_config_file", stand_in)
+    for i in range(20):
+        with open(str(tmp_path / ("job-%02d.yaml" % i)), "w") as handle:
+            handle.write("jobs:\n")
+    config.parse_config(str(tmp_path))
+
+    merges = []
+    real = config.mergedicts
+
+    def counting(dict1, dict2):
+        merges.append(1)
+        return real(dict1, dict2)
+
+    monkeypatch.setattr(config, "mergedicts", counting)
+    config.parse_config(str(tmp_path))
+    assert merges == [], (
+        "an unchanged warm load of a 20-file directory made %d mergedicts "
+        "calls" % len(merges)
+    )
+
+
 # --- one read per source per load --------------------------------------------
 #
 # A cache entry is signed with the bytes its parse read, so a cold load

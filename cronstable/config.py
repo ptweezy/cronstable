@@ -5861,7 +5861,6 @@ def _parse_config_dir(
     push_config: dict[str, Any] | None = None
     push_config_source_fname: str | None = None
     pools: dict[str, dict[str, int]] = {}
-    job_defaults: JobDefaults = JobDefaults({})
     entries = _config_dir_entries(config_arg)
     if _listed is not None:
         # for parsed_listing_unchanged: a file that joins the directory
@@ -5934,9 +5933,6 @@ def _parse_config_dir(
             push_config_source_fname,
             direntry.path,
         )
-        job_defaults = JobDefaults(
-            mergedicts(job_defaults, config.job_defaults)
-        )
     if config_errors:
         raise ConfigError("\n---".join(config_errors.values()))
     # Build the result from the accumulated values (never the last file's
@@ -5945,7 +5941,11 @@ def _parse_config_dir(
     return CronstableConfig(
         jobs=jobs,
         web_config=web_config,
-        job_defaults=job_defaults,
+        # A directory has no defaults of its own: each file's `defaults:`
+        # block applies to that file's jobs when the file is parsed. The
+        # only reader of job_defaults is the include merge, and an include
+        # names a file.
+        job_defaults=JobDefaults({}),
         logging_config=logging_config,
         cluster_config=cluster_config,
         state_config=state_config,
