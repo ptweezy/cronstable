@@ -3176,6 +3176,43 @@ async def test_denied_semaphore_acquire_probes_each_permit_once(fs_backend):
         await api.stop()
 
 
+# --- an MCP response pays no portability walk ------------------------------
+#
+# An MCP payload is a transient response, so it encodes trusted, as a REST
+# response does.  The portability walk visits every node of a payload in
+# Python, and a tool call encodes its result twice: into the text block,
+# then inside the envelope, which carries structuredContent as well.  The
+# invariant is that COUNT: zero walks per encode.
+
+
+def test_mcp_response_encodes_without_a_portability_walk(monkeypatch):
+    from cronstable import _json, mcp
+
+    walks = []
+
+    def counting(name):
+        real = getattr(_json, name)
+
+        def walk(*args, **kwargs):
+            walks.append(name)
+            return real(*args, **kwargs)
+
+        return walk
+
+    # the orjson flavour pre-walks with _ensure_finite, the stdlib flavour
+    # with ensure_portable
+    for name in ("ensure_portable", "_ensure_finite"):
+        monkeypatch.setattr(_json, name, counting(name))
+    payload = {
+        "rows": [
+            {"name": "job%d" % i, "history": [{"ok": True, "secs": 1.5}]}
+            for i in range(20)
+        ]
+    }
+    assert _json.loads(mcp._dumps(payload)) == payload
+    assert walks == []
+
+
 async def test_mcp_list_jobs_builds_one_row_per_returned_job(monkeypatch):
     # cron_list_jobs chooses its page from each job's name, enabled flag and
     # live-run list, then builds a full row for every job on that page. The

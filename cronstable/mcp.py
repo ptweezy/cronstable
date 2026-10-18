@@ -222,14 +222,17 @@ class _ToolInputError(Exception):
 def _dumps(obj: Any) -> bytes:
     """Serialize a response body to JSON bytes.
 
-    Prefers the orjson-accelerated :func:`cronstable._json.dumps_bytes`, but
-    an MCP payload is a transient response (never a durable, cross-fleet
-    record), so a non-finite float or other non-"portable" value should not
-    500 the endpoint: fall back to the stdlib, which encodes it.
+    An MCP payload is a transient response (never a durable, cross-fleet
+    record), so the orjson-accelerated :func:`cronstable._json.dumps_bytes`
+    runs ``trusted`` and skips the portability walk, as the REST encoder
+    (:func:`cronstable.cron._json_response`) does. The stdlib fallback
+    encodes any value the fast path refuses, such as a non-finite float on
+    the stdlib flavour, so no such value can 500 the endpoint. orjson
+    writes a non-finite float as ``null``.
     """
     try:
-        return _json.dumps_bytes(obj)
-    except _json.UnsupportedValue:
+        return _json.dumps_bytes(obj, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
         return _stdlib_json.dumps(obj, default=str).encode("utf-8")
 
 
