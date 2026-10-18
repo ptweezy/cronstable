@@ -2879,6 +2879,32 @@ def test_state_get_dispatch_loads_only_the_client_modules():
     )
 
 
+def test_importing_jobcli_loads_no_ca_store():
+    # The client's shared opener carries an HTTPS handler, and on Python
+    # 3.12 and later a stock HTTPSHandler loads the system CA store when it
+    # is constructed, about 30ms before a plain-HTTP loopback request can
+    # start.  The opener's handler loads the store on its first HTTPS
+    # request, so importing the client loads it zero times.
+    code = textwrap.dedent(
+        """
+        import ssl
+
+        loads = []
+        real = ssl.SSLContext.load_default_certs
+
+        def counting(self, *args, **kwargs):
+            loads.append(1)
+            return real(self, *args, **kwargs)
+
+        ssl.SSLContext.load_default_certs = counting
+        import cronstable.jobcli
+
+        print(len(loads))
+        """
+    )
+    assert _configcli_child(code) == "0"
+
+
 def test_importing_taskxml_loads_the_standard_library_only():
     # `cronstable import-taskscheduler` converts an estate on any machine,
     # so the converter depends on nothing a bare interpreter lacks.

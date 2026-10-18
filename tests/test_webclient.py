@@ -14,6 +14,7 @@ import http.server
 import io
 import socketserver
 import ssl
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -97,6 +98,44 @@ def test_openers_use_no_proxy_and_follow_no_redirect(monkeypatch):
         assert "NoRedirect" in handlers
         assert "HTTPRedirectHandler" not in handlers
         assert "ProxyHandler" not in handlers
+
+
+def test_shared_opener_loads_the_ca_store_on_its_first_https_request(
+    monkeypatch,
+):
+    # On Python 3.12 and later a stock HTTPSHandler loads the system CA
+    # store in its constructor. The shared opener's HTTPS handler runs that
+    # constructor when the first HTTPS request arrives.
+    https = [
+        h
+        for h in webclient.OPENER.handlers
+        if isinstance(h, urllib.request.HTTPSHandler)
+    ]
+    assert [type(h) for h in https] == [webclient._DeferredHTTPSHandler]
+    loads = []
+    real = ssl.SSLContext.load_default_certs
+
+    def counting(self, *args, **kwargs):
+        loads.append(self)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_default_certs", counting)
+    handler = webclient._DeferredHTTPSHandler()
+    assert loads == []
+    opened = []
+    monkeypatch.setattr(
+        handler, "do_open", lambda conn, req, **kwargs: opened.append(kwargs)
+    )
+    request = urllib.request.Request("https://127.0.0.1:1/")
+    handler.https_open(request)
+    handler.https_open(request)
+    if sys.version_info >= (3, 12):
+        assert len(loads) == 1
+        assert opened[0]["context"] is opened[1]["context"] is loads[0]
+    else:
+        # the stock handler leaves the default context to each connection
+        assert loads == []
+        assert [kwargs["context"] for kwargs in opened] == [None, None]
 
 
 class _FirstBytes(socketserver.BaseRequestHandler):
