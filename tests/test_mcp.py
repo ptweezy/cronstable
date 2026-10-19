@@ -26,7 +26,7 @@ from cronstable.config import (
     _validate_cross_sections,
     parse_config_string,
 )
-from cronstable.cron import Cron
+from cronstable.cron import ApiActionError, Cron
 from cronstable.mcp import MCPHandler
 
 _YAML = """
@@ -416,6 +416,19 @@ async def test_run_job_requires_confirm():
     )
     assert resp["result"]["isError"] is True
     assert "confirm=true" in resp["result"]["content"][0]["text"]
+
+
+async def test_run_job_reports_why_nothing_started(monkeypatch):
+    h = _handler({"readOnly": False, "toolsets": ["act"]})
+    reason = "job 'hello' is still running and its concurrencyPolicy is Forbid"
+
+    async def held_back(name):
+        raise ApiActionError(reason, status=409)
+
+    monkeypatch.setattr(h._cron, "start_job_by_name", held_back)
+    result = await _call(h, "cron_run_job", {"name": "hello", "confirm": True})
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == reason
 
 
 async def test_backfill_dry_run_is_default_preview():

@@ -1730,7 +1730,37 @@ async def test_web_job_logs_streams_last_run():
     assert "event: line" in body
     assert "hello world" in body
     assert "uh oh" in body
-    assert "event: end" in body
+    # a run without a start time ends with no run to name
+    assert body.endswith("event: end\ndata: {}\n\n")
+
+
+async def test_web_job_logs_end_names_the_run_it_showed():
+    # the end event carries the run's started_at as /jobs writes it in
+    # last_run, so a client can tell a later run from the one it showed
+    import json
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = _cron(TWO_JOBS)
+    out = JobOutputStream()
+    out.publish("stdout", "hello\n")
+    out.close()
+    run = cronstable.cron.JobRunInfo(
+        outcome="success",
+        exit_code=0,
+        started_at=DT(1999, 12, 31, 11, 59, 30, 123456, tzinfo=UTC),
+        finished_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
+        fail_reason=None,
+        output=out,
+    )
+    cron.last_run["alpha"] = run
+    app = web.Application()
+    app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
+    async with TestClient(TestServer(app)) as client:
+        body = await (await client.get("/jobs/alpha/logs")).text()
+    end = body.split("event: end\ndata: ", 1)[1].split("\n", 1)[0]
+    assert json.loads(end) == {"started_at": run.to_dict()["started_at"]}
 
 
 async def test_web_job_logs_batches_live_bursts(monkeypatch):
@@ -2914,7 +2944,10 @@ async def test_webloop_web_job_logs_live_running():
     cron = _cron(TWO_JOBS)
     out = JobOutputStream()
     # a currently-running instance exposes its live output buffer.
-    cron.running_jobs["alpha"] = [SimpleNamespace(output=out)]
+    started = DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC)
+    cron.running_jobs["alpha"] = [
+        SimpleNamespace(output=out, started_at=started)
+    ]
 
     app = web.Application()
     app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
@@ -2928,7 +2961,10 @@ async def test_webloop_web_job_logs_live_running():
         out.close()
         body = await resp.text()
     assert "live line" in body
-    assert "event: end" in body
+    # the end names the running instance it tailed
+    assert body.endswith(
+        'event: end\ndata: {"started_at":"%s"}\n\n' % started.isoformat()
+    )
 
 
 _DAG_LOGS_YAML = """
@@ -3054,6 +3090,8 @@ async def test_web_teardown_ends_open_sse_tails_promptly(
     # established connection. Without the on_shutdown drain, a teardown
     # blocked on aiohttp's 60s in-flight-handler wait, freezing the
     # housekeeping loop (and with it every job launch) for the duration.
+    from types import SimpleNamespace
+
     import aiohttp
 
     from cronstable.job import JobOutputStream
@@ -3061,7 +3099,11 @@ async def test_web_teardown_ends_open_sse_tails_promptly(
     cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
     live = JobOutputStream()
     live.publish("stdout", "hello")  # replay content the client can sync on
-    monkeypatch.setattr(cron, "_job_output", lambda name: live)
+    monkeypatch.setattr(
+        cron,
+        "_job_tail_run",
+        lambda name: SimpleNamespace(output=live, started_at=None),
+    )
     await start_web_app(cron, {"listen": ["http://127.0.0.1:0"]})
     port = cron.web_runner.addresses[0][1]
     base = "http://127.0.0.1:{}".format(port)

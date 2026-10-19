@@ -92,7 +92,9 @@ async def test_retryclaim_start_job_counts_as_pause_deferred_boot_run(monkeypatc
     monkeypatch.setattr(cron, "_reboot_boot_gate", _gate)
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job", lambda j: launched.append(j.name) or _noop()
+        cron,
+        "maybe_launch_job",
+        lambda j, **kw: launched.append(j.name) or _noop(),
     )
     await cron.start_job_by_name("alpha")
     assert "alpha" not in cron._paused_reboot_jobs

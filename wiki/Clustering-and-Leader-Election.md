@@ -260,7 +260,10 @@ The trust model is deliberately small and keeps no shared state:
   * Provision the certificates from your own dedicated PKI (a private
     cert-manager issuer, an internal CA); cronstable only consumes them. The
     node uses the same per-node cert/key both to serve `/peer` and to
-    authenticate as a client when it polls peers.
+    authenticate as a client when it polls peers. cronstable verifies peer
+    certificates in OpenSSL's strict X.509 mode on every Python version, so
+    the CA and the node certificates must meet the
+    [certificate requirements](Listener-TLS#certificate-requirements).
   * The daemon detects an **in-place renewal** of these files (same paths, new
     bytes) and applies it automatically, with no restart (see
     [certificate rotation](#certificate-rotation)).
@@ -552,7 +555,7 @@ deliberately runs it on every node.
 | `clusterPolicy` | Healthy (quorate) | Partitioned / sub-quorum | Guarantee by backend | Use for |
 | --- | --- | --- | --- | --- |
 | `Leader` *(default)* | leader runs once | **nobody** runs (skips) | may skip on every backend: best-effort on `gossip` (rare dup); fenced on `kubernetes` / `etcd`; fenced under NTP-bounded skew on `filesystem` | non-idempotent jobs where a duplicate is harmful and an occasional skip is OK (billing, outbound email) |
-| `PreferLeader` | lowest node runs once | each side's lowest node runs (**may double-run**) | never-skip on every backend (may dup) | important **and** idempotent jobs that should never skip |
+| `PreferLeader` | lowest node runs once | each side's lowest node runs (**may double-run**) | never-skip for a quorum or store outage on every backend (may dup); a stopped owner's firings skip until the other nodes notice | important **and** idempotent jobs that should never skip |
 | `EveryNode` | every node runs | every reachable node runs | every node on every backend | genuinely per-node work (local log rotation), or fully idempotent jobs |
 
 In the guarantee column, "fenced" is the hard, single-holder guarantee,
@@ -620,12 +623,29 @@ and `size_conflict`. Under `distribution: spread`, described next, the last two
 lines become "the *per-job owner* among the reachable agreeing nodes" and "the
 quorum-gated *per-job owner*" respectively.)
 
-One transient exception to `PreferLeader`'s never-skip applies to the gossip
-backend only. A node whose manager was newly (re)built (a cold boot, or a
-reload that changed the `cluster` section) holds its never-skip gates **closed**
-while its view is still converging: until every configured peer has been polled
-once, and (bounded by about two poll `interval`s) until the current-build
-agreeing peers re-attest this incarnation.
+On the gossip backend, two transient windows can skip a `PreferLeader` firing.
+
+The first follows an owner that stops. Until a surviving node's own poll of
+the stopped node fails, the survivor still sees that node agreeing and defers
+to it, so a firing due in that window runs nowhere. The window lasts up to one
+`interval` plus `connectTimeout` when the stopped node's host refuses
+connections, and up to one `interval` plus twice `connectTimeout` when the
+host doesn't answer at all. Once its own poll fails, the survivor takes
+over the stopped node's jobs, even while its peers' last reports still list
+that node. The survivor keeps setting those reports aside for
+`2 + ceil(3 × connectTimeout / interval)` of its own failed poll rounds (3 with
+the defaults), long enough for every peer to have polled the stopped node too.
+After that, a node that the peers still report is alive behind a broken link,
+so the survivor counts it again when it picks each job's owner. That keeps two
+nodes that can't reach each other from both running a job. Until then, both
+ends of a newly broken link can run that node's `PreferLeader` jobs.
+
+The second applies while a view converges. A node whose manager was newly
+(re)built (a cold boot, or a reload that changed the `cluster` section) holds
+its never-skip gates **closed** while its view is still converging: until every
+configured peer has been polled once, and (bounded by about two poll
+`interval`s) until the current-build agreeing peers re-attest this
+incarnation.
 
 Without the hold, a fresh manager's blank view would elect *itself* on every
 node at once and double-run each due `PreferLeader` firing on a responsive
@@ -1028,8 +1048,17 @@ The gossip backend keeps **no shared state** and provides *best-effort*
 coordination. Each node acts on a view only as fresh as its last poll
 (`interval`), leaving narrow windows where behavior degrades:
 
-* **Immediately after a leader dies**, a `Leader` firing may be *skipped* until
-  the survivors notice (up to one `interval`) and re-elect.
+* **Immediately after a leader dies**, a `Leader` or `PreferLeader` firing may
+  be *skipped* until the survivors notice and re-elect. Under `spread`, the
+  same holds for the jobs that the dead node owned. A `PreferLeader` survivor
+  takes over once its own poll of the dead node fails (see
+  [per-job policy](#per-job-policy) for the bound). A `Leader` survivor also
+  follows its peers' last reports, which list the dead node until each peer's
+  own poll of it fails and the survivor polls that peer again. A `Leader`
+  firing can therefore be skipped for up to about two `interval`s plus a few
+  `connectTimeout`s (about 60 to 100 seconds with the defaults). Under
+  `spread`, a peer's report can also carry the survivor's own stale view back
+  to it, which adds about one `interval`.
 
 * **A leader partitioned away while still alive** keeps electing itself on its
   last (now-stale) view until its *own* next poll fails (up to one `interval`),

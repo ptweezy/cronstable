@@ -16,6 +16,8 @@ Style follows tests/test_state_job_api.py: bare ``async def``, the server in
 a ``try`` with ``cleanup()`` in ``finally``.
 """
 
+import asyncio
+import re
 import ssl
 
 import aiohttp
@@ -32,6 +34,7 @@ from tests._helpers import (
     _backend,
     _free_port,
     _state_cfg,
+    _wait_until,
     _write_tls,
     start_state,
 )
@@ -592,6 +595,186 @@ async def test_client_ca_requires_a_client_certificate(tmp_path):
         async with aiohttp.ClientSession() as session:
             async with session.get(url, ssl=ctx) as resp:
                 assert resp.status == 200
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+_STRICT = ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
+
+
+def _lax_default_contexts(monkeypatch):
+    """Make ssl.create_default_context leave out the verify flags that
+    Python 3.13 and later set, as 3.10 to 3.12 do."""
+    real = ssl.create_default_context
+
+    def lax(*args, **kwargs):
+        ctx = real(*args, **kwargs)
+        ctx.verify_flags &= ~_STRICT
+        return ctx
+
+    monkeypatch.setattr(ssl, "create_default_context", lax)
+
+
+def test_every_context_verifies_strictly(tmp_path, monkeypatch):
+    tls = _write_tls(tmp_path)
+    _lax_default_contexts(monkeypatch)
+    contexts = [
+        tlsutil.build_listener_ssl_context(
+            tls["cert"], tls["key"], client_ca=tls["ca"]
+        ),
+        tlsutil.build_mutual_client_ssl_context(
+            tls["ca"], tls["cert"], tls["key"]
+        ),
+        tlsutil.build_verifying_client_ssl_context(ca=tls["ca"]),
+    ]
+    for ctx in contexts:
+        assert ctx.verify_flags & _STRICT == _STRICT
+
+
+@pytest.mark.parametrize(
+    "reason, words",
+    [
+        ("PEER_DID_NOT_RETURN_A_CERTIFICATE", "the client sent no certificate"),
+        ("HTTP_REQUEST", "the client sent plain HTTP"),
+        ("TLSV1_ALERT_UNKNOWN_CA", "tlsv1 alert unknown ca"),
+        (None, "boom"),
+    ],
+)
+def test_failed_handshake_reasons_read_as_words(reason, words):
+    exc = ssl.SSLError("boom")
+    exc.reason = reason
+    assert tlsutil._refusal_reason(exc) == words
+
+
+def test_only_a_labelled_listener_logs_failed_handshakes(tmp_path):
+    # a dry-run build (listener_tls_loadable) serves nothing, so it names
+    # no listener and installs no logging
+    tls = _write_tls(tmp_path)
+    plain = tlsutil.build_listener_ssl_context(tls["cert"], tls["key"])
+    assert plain.sslobject_class is ssl.SSLObject
+    labelled = tlsutil.build_listener_ssl_context(
+        tls["cert"], tls["key"], label="web"
+    )
+    assert issubclass(labelled.sslobject_class, ssl.SSLObject)
+    assert labelled.sslobject_class is not ssl.SSLObject
+
+
+def _client_without_aki(tmp_path):
+    """A client CA, and a client certificate that it signed without an
+    Authority Key Identifier, which strict verification refuses."""
+    pytest.importorskip("cryptography")
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    from tests._helpers import TLS_NOW, _gen_ca
+
+    ca_key, ca_cert = _gen_ca("client-ca")
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(
+            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ops")])
+        )
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(TLS_NOW - datetime.timedelta(days=1))
+        .not_valid_after(TLS_NOW + datetime.timedelta(days=3650))
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    paths = {
+        "ca": tmp_path / "client-ca.pem",
+        "cert": tmp_path / "ops.pem",
+        "key": tmp_path / "ops.key",
+    }
+    paths["ca"].write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    paths["cert"].write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    paths["key"].write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return {name: str(path) for name, path in paths.items()}
+
+
+@pytest.mark.parametrize(
+    "send_cert, reason",
+    [
+        pytest.param(False, "the client sent no certificate", id="no-cert"),
+        pytest.param(
+            True,
+            "client certificate rejected: Missing Authority Key Identifier",
+            id="no-aki",
+            marks=pytest.mark.skipif(
+                ssl.OPENSSL_VERSION_INFO < (3,),
+                reason="OpenSSL 1.1.1 does not check the AKI",
+            ),
+        ),
+    ],
+)
+async def test_a_failed_handshake_is_logged_once_a_minute(
+    tmp_path, caplog, monkeypatch, send_cert, reason
+):
+    tls = _write_tls(tmp_path)
+    client = _client_without_aki(tmp_path)
+    port = _free_port()
+    cron = Cron(None)
+    caplog.set_level("WARNING", logger="cronstable.tls")
+
+    def refusals():
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "cronstable.tls"
+        ]
+
+    async def attempt():
+        ctx = _client_ctx(tls["ca"])
+        if send_cert:
+            ctx.load_cert_chain(client["cert"], client["key"])
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises((aiohttp.ClientError, ssl.SSLError, OSError)):
+                async with session.get(
+                    "https://127.0.0.1:{}/version".format(port), ssl=ctx
+                ) as resp:
+                    await resp.read()
+
+    try:
+        await _serve(
+            cron,
+            ["https://127.0.0.1:{}".format(port)],
+            {
+                "cert": tls["cert"],
+                "key": tls["key"],
+                "clientCa": client["ca"],
+            },
+        )
+        await attempt()
+        await _wait_until(lambda: refusals())
+        assert refusals() == ["web: TLS handshake failed: " + reason]
+        # later failures inside the minute are counted, not logged
+        await attempt()
+        await asyncio.sleep(0.2)
+        assert len(refusals()) == 1
+        monkeypatch.setattr(tlsutil, "REFUSAL_LOG_INTERVAL", 0.0)
+        await attempt()
+        await _wait_until(lambda: len(refusals()) >= 2)
+        # a client can retry the handshake, so the count is at least one
+        assert re.fullmatch(
+            re.escape("web: TLS handshake failed: " + reason)
+            + r" \([1-9]\d* more since the last report\)",
+            refusals()[1],
+        )
     finally:
         await cron.start_stop_web_app(None)
 

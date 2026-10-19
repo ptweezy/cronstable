@@ -1411,6 +1411,18 @@ def _rendered_qr(page):
     return page.get_attribute("#pairQr svg path", "d")
 
 
+# Records what the page copies in window.__copied, on a page whose origin
+# offers no clipboard API.
+_RECORD_CLIPBOARD = """
+Object.defineProperty(navigator, "clipboard", {
+  configurable: true,
+  value: {
+    writeText: (t) => { window.__copied = t; return Promise.resolve(); },
+  },
+});
+"""
+
+
 def test_pair_qr_encodes_the_link_for_a_non_ascii_node(browser, tmp_path):
     node = "büro-節点-🚀/north+east?"
     with e2e.Daemon(tmp_path, auth="scoped") as daemon:
@@ -1418,9 +1430,10 @@ def test_pair_qr_encodes_the_link_for_a_non_ascii_node(browser, tmp_path):
         def routes(page):
             page.faults.json(r"/cluster", _gossip(node_name=node))
 
+        url = e2e.lan_url(daemon.url)
         with e2e.open_page(
             browser,
-            daemon.url,
+            url,
             token=e2e.VIEW_TOKEN,
             before_goto=routes,
         ) as page:
@@ -1436,7 +1449,7 @@ def test_pair_qr_encodes_the_link_for_a_non_ascii_node(browser, tmp_path):
             assert json.loads(payload) == {
                 "v": 1,
                 "name": node,
-                "url": daemon.url.rstrip("/"),
+                "url": url.rstrip("/"),
                 "token": e2e.VIEW_TOKEN,
             }
             # the link: base + "#" + base64url(JSON), no padding, URL-safe
@@ -1448,7 +1461,7 @@ def test_pair_qr_encodes_the_link_for_a_non_ascii_node(browser, tmp_path):
             # the terminal clients (cronstable pair, the TUI's panel)
             # write the same bytes for the same server
             assert payload == pairlink.payload(
-                node, daemon.url.rstrip("/"), e2e.VIEW_TOKEN
+                node, url.rstrip("/"), e2e.VIEW_TOKEN
             )
             assert link == pairlink.link(payload, pairlink.PAIR_LINK_FALLBACK)
             # the rendered code is exactly the code for that link
@@ -1473,9 +1486,10 @@ def test_pair_qr_follows_the_daemons_link_base(browser, tmp_path):
         base = "https://relay.example.test/pair"
         with e2e.open_page(
             browser,
-            daemon.url,
+            e2e.lan_url(daemon.url),
             token=e2e.FULL_TOKEN,
-            permissions=["clipboard-read", "clipboard-write"],
+            # an http page that is not loopback has no clipboard API
+            init_scripts=[_RECORD_CLIPBOARD],
         ) as page:
             # the first /whoami named the default base; the panel's own
             # probe names another one, and the code is redrawn for it
@@ -1500,7 +1514,7 @@ def test_pair_qr_follows_the_daemons_link_base(browser, tmp_path):
             )
             page.click("#pairCopy")
             e2e.wait_toast(page, "copied pairing payload")
-            assert page.evaluate("navigator.clipboard.readText()") == payload
+            assert page.evaluate("window.__copied") == payload
             # "set a token" opens the token dialog.
             page.click("#pairClose")
             page.wait_for_function(
@@ -1512,7 +1526,7 @@ def test_pair_qr_follows_the_daemons_link_base(browser, tmp_path):
 def test_pair_panel_ignores_a_stale_whoami_answer(browser, tmp_path):
     """Ignore pairing responses from a previously closed panel."""
     with e2e.Daemon(tmp_path) as daemon:
-        with e2e.open_page(browser, daemon.url) as page:
+        with e2e.open_page(browser, e2e.lan_url(daemon.url)) as page:
             parked = page.faults.hang(r"/whoami")
             _click(page, "#settingsBtn")
             _click(page, "#openPair")
@@ -1556,6 +1570,71 @@ def test_pair_panel_ignores_a_stale_whoami_answer(browser, tmp_path):
                 "document.getElementById('pairWrap').classList"
                 ".contains('open')"
             )
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_pair_panel_on_a_loopback_page_shows_no_code(browser, tmp_path, host):
+    """A phone cannot dial a loopback page's address, so the panel says so
+    and draws no code, as cronstable pair and the terminal dashboard do."""
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        url = daemon.url.replace("127.0.0.1", host)
+        with e2e.open_page(browser, url, token=e2e.FULL_TOKEN) as page:
+            _click(page, "#settingsBtn")
+            _click(page, "#openPair")
+            page.wait_for_selector("#pairLoop", state="visible")
+            page.wait_for_function(
+                "performance.getEntriesByName(location.origin + '/whoami')"
+                ".length >= 2"
+            )
+            text = page.inner_text("#pairLoop")
+            origin = url.rstrip("/")
+            assert text.startswith(
+                origin + " is a loopback address, which a phone cannot reach."
+            )
+            # the daemon binds 127.0.0.1 alone, so there is no address to name
+            assert "LAN, VPN, or public address" in text
+            assert "cronstable pair --public-url URL" in text
+            assert page.query_selector("#pairQr svg") is None
+            assert page.text_content("#pairPayload") == ""
+            assert e2e.FULL_TOKEN not in page.text_content("#pairWrap")
+            for hidden in ("#pairCopy", "#pairWarn", "#pairHint"):
+                assert not page.is_visible(hidden), hidden
+
+
+def test_pair_panel_on_a_loopback_page_names_dialable_listeners(
+    browser, tmp_path
+):
+    listeners = [
+        "http://127.0.0.1:8080",
+        "http://0.0.0.0:8080",
+        "http://[::]:8080",
+        "http://169.254.10.20:8080",
+        "http://[fe80::1]:8080",
+        "https://192.0.2.10:8443",
+        "http://192.0.2.10:8080",
+        "http://[2001:db8::5]:8080",
+    ]
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+        with e2e.open_page(
+            browser, daemon.url, token=e2e.FULL_TOKEN
+        ) as page:
+            page.faults.rewrite(
+                r"/whoami", lambda body: dict(body, listeners=listeners)
+            )
+            _click(page, "#settingsBtn")
+            _click(page, "#openPair")
+            page.wait_for_function(
+                "document.getElementById('pairLoop').textContent"
+                ".includes('also listens on')"
+            )
+            text = page.inner_text("#pairLoop")
+            # an http page names the http listeners another host can dial
+            assert (
+                "This server also listens on http://192.0.2.10:8080, "
+                "http://[2001:db8::5]:8080. Open this dashboard there to "
+                "pair a device, or run cronstable pair --public-url URL."
+            ) in text
+            assert page.query_selector("#pairQr svg") is None
 
 
 # --------------------------------------------------------------------------

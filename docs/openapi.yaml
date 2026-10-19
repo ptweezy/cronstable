@@ -425,10 +425,13 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >-
-            The job is disabled, or its resource pool refuses the run: the
-            pool queue is full, the pool is draining before a capacity
-            change, or pool state requires reliable exclusive locks (JSON
-            error envelope).
+            The job is disabled; concurrencyPolicy Forbid starts nothing
+            because an instance is still running, or, under
+            concurrencyScope cluster, because another node holds the job's
+            slot; or its resource pool refuses the run: the pool queue is
+            full, the pool is draining before a capacity change, or pool
+            state requires reliable exclusive locks (JSON error envelope
+            with the reason).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -437,7 +440,9 @@ paths:
             Pool state is unavailable for a job in a resource pool: the
             configured store has not started, a store operation fails with
             an I/O error or takes longer than 5 seconds, or a pool document
-            cannot be read.
+            cannot be read. Also answered when the store that holds a
+            concurrencyScope cluster job's slot does not answer within 10
+            seconds and onStoreUnavailable is fail-closed.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

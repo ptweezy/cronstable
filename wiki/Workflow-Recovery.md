@@ -8,6 +8,8 @@ In the dashboard, open a failed run and select **Retry failed tasks**. To
 repeat a larger portion of a finished run, select **Recover from here** on a
 task. The preview lists tasks to run, results to reuse, retained artifacts,
 and the configuration revision. Review it, then select **Start recovery**.
+A results card then lists the new runs with their states and counts the ones
+that have finished. It updates until every run has finished.
 
 For mapped tasks, retrying failures preserves successful instances and their
 map items. Recovering from the mapping producer discards the old expansion

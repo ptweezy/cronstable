@@ -57,6 +57,15 @@ NEVER = "0 0 29 2 *"
 # purpose. Everything else at error level fails the test.
 _DEFAULT_ALLOW = (r"Failed to load resource",)
 
+#: A name the test browser resolves to 127.0.0.1, for a page whose origin
+#: must not be a loopback address (see :func:`lan_url`).
+LAN_HOST = "cronstable.test"
+
+
+def lan_url(url):
+    """``url`` with its ``127.0.0.1`` host replaced by :data:`LAN_HOST`."""
+    return url.replace("://127.0.0.1", "://" + LAN_HOST, 1)
+
 
 # --------------------------------------------------------------------------
 # browser
@@ -72,7 +81,10 @@ def browser_session():
     """
     with playwright_api.sync_playwright() as p:
         try:
-            browser = p.chromium.launch(channel=os.environ.get(CHANNEL_ENV))
+            browser = p.chromium.launch(
+                channel=os.environ.get(CHANNEL_ENV),
+                args=["--host-resolver-rules=MAP %s 127.0.0.1" % LAN_HOST],
+            )
         except Exception as exc:  # no chromium provisioned
             pytest.skip("playwright chromium unavailable: {}".format(exc))
         try:
@@ -300,7 +312,7 @@ def _is_dashboard_url(url):
     Inline scripts report the URL of their document: the daemon's ``/``
     or the demo mirror's ``index.html``.
     """
-    if url.startswith("http://127.0.0.1"):
+    if url.startswith(("http://127.0.0.1", "http://" + LAN_HOST)):
         tail = url.split("/", 3)[-1] if url.count("/") >= 3 else ""
         return tail.split("#")[0].split("?")[0] == ""
     return url.startswith("file:") and url.split("#")[0].endswith(
@@ -981,11 +993,15 @@ class Faults:
 
         def handler(route):
             response = route.fetch(
+                # Playwright's own client cannot resolve LAN_HOST
+                url=route.request.url.replace(
+                    "://" + LAN_HOST, "://127.0.0.1", 1
+                ),
                 headers={
                     name: value
                     for name, value in route.request.headers.items()
                     if name.lower() != "if-none-match"
-                }
+                },
             )
             try:
                 body = json.loads(response.text())

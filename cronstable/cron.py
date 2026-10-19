@@ -274,6 +274,9 @@ CATCHUP_STREAM_KEEP = 8
 # Cap on awaited state READS from scheduling paths: a hung mount degrades
 # stateful features, never stalls scheduling.
 STATE_OP_TIMEOUT = 10.0
+# Total store wait in a manual start's cluster slot claim: the API answers
+# before the dashboards' request timeouts (15 s in the TUI, 20 s on the page).
+MANUAL_START_STORE_BUDGET = 10.0
 # Cap on the tracked fire-and-forget write set; sheds new best-effort
 # writes against a wedged store instead of growing without bound.
 MAX_PENDING_STATE_WRITES = 8192
@@ -676,6 +679,32 @@ class ApiActionError(Exception):
         super().__init__(message)
         self.message = message
         self.status = status
+
+
+def _refuse(
+    refusals: "list[tuple[int, str]] | None", status: int, reason: str
+) -> None:
+    """Add a held-back launch's ``(status, reason)`` for a caller that
+    collects them (see :meth:`Cron.start_job_by_name`)."""
+    if refusals is not None:
+        refusals.append((status, reason))
+
+
+async def _bounded(
+    op: Coroutine[Any, Any, Any], cap: float | None, deadline: float | None
+) -> Any:
+    """``op``'s result within ``cap`` seconds and before ``deadline`` (loop
+    time), else ``None``."""
+    if deadline is not None:
+        left = deadline - asyncio.get_running_loop().time()
+        if left <= 0:
+            op.close()  # never started: no store call left running
+            return None
+        cap = left if cap is None else min(cap, left)
+    try:
+        return await (op if cap is None else asyncio.wait_for(op, cap))
+    except asyncio.TimeoutError:
+        return None
 
 
 def _strip_headers(headers: Any | None, *names: str) -> dict[str, str]:
@@ -1905,6 +1934,20 @@ def _sse_frame(stream_name: str, line: str) -> bytes:
         b"event: line\ndata: "
         + _json.dumps_bytes(
             {"stream": stream_name, "line": line.rstrip("\n")}, trusted=True
+        )
+        + b"\n\n"
+    )
+
+
+def _sse_end_frame(started_at: datetime.datetime | None) -> bytes:
+    """The ``event: end`` frame of a job log stream: ``started_at`` names
+    the run it showed, so a client can tell a later run apart."""
+    if started_at is None:
+        return b"event: end\ndata: {}\n\n"
+    return (
+        b"event: end\ndata: "
+        + _json.dumps_bytes(
+            {"started_at": started_at.isoformat()}, trusted=True
         )
         + b"\n\n"
     )
@@ -5076,10 +5119,12 @@ class Cron:
 
         Raises :class:`ApiActionError` for an unknown (404) or disabled (409)
         job; otherwise honors the job's concurrencyPolicy exactly as the
-        scheduler would.  A PAUSED job may still be started manually: a pause
-        skips scheduled fires only, and the operator asking by hand is the
-        operator overriding their own pause (unlike `enabled: false`, which
-        is config the API must not silently override).
+        scheduler would, and raises the reason when that starts nothing
+        (409, or 503 for a cluster slot store that does not answer).  A
+        PAUSED job may still be started manually: a pause skips scheduled
+        fires only, and the operator asking by hand is the operator
+        overriding their own pause (unlike `enabled: false`, which is config
+        the API must not silently override).
         """
         try:
             job = self.cron_jobs[name]
@@ -5139,8 +5184,11 @@ class Cron:
                 ) from ex
             except PoolError as ex:
                 raise ApiActionError(str(ex), status=409) from ex
-        else:
-            await self.maybe_launch_job(job)
+        refusals: list[tuple[int, str]] = []
+        launched = await self.maybe_launch_job(job, refusals=refusals)
+        if not launched and refusals:
+            status, reason = refusals[0]
+            raise ApiActionError(reason, status=status)
         return None
 
     async def cancel_job_by_name(self, name: str) -> int:
@@ -7459,14 +7507,17 @@ class Cron:
             "windows": windows,
         }
 
-    def _job_output(self, name: str) -> JobOutputStream | None:
-        # the live output of the most recent running instance, else the last
-        # finished run's retained output, else nothing captured yet.
+    def _job_tail_run(self, name: str) -> "RunningJob | JobRunInfo | None":
+        # the most recent running instance, else the last finished run,
+        # else nothing captured yet.
         running = self.running_jobs.get(name) or []
         if running:
-            return running[-1].output
-        last = self.last_run.get(name)
-        return last.output if last is not None else None
+            return running[-1]
+        return self.last_run.get(name)
+
+    def _job_output(self, name: str) -> JobOutputStream | None:
+        run = self._job_tail_run(name)
+        return run.output if run is not None else None
 
     def _dag_task_output(
         self, dag_name: str, run_key: str, taskkey: str
@@ -7541,11 +7592,13 @@ class Cron:
         request: web.Request,
         resp: web.StreamResponse,
         output: JobOutputStream,
+        run: "RunningJob | JobRunInfo | None" = None,
     ) -> None:
         """Replay the retained buffer then live-tail an output stream over SSE.
 
         Shared by the job- and DAG-task log endpoints.  The response must
-        already be prepared.
+        already be prepared.  The end frame after the output ends carries
+        ``run``'s start time.
         """
         # Subscribe first, then snapshot the buffer: there is no await between
         # the two, so no line can slip through the gap. The snapshot holds
@@ -7601,7 +7654,9 @@ class Cron:
                         break
                     frames.append(_sse_frame(nxt[0], nxt[1]))
                 await resp.write(b"".join(frames))
-            await resp.write(b"event: end\ndata: {}\n\n")
+            await resp.write(
+                _sse_end_frame(run.started_at if run is not None else None)
+            )
         except (ConnectionResetError, asyncio.CancelledError):
             # client navigated away / closed the tab: nothing to do
             pass
@@ -7698,11 +7753,12 @@ class Cron:
         resp = web.StreamResponse(headers=self._sse_headers())
         await resp.prepare(request)
 
-        output = self._job_output(name)
+        run = self._job_tail_run(name)
+        output = run.output if run is not None else None
         if output is None:
             await resp.write(b'event: end\ndata: {"reason": "no-output"}\n\n')
             return resp
-        await self._pump_output(request, resp, output)
+        await self._pump_output(request, resp, output, run)
         return resp
 
     async def _web_dag_task_logs(
@@ -7817,6 +7873,7 @@ class Cron:
                 web_tls["cert"],
                 web_tls["key"],
                 client_ca=web_tls.get("clientCa"),
+                label="web",
             )
         except (OSError, ssl.SSLError) as ex:
             logger.error(
@@ -11596,6 +11653,7 @@ class Cron:
         with_retries: bool = True,
         pool_ticket: Ticket | None = None,
         catchup_after: datetime.datetime | None = None,
+        refusals: "list[tuple[int, str]] | None" = None,
     ) -> bool:
         """Accept a job into its pool queue or launch it immediately.
 
@@ -11604,6 +11662,10 @@ class Cron:
         work independent of the job's retry ladder. The launch that
         :meth:`launch_scheduled_job` makes for a job with no pool starts
         the fire's retry sequence, unless Forbid drops the fire.
+
+        ``refusals`` collects ``(HTTP status, reason)`` for a launch that
+        concurrencyPolicy or the cluster slot holds back; see
+        :meth:`start_job_by_name`.
         """
         if job.pool is not None and pool_ticket is None:
             await self._pools.enqueue_job(
@@ -11630,6 +11692,7 @@ class Cron:
                 with_retries,
                 pool_ticket,
                 asyncio.current_task() in self._fire_tasks,
+                refusals,
             )
 
     def _take_retry_ladder(
@@ -11675,6 +11738,7 @@ class Cron:
         with_retries: bool,
         pool_ticket: Ticket | None = None,
         scheduled_fire: bool = False,
+        refusals: "list[tuple[int, str]] | None" = None,
     ) -> bool:
         """The body of :meth:`maybe_launch_job`, under its per-job lock."""
         retry_current = True
@@ -11690,7 +11754,11 @@ class Cron:
                 return False
         live = self._live_instances(job.name)
         if live:
-            logger.warning(
+            # an overlap that the default Allow permits is routine
+            logger.log(
+                logging.INFO
+                if job.concurrencyPolicy == "Allow"
+                else logging.WARNING,
                 "Job %s: still running and concurrencyPolicy is %s",
                 job.name,
                 job.concurrencyPolicy,
@@ -11702,6 +11770,12 @@ class Cron:
                 # the run finishing and the next slot launching; mirrors
                 # the cluster-slot path's _sla_peer_owns_slot excuse.
                 self._sla_due.pop(job.name, None)
+                _refuse(
+                    refusals,
+                    409,
+                    "job {!r} is still running and its concurrencyPolicy "
+                    "is Forbid".format(job.name),
+                )
                 return False
         fire_ladder: JobRetryState | None = None
         if scheduled_fire:
@@ -11718,7 +11792,7 @@ class Cron:
             # shared store excludes instances on OTHER nodes. Bounded; a
             # foreign Replace holder is pursued by a background task,
             # never waited out on the scheduler path.
-            if not await self._claim_cluster_slot(job):
+            if not await self._claim_cluster_slot(job, refusals):
                 # no launch carries the fire's ladder
                 self._hand_back_retry_ladder(fire_ladder)
                 return False
@@ -11926,7 +12000,11 @@ class Cron:
             # rather than letting it escape and crash the loop.
             return None
 
-    async def _claim_cluster_slot(self, job: JobConfig) -> bool:
+    async def _claim_cluster_slot(
+        self,
+        job: JobConfig,
+        refusals: "list[tuple[int, str]] | None" = None,
+    ) -> bool:
         """Claim the cluster-wide concurrency slot for one launch of ``job``.
 
         True means launch (holding the lease, or degraded to node-local
@@ -11938,6 +12016,12 @@ class Cron:
         exactly-once; a holder that loses its lease to a store outage
         keeps running, and degrade trades the cluster gate for
         availability.
+
+        A Forbid skip and a fail-closed skip add ``(HTTP status, reason)``
+        to ``refusals``; a Replace pursuit adds nothing, since it launches
+        the run once the slot frees. A claim given ``refusals`` (a manual
+        start) waits :data:`MANUAL_START_STORE_BUDGET` for the store in all;
+        past it, the store counts as not answering.
         """
         backend = self.state_backend
         if not self._state_configured:
@@ -11946,6 +12030,11 @@ class Cron:
             return True
         fail_closed = self._state_on_unavailable == "fail-closed"
         name = job.name
+        deadline = (
+            asyncio.get_running_loop().time() + MANUAL_START_STORE_BUDGET
+            if refusals is not None
+            else None
+        )
 
         def _unavailable(why: str) -> bool:
             if fail_closed:
@@ -11954,6 +12043,14 @@ class Cron:
                     "slot (%s) and onStoreUnavailable is fail-closed",
                     name,
                     why,
+                )
+                _refuse(
+                    refusals,
+                    503,
+                    "job {!r} cannot claim its cluster concurrency slot "
+                    "({}), and onStoreUnavailable is fail-closed".format(
+                        name, why
+                    ),
                 )
                 return False
             logger.warning(
@@ -11968,7 +12065,8 @@ class Cron:
 
         if backend is None:
             return _unavailable("the state store is unavailable")
-        fidelity = await self._slot_fidelity_reason()
+        # None past the budget: inconclusive, like a probe that cannot run
+        fidelity = await _bounded(self._slot_fidelity_reason(), None, deadline)
         if fidelity is not None:
             return _unavailable(fidelity)
         async with self._slot_mutex(name):
@@ -11980,7 +12078,9 @@ class Cron:
                 self._slot_refs[name] = self._slot_refs.get(name, 0) + 1
                 return True
             lease_name = self._slot_name(name)
-            got = await self._acquire_slot_lease(backend, lease_name)
+            got = await _bounded(
+                self._acquire_slot_lease(backend, lease_name), None, deadline
+            )
             if got is None:
                 # denied, sick, or timed out: a bounded read tells a
                 # foreign holder apart from a store that cannot answer
@@ -11988,9 +12088,10 @@ class Cron:
                 observed: Lease | None = None
                 answered = False
                 try:
-                    observed = await asyncio.wait_for(
+                    observed = await _bounded(
                         backend.read_lease(lease_name),
-                        timeout=STATE_OP_TIMEOUT,
+                        STATE_OP_TIMEOUT,
+                        deadline,
                     )
                     answered = observed is not None
                 except asyncio.TimeoutError:
@@ -12014,14 +12115,23 @@ class Cron:
                         answered = False
                         observed = None
                     elif job.concurrencyPolicy == "Forbid":
+                        holder = observed.holder.rsplit("#", 1)[0]
                         logger.warning(
                             "Job %s skipped: its cluster concurrency slot "
                             "is held by %s (concurrencyPolicy: Forbid, "
                             "concurrencyScope: cluster)",
                             name,
-                            observed.holder.rsplit("#", 1)[0],
+                            holder,
                         )
                         self._sla_peer_owns_slot(name)
+                        _refuse(
+                            refusals,
+                            409,
+                            "job {!r} is running on {} (concurrencyPolicy: "
+                            "Forbid, concurrencyScope: cluster)".format(
+                                name, holder
+                            ),
+                        )
                         return False
                     else:  # Replace
                         self._spawn_slot_pursuit(job, observed)

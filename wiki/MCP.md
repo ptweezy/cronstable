@@ -164,7 +164,10 @@ route answers `503` while the store has not started.
 pooled job return the tool error `pool state is unavailable` when pool state
 cannot be read or written. A refusal by a pool that answers comes back as a
 tool error with the refusal's message, such as `queue entry not found` or
-`pool queue is full`. On a daemon whose configuration has no `state`
+`pool queue is full`. When `concurrencyPolicy: Forbid` keeps
+`cron_run_job` from starting a job, because an instance is still running
+or another node holds its cluster slot, the tool error names the reason. On
+a daemon whose configuration has no `state`
 section, the recovery tools return `workflow run not found` for a run and
 `workflow not found` for a date range, `cron_backfill_dag` returns
 `dag not found: '<name>'`, and `cron_cancel_queued` returns

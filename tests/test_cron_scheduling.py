@@ -963,7 +963,7 @@ async def test_perf_wake_is_o_due_not_o_all(monkeypatch, capsys):
 def _launch_recorder(monkeypatch, cron):
     launched = []
 
-    async def fake(job, *, with_retries=True):
+    async def fake(job, *, with_retries=True, refusals=None):
         launched.append(job.name)
         return True
 

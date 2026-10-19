@@ -287,7 +287,7 @@ def test_verdict_uncorrelated_failures():
     ]
     verdict, incident = verdict_info(jobs, None)
     assert verdict is not None
-    assert "no matching failure details found" in verdict["sub"]
+    assert verdict["sub"] == "no two share an exit code and reason"
     assert sorted(incident) == ["a", "b"]
 
 
@@ -3440,6 +3440,22 @@ async def test_job_action_error_and_status_paths(tmp_path):
     app.api.post = _post_status(503)
     await app.run_job("j")
     assert any("HTTP 503" in m for m in _msgs(app))
+    # the daemon's reason, when it gives one, is the toast
+    forbid = "job 'j' is still running and its concurrencyPolicy is Forbid"
+    app.api.post = _post_status(409, {"error": forbid})
+    await app.run_job("j")
+    assert _msgs(app)[-1] == forbid
+    app.api.post = _post_status(503, {"error": "the store did not answer"})
+    await app.run_job("j")
+    assert _msgs(app)[-1] == "start j: the store did not answer"
+
+    # a request that times out has an empty message of its own
+    async def _time_out(*a, **k):
+        raise asyncio.TimeoutError()
+
+    app.api.post = _time_out
+    await app.run_job("j")
+    assert _msgs(app)[-1] == "start j: no answer from the daemon"
 
     # cancel_job: 409 not running, other -> HTTP N
     app.toasts = []
@@ -4309,11 +4325,11 @@ def test_render_timeline_blast_and_empty(tmp_path):
 def test_drawer_logs_suffix_and_empty(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
-    # a no-output end shows its own separator
+    # a no-output end: the daemon holds no run of the job
     tail = _stub_tail(app, [])
     tail.ended = "no-output"
     app.log_tail = tail
-    assert "no-output" in _txt(app._drawer_logs(paint, 90, 12))
+    assert "no run recorded yet" in _txt(app._drawer_logs(paint, 90, 12))
     # a still-open empty tail shows the waiting hint
     tail2 = _stub_tail(app, [])
     app.log_tail = tail2
@@ -4333,6 +4349,7 @@ def test_drawer_history_variants(tmp_path):
     app.drawer_runs = {"stats": {"total": 0}, "runs": []}
     assert "no run history yet" in _txt(app._drawer_history(paint, 80, 20))
     # full stats block with cpu line + a failure run with resources
+    due = _iso_ago(30)
     app.drawer_runs = {
         "stats": {
             "total": 2,
@@ -4361,10 +4378,22 @@ def test_drawer_history_variants(tmp_path):
                 "started_at": _iso_ago(60),
                 "duration": 1.0,
             },
+            {
+                "outcome": "skipped",
+                "started_at": None,
+                "finished_at": due,
+                "duration": None,
+                "skip_reason": "paused",
+            },
         ],
     }
     body = _txt(app._drawer_history(paint, 90, 24))
     assert "peak rss" in body and "exit 7" in body and "cpu" in body
+    # a pause-skipped slot names its reason, stamped with its due time
+    stamp = datetime.datetime.fromisoformat(due).astimezone()
+    skipped = next(line for line in body.splitlines() if "skipped" in line)
+    assert "skipped · paused" in skipped
+    assert stamp.strftime("%m-%d %H:%M:%S") in skipped
 
 
 def test_drawer_resources_variants(tmp_path):

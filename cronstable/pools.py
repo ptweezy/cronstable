@@ -122,6 +122,11 @@ def _used_slots(body):
     )
 
 
+def _slot_count(count):
+    """``count`` slots in words: "1 slot", "2 slots"."""
+    return "{} slot{}".format(count, "" if count == 1 else "s")
+
+
 class _Queue:
     """One copy of a pool's document, and the rule on which waiting entry
     starts next: the one at the head, when the free slots hold it.
@@ -625,7 +630,8 @@ class PoolScheduler:
                     item["waitingReason"] = (
                         "Waiting behind higher-priority or earlier work"
                         if item["position"] > 1
-                        else f"Needs {entry['slots']} slots; {free} available"
+                        else f"Needs {_slot_count(entry['slots'])}; "
+                        f"{free} available"
                         if entry["slots"] > free
                         else entry.get("reason") or "Waiting for admission"
                     )

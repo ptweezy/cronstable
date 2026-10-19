@@ -198,13 +198,18 @@ def test_run_409_shows_the_daemons_reason(browser, tmp_path):
             assert _posts(page) == [("POST", "/jobs/alpha-ok/start")]
 
 
+_FORBID = "job 'alpha-ok' is still running and its concurrencyPolicy is Forbid"
+
+
 @pytest.mark.parametrize(
     "fault,toast",
     [
         ("500", "could not start (HTTP 500)"),
         ("404", "could not start (HTTP 404)"),
         ("abort", "could not start alpha-ok"),
-        ("409-empty", "Job could not be queued"),
+        ("409-empty", "could not start (HTTP 409)"),
+        ("409-forbid", _FORBID),
+        ("503-reason", "pool state is unavailable"),
     ],
 )
 def test_run_failures_are_reported(browser, tmp_path, fault, toast):
@@ -215,6 +220,12 @@ def test_run_failures_are_reported(browser, tmp_path, fault, toast):
                 page.faults.abort(path)
             elif fault == "409-empty":
                 page.faults.status(path, 409, {})
+            elif fault == "409-forbid":
+                page.faults.status(path, 409, {"error": _FORBID})
+            elif fault == "503-reason":
+                page.faults.status(
+                    path, 503, {"error": "pool state is unavailable"}
+                )
             else:
                 page.faults.status(path, int(fault))
             _click(page, '#rows [data-run="alpha-ok"]')

@@ -1609,7 +1609,7 @@
   <div class="toolbar">
     <label class="search">
       <span class="prompt">$</span>
-      <input id="search" type="search" placeholder="filter jobs… (press /)" autocomplete="off" spellcheck="false" />
+      <input id="search" type="search" placeholder="filter jobs (/)" autocomplete="off" spellcheck="false" />
     </label>
     <div class="segs" id="statusFilter">
       <button data-f="all" class="active">all</button>
@@ -2009,6 +2009,7 @@
     <h3 id="pairTitle">Pair a device</h3>
     <p id="pairMsg">Scan the QR code with your phone’s camera or the companion app to pair your phone with this server. The code includes the dashboard address and your access token, so use HTTPS or a trusted network. After pairing, compare the app’s key fingerprint with the one returned by <code>GET /push/devices</code>. They must match; a mismatch means the server has a different key from your phone.</p>
     <div class="pair-qr" id="pairQr"></div>
+    <div class="pair-warn" id="pairLoop" role="status" style="display:none"></div>
     <div class="pair-hint" id="pairHint" style="display:none"><span>No token is saved in this tab. Pairing will use an unauthenticated connection.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
     <div class="pair-payload" id="pairPayload"></div>
     <div class="pair-warn" id="pairWarn" style="display:none">This token grants full access. To limit phone access, configure a token with fewer permissions in <code>web.authTokens</code>.</div>
@@ -5452,6 +5453,8 @@ var qrcode = function() {
     selected: null,            // selected job name (keyboard cursor)
     drawerJob: null, tab: "logs",
     stream: null,              // AbortController for the log SSE
+    streamFin: null,           // last_run.finished_at when the stream opened
+    streamShown: null,         // started_at of the run the stream showed to its end
     log: { lines: [], curMatch: -1, total: 0, matchCount: 0, matchSig: null },
     prevFail: {},              // name -> finished_at of last seen failure (notifications)
     seenFirst: false,
@@ -8176,7 +8179,7 @@ var qrcode = function() {
       loadState();
       loadPools();
       if (recovered || performance.now() - whoamiAt >= WHOAMI_REFRESH_MS) loadWhoami();
-      if (state.drawerJob) { renderDrawerMeta(); maybeReattachDrawerStream(); }
+      if (state.drawerJob) { renderDrawerMeta(); maybeReattachDrawerStream(); refreshHistory(); }
       if (hashPending) {
         // an open drawer or the wallboard already owns the hash; any other
         // overlay holds the link until the first poll after it closes
@@ -8286,8 +8289,12 @@ var qrcode = function() {
         if (res.status === 202) loadPools();
         if (res.status !== 202 && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
         setTimeout(loadJobs, 300);
-      } else if (res.status === 409) { const error = await res.json(); toast("err", error.error || "Job could not be queued"); }
-      else { toast("err", "could not start (HTTP " + res.status + ")"); }
+      } else if (res.status === 409 || res.status === 503) {
+        // the daemon's reason: a disabled job, a run that Forbid holds
+        // back, a pool or cluster slot that refuses it
+        const error = await res.json().catch(() => ({}));
+        toast("err", error.error || "could not start (HTTP " + res.status + ")");
+      } else { toast("err", "could not start (HTTP " + res.status + ")"); }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "could not start " + name); }
   }
   async function cancelJob(name) {
@@ -8603,12 +8610,36 @@ var qrcode = function() {
   }
 
   // ---- history pane ----
-  async function renderHistory(name) {
+  // The /jobs fields that change when the job records a run or a skipped
+  // slot: a poll refetches an open History tab only when they move.
+  function historyKey(job) {
+    return job ? JSON.stringify([job.last_run && job.last_run.finished_at, job.history]) : "";
+  }
+  let historySeq = 0;  // drops an answer that a newer fetch has replaced
+  let historyBody = null;  // the /runs answer the pane shows
+  function refreshHistory() {
+    const name = state.drawerJob;
+    if (name && state.tab === "history" && historyKey(state.byName[name]) !== state.historyKey) renderHistory(name, true);
+  }
+  // `quiet` keeps the pane as it is until a changed answer arrives, and
+  // keeps it when the fetch fails.
+  async function renderHistory(name, quiet) {
     const box = $("historyPane");
-    box.innerHTML = '<div class="term-empty">loading run history…</div>';
-    const data = await fetchJsonInto("/jobs/" + encodeURIComponent(name) + "/runs", box, "history");
-    if (data == null) return;
+    const seq = ++historySeq;
+    state.historyKey = historyKey(state.byName[name]);
+    if (!quiet) { box.innerHTML = '<div class="term-empty">loading run history…</div>'; historyBody = null; }
+    const data = await fetchJsonInto("/jobs/" + encodeURIComponent(name) + "/runs", quiet ? el("div") : box, "history");
+    if (seq !== historySeq) return;
+    if (data == null) { state.historyKey = null; return; }  // the next poll retries
     if (state.drawerJob !== name) return; // drawer changed while loading
+    const body = JSON.stringify(data);
+    if (body === historyBody) return;
+    historyBody = body;
+    const top = box.scrollTop;
+    paintHistory(box, name, data);
+    box.scrollTop = top;
+  }
+  function paintHistory(box, name, data) {
     const runs = data.runs || [], s = data.stats || {};
     if (!runs.length) { box.innerHTML = '<div class="term-empty">No runs recorded yet. History is kept in memory and resets when cronstable restarts.</div>'; return; }
     const pct = s.success_rate == null ? "—" : Math.round(s.success_rate * 100) + "%";
@@ -8645,7 +8676,7 @@ var qrcode = function() {
         "<td>" + fmtDuration(r.duration) + "</td>" +
         (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
                   "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
-        '<td class="reason">' + limitsChips(r.limits, r.verification && r.verification.limits) + esc(r.fail_reason || "") + verificationDetail(r.verification) + "</td>" +
+        '<td class="reason">' + limitsChips(r.limits, r.verification && r.verification.limits) + esc(r.fail_reason || r.skip_reason || "") + verificationDetail(r.verification) + "</td>" +
       "</tr>";
     }
     const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th>' +
@@ -9315,9 +9346,10 @@ var qrcode = function() {
   // controller aborts (fetch + manual parse: EventSource cannot attach the
   // Authorization header). Serves the job log pane, the multi-tail and the
   // DAG task-log pane. hooks: line(stream, text) per output line;
-  // end(sawAnyLine, reason) per server end event (reason "no-output" = the
-  // job has no output buffer at all); err(msg) on failure, with msg null for
-  // a 401 (the re-auth flow is already driven by apiFetch's modal).
+  // end(sawAnyLine, reason, data) per server end event (reason "no-output" =
+  // the job has no output buffer at all; data is the event's whole JSON
+  // object); err(msg) on failure, with msg null for a 401 (the re-auth flow
+  // is already driven by apiFetch's modal).
   async function readSSE(path, ctrl, hooks) {
     let gotLine = false;
     try {
@@ -9343,9 +9375,9 @@ var qrcode = function() {
           if (ev === "line" && data) {
             try { const o = JSON.parse(data); gotLine = true; hooks.line(o.stream, o.line); } catch (_) {}
           } else if (ev === "end") {
-            let reason = null;
-            try { reason = (JSON.parse(data || "{}") || {}).reason || null; } catch (_) {}
-            hooks.end(gotLine, reason);
+            let info = {};
+            try { info = JSON.parse(data || "{}") || {}; } catch (_) {}
+            hooks.end(gotLine, info.reason || null, info);
           }
         }
       }
@@ -9364,10 +9396,20 @@ var qrcode = function() {
     }
     const ctrl = new AbortController();
     state.stream = ctrl;
+    state.streamFin = job && job.last_run ? job.last_run.finished_at : null;
+    state.streamShown = null;
     try {
       await readSSE("/jobs/" + encodeURIComponent(name) + "/logs", ctrl, {
         line: (stream, text) => appendLine(stream, text, null),
-        end: (sawLine) => { if (!sawLine) appendLine("", "(no output captured for the latest run)", "sys"); },
+        // "no-output": the job has no running instance and no recorded run
+        end: (sawLine, reason, info) => {
+          if (state.stream === ctrl) state.streamShown = info.started_at || null;
+          if (sawLine) return;
+          const lr = (state.byName[name] || {}).last_run;
+          appendLine("", reason === "no-output" ? "(no run recorded yet)"
+            : lr && lr.outcome === "skipped" ? "(no output: a pause skipped the latest slot)"
+            : "(no output captured for the latest run)", "sys");
+        },
         err: (msg) => { if (msg) appendLine("", msg, "sys"); },
       });
     } finally {
@@ -9377,16 +9419,26 @@ var qrcode = function() {
 
   // The daemon closes a log stream when the tailed run's output ends (the
   // multi-tail reconnects via its governor), so the drawer pane re-attaches
-  // here, poll-paced, whenever a run is producing output and no stream is
-  // live; without this the pane silently froze at the previous run's end
-  // and a retry's output never appeared. clear=true because attaching
-  // replays the run's whole retained buffer: clearing first repaints
-  // without duplicating a replay that already rendered.
+  // here, poll-paced, when no stream is live and the job is running or has
+  // finished a run the pane hasn't shown, such as one that started and
+  // ended between two polls. The stream's end event names the run it
+  // showed, and the end of that run replays nothing. A slot that a pause
+  // skipped has no output and leaves the pane as it is. clear=true
+  // because attaching replays the run's whole retained buffer: clearing
+  // first repaints without duplicating a replay that already rendered.
   function maybeReattachDrawerStream() {
     if (!state.drawerJob || state.tab !== "logs" || state.stream) return;
     const job = state.byName[state.drawerJob];
-    if (!job || !job.running) return;
-    if (!capturesLogs(job)) return;
+    if (!job || !capturesLogs(job)) return;
+    const lr = job.last_run;
+    const fin = lr ? lr.finished_at : null;
+    if (!job.running) {
+      if (fin === state.streamFin) return;
+      if (lr && (lr.outcome === "skipped" || (lr.started_at && lr.started_at === state.streamShown))) {
+        state.streamFin = fin;
+        return;
+      }
+    }
     startStream(state.drawerJob, true);
   }
 
@@ -10018,13 +10070,60 @@ var qrcode = function() {
     const b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     return (base || pairLinkBase()) + "#" + b64;
   }
+  // Whether a host names only this machine, which a phone cannot dial: the
+  // rule of netutil.is_loopback. URL parsing has already normalized it.
+  function loopbackHost(host) {
+    host = String(host || "").toLowerCase().replace(/\.$/, "");
+    if (host === "localhost" || host.endsWith(".localhost")) return true;
+    const v4 = /^(\d+)\.\d+\.\d+\.\d+$/.exec(host);
+    if (v4) return +v4[1] === 127 || host === "0.0.0.0";
+    host = host.replace(/^\[|\]$/g, "");
+    if (host === "::1" || host === "::") return true;
+    const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+    if (!mapped) return false;
+    const high = parseInt(mapped[1], 16);
+    return high >> 8 === 127 || (high === 0 && parseInt(mapped[2], 16) === 0);
+  }
+  // The /whoami listeners with this page's scheme that another host can
+  // dial: pairlink.dial_urls without the LAN address, which a page cannot
+  // learn.
+  function dialableListeners(w) {
+    const out = [];
+    for (const raw of (w && Array.isArray(w.listeners) ? w.listeners : [])) {
+      let u;
+      try { u = new URL(raw); } catch (_) { continue; }
+      const host = u.hostname.replace(/^\[|\]$/g, "");
+      if (u.protocol !== location.protocol || loopbackHost(u.hostname)) continue;
+      if (/^169\.254\./.test(host) || /^fe[89ab][0-9a-f]:/i.test(host)) continue;
+      out.push(u.origin);
+    }
+    return [...new Set(out)];
+  }
+  function showPairLoop(listeners) {
+    const where = listeners.length
+      ? "This server also listens on " + listeners.map((u) => "<code>" + esc(u) + "</code>").join(", ") + ". Open this dashboard there to pair a device"
+      : "Open this dashboard at the server’s LAN, VPN, or public address";
+    $("pairLoop").innerHTML = esc(location.origin) + " is a loopback address, which a phone cannot reach. " +
+      where + ", or run <code>cronstable pair --public-url URL</code>.";
+  }
   function openPair() {
     if (!openOverlay("pairWrap")) return;
+    // A loopback page has no address to give a phone, so the panel says so
+    // in place of a code, as cronstable pair and the terminal dashboard do.
+    const loop = loopbackHost(location.hostname);
     const payload = JSON.stringify({ v: 1, name: state.clusterNode || location.host, url: location.origin, token: token() });
     let renderedBase = pairLinkBase();
-    renderPairQr(pairLink(payload, renderedBase));
-    $("pairPayload").textContent = payload;
-    $("pairHint").style.display = token() ? "none" : "";
+    if (loop) {
+      $("pairQr").textContent = "";
+      $("pairPayload").textContent = "";
+      showPairLoop([]);
+    } else {
+      renderPairQr(pairLink(payload, renderedBase));
+      $("pairPayload").textContent = payload;
+    }
+    $("pairLoop").style.display = loop ? "" : "none";
+    $("pairCopy").style.display = loop ? "none" : "";
+    $("pairHint").style.display = token() || loop ? "none" : "";
     $("pairHint").querySelector("span").textContent = publicView()
       ? "Pairing requires an access token. This tab is using the public view; enter a token to pair a device."
       : "No token is saved in this tab. Pairing will use an unauthenticated connection.";
@@ -10033,6 +10132,7 @@ var qrcode = function() {
     const seq = ++pairSeq;
     apiFetch("/whoami").then((r) => (r.ok ? r.json() : null)).then((w) => {
       if (!w || seq !== pairSeq) return;
+      if (loop) { showPairLoop(dialableListeners(w)); return; }
       if (typeof w.pairLinkBase === "string" && w.pairLinkBase && w.pairLinkBase !== renderedBase) {
         renderedBase = w.pairLinkBase;
         renderPairQr(pairLink(payload, renderedBase));
@@ -10549,6 +10649,7 @@ var qrcode = function() {
     clearRecoveryPreview();
     stopDagTaskLog();
     if (state.dagRunPoll) { clearTimeout(state.dagRunPoll); state.dagRunPoll = null; }
+    stopRecoveryPoll();
     state.dagDrawer.dag = null; state.dagDrawer.runKey = null; state.dagDrawer.run = null;
     $("dagDrawer").setAttribute("aria-hidden", "true");
     $("dagScrim").classList.remove("open");
@@ -11123,13 +11224,19 @@ var qrcode = function() {
   }
 
   const recoveryResults = {};
+  let recoveryPoll = null;  // timer that reloads the runs list for the card
+  function stopRecoveryPoll() { if (recoveryPoll) { clearTimeout(recoveryPoll); recoveryPoll = null; } }
   function renderRecoveryResults() {
     const holder = $("dgRecoveryResults"), dag = state.dagDrawer.dag;
     const batch = recoveryResults[dag];
     holder.style.display = batch && !state.recoveryPreview ? "" : "none";
-    if (!batch) return;
+    if (!batch) { stopRecoveryPoll(); return; }
     const runs = new Map((state.dagDrawer.runs || []).map(r => [r.runKey, r]));
     const finished = batch.runs.filter(key => ["success", "failed"].includes((runs.get(key) || {}).state)).length;
+    // The drawer polls only the selected run, so the card reloads the runs
+    // list until every run in its batch has finished.
+    if (finished === batch.runs.length) stopRecoveryPoll();
+    else if (!recoveryPoll) recoveryPoll = setTimeout(() => { recoveryPoll = null; loadDagRuns(); }, 3000);
     const signature = JSON.stringify([dag, batch.runs, state.dagDrawer.runsStale, batch.runs.map(key => runs.get(key))]);
     if (signature === holder.dataset.signature) return;
     const opened = !holder.firstElementChild || holder.firstElementChild.open;
@@ -12345,7 +12452,7 @@ var qrcode = function() {
       sub = corr
         ? "×" + corr.n + " share exit code " + (corr.exit == null ? "?" : corr.exit) + (corr.reason ? " (" + corr.reason + ")" : "") +
           (corr.span <= CORR_WINDOW ? " within " + Math.max(1, Math.round(corr.span / 1000)) + "s" : "") + " — may share a cause"
-        : "no matching failure details found";
+        : "no two share an exit code and reason";
     }
     return { sev: sev, glyph: glyph, head: head, sub: sub };
   }

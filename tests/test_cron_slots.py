@@ -396,8 +396,81 @@ async def test_slotlease_claim_fails_closed_when_backend_is_none():
     cron._state_configured = True
     cron.state_backend = None
     cron._state_on_unavailable = "fail-closed"
-    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    refusals = []
+    claimed = await cron._claim_cluster_slot(cron.cron_jobs["s"], refusals)
+    assert claimed is False
     assert "s" not in cron._slot_refs
+    # a manual start answers 503 with the reason
+    assert refusals == [
+        (
+            503,
+            "job 's' cannot claim its cluster concurrency slot (the state "
+            "store is unavailable), and onStoreUnavailable is fail-closed",
+        )
+    ]
+
+
+class _HungBackend(_SlotleaseBackend):
+    """A store whose lock probe and lease calls never return."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    async def _hang(self, call):
+        self.calls.append(call)
+        await asyncio.Event().wait()
+
+    async def verify_locking(self):
+        await self._hang("verify_locking")
+
+    async def acquire_lease(self, name, holder, ttl):
+        await self._hang("acquire_lease")
+
+    async def read_lease(self, name):
+        await self._hang("read_lease")
+
+
+@pytest.mark.parametrize("probed", [True, False], ids=["probed", "unprobed"])
+async def test_slotlease_manual_start_answers_503_within_its_budget(
+    monkeypatch, probed
+):
+    # a manual start's store waits share one budget, so a hung store gives
+    # the 503 well inside STATE_OP_TIMEOUT, let alone three of them
+    from aiohttp import web
+
+    from tests.conftest import Req
+
+    monkeypatch.setattr(cronstable.cron, "MANUAL_START_STORE_BUDGET", 0.2)
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.web_config = {}
+    cron._state_on_unavailable = "fail-closed"
+    if not probed:
+        cron._slot_fidelity = None
+    cron.state_backend = _HungBackend()
+    with pytest.raises(web.HTTPServiceUnavailable) as caught:
+        await asyncio.wait_for(
+            cron._web_start_job(Req(match={"name": "s"})), timeout=5
+        )
+    assert "the store did not answer" in caught.value.text
+    assert "s" not in cron.running_jobs or not cron.running_jobs["s"]
+
+
+async def test_slotlease_scheduled_claim_waits_out_each_operation(
+    monkeypatch,
+):
+    # the budget is a manual start's: a scheduled claim gives the acquire
+    # and the read-back STATE_OP_TIMEOUT each
+    monkeypatch.setattr(cronstable.cron, "MANUAL_START_STORE_BUDGET", 0.05)
+    monkeypatch.setattr(cronstable.cron, "STATE_OP_TIMEOUT", 0.3)
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron._state_on_unavailable = "fail-closed"
+    cron.state_backend = _HungBackend()
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    assert loop.time() - began >= 0.5
+    assert cron.state_backend.calls == ["acquire_lease", "read_lease"]
 
 
 async def test_slotlease_claim_degrades_when_locks_cannot_fence(monkeypatch):
@@ -431,8 +504,18 @@ async def test_slotlease_claim_forbid_when_peer_holds_slot(monkeypatch):
     cron.state_backend = _SlotleaseBackend(acquire=None, read=_slotlease_lease())
     seen = []
     monkeypatch.setattr(cron, "_sla_peer_owns_slot", lambda name: seen.append(name))
-    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    refusals = []
+    claimed = await cron._claim_cluster_slot(cron.cron_jobs["s"], refusals)
+    assert claimed is False
     assert seen == ["s"]
+    # a manual start answers 409 naming the node that holds the slot
+    assert refusals == [
+        (
+            409,
+            "job 's' is running on peer (concurrencyPolicy: Forbid, "
+            "concurrencyScope: cluster)",
+        )
+    ]
 
 
 async def test_slotlease_claim_replace_spawns_pursuit(monkeypatch):
@@ -445,11 +528,15 @@ async def test_slotlease_claim_replace_spawns_pursuit(monkeypatch):
 
     monkeypatch.setattr(cron, "_pursue_replace_slot", _fake_pursue)
     monkeypatch.setattr(cron, "_sla_peer_owns_slot", lambda name: None)
-    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    refusals = []
+    claimed = await cron._claim_cluster_slot(cron.cron_jobs["s"], refusals)
+    assert claimed is False
     pursuit = cron._slot_pursuits.get("s")
     if pursuit is not None:
         await pursuit
     assert spawned and spawned[0][0] == "s"
+    # the pursuit launches the run later, so a manual start is no refusal
+    assert refusals == []
 
 
 def _slotlease_retry_job(policy):
@@ -1139,7 +1226,7 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     job = cron.cron_jobs["s"]
 
-    async def _claim(j):
+    async def _claim(j, refusals=None):
         return True
 
     monkeypatch.setattr(cron, "_claim_cluster_slot", _claim)
@@ -1190,7 +1277,7 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_prepare_cancel(
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     job = cron.cron_jobs["s"]
 
-    async def _claim(j):
+    async def _claim(j, refusals=None):
         return True
 
     monkeypatch.setattr(cron, "_claim_cluster_slot", _claim)

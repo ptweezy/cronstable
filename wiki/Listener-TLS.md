@@ -18,6 +18,7 @@ own mutual TLS configuration for peer connections.
 [Quickstart](#quickstart-an-https-dashboard) ·
 [The `web.tls` block](#the-webtls-block) ·
 [Mutual TLS](#mutual-tls-clientca) ·
+[Certificate requirements](#certificate-requirements) ·
 [Mixed listeners](#mixed-listeners-one-daemon-two-transports) ·
 [The job state API over TLS](#the-job-state-api-over-tls) ·
 [Client configuration](#client-configuration) ·
@@ -196,6 +197,9 @@ cronstable tui --url https://cronstable.internal:8443 \
                --client-key  /etc/cronstable/tls/ops.key
 ```
 
+A client certificate must meet the
+[certificate requirements](#certificate-requirements).
+
 ### mTLS satisfies the MCP token gate
 
 `mcp.enabled` with no `web.authToken` on a routable listener is normally a
@@ -207,6 +211,57 @@ verdict, because encryption is not caller authentication.
 the transport, which is the same guarantee the gate already accepts from an
 mTLS-terminating proxy. Therefore `mcp.enabled` on an `https://` listener with
 `clientCa` set is allowed with no token. See [MCP](MCP) for the endpoint itself.
+
+## Certificate requirements
+
+cronstable verifies certificates in OpenSSL's strict X.509 mode on every
+Python version, the mode that Python 3.13 and later use by default. That
+covers client certificates on an mTLS listener, the job CLI's check of the
+`state.jobApi` certificate, the `--cacert` checks of the terminal dashboard
+and the other CLI clients, and the cluster's peer certificates. With OpenSSL
+3.0 or later, strict mode requires the following:
+
+- A CA certificate is marked as a CA (`basicConstraints=critical,CA:TRUE`),
+  has a key usage that includes `keyCertSign`, and carries a Subject Key
+  Identifier.
+- A certificate that a CA issued carries an Authority Key Identifier that
+  names the CA's key.
+
+A Python linked to OpenSSL 1.1.1, such as the python.org builds of Python
+3.10 for Windows and macOS, makes fewer of these checks. It accepts a
+certificate without an Authority Key Identifier, and a CA certificate
+without a key usage extension, a Subject Key Identifier, or a critical
+`basicConstraints`. To see which OpenSSL a Python links, run
+`python -c "import ssl; print(ssl.OPENSSL_VERSION)"` with the Python that
+runs cronstable.
+
+As in Python 3.13, a chain may also end at an intermediate CA that the trust
+file holds.
+
+A self-signed certificate that a client trusts directly, such as the one from
+the [quickstart](#quickstart-an-https-dashboard), needs neither. OpenSSL 3
+adds both identifiers when it issues a certificate, but `openssl req -x509`
+adds no key usage, so a CA made with that command alone fails. This recipe
+makes a client CA and one client certificate for `clientCa` that pass:
+
+```shell
+openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
+  -keyout client-ca.key -out client-ca.pem -subj "/CN=cronstable client CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl req -newkey rsa:2048 -nodes -keyout ops.key -out ops.csr -subj "/CN=ops"
+printf "extendedKeyUsage=clientAuth\nauthorityKeyIdentifier=keyid\n" > client.ext
+openssl x509 -req -in ops.csr -CA client-ca.pem -CAkey client-ca.key \
+  -CAcreateserial -out ops.pem -days 365 -sha256 -extfile client.ext
+```
+
+To check a certificate the way cronstable does, pass `-x509_strict` to
+`openssl verify`. Without it, `openssl verify` accepts certificates that
+cronstable refuses:
+
+```shell
+openssl verify -x509_strict -CAfile client-ca.pem ops.pem
+```
 
 ## Mixed listeners: one daemon, two transports
 
@@ -430,14 +485,23 @@ minutes, the new material is genuinely broken rather than half-written. Check
 the renewal job and that the certificate and key are a matching pair.
 
 **An mTLS listener refuses a client during the handshake.** With `clientCa` set,
-the listener rejects a client that sends no certificate, or one signed by a
-different CA, before any HTTP request happens, so there is no status code to
-read, only a handshake error. Confirm the client is passing both `--client-cert`
-and `--client-key`, and that the certificate chains to the exact CA in
-`clientCa`:
+the listener rejects a client that sends no certificate, or one that fails
+verification, before any HTTP request happens, so the client sees no status
+code, only a handshake error. The daemon logs a warning with the reason, for
+example:
+
+```text
+web: TLS handshake failed: client certificate rejected: Missing Authority Key Identifier
+```
+
+It logs at most one such line a minute for each listener, and the next line
+counts the failures in between. Confirm the client is passing both
+`--client-cert` and `--client-key`, and that the certificate chains to the
+exact CA in `clientCa` and meets the
+[certificate requirements](#certificate-requirements):
 
 ```shell
-openssl verify -CAfile /etc/cronstable/tls/client-ca.pem /etc/cronstable/tls/ops.pem
+openssl verify -x509_strict -CAfile /etc/cronstable/tls/client-ca.pem /etc/cronstable/tls/ops.pem
 ```
 
 **A job reports a TLS handshake failure against the state endpoint.** The

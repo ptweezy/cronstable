@@ -6,6 +6,18 @@ import pytest
 playwright_api = pytest.importorskip("playwright.sync_api")
 DEMO = Path(__file__).resolve().parents[1] / "docs" / "demo" / "index.html"
 
+# counts the page's requests for a workflow's runs list from here on
+_COUNT_RUN_LISTS = """
+() => {
+  window.__runLists = 0;
+  const orig = window.fetch;
+  window.fetch = function (url, opts) {
+    if (/\\/dags\\/[^/]+\\/runs\\?/.test(String(url))) window.__runLists++;
+    return orig.call(this, url, opts);
+  };
+}
+"""
+
 
 def test_pool_cancellation_and_reviewed_recovery(tmp_path):
     with playwright_api.sync_playwright() as p:
@@ -38,5 +50,19 @@ def test_pool_cancellation_and_reviewed_recovery(tmp_path):
             page.wait_for_function("document.querySelector('#dgTasks').textContent.includes('Reused')")
             assert not errors, errors
             assert not page.locator("#dgRecovery").is_visible()
+            # the card follows its run to the end (the demo run takes 8 s)
+            results = "#dgRecoveryResults"
+            page.wait_for_function(
+                "(s) => document.querySelector(s + ' summary').textContent"
+                ".endsWith('1/1 finished')",
+                arg=results,
+                timeout=30000,
+            )
+            assert " · success" in page.locator(results).inner_text()
+            # then stops reloading the runs list
+            page.evaluate(_COUNT_RUN_LISTS)
+            page.wait_for_timeout(4000)
+            assert page.evaluate("window.__runLists") == 0
+            assert not errors, errors
         finally:
             browser.close()

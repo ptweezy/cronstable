@@ -127,8 +127,13 @@ def _opener() -> urllib.request.OpenerDirector:
     cached = _TLS_OPENERS.get(cacert)
     if cached is not None:
         return cached
+    # deferred: a plaintext call loads only the client modules
+    from cronstable import tlsutil
+
     try:
-        ctx = ssl.create_default_context(cafile=cacert)
+        ctx = tlsutil.verify_strictly(
+            ssl.create_default_context(cafile=cacert)
+        )
     except (OSError, ssl.SSLError) as ex:
         # A missing or malformed CA file is the job environment's problem and
         # must read as one.

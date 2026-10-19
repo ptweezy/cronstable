@@ -84,7 +84,7 @@ def test_real_run_streams_into_the_drawer_and_ends(browser, tmp_path):
             # never ran: the daemon ends the tail with nothing to replay
             page.wait_for_function(
                 "document.getElementById('term').textContent"
-                ".includes('(no output captured for the latest run)')"
+                ".includes('(no run recorded yet)')"
             )
             page.click("#dRun")
             page.wait_for_function(
@@ -141,6 +141,116 @@ def test_real_run_streams_into_the_drawer_and_ends(browser, tmp_path):
             page.keyboard.press("Escape")
             page.wait_for_selector('#drawer[aria-hidden="true"]')
             daemon.api("POST", "/jobs/gamma-slow/cancel")
+
+
+def test_a_run_between_two_polls_shows_in_the_open_pane(browser, tmp_path):
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(
+            browser, daemon.url, prefs={"pollMs": 1000}
+        ) as page:
+            page.faults.record()
+            _open_logs(page)
+            page.wait_for_function(
+                "document.getElementById('term').textContent"
+                ".includes('(no run recorded yet)')"
+            )
+            # started outside the page, and usually over before a poll
+            # sees it running
+            daemon.run_and_wait("alpha-ok")
+            page.wait_for_function(
+                "document.getElementById('term').textContent"
+                ".includes('alpha-out')"
+            )
+            opens = len(page.faults.sent("GET", "/jobs/alpha-ok/logs"))
+            # later polls see that the pane shows the run, and attach nothing
+            page.wait_for_timeout(2500)
+            assert len(page.faults.sent("GET", "/jobs/alpha-ok/logs")) == opens
+
+
+def _release_polls(page, parked):
+    page.faults.clear(r"/jobs")
+    for route in parked:
+        route.fallback()
+
+
+def _run_from_the_drawer(page, daemon, later_run):
+    """Press Run with polls parked until the run ends, then count the
+    pane's log streams once the polls resume."""
+    logs = "/jobs/alpha-ok/logs"
+
+    def opened():
+        return len(page.faults.sent("GET", logs))
+
+    parked = page.faults.hang(r"/jobs")
+    e2e.wait_until(lambda: len(parked) == 1, page)
+    opens = opened()
+    _click(page, "#dRun")
+    e2e.wait_until(lambda: opened() == opens + 1, page)
+    page.wait_for_function(
+        "document.getElementById('term').textContent.includes('alpha-out')"
+    )
+    e2e.wait_until(lambda: not daemon.jobs()["alpha-ok"]["running"])
+    page.wait_for_timeout(500)  # the stream's end event
+    if later_run:
+        # another run starts and ends before the next poll
+        daemon.run_and_wait("alpha-ok")
+    _release_polls(page, parked)
+    # the pane attaches to that run, and replays nothing for the run it
+    # streamed
+    want = opens + 1 + later_run
+    e2e.wait_until(lambda: opened() == want, page)
+    page.wait_for_timeout(2500)
+    assert opened() == want
+
+
+def test_a_run_after_a_streamed_run_shows_in_the_open_pane(browser, tmp_path):
+    with e2e.Daemon(tmp_path) as daemon:
+        with e2e.open_page(
+            browser, daemon.url, prefs={"pollMs": 1000}
+        ) as page:
+            page.faults.record()
+            _open_logs(page)
+            page.wait_for_function(
+                "document.getElementById('term').textContent"
+                ".includes('(no run recorded yet)')"
+            )
+            _run_from_the_drawer(page, daemon, later_run=False)
+            _run_from_the_drawer(page, daemon, later_run=True)
+
+
+def test_a_paused_job_keeps_the_open_pane(browser, tmp_path):
+    jobs = [e2e.job("ticker", "echo tick", schedule="* * * * * * *")]
+    with e2e.Daemon(tmp_path, jobs=jobs) as daemon:
+        with e2e.open_page(
+            browser, daemon.url, prefs={"pollMs": 1000}
+        ) as page:
+            page.faults.record()
+            _open_logs(page, "ticker")
+            page.wait_for_function(
+                "document.getElementById('term').textContent"
+                ".includes('tick')"
+            )
+            status, body = daemon.api("POST", "/jobs/ticker/pause")
+            assert status == 200, body
+            e2e.wait_until(
+                lambda: (daemon.jobs()["ticker"]["last_run"] or {}).get(
+                    "outcome"
+                )
+                == "skipped"
+            )
+            polls = len(page.faults.sent("GET", "/jobs"))
+            e2e.wait_until(
+                lambda: len(page.faults.sent("GET", "/jobs")) >= polls + 2,
+                page,
+            )
+            opens = len(page.faults.sent("GET", "/jobs/ticker/logs"))
+            # a slot skipped every second: the pane keeps the last run's
+            # output and attaches nothing
+            page.wait_for_timeout(3000)
+            assert len(page.faults.sent("GET", "/jobs/ticker/logs")) == opens
+            text = page.text_content("#term")
+            assert "tick" in text
+            assert "no output" not in text
 
 
 def test_stderr_and_stdout_are_classed_and_tabs_stop_the_tail(
@@ -302,13 +412,20 @@ def test_stream_truncated_without_an_end_frame(browser, tmp_path):
 def test_end_frames(browser, tmp_path):
     with e2e.Daemon(tmp_path) as daemon:
         with e2e.open_page(browser, daemon.url) as page:
-            # end with no line: the drawer says nothing was captured
+            # end with no line and no recorded run
             page.faults.sse(
                 LOGS,
                 [e2e.sse_frame("end", {"reason": "no-output"})],
                 close=True,
             )
             _open_logs(page)
+            page.wait_for_selector("#term .ln.sys")
+            assert _lines(page) == [["sys", "(no run recorded yet)"]]
+            page.keyboard.press("Escape")
+            # end with no line after a run: the drawer says nothing was
+            # captured
+            page.faults.sse(LOGS, ["event: end\ndata: {}\n\n"], close=True)
+            _open_logs(page, "alpha-ok")
             page.wait_for_selector("#term .ln.sys")
             assert _lines(page) == [
                 ["sys", "(no output captured for the latest run)"]

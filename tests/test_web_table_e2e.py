@@ -213,6 +213,36 @@ def test_search_filters_by_name_and_command(browser, tmp_path):
             _wait_names(page, [])
 
 
+# The filter box's room left over after its placeholder text, in pixels.
+_PLACEHOLDER_ROOM = """
+() => {
+  const input = document.getElementById("search");
+  const cs = getComputedStyle(input);
+  const ctx = document.createElement("canvas").getContext("2d");
+  ctx.font = cs.font;
+  const room = input.clientWidth - parseFloat(cs.paddingLeft)
+    - parseFloat(cs.paddingRight);
+  return room - ctx.measureText(input.placeholder).width;
+}
+"""
+
+
+@pytest.mark.parametrize("width", [1440, 1600, 1920])
+def test_filter_placeholder_fits_beside_a_full_toolbar(browser, width):
+    # the demo page shows every toolbar button, which leaves the filter box
+    # at its narrowest
+    page = browser.new_page(viewport={"width": width, "height": 900})
+    try:
+        page.goto(e2e.DEMO.resolve().as_uri())
+        page.wait_for_selector("#rows tr")
+        page.wait_for_function(
+            "document.getElementById('dagsBtn').style.display === ''"
+        )
+        assert page.evaluate(_PLACEHOLDER_ROOM) >= 0
+    finally:
+        page.close()
+
+
 def test_status_filter_selects_by_real_state(browser, tmp_path):
     with e2e.Daemon(tmp_path) as daemon:
         _real_states(daemon)

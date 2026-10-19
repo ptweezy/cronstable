@@ -70,11 +70,28 @@ _STALE_STATUSES = frozenset(
     {STATUS_UNKNOWN, STATUS_UNREACHABLE, STATUS_UNTRUSTED}
 )
 
+# Statuses of a peer whose last poll failed (see ClusterView.end_round).
+_FAILED_STATUSES = frozenset({STATUS_UNREACHABLE, STATUS_UNTRUSTED})
+
 # Completed poll rounds after which the never-skip available_* gates stop
 # holding for an AGREED peer that has not attested this instance back (see
 # ClusterManager.view_settled): a peer still silent after 3 rounds is a
 # genuinely one-way link, and the never-skip contract leans toward running.
 _SETTLE_ROUNDS = 3
+
+
+def _distrust_rounds(interval: float, connect_timeout: float) -> int:
+    """Failed poll rounds for which a node sets aside its peers' reports of
+    a peer it cannot reach (see ClusterManager._available_contenders).
+
+    A peer polls every node at least every
+    ``interval + 2 * connectTimeout``, and this node's rounds start at
+    least ``interval`` apart, so after this many failed rounds a peer that
+    still reports the node has reached it since this node's first failed
+    poll.
+    """
+    return 2 + math.ceil(3 * connect_timeout / interval)
+
 
 # Cap on the /peer response buffered per poll: bounds the memory a
 # misbehaving-but-CA-trusted peer can force (see _read_capped / _poll_peer).
@@ -610,6 +627,9 @@ class PeerState:
     last_error: str | None = None
     # consecutive reachable-but-mismatched rounds, for the drift hysteresis
     mismatch_streak: int = 0
+    # consecutive completed poll rounds that failed to reach the peer (see
+    # ClusterView.end_round). Internal; not in to_dict.
+    failed_rounds: int = 0
     # the peer's own reported observations (node_name, instance_id, agreed),
     # feeding mutual-agreement and transitive conflict detection (see
     # _agreeing_peer_names / conflict_names). None when no fresh response.
@@ -777,6 +797,7 @@ class ClusterView:
         peer = self.peers[host]
         peer.last_seen = now
         peer.last_error = None
+        peer.failed_rounds = 0
         peer.job_set_id = peer_id
         peer.node_name = peer_name
         peer.instance_id = peer_instance
@@ -892,6 +913,12 @@ class ClusterView:
         # is not AGREED, so _agreeing_peers skips it regardless).
         peer.reports_members = False
 
+    def end_round(self) -> None:
+        """Count a completed poll round against each peer it did not reach."""
+        for peer in self.peers.values():
+            if peer.status in _FAILED_STATUSES:
+                peer.failed_rounds += 1
+
     def to_list(
         self,
         now: datetime.datetime | None = None,
@@ -969,7 +996,7 @@ def build_server_ssl_context(tls: dict[str, str]) -> ssl.SSLContext:
         # standing up an unauthenticated listener.
         raise ValueError("cluster.tls.ca is required for the peer listener")
     return tlsutil.build_listener_ssl_context(
-        tls["cert"], tls["key"], client_ca=tls["ca"]
+        tls["cert"], tls["key"], client_ca=tls["ca"], label="cluster"
     )
 
 
@@ -1134,6 +1161,10 @@ class ClusterManager(LeadershipBackend):
         # the convergence hold view_settled() places on the never-skip
         # available_* gates during that window.
         self._poll_rounds = 0
+        # see _available_contenders
+        self._distrust_rounds = _distrust_rounds(
+            config["interval"], config["connectTimeout"]
+        )
         # emit-once latch for the degenerate 2-of-2 self-listing warning
         # (see _maybe_warn_degenerate_self_listing).
         self._warned_degenerate_self = False
@@ -1742,6 +1773,7 @@ class ClusterManager(LeadershipBackend):
                 )
         # one full round completed: every configured peer now carries a real
         # observation (success or failure); feeds view_settled()'s bound.
+        self.view.end_round()
         self._poll_rounds += 1
         # Re-run the degenerate-self check with the round's full information:
         # at the SELF transition a multi-homed duplicate may not be deduped
@@ -2828,8 +2860,8 @@ class ClusterManager(LeadershipBackend):
         reachable co-owners a witness vouches a two-way edge to
         (:meth:`_available_contenders`): without the fold, two nodes blind
         to each other but sharing a witness both run on a converged
-        cluster. It cannot zero-run: the global-minimum node is the min of
-        any set containing it, so it always self-elects (never-skip).
+        cluster. The global-minimum node is the min of any set containing
+        it, so while it runs it self-elects (never-skip).
         """
         return elect_available_leader(
             self.node_name,
@@ -2971,17 +3003,29 @@ class ClusterManager(LeadershipBackend):
         but folding the RAW ``mutual_agreeing`` edge, not quorate_vouched:
         with no quorum gate a sub-quorum node still runs the jobs it owns,
         so it is a legitimate co-owner and must be in everyone's rendezvous
-        set. Folding raw edges cannot zero-run here: a rendezvous winner
-        has no quorum gate to stand down on, and the global-max node is the
-        max of any set containing it, so it always self-owns and runs.
+        set. A running winner has no quorum gate to stand down on, so it
+        self-owns and runs.
+
+        A peer this node has failed to reach for fewer than
+        :func:`_distrust_rounds` rounds is left out: a report of it can
+        predate the reporter's own failed poll, and deferring to a stopped
+        node runs its jobs nowhere. Until then, a link that broke between
+        two running nodes can double-run the far node's jobs.
         """
         agreeing = self._agreeing_peers()
         accounted = {self.node_name}
         accounted |= {peer.node_name for peer in agreeing if peer.node_name}
+        distrusted = {
+            peer.node_name
+            for peer in self.view.peers.values()
+            if peer.node_name
+            and peer.status in _FAILED_STATUSES
+            and peer.failed_rounds < self._distrust_rounds
+        }
         possible: set[str] = set()
         for peer in agreeing:
             for name in peer.mutual_agreeing or ():
-                if name and name not in accounted:
+                if name and name not in accounted and name not in distrusted:
                     possible.add(name)
         return sorted(possible)
 
@@ -2990,8 +3034,8 @@ class ClusterManager(LeadershipBackend):
 
         The rendezvous winner over ourselves, the peers we see agreeing,
         and :meth:`_available_contenders`: two never-skip nodes blind to
-        each other converge on one owner (no double-run) while the absent
-        quorum gate guarantees the winner runs (no zero-run).
+        each other converge on one owner (no double-run), and with no
+        quorum gate a running winner runs the job (no zero-run).
         """
         members, member_bytes, owners = self._available_owner_members()
         owner = owners.get(job_name)

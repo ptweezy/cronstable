@@ -24,6 +24,7 @@ from cronstable.cluster import (
     ClusterView,
     PeerState,
     _aged_job_summaries,
+    _distrust_rounds,
     _hrw_owner,
     _hrw_owner_bytes,
     _parse_members,
@@ -692,7 +693,7 @@ async def test_mtls_untrusted_peer(tmp_path):
         await rogue_b.stop()
 
 
-async def test_server_mtls_rejects_client_without_cert(tmp_path):
+async def test_server_mtls_rejects_client_without_cert(tmp_path, caplog):
     # F20: the /peer listener is the membership boundary -- it must REFUSE a
     # client that presents NO CA-signed client cert (CERT_REQUIRED). Previously
     # only the client-verifies-server direction was exercised.
@@ -701,6 +702,7 @@ async def test_server_mtls_rejects_client_without_cert(tmp_path):
     mine = _write_tls(tmp_path, cn="mine")
     pa = _free_port()
     a = _mgr([], job_set="v1:same", tls=mine, listen=f"127.0.0.1:{pa}")
+    caplog.set_level("WARNING", logger="cronstable.tls")
     await a.start()
     try:
         # trust the server's CA (so its cert verifies) but present NO client
@@ -713,6 +715,19 @@ async def test_server_mtls_rejects_client_without_cert(tmp_path):
                     f"https://127.0.0.1:{pa}/peer", ssl=cctx
                 ) as resp:
                     await resp.read()
+
+        # the listener logs why it refused the handshake
+        def refusals():
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == "cronstable.tls"
+            ]
+
+        await _wait_until(refusals)
+        assert refusals() == [
+            "cluster: TLS handshake failed: the client sent no certificate"
+        ]
     finally:
         await a.stop()
 
@@ -2212,9 +2227,13 @@ def _spread_mesh(mgr_graph, distribution, electLeader=True):
                 # failed. Leaving it never-polled (unknown) would instead hold
                 # the never-skip available_* gates closed (see view_settled),
                 # which is the startup state, not the converged mesh these
-                # tests model.
+                # tests model. The link has been down past the distrust
+                # window, so peers' reports of the node count again.
                 mgrs[n].view.record_failure(
                     other + ":1", "link down", untrusted=False
+                )
+                mgrs[n].view.peers[other + ":1"].failed_rounds = (
+                    mgrs[n]._distrust_rounds
                 )
     # second pass: advertise quorate_vouched = each node's
     # _eligible_candidates, computable only once mutual edges are seeded above.
@@ -2277,6 +2296,131 @@ def test_preferleader_spread_partial_mesh_no_double_run(no_tls):
         job = "job-%d" % i
         owners = [n for n in names if mgrs[n].is_available_job_owner(job)]
         assert len(owners) == 1, (job, owners)  # never zero, never two
+
+
+def _stop_node(mgrs, stopped):
+    # every survivor's own poll of `stopped` has failed, while the gossip it
+    # holds from its live peers predates their failed polls and still lists
+    # `stopped` in mutual_agreeing (up to about two poll rounds on a fleet).
+    survivors = [n for n in sorted(mgrs) if n != stopped]
+    for n in survivors:
+        mgrs[n].view.record_failure(
+            stopped + ":1", "connection refused", untrusted=False
+        )
+    return survivors
+
+
+def test_preferleader_spread_stale_vouch_for_stopped_owner(no_tls):
+    # A job whose rendezvous winner has stopped must still run on a survivor:
+    # PreferLeader never skips. Each survivor records the stopped node
+    # unreachable, but its peers' stale vouches keep the node in its owner
+    # set, so today every survivor defers to it.
+    names = ["node-a", "node-b", "node-c", "node-d", "node-e"]
+    mgrs = _spread_mesh({x: set(names) - {x} for x in names}, "spread")
+    survivors = _stop_node(mgrs, "node-c")
+    jobs = [
+        job
+        for job in ("job-%d" % i for i in range(200))
+        if _hrw_owner(job, names) == "node-c"
+    ]
+    assert jobs
+    for job in jobs:
+        owners = [n for n in survivors if mgrs[n].is_available_job_owner(job)]
+        assert owners, job
+
+
+def test_preferleader_single_leader_stale_vouch_for_stopped_leader(no_tls):
+    # The single-leader form: the stopped node has the lowest name, so every
+    # survivor's available_leader_name() still elects it.
+    names = ["node-a", "node-b", "node-c", "node-d", "node-e"]
+    mgrs = _spread_mesh(
+        {x: set(names) - {x} for x in names}, "single-leader"
+    )
+    survivors = _stop_node(mgrs, "node-a")
+    assert any(mgrs[n].is_available_leader() for n in survivors)
+
+
+def test_preferleader_newly_broken_link_never_zero_runs(no_tls):
+    # A link that has just broken looks like a stopped node from both ends:
+    # each sets aside its peers' reports of the other, so a job that either
+    # end wins may run on both (PreferLeader accepts that), never on neither.
+    # Past the distrust window the reports count again: one owner per job.
+    # (A peer never reached has no known name, so its reports count from
+    # the start, as in the partial-mesh test above.)
+    names = ["node-a", "node-b", "node-c", "node-m", "node-n"]
+    graph = {x: set(names) - {x} for x in names}
+    graph["node-m"].discard("node-n")
+    graph["node-n"].discard("node-m")
+    mgrs = _spread_mesh(graph, "spread")
+    for here, there in (("node-m", "node-n"), ("node-n", "node-m")):
+        # reached before the link broke, so the peer's name is known
+        peer = mgrs[here].view.peers[there + ":1"]
+        peer.node_name = there
+        peer.failed_rounds = 0
+    jobs = ["job-%d" % i for i in range(300)]
+    owners = {
+        job: [n for n in names if mgrs[n].is_available_job_owner(job)]
+        for job in jobs
+    }
+    assert all(owners.values())
+    assert any(len(found) == 2 for found in owners.values())
+    for here, there in (("node-m", "node-n"), ("node-n", "node-m")):
+        peer = mgrs[here].view.peers[there + ":1"]
+        for _ in range(mgrs[here]._distrust_rounds):
+            mgrs[here].view.end_round()
+        assert peer.failed_rounds == mgrs[here]._distrust_rounds
+    for job in jobs:
+        found = [n for n in names if mgrs[n].is_available_job_owner(job)]
+        assert len(found) == 1, (job, found)
+
+
+def test_view_counts_failed_rounds_until_a_poll_succeeds(no_tls):
+    mgr = _mgr(["b:1", "c:1"])
+    _seed_agree(mgr, "b:1", "node-b")
+    mgr.view.record_failure("c:1", "down", untrusted=False)
+    mgr.view.end_round()
+    mgr.view.record_failure("c:1", "down", untrusted=True)
+    mgr.view.end_round()
+    assert mgr.view.peers["c:1"].failed_rounds == 2
+    assert mgr.view.peers["b:1"].failed_rounds == 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    mgr.view.record_success(
+        "c:1", "node-c", "v1:mine", SCHEME_VERSION, "v1:mine", now, "node-a"
+    )
+    assert mgr.view.peers["c:1"].failed_rounds == 0
+
+
+@pytest.mark.parametrize(
+    "interval, connect_timeout, rounds",
+    [(30, 10, 3), (60, 10, 3), (10, 10, 5), (5, 10, 8)],
+)
+def test_distrust_window_outlasts_a_peer_round(
+    interval, connect_timeout, rounds
+):
+    # A peer polls every node at least every interval + 2 * connectTimeout,
+    # and this node's rounds start at least interval apart, so the window is
+    # 2 + ceil(3 * connectTimeout / interval) rounds.
+    assert _distrust_rounds(interval, connect_timeout) == rounds
+
+
+async def test_poll_round_counts_an_unreachable_peer(no_tls):
+    # start() runs one poll round inline, and the poll loop starts the next
+    # one at once (the interval wait comes after it). Each round that
+    # completes counts once against the peer.
+    mgr = _mgr(
+        ["127.0.0.1:%d" % _free_port()],
+        listen="127.0.0.1:%d" % _free_port(),
+    )
+    await mgr.start()
+    try:
+        (peer,) = mgr.view.peers.values()
+        assert peer.status == STATUS_UNREACHABLE
+        assert peer.failed_rounds == 1
+        # a refused loopback connect takes about 2 s on Windows
+        await _wait_until(lambda: mgr._poll_rounds >= 2, 200, 0.05)
+        assert peer.failed_rounds == 2
+    finally:
+        await mgr.stop()
 
 
 def test_unconfirmed_contenders_folds_only_quorate_vouched(no_tls):

@@ -654,9 +654,14 @@ not there, so the API refuses to launch it manually rather than overriding the
 config.
 
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
-applies. If an instance is already running, `Allow` starts another, `Forbid` does
-not start a new one (the `200` still returns), and `Replace` cancels the running
-instance(s) first. See [concurrency and timeouts](Concurrency-and-Timeouts).
+applies. If an instance is already running, `Allow` starts another, `Replace`
+cancels the running instance(s) first, and `Forbid` starts nothing and answers
+`409` with the reason in the JSON error. Under `concurrencyScope: cluster`,
+`Forbid` also answers `409` while another node holds the job's slot, and
+`Replace` answers `200` and starts the run when that node yields the slot.
+The claim waits at most 10 seconds for the store that holds the slot. When the
+store doesn't answer in that time and `onStoreUnavailable` is `fail-closed`,
+the answer is `503`. See [concurrency and timeouts](Concurrency-and-Timeouts).
 
 ### `POST /jobs/{name}/cancel`
 
@@ -1052,9 +1057,12 @@ running job's new lines live, and finishes with an `end` event:
 
 - Each line arrives as an `event: line` whose `data` is a JSON object
   `{"stream": "stdout"|"stderr", "line": "..."}`.
-- When the run finishes, the server sends `event: end` with data `{}`. If the
-  job has no captured output at all yet, the stream ends immediately with
-  `event: end` and data `{"reason": "no-output"}`.
+- When the run finishes, the server sends `event: end` with data
+  `{"started_at": "<ISO 8601>"}`, the start time of the run the stream
+  showed. A run without a start time, such as a slot that a pause skipped,
+  ends with data `{}`. If the job has no running instance and no recorded
+  run, the stream ends immediately with `event: end` and data
+  `{"reason": "no-output"}`.
 - During quiet periods the server writes an SSE comment (`: ping`) every 15
   seconds as a keep-alive, which also detects disconnected clients.
 

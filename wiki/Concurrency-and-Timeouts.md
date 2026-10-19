@@ -85,9 +85,10 @@ options sit in the document and how `defaults` apply.
 ## Concurrency policy
 
 When `maybe_launch_job` runs for a job and one or more instances of that
-name are already running in this process, it logs a warning
-(`Job <name>: still running and concurrencyPolicy is <policy>`) and then acts
-according to `concurrencyPolicy`. This local check always runs first. For a
+name are already running in this process, it logs
+`Job <name>: still running and concurrencyPolicy is <policy>` and then acts
+according to `concurrencyPolicy`. It logs the line at INFO under `Allow`,
+which permits the overlap, and as a warning under `Forbid` and `Replace`. This local check always runs first. For a
 `concurrencyScope: cluster` job, a launch that clears it must then also claim
 the job's cluster slot (see
 [concurrency across a cluster](#concurrency-across-a-cluster)).
@@ -233,7 +234,9 @@ deferred `@reboot`, or a manual API start) first claims a TTL **slot lease**
 named `slots/<job name>` in the state store (the cron `state` store, not the
 leadership store). The claim is a single choke point in `maybe_launch_job`,
 and each store operation in it is bounded (10 seconds), so an unresponsive
-mount cannot stall the scheduler pass.
+mount cannot stall the scheduler pass. A manual start's claim waits for the
+store at most 10 seconds in all, so the API answers before a dashboard's
+request times out.
 
 - The lease TTL is `state.slotTtlSeconds` (default `30`; a value below 5
   raises `state.slotTtlSeconds must be >= 5`). While the job runs here, the

@@ -776,7 +776,7 @@ def verdict_info(
             sub += " within %ds" % max(1, round(corr["span"] / 1000))
         sub += " — may share a cause"
     else:
-        sub = "no matching failure details found"
+        sub = "no two share an exit code and reason"
     return ({"sev": "crit", "glyph": "▲", "head": head, "sub": sub}, incident)
 
 
@@ -4728,25 +4728,32 @@ class AppActions(App):
     # ---- job actions (instant + toast, exactly like the page) -------
     async def run_job(self, name: str) -> None:
         try:
-            status, _ = await self.api.post("/jobs/%s/start" % _quote(name))
+            status, body = await self.api.post("/jobs/%s/start" % _quote(name))
         except Unauthorized:
             self.open("token")
             self.focus = "token"
             return
+        except asyncio.TimeoutError:
+            self.toast("fail", "start %s: no answer from the daemon" % name)
+            return
         except Exception as exc:  # noqa: BLE001 - toast + carry on
             self.toast("fail", "start %s: %s" % (name, exc))
             return
+        # the daemon's reason: a disabled job, a run that Forbid holds back
+        reason = body.get("error") if isinstance(body, dict) else None
         if status in (200, 202):
             self.toast(
                 "ok", ("queued %s" if status == 202 else "▶ started %s") % name
             )
             self.refresh_now()
         elif status == 409:
-            self.toast("warn", "%s is disabled" % name)
+            self.toast("warn", reason or "%s is disabled" % name)
         elif status == 404:
             self.toast("fail", "no such job: %s" % name)
         else:
-            self.toast("fail", "start %s: HTTP %d" % (name, status))
+            self.toast(
+                "fail", "start %s: %s" % (name, reason or "HTTP %d" % status)
+            )
 
     async def cancel_job(self, name: str) -> None:
         try:
@@ -8567,9 +8574,8 @@ class AppDrawers(AppOverlays):
         if tail.error:
             suffix.append(paint.style("  ⚠ %s" % tail.error, "fail"))
         elif tail.ended == "no-output":
-            suffix.append(
-                paint.style("  ── end of run output (no-output) ──", "dim")
-            )
+            # the job has no running instance and no recorded run
+            suffix.append(paint.style("  ── no run recorded yet ──", "dim"))
         if wrap:
             rows.extend(
                 self._wrapped_window(
@@ -8836,7 +8842,8 @@ class AppDrawers(AppOverlays):
             if dur is not None and top:
                 filled = max(1, int((dur / top) * bar_w))
                 bar = "▪" * filled
-            started = run.get("started_at")
+            # a skipped slot never started, so it shows its due time
+            started = run.get("started_at") or run.get("finished_at")
             stamp = ""
             t = parse_iso(started)
             if t is not None:
@@ -8856,6 +8863,9 @@ class AppDrawers(AppOverlays):
                 exit_code = run.get("exit_code")
                 detail = " exit %s" % ("?" if exit_code is None else exit_code)
                 reason = run.get("fail_reason")
+            elif outcome == "skipped":
+                detail = " skipped"
+                reason = run.get("skip_reason")
             for mark in marks[1:]:
                 detail += " · %s" % mark
             if reason:

@@ -13,16 +13,36 @@ helpers:
   :func:`listener_tls_loadable` checks replacement certificates before
   restarting a listener.
 
+Every context verifies certificates with :data:`VERIFY_FLAGS`, and a
+listener context given a ``label`` logs its failed handshakes.
+
 This module imports only the standard library. Other cronstable modules
 can import it without creating circular dependencies.
 """
 
+import logging
 import os
 import ssl
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import (
     Any,
 )
+
+logger = logging.getLogger("cronstable.tls")
+
+#: OpenSSL's strict X.509 checks, and chains that may end at an intermediate
+#: CA in the trust file: Python 3.13's defaults, set on every version.
+VERIFY_FLAGS = ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
+
+#: Seconds between two failed-handshake warnings from one listener.
+REFUSAL_LOG_INTERVAL = 60.0
+
+# OpenSSL reasons that read better in plain words.
+_REFUSAL_WORDS = {
+    "PEER_DID_NOT_RETURN_A_CERTIFICATE": "the client sent no certificate",
+    "HTTP_REQUEST": "the client sent plain HTTP",
+}
 
 # The keys of a listener `tls:` block, in the order the rotation check stats
 # them. `clientCa` is optional, which is why tls_file_signature tolerates a
@@ -54,6 +74,87 @@ def listener_tls_configured(tls: Mapping[str, Any] | None) -> bool:
     return bool(tls.get("cert")) and bool(tls.get("key"))
 
 
+def verify_strictly(ctx: ssl.SSLContext) -> ssl.SSLContext:
+    """Set :data:`VERIFY_FLAGS` on ``ctx`` and return it."""
+    ctx.verify_flags |= VERIFY_FLAGS
+    return ctx
+
+
+# --------------------------------------------------------------------------
+# failed handshakes
+# --------------------------------------------------------------------------
+
+
+def _refusal_reason(exc: ssl.SSLError) -> str:
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "client certificate rejected: {}".format(
+            exc.verify_message or "verification failed"
+        )
+    reason = exc.reason
+    if not reason:
+        return str(exc.strerror or (exc.args[0] if exc.args else exc))
+    return _REFUSAL_WORDS.get(reason, reason.replace("_", " ").lower())
+
+
+class _RefusalLog:
+    """The warning for one listener's failed handshakes, at most one a
+    :data:`REFUSAL_LOG_INTERVAL`, with a count of those in between."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.logged_at: float | None = None
+        self.held = 0
+
+    def note(self, exc: ssl.SSLError) -> None:
+        now = time.monotonic()
+        if (
+            self.logged_at is not None
+            and now - self.logged_at < REFUSAL_LOG_INTERVAL
+        ):
+            self.held += 1
+            return
+        more = (
+            " ({} more since the last report)".format(self.held)
+            if self.held
+            else ""
+        )
+        logger.warning(
+            "%s: TLS handshake failed: %s%s",
+            self.label,
+            _refusal_reason(exc),
+            more,
+        )
+        self.logged_at = now
+        self.held = 0
+
+
+def _refusal_logging(label: str) -> type[ssl.SSLObject]:
+    """An ``SSLObject`` class that logs each failed handshake.
+
+    asyncio logs a failed server handshake only in debug mode, since
+    :exc:`ssl.SSLError` is an :exc:`OSError`.
+    """
+    log = _RefusalLog(label)
+
+    class _LoggedSSLObject(ssl.SSLObject):
+        def do_handshake(self) -> None:
+            try:
+                super().do_handshake()
+            except (
+                # a handshake in progress, or a client that hung up
+                ssl.SSLWantReadError,
+                ssl.SSLWantWriteError,
+                ssl.SSLEOFError,
+                ssl.SSLZeroReturnError,
+            ):
+                raise
+            except ssl.SSLError as exc:
+                log.note(exc)
+                raise
+
+    return _LoggedSSLObject
+
+
 # --------------------------------------------------------------------------
 # server contexts
 # --------------------------------------------------------------------------
@@ -64,6 +165,7 @@ def build_listener_ssl_context(
     key: str,
     *,
     client_ca: str | None = None,
+    label: str | None = None,
 ) -> ssl.SSLContext:
     """A server context serving ``cert``/``key``.
 
@@ -79,6 +181,9 @@ def build_listener_ssl_context(
     With ``client_ca`` set, that CA file IS the caller allowlist: a server
     cannot do hostname verification, so any certificate the CA ever signed is
     accepted.  Point it at a dedicated CA, never a shared organisational one.
+
+    ``label`` names the listener in the warning for a failed handshake;
+    without it, failures are not logged.
 
     Raises :exc:`OSError` (missing or unreadable file) or
     :exc:`ssl.SSLError` (malformed PEM, certificate/key mismatch); callers
@@ -100,7 +205,9 @@ def build_listener_ssl_context(
     # "fix" it by passing cafile=None and calling load_verify_locations
     # later: that is the dangerous shape the comment above describes.
     ctx.verify_mode = ssl.CERT_REQUIRED if client_ca else ssl.CERT_NONE
-    return ctx
+    if label is not None:
+        ctx.sslobject_class = _refusal_logging(label)
+    return verify_strictly(ctx)
 
 
 # --------------------------------------------------------------------------
@@ -128,7 +235,7 @@ def build_mutual_client_ssl_context(
     # verify_mode=CERT_REQUIRED for the client purpose; be explicit anyway.
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
-    return ctx
+    return verify_strictly(ctx)
 
 
 def build_verifying_client_ssl_context(
@@ -169,7 +276,7 @@ def build_verifying_client_ssl_context(
         ctx.verify_mode = ssl.CERT_NONE
     if cert:
         ctx.load_cert_chain(cert, key)
-    return ctx
+    return verify_strictly(ctx)
 
 
 # --------------------------------------------------------------------------

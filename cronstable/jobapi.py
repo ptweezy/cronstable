@@ -583,7 +583,7 @@ class JobStateAPI:
         if scheme == "https":
             tls = self._config.get("tls") or {}
             ssl_context = tlsutil.build_listener_ssl_context(
-                tls["cert"], tls["key"]
+                tls["cert"], tls["key"], label="state job API"
             )
         site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
         await site.start()

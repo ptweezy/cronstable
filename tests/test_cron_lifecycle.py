@@ -316,7 +316,7 @@ async def test_execution_timeout(tracing_running_job, monkeypatch, spawn_delay):
 
 
 @pytest.mark.parametrize("policy", ["Allow", "Forbid", "Replace"])
-async def test_concurrency_policy(policy):
+async def test_concurrency_policy(policy, caplog):
     # Launch the same long-running job twice and assert the second launch is
     # handled per the policy. Driven directly (no wall-clock dependence) so it
     # is deterministic.
@@ -330,8 +330,19 @@ async def test_concurrency_policy(policy):
         assert first.proc.returncode is None
         await _wait_until(lambda: bool(first.output.lines))
 
+        caplog.set_level("INFO", logger="cronstable")
         await cron.maybe_launch_job(job)  # second launch, subject to policy
         running = cron.running_jobs["test"]
+        # the overlap is routine under Allow, a warning otherwise
+        [overlap] = [
+            r
+            for r in caplog.records
+            if r.getMessage()
+            == "Job test: still running and concurrencyPolicy is " + policy
+        ]
+        assert overlap.levelname == (
+            "INFO" if policy == "Allow" else "WARNING"
+        )
 
         if policy == "Allow":
             assert len(running) == 2
@@ -355,6 +366,36 @@ async def test_concurrency_policy(policy):
             if rj.proc is not None and rj.proc.returncode is None:
                 # Wait for Python initialization before sending CTRL_BREAK.
                 await _wait_until(lambda: bool(rj.output.lines))
+                await rj.cancel()
+            await rj.wait()
+
+
+async def test_manual_start_that_forbid_holds_back_is_refused():
+    # A manual start that Forbid keeps from launching answers 409 with the
+    # reason, rather than claiming a start.
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(
+        None, config_yaml=CONCURRENT_JOB.format(policy="Forbid")
+    )
+    cron.web_config = {}
+    job = cron.cron_jobs["test"]
+    reason = "job 'test' is still running and its concurrencyPolicy is Forbid"
+    try:
+        await cron.maybe_launch_job(job)
+        first = cron.running_jobs["test"][0]
+        await _wait_until(lambda: bool(first.output.lines))
+        with pytest.raises(cron_mod.ApiActionError) as caught:
+            await cron.start_job_by_name("test")
+        assert (caught.value.status, caught.value.message) == (409, reason)
+        with pytest.raises(web.HTTPConflict) as conflict:
+            await cron._web_start_job(Req(match={"name": "test"}))
+        assert reason in conflict.value.text
+        assert cron.running_jobs["test"] == [first]
+    finally:
+        for rj in list(cron.running_jobs.get("test", [])):
+            if rj.proc is not None and rj.proc.returncode is None:
+                await _wait_until(lambda rj=rj: bool(rj.output.lines))
                 await rj.cancel()
             await rj.wait()
 
@@ -665,7 +706,7 @@ def _cluster_slot(cron, monkeypatch, job):
     """
     holder = {"free": True}
 
-    async def claim(job):
+    async def claim(job, refusals=None):
         return holder["free"]
 
     async def release(job):
@@ -3359,7 +3400,7 @@ def reboot_cron(monkeypatch):
             cron.web_config = {}
         launched = []
 
-        def capture(job):
+        def capture(job, **kwargs):
             launched.append(job.name if record == "name" else job)
             return _noop()
 

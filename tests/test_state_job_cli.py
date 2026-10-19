@@ -744,6 +744,28 @@ def test_opener_with_cacert_verifies_against_it(monkeypatch, tmp_path):
     assert jobcli._opener() is opener
 
 
+def test_opener_verifies_strictly_on_every_python(monkeypatch, tmp_path):
+    # Python 3.13 and later set these flags by default; the opener sets them
+    # on every version, as the daemon's own contexts do.
+    flags = ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
+    real = ssl.create_default_context
+
+    def like_python_312(*args, **kwargs):
+        ctx = real(*args, **kwargs)
+        ctx.verify_flags &= ~flags
+        return ctx
+
+    monkeypatch.setattr(ssl, "create_default_context", like_python_312)
+    monkeypatch.setattr(jobcli, "_TLS_OPENERS", {})
+    monkeypatch.setenv(jobcli.ENV_CACERT, _write_ca(tmp_path))
+    (https,) = [
+        h
+        for h in jobcli._opener().handlers
+        if isinstance(h, urllib.request.HTTPSHandler)
+    ]
+    assert https._context.verify_flags & flags == flags
+
+
 def test_opener_with_unloadable_cacert_is_a_clean_error(monkeypatch, tmp_path):
     # a CA path that does not resolve is the job environment's problem, and
     # the message names the bundle.

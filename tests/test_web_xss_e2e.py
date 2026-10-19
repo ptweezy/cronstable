@@ -219,7 +219,11 @@ def _tour_overlays(page, where):
     assert_clean(page, where + " settings")
     _click(page, "#openPair")
     _wait_overlay(page, "pairWrap")
-    page.wait_for_selector("#pairQr svg")
+    # a code, or on a loopback page the notice that stands in for one
+    page.wait_for_function(
+        "!!document.querySelector('#pairQr svg') || "
+        "document.getElementById('pairLoop').style.display === ''"
+    )
     assert_clean(page, where + " pair")
     page.keyboard.press("Escape")
     _wait_overlay(page, "pairWrap", False)
@@ -1386,7 +1390,8 @@ def test_pair_panel_fields(browser, tmp_path):
 
         with e2e.open_page(
             browser,
-            daemon.url,
+            # the panel draws a code only on a page that is not loopback
+            e2e.lan_url(daemon.url),
             token=e2e.FULL_TOKEN,
             before_goto=routes,
         ) as page:
@@ -1413,3 +1418,37 @@ def test_pair_panel_fields(browser, tmp_path):
                 )
                 == 2
             )
+
+
+def test_pair_panel_loopback_notice(browser, tmp_path):
+    """Listener addresses from /whoami reach the loopback notice as text."""
+    listeners = [
+        "http://10.0.0.5:8080/" + PAYLOAD,
+        "http://" + IMG + ":8080",
+        PAYLOAD,
+        JSURL,
+    ]
+    with e2e.Daemon(tmp_path, auth="full") as daemon:
+
+        def routes(page):
+            page.faults.rewrite(
+                r"/whoami", lambda body: dict(body, listeners=listeners)
+            )
+
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            token=e2e.FULL_TOKEN,
+            before_goto=routes,
+        ) as page:
+            _click(page, "#settingsBtn")
+            _click(page, "#openPair")
+            _wait_overlay(page, "pairWrap")
+            page.wait_for_function(
+                "document.getElementById('pairLoop').textContent"
+                ".includes('also listens on')"
+            )
+            # only the dialable listener's origin is named
+            notice = page.inner_text("#pairLoop")
+            assert "also listens on http://10.0.0.5:8080. Open" in notice
+            assert_clean(page, "pair loopback notice")
