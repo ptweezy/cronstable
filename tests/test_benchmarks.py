@@ -1927,9 +1927,11 @@ def test_effective_gate_percentage_is_reported(tmp_path):
 
 def test_suppressed_regression_reaches_the_job_log(tmp_path):
     # A move over the raw limit but inside the noise band deliberately does
-    # not gate -- but it must not vanish into a bare "0 gate violation(s)"
+    # not gate, but it must not vanish into a bare "0 gate violation(s)"
     # line either. Craft one: +21% delta on a 15% gate with round scatter
-    # wide enough that 2 noise bands exceed it.
+    # wide enough that 2 noise bands exceed it. The median of the rounds
+    # moves exactly 15%, so the median check fails too, and the noise
+    # reason takes precedence.
     def rounds(path, name, values, version="1.0.0"):
         docs = [
             _write(
@@ -1952,3 +1954,208 @@ def test_suppressed_regression_reaches_the_job_log(tmp_path):
     assert "0 gate violation(s)" in proc.stdout
     assert "::warning::perf gate: state.wobbly" in proc.stdout
     assert "reported, not gated" in proc.stdout
+    assert "within the noise band" in proc.stdout
+    assert "in its fastest round" not in proc.stdout
+
+
+def _round_files(tmp_path, prefix, name, values, version="1.0.0", **gate):
+    """One result file per round, each holding ``name`` at that value."""
+    gate = dict({"gate_pct": 25.0, "gate_floor": 0.002}, **gate)
+    return [
+        _write(
+            tmp_path / ("%s%d.json" % (prefix, i)),
+            _doc([_entry(name, v, **gate)], version=version),
+        )
+        for i, v in enumerate(values)
+    ]
+
+
+def test_noise_alone_suppresses_a_regression(tmp_path):
+    # The median of the rounds moves +20%, past the 15% limit, so only the
+    # noise band holds this +21% change back.
+    gate = {"gate_pct": 15.0, "gate_floor": 0.010}
+    base = _round_files(
+        tmp_path, "b", "state.wobbly", [1.00, 1.30, 0.70], **gate
+    )
+    cur = _round_files(
+        tmp_path, "c", "state.wobbly", [0.85, 1.20, 1.55], "1.1.0", **gate
+    )
+    md = tmp_path / "out.md"
+    proc = _run(
+        [COMPARE, "--baseline"]
+        + base
+        + ["--current"]
+        + cur
+        + ["--md", str(md)]
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "0 gate violation(s)" in proc.stdout
+    assert "state.wobbly regressed +21.4%" in proc.stdout
+    assert "within the noise band" in proc.stdout
+    assert "in its fastest round" not in proc.stdout
+    text = md.read_text(encoding="utf-8")
+    assert "within the measurement noise threshold" in text
+    assert "state.wobbly (+21.4%; noise " in text
+    assert "+21.4% (within noise threshold)" in text
+    assert "but not in the median of the rounds" not in text
+
+
+# webui.swim_400x49 in CI run 39287746251: the swimlane code was identical on
+# both sides, and one baseline round ran a third faster than the other nine.
+_FAST_BASELINE_ROUNDS = [0.0510, 0.0300, 0.0455, 0.0462, 0.0457]
+
+
+def test_a_lone_fast_baseline_round_does_not_gate(tmp_path):
+    base = _round_files(tmp_path, "b", "webui.swim", _FAST_BASELINE_ROUNDS)
+    cur = _round_files(
+        tmp_path,
+        "c",
+        "webui.swim",
+        [0.0462, 0.0457, 0.0456, 0.0443, 0.0463],
+        version="1.1.0",
+    )
+    md = tmp_path / "out.md"
+    proc = _run(
+        [COMPARE, "--baseline"]
+        + base
+        + ["--current"]
+        + cur
+        + ["--md", str(md)]
+    )
+    # +47.7% best-of-rounds, well past 2x the robust band, which leaves the
+    # outlier out; the medians of the rounds are level.
+    assert proc.returncode == 0, proc.stdout
+    assert "0 gate violation(s)" in proc.stdout
+    assert (
+        "::warning::perf gate: webui.swim regressed +47.7% (over its 25% "
+        "limit) in its fastest round, but not in the median of its rounds "
+        "(+0.0%); reported, not gated" in proc.stdout
+    )
+    assert proc.stdout.count("::warning::perf gate: webui.swim") == 1
+    assert "within the noise band" not in proc.stdout
+    text = md.read_text(encoding="utf-8")
+    assert "Regression check: passed" in text
+    assert "but not in the median of the rounds" in text
+    assert "webui.swim (+47.7%; median of rounds +0.0%)" in text
+    assert "+47.7% (median of rounds within limits)" in text
+    assert "within the measurement noise threshold" not in text
+
+
+def test_a_slowdown_in_every_round_gates_past_a_fast_baseline_round(
+    tmp_path,
+):
+    base = _round_files(tmp_path, "b", "webui.swim", _FAST_BASELINE_ROUNDS)
+    cur = _round_files(
+        tmp_path,
+        "c",
+        "webui.swim",
+        [0.0610, 0.0605, 0.0598, 0.0612, 0.0601],
+        version="1.1.0",
+    )
+    proc = _run([COMPARE, "--baseline"] + base + ["--current"] + cur)
+    assert proc.returncode == 1, proc.stdout
+    assert "1 gate violation(s)" in proc.stdout
+    assert "median of rounds +32.4%" in proc.stdout
+
+
+def _startup_side(version_s, floor_s, rounds=3):
+    """One side of a startup.version comparison with its interpreter floor,
+    every round at the same value."""
+    return {
+        "startup.python_baseline": dict(
+            _entry("startup.python_baseline", floor_s, gate_pct=None),
+            round_values=[floor_s] * rounds,
+        ),
+        "startup.version": dict(
+            _entry("startup.version", version_s),
+            round_values=[version_s] * rounds,
+        ),
+    }
+
+
+def test_median_check_applies_the_startup_adjustment():
+    # Raw medians move -10.5% (0.190 to 0.170) as the interpreter floor
+    # drops, but cronstable's own share moves +40% (0.050 to 0.070) in every
+    # round. The median check must judge the own share, with each side's
+    # own floor, as the best-of-rounds comparison does.
+    compare = _load_compare()
+    rows, violations, _ = compare._compare(
+        _startup_side(0.190, 0.140), _startup_side(0.170, 0.100)
+    )
+    row = next(r for r in rows if r["name"] == "startup.version")
+    assert row["delta_pct"] == pytest.approx(40.0)
+    assert row["median_delta_pct"] == pytest.approx(40.0)
+    assert row["gated"] and row["suppressed_by"] is None
+    assert len(violations) == 1
+
+
+def test_median_check_stays_raw_when_the_fastest_round_does():
+    # The fastest baseline round sits under the interpreter floor, so the
+    # best-of-rounds comparison falls back to raw values and the raw floor.
+    # The medians must stay raw too: +20%, not the own-share +80%.
+    compare = _load_compare()
+
+    def side(rounds):
+        out = _startup_side(min(rounds), 0.030)
+        out["startup.version"]["round_values"] = rounds
+        return out
+
+    rows, violations, _ = compare._compare(
+        side([0.028, 0.040, 0.040]), side([0.048, 0.048, 0.048])
+    )
+    row = next(r for r in rows if r["name"] == "startup.version")
+    assert row["delta_pct"] == pytest.approx(71.43, abs=0.01)
+    assert row["median_delta_pct"] == pytest.approx(20.0)
+    assert row["suppressed_by"] == "median" and not violations
+
+
+def test_median_check_names_the_floor_that_held_it_back():
+    # The median of the rounds moves +31.7%, past the 25% limit, but only
+    # 1.9 ms against a 2 ms floor, so the report must name the floor rather
+    # than call the change within the percentage limit.
+    compare = _load_compare()
+
+    def side(rounds):
+        entry = _entry("webui.tiny", min(rounds), gate_floor=0.002)
+        return {"webui.tiny": dict(entry, round_values=rounds)}
+
+    rows, violations, _ = compare._compare(
+        side([0.0030, 0.0060, 0.0061]), side([0.0079, 0.0079, 0.0080])
+    )
+    row = rows[0]
+    assert row["median_delta_pct"] == pytest.approx(31.67, abs=0.01)
+    assert row["significant"] and row["suppressed_by"] == "median"
+    assert not row["gated"] and not violations
+    detail = "+31.7%; 1.90 ms is under the 2.00 ms minimum change"
+    assert detail in compare._suppressed_warnings(rows)[0]
+    assert detail in "\n".join(compare._suppressed_md(rows))
+
+
+def test_two_round_sides_skip_the_median_check():
+    # The median of two rounds is their mean, so the check does not apply
+    # and the regression gates on the fastest round alone.
+    compare = _load_compare()
+
+    def side(rounds):
+        entry = _entry("startup.import_x", min(rounds))
+        return {"startup.import_x": dict(entry, round_values=rounds)}
+
+    rows, violations, _ = compare._compare(
+        side([1.00, 1.10]), side([1.30, 1.30])
+    )
+    assert rows[0]["median_delta_pct"] is None
+    assert rows[0]["gated"] and len(violations) == 1
+
+
+def test_median_check_skips_median_merged_metrics():
+    # A memory metric merges to its median already, so it has no separate
+    # median-of-rounds figure and the check can't suppress it.
+    compare = _load_compare()
+
+    def side(value):
+        entry = dict(_entry("mem.rss", value, unit="MB"), compare="median")
+        return {"mem.rss": dict(entry, round_values=[value] * 3)}
+
+    rows, violations, _ = compare._compare(side(10.0), side(20.0))
+    assert rows[0]["median_delta_pct"] is None
+    assert rows[0]["gated"] and len(violations) == 1

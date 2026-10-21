@@ -53,7 +53,10 @@ A metric fails its gate only when it slows down by more than its declared
 percentage limit (15% for most metrics, 25% for noisier ones such as the
 subprocess, disk I/O, and peak-RSS metrics), by more than its absolute floor,
 and by more than twice its measured round-to-round noise. Microsecond jitter
-on a tiny metric can therefore never gate.
+on a tiny metric can therefore never gate. A best-of-rounds metric with three
+or more rounds per side, such as an in-process metric, must also slow down
+past its percentage limit and floor in the median of its rounds, so one
+round that runs unusually fast on the old release can't fail the gate.
 
 A metric counts as compared only when both sides hold a finite value and the
 baseline is above zero. A metric that skipped in some rounds of a side, or

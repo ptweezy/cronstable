@@ -53,6 +53,10 @@
   the reason.
 - The `end` event of `GET /jobs/{name}/logs` carries the `started_at` of the
   run that the stream showed.
+- The release performance check fails a timing benchmark measured in three
+  or more rounds only when the median of its rounds also exceeds the
+  benchmark's limits, so one round that runs unusually fast on the previous
+  release can't block a release.
 
 ## 1.2.69
 
