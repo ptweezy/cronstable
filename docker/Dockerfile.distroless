@@ -60,7 +60,7 @@ RUN set -eux; \
 RUN /opt/venv/bin/pip uninstall -y pip || true
 
 # Runtime packages must match the builder interpreter and shared libraries.
-FROM gcr.io/distroless/python3-debian13:latest@sha256:dcb4e83bc06eccbee7b626d8cc1c6177f5c3a549235e70ac6e7f8cc98f4264a1
+FROM gcr.io/distroless/python3-debian13:latest@sha256:96234eaf03bba491856ead9142eccdda8cf9d09ce418770a260b84f529d81848
 LABEL org.opencontainers.image.title="cronstable" \
       org.opencontainers.image.description="A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (distroless)." \
       org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
