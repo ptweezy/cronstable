@@ -69,7 +69,7 @@ toolchain = '''
     rm -rf /var/lib/apt/lists/*
 '''
 python = "python3.13"
-runtime = "gcr.io/distroless/python3-debian13:latest@sha256:931a490beb37db6a1d137ad11ed47ae4c0d4741ca5c2285818b49e9a8ee11c56"
+runtime = "gcr.io/distroless/python3-debian13:latest@sha256:96234eaf03bba491856ead9142eccdda8cf9d09ce418770a260b84f529d81848"
 entrypoint = "[\"/opt/venv/bin/cronstable\"]"
 description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (distroless)."
 
@@ -125,12 +125,12 @@ description = "A job scheduler with retries, alerts, saved run history, workflow
 
 # UBI builder and ubi-minimal runtime share their Python 3.12 layout.
 [rhel]
-builder = "registry.access.redhat.com/ubi10/ubi:latest@sha256:a75ad754aa048d808dd3260243452f8c9a665831d0493b4c9d92f0c88fe2f8c3"
+builder = "registry.access.redhat.com/ubi10/ubi:latest@sha256:4debe04be3b15ff2861e3428cbfa42379a183b16787ca2b8cf124d7afd6e84a5"
 toolchain = '''
     retry dnf --setopt=retries=10 install -y python3 python3-pip python3-devel gcc make libffi-devel git; \
     dnf clean all
 '''
-runtime = "registry.access.redhat.com/ubi10/ubi-minimal:latest@sha256:552f8cc1ddb0bc9e411065c78499aa4dbc2c4ea9bd057aa0e6e44940db13acb5"
+runtime = "registry.access.redhat.com/ubi10/ubi-minimal:latest@sha256:c769ab6615ab32d02d5b3d65ff2eae6bc668ba823e77f46b78a4181f54d17a27"
 runtime_install = '''
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
@@ -145,7 +145,7 @@ rust_cleanup = '''
 description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (RHEL/UBI 10)."
 
 [ubuntu]
-builder = "ubuntu:26.04@sha256:2e27ff302056b2b96df4a524ce48e72c595abfe3fd7a3d923adf8e782e16896f"
+builder = "ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944"
 builder_env = "ENV DEBIAN_FRONTEND=noninteractive"
 toolchain = '''
     retry apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update; \

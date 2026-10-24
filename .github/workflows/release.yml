@@ -2285,6 +2285,100 @@ jobs:
             /usr/local/bin/cronstable --version
             test -x /usr/local/etc/rc.d/cronstable
             pw usershow cronstable >/dev/null
+
+            # Start the installed service: daemon(8) keeps root, cronstable
+            # runs as the cronstable account, and the state directory takes
+            # that account's primary group. stable_child prints the
+            # supervisor's child pid once a child other than pid $1 has lived
+            # 5 seconds, and fails after 60 seconds. Without --foreground,
+            # timeout(1) reaps the daemon a command leaves running, waits for
+            # it, and kills it at the deadline.
+            stable_child() {
+              last=
+              seen=0
+              i=0
+              while [ "$i" -lt 60 ]; do
+                pid=$(cat /var/run/cronstable-child.pid 2>/dev/null || :)
+                if [ -n "$pid" ] && [ "$pid" != "${1:-}" ] \
+                  && kill -0 "$pid" 2>/dev/null; then
+                  if [ "$pid" = "$last" ]; then
+                    seen=$((seen + 1))
+                  else
+                    seen=0
+                  fi
+                  last=$pid
+                  if [ "$seen" -ge 5 ]; then
+                    echo "$pid"
+                    return 0
+                  fi
+                fi
+                sleep 1
+                i=$((i + 1))
+              done
+              echo "::error::the cronstable service did not stay up" >&2
+              ps -axww -o pid,ppid,command | grep '[c]ronstable' >&2 || :
+              tail -n 50 /var/log/messages >&2 || :
+              return 1
+            }
+            owner() { ps -o user= -p "$1" | tr -d ' '; }
+            owners() {
+              if [ "$(owner "$1")" != root ] \
+                || [ "$(owner "$2")" != cronstable ]; then
+                echo "::error::daemon(8) must run as root and cronstable as the cronstable account" >&2
+                ps -axww -o user,pid,ppid,command | grep '[c]ronstable' >&2 || :
+                exit 1
+              fi
+            }
+            sysrc cronstable_enable=YES
+            timeout --foreground 60 service cronstable start
+            child=$(stable_child)
+            service cronstable status
+            supervisor=$(cat /var/run/cronstable.pid)
+            owners "$supervisor" "$child"
+            state=$(stat -f %Su:%Sg /var/db/cronstable)
+            if [ "$state" != cronstable:cronstable ]; then
+              echo "::error::/var/db/cronstable is owned by $state, not cronstable:cronstable" >&2
+              exit 1
+            fi
+
+            # Upgrade in place: the new post-install sends SIGTERM to
+            # cronstable, and daemon(8) restarts it on the new binary. The
+            # ",1" epoch sorts the second package above the first, and -R
+            # gives pkg a configuration directory that lists only the local
+            # repository.
+            next="${SETUPTOOLS_SCM_PRETEND_VERSION},1"
+            python3.14 .github/scripts/freebsd_pkg.py "$next" \
+              "dist/cronstable-freebsd-${{ matrix.arch }}" /tmp/cronstable-next
+            pkg repo /tmp/cronstable-next
+            mkdir /tmp/cronstable-repos
+            echo 'upgrade_test: { url: "file:///tmp/cronstable-next" }' \
+              > /tmp/cronstable-repos/upgrade_test.conf
+            timeout --foreground 300 \
+              pkg -R /tmp/cronstable-repos upgrade -y -r upgrade_test cronstable
+            installed=$(pkg query %v cronstable)
+            if [ "$installed" != "$next" ]; then
+              echo "::error::pkg upgrade installed $installed, not $next" >&2
+              exit 1
+            fi
+            upgraded=$(stable_child "$child") || {
+              echo "::error::the upgrade did not restart cronstable, child pid $child" >&2
+              exit 1
+            }
+            service cronstable status
+            if [ "$(cat /var/run/cronstable.pid)" != "$supervisor" ]; then
+              echo "::error::the upgrade replaced daemon(8), pid $supervisor" >&2
+              exit 1
+            fi
+            owners "$supervisor" "$upgraded"
+
+            timeout --foreground 120 service cronstable stop
+            if [ -e /var/run/cronstable-child.pid ] || kill -0 "$upgraded" 2>/dev/null; then
+              echo "::error::service cronstable stop left the daemon running" >&2
+              exit 1
+            fi
+            sysrc -x cronstable_enable
+            rm -rf /tmp/cronstable-next /tmp/cronstable-repos
+
             mv dist/pkgout/cronstable-*.pkg "dist/cronstable-freebsd-${{ matrix.arch }}.pkg"
             # Keep hundreds of megabytes of build tree out of the copyback.
             rm -rf venv build get-pip.py freebsd-pkg-work dist/pkgout
@@ -2320,7 +2414,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (OpenBSD 7.9 amd64)
-        uses: vmactions/openbsd-vm@5f7b2c933b8846a138361d6843c52af4bef5d945 # v1.4.8
+        uses: vmactions/openbsd-vm@f1ca8bc8ecc5b6ef7218e5b914836e067e1546d3 # v1.4.9
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -4049,7 +4143,7 @@ jobs:
       - name: Verify prepared artifact checksums
         run: python3 .github/scripts/verify_release_checksums.py
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           # Runs before the tag and Release, so a retry after a later failure
           # finds the files on PyPI; skip-existing lets it finish the release.

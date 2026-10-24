@@ -870,8 +870,7 @@ async def test_a_start_the_concurrency_policy_refuses_says_so(dag_cron):
         await cron.start_job("report", {"region": "us"})
     assert err.value.status == 409
     assert err.value.message == (
-        "job 'report' was not started: its concurrencyPolicy (Forbid) "
-        "admitted no new run"
+        "job 'report' is still running and its concurrencyPolicy is Forbid"
     )
     (running,) = cron.running_jobs["report"]
     assert running.params == _DEFAULTS
@@ -1155,8 +1154,8 @@ async def test_a_start_that_cluster_forbid_refuses_is_not_taken_for_a_wait(
         await cron.start_job("s", {"region": "us"})
     assert err.value.status == 409
     assert err.value.message == (
-        "job 's' was not started: its concurrencyPolicy (Forbid) admitted "
-        "no new run"
+        "job 's' is running on nodeB (concurrencyPolicy: Forbid, "
+        "concurrencyScope: cluster)"
     )
     # a start that is refused takes no launch's place, so the sequence stays
     assert cron.retry_state.pop("s") is ladder and not ladder.cancelled
@@ -1866,8 +1865,8 @@ async def test_http_start_answers_503_when_the_slot_claim_gets_no_answer(
                 # the store's silence is not the concurrency policy's refusal
                 assert r.status == 503
                 assert await r.json() == {
-                    "error": "job 's' was not started: the state store "
-                    "cannot answer for its cluster concurrency slot, and "
+                    "error": "job 's' cannot claim its cluster concurrency "
+                    "slot (the store did not answer), and "
                     "onStoreUnavailable is fail-closed"
                 }
     finally:

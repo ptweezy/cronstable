@@ -1,5 +1,7 @@
 # Shared dependency updates while nixpkgs catches up with pyproject.toml.
-# Keep upstream recipes and automatically prefer newer nixpkgs versions.
+# Keep upstream recipes and automatically prefer newer nixpkgs versions: an
+# override applies only while nixpkgs is older than the pyproject.toml
+# `floor`, and then builds `version`, which can be newer than the floor.
 #
 # No binary cache holds an override, so each CI run rebuilds it. Its upstream
 # suite would rerun there too, and its timing tests fail on slow runners.
@@ -8,9 +10,10 @@
 let
   setuptools =
     let
+      floor = "83.0.0";
       version = "84.0.0";
     in
-    if pkgs.lib.versionAtLeast pkgs.python3Packages.setuptools.version version then
+    if pkgs.lib.versionAtLeast pkgs.python3Packages.setuptools.version floor then
       pkgs.python3Packages.setuptools
     else
       pkgs.python3Packages.setuptools.overridePythonAttrs (old: {
@@ -104,10 +107,11 @@ pkgs.python3Packages
   # setuptools-scm built on it: two setuptools versions cannot share one build.
   setuptools-scm =
     let
+      floor = "8.0.0";
       version = "10.3.4";
     in
     if
-      setuptools == pkgs.python3Packages.setuptools && pkgs.lib.versionAtLeast pkgs.python3Packages.setuptools-scm.version version
+      setuptools == pkgs.python3Packages.setuptools && pkgs.lib.versionAtLeast pkgs.python3Packages.setuptools-scm.version floor
     then
       pkgs.python3Packages.setuptools-scm
     else
@@ -135,9 +139,10 @@ pkgs.python3Packages
   # aiohttp propagates yarl, so the override builds on the yarl above.
   aiohttp =
     let
+      floor = "3.14.4";
       version = "3.14.5";
     in
-    if pkgs.lib.versionAtLeast pkgs.python3Packages.aiohttp.version version then
+    if pkgs.lib.versionAtLeast pkgs.python3Packages.aiohttp.version floor then
       pkgs.python3Packages.aiohttp
     else
       (pkgs.python3Packages.aiohttp.override { inherit yarl; }).overridePythonAttrs (old: {
@@ -161,44 +166,6 @@ pkgs.python3Packages
         doCheck = false;
         meta = old.meta // {
           changelog = "https://docs.aiohttp.org/en/v${version}/changes.html";
-        };
-      });
-  sentry-sdk =
-    let
-      version = "2.71.0";
-    in
-    if pkgs.lib.versionAtLeast pkgs.python3Packages.sentry-sdk.version version then
-      pkgs.python3Packages.sentry-sdk
-    else
-      pkgs.python3Packages.sentry-sdk.overridePythonAttrs (old: {
-        inherit version;
-        src = pkgs.fetchPypi {
-          pname = "sentry_sdk";
-          inherit version;
-          hash = "sha256-e+snoi8GOW86BVEMPabqEOHHngLoWZk8J85P8HTiltY=";
-        };
-        doCheck = false;
-        meta = old.meta // {
-          changelog = "https://github.com/getsentry/sentry-python/blob/${version}/CHANGELOG.md";
-        };
-      });
-  tzdata =
-    let
-      version = "2026.5";
-    in
-    if pkgs.lib.versionAtLeast pkgs.python3Packages.tzdata.version version then
-      pkgs.python3Packages.tzdata
-    else
-      pkgs.python3Packages.tzdata.overridePythonAttrs (old: {
-        inherit version;
-        src = pkgs.fetchPypi {
-          pname = "tzdata";
-          inherit version;
-          hash = "sha256-jMc8Cgv8p9v6WSNdYLLv+CIx3uM/U9IG2xrNkXPPwKc=";
-        };
-        doCheck = false;
-        meta = old.meta // {
-          changelog = "https://github.com/python/tzdata/blob/${version}/NEWS.md";
         };
       });
 }

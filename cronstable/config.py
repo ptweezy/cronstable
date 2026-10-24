@@ -785,6 +785,23 @@ _late_report["sentry"]["fingerprint"] = ["cronstable", "sla", "{{ name }}"]
 del _late_report
 
 
+def _mail_tls_conflict(report: Mapping[str, Any], where: str) -> str | None:
+    """The refusal for a sending mail block that sets tls and starttls.
+
+    The aiosmtplib client constructor refuses the pair, so every send fails.
+    """
+    mail = report.get("mail") or {}
+    if not (mail.get("tls") and mail.get("starttls")):
+        return None
+    if not (mail.get("to") and mail.get("from")):
+        return None  # mail reporting is off
+    return (
+        "{}.mail sets both tls and starttls, which are mutually exclusive: "
+        "tls uses TLS from the start of the connection and starttls "
+        "upgrades a plain connection. Set one of them to false.".format(where)
+    )
+
+
 def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
     """Whether an ``onLate`` block would actually report anything.
 
@@ -2130,6 +2147,18 @@ class JobConfig:
         self._warn_if_priority_needs_privilege()
 
         self._validate_numeric_ranges()
+        for hook, block in (
+            ("onFailure", self.onFailure),
+            ("onPermanentFailure", self.onPermanentFailure),
+            ("onSuccess", self.onSuccess),
+            ("onLate", self.onLate),
+        ):
+            report = block.get("report") or {}
+            mail = report.get("mail") or {}
+            if mail.get("tls") and mail.get("starttls"):
+                conflict = _mail_tls_conflict(report, hook + ".report")
+                if conflict is not None:
+                    raise self._reject(conflict)
 
         # Memoized job digest slot, filled at most once per instance by
         # cronstable.fingerprint.job_digest_cached. A reload rebuilds every
@@ -4762,6 +4791,44 @@ def _eventlog_report_users(config: "CronstableConfig") -> list[str]:
 _EVENTLOG_RESERVED_SOURCES = frozenset({"application", "system", "security"})
 
 
+def _report_blocks(
+    config: "CronstableConfig", *, sent_only: bool = False
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """``(where, report)`` for every report block of the assembled config.
+
+    Jobs and DAG task templates yield one per hook; ``notify`` comes last.
+    With ``sent_only``, DAG tasks yield only the hooks a task run fires
+    (onFailure and onSuccess), and approval gates yield nothing.
+    """
+    every_hook: tuple[str, ...] = (
+        "onFailure",
+        "onPermanentFailure",
+        "onSuccess",
+        "onLate",
+    )
+    task_hooks = ("onFailure", "onSuccess") if sent_only else every_hook
+    holders = [(job.name, job, every_hook) for job in config.jobs]
+    for dag_config in config.dags:
+        for task in dag_config.tasks:
+            if sent_only and task.type == "approval":
+                continue  # a gate starts no process
+            holders.append(
+                (
+                    "dag {} task {}".format(dag_config.name, task.id),
+                    task.job_template,
+                    task_hooks,
+                )
+            )
+    for where, holder, hooks in holders:
+        for action in hooks:
+            block = getattr(holder, action, None)
+            if isinstance(block, dict):
+                yield where, (block.get("report") or {})
+    notify = config.notify_config
+    if notify is not None:
+        yield "notify", (notify.get("report") or {})
+
+
 def _validate_eventlog_config(config: "CronstableConfig") -> None:
     """Shape checks for ``report.eventlog``, plus the POSIX advisory.
 
@@ -4789,31 +4856,7 @@ def _validate_eventlog_config(config: "CronstableConfig") -> None:
         # checked below
         return
 
-    def _blocks() -> Any:
-        holders = [(job.name, job) for job in config.jobs]
-        for dag_config in config.dags:
-            for taskkey, template in dag_config.task_templates.items():
-                holders.append(
-                    (
-                        "dag {} task {}".format(dag_config.name, taskkey),
-                        template,
-                    )
-                )
-        for where, holder in holders:
-            for action in (
-                "onFailure",
-                "onPermanentFailure",
-                "onSuccess",
-                "onLate",
-            ):
-                block = getattr(holder, action, None)
-                if isinstance(block, dict):
-                    yield where, (block.get("report") or {})
-        notify = config.notify_config
-        if notify is not None:
-            yield "notify", (notify.get("report") or {})
-
-    for where, report in _blocks():
+    for where, report in _report_blocks(config):
         eventlog = report.get("eventlog") or {}
         if not eventlog.get("enabled"):
             continue
@@ -4964,6 +5007,10 @@ class CronstableConfig:
     notify_config: dict[str, Any] | None = None
     push_config: dict[str, Any] | None = None
     pools: dict[str, dict[str, int]] = field(default_factory=dict)
+    # This file's defaults: block merged over its includes' deltas, without
+    # DEFAULT_CONFIG. Includers merge this, never job_defaults, which holds
+    # every built-in default.
+    defaults_delta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.dags:
@@ -5239,6 +5286,9 @@ def _build_notify_config(raw: dict) -> dict[str, Any]:
     report = mergedicts(
         copy.deepcopy(_NOTIFY_REPORT_DEFAULTS), raw.get("report") or {}
     )
+    conflict = _mail_tls_conflict(report, "notify.report")
+    if conflict is not None:
+        raise ConfigError(conflict)
     events = raw.get("events")
     return {
         "events": frozenset(events) if events else None,
@@ -5376,7 +5426,7 @@ def _config_from_doc(
         # here, and they affect this file's inline jobs.
         inc_config = _parse_included_file(inc_path, _seen, _sources)
         inc_defaults_merged = mergedicts(
-            inc_defaults_merged, inc_config.job_defaults
+            inc_defaults_merged, inc_config.defaults_delta
         )
         jobs.extend(inc_config.jobs)
         dags.extend(inc_config.dags)
@@ -5409,8 +5459,9 @@ def _config_from_doc(
             if pushconf:
                 raise ConfigError("multiple push configs")
             pushconf = inc_config.push_config
+    own_defaults = doc.get("defaults", {})
     defaults = mergedicts(DEFAULT_CONFIG, inc_defaults_merged)
-    defaults = mergedicts(defaults, doc.get("defaults", {}))
+    defaults = mergedicts(defaults, own_defaults)
     # One env_file is frequently shared by many jobs and DAG tasks in a doc;
     # a per-doc cache reads and parses each such file once for all of them.
     env_cache: dict[str, dict[str, str]] = {}
@@ -5440,6 +5491,7 @@ def _config_from_doc(
         notify_config=notifyconf,
         push_config=pushconf,
         pools=pools,
+        defaults_delta=mergedicts(inc_defaults_merged, own_defaults),
     )
 
 
@@ -5564,6 +5616,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _validate_push_config(config)
     _validate_eventlog_config(config)
     _warn_if_resource_limits_unsupported(config)
+    _warn_if_mail_login_unencrypted(config)
 
 
 def capped_jobs(
@@ -5606,6 +5659,43 @@ def _warn_if_resource_limits_unsupported(config: CronstableConfig) -> None:
             "cgroup v2 nor Job Objects, so those jobs run without caps; runs "
             "of jobs with resourceLimits.required fail",
             ", ".join(name for name, _ in capped),
+        )
+
+
+def _warn_if_mail_login_unencrypted(config: CronstableConfig) -> None:
+    """Warn when a sending mail block logs in to a remote host without TLS.
+
+    Once per load per ``(smtpHost, smtpPort, username)``, so credentials in
+    ``defaults:`` warn once, however many jobs inherit them. Host names
+    compare case-insensitively, ignoring a trailing dot. Only an unset
+    ``smtpHost``, ``localhost``, and loopback address literals count as
+    local, since names are never resolved.
+    """
+    checked: set[tuple[str, Any, str]] = set()
+    for _, report in _report_blocks(config, sent_only=True):
+        mail = report.get("mail") or {}
+        if not (mail.get("to") and mail.get("from")):
+            continue  # mail reporting is off
+        if mail.get("tls") or mail.get("starttls"):
+            continue
+        username = mail.get("username")
+        if not (username and any((mail.get("password") or {}).values())):
+            continue  # no login
+        # aiosmtplib dials localhost when smtpHost is unset
+        host = mail.get("smtpHost") or "localhost"
+        port = mail.get("smtpPort")
+        name = host.lower().rstrip(".")
+        if (name, port, username) in checked:
+            continue
+        checked.add((name, port, username))
+        if name == "localhost" or _loopback_ip_version(name) is not None:
+            continue
+        logger.warning(
+            "mail reporting sends its SMTP login unencrypted to %s as %r, "
+            "because tls and starttls are both false; set starttls: true "
+            "if the server offers STARTTLS",
+            netutil.netloc(host, port),
+            username,
         )
 
 
@@ -6289,7 +6379,7 @@ def _parse_config_dir(
     push_config: dict[str, Any] | None = None
     push_config_source_fname: str | None = None
     pools: dict[str, dict[str, int]] = {}
-    job_defaults: JobDefaults = JobDefaults({})
+    defaults_delta: dict[str, Any] = {}
     entries = _config_dir_entries(config_arg)
     if _listed is not None:
         # for parsed_listing_unchanged: a file that joins the directory
@@ -6362,9 +6452,7 @@ def _parse_config_dir(
             push_config_source_fname,
             direntry.path,
         )
-        job_defaults = JobDefaults(
-            mergedicts(job_defaults, config.job_defaults)
-        )
+        defaults_delta = mergedicts(defaults_delta, config.defaults_delta)
     if config_errors:
         raise ConfigError("\n---".join(config_errors.values()))
     # Build the result from the accumulated values (never the last file's
@@ -6373,7 +6461,9 @@ def _parse_config_dir(
     return CronstableConfig(
         jobs=jobs,
         web_config=web_config,
-        job_defaults=job_defaults,
+        job_defaults=JobDefaults(
+            mergedicts(DEFAULT_CONFIG, defaults_delta) if entries else {}
+        ),
         logging_config=logging_config,
         cluster_config=cluster_config,
         state_config=state_config,
@@ -6382,4 +6472,5 @@ def _parse_config_dir(
         notify_config=notify_config,
         push_config=push_config,
         pools=pools,
+        defaults_delta=defaults_delta,
     )

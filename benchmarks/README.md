@@ -24,7 +24,9 @@ ship.
   bar chart of every compared metric, and exits nonzero when a gated metric
   regressed. A regression gates only when it clears both its declared limit
   and a couple of its measured noise bands (the per-metric round-to-round
-  scatter), so jitter alone can never fail the gate.
+  scatter), so jitter alone can never fail the gate. For a best-of-rounds
+  metric with three or more rounds per side, the median of the rounds must
+  clear the limits too.
 
 ## Running locally
 
@@ -92,12 +94,20 @@ scatter statistic enough points to work with; they do not tighten the noise
 band itself (the band estimates single-round scatter, while the comparison
 diffs min-of-rounds, so measured bands can even widen as rounds are added).
 
-Three refinements keep the gate both tight and honest:
+Four refinements keep the gate both tight and honest:
 
 - **Robust noise band.** From three rounds up, the round-to-round scatter is
   the median absolute deviation (scaled to a standard-deviation equivalent),
   not a plain standard deviation. One throttled or GC-stalled round can no
   longer inflate the band and hide a real regression behind it.
+- **Median-of-rounds check.** A best-of-rounds metric merges to its fastest
+  round, and the robust band ignores one outlying round, so a single
+  baseline round that runs unusually fast sets the baseline without widening
+  the band. When both sides have three or more rounds, such a metric gates
+  only if the median of its rounds also exceeds the percentage limit and the
+  absolute floor. A change that clears them only in the fastest round is
+  reported but does not fail the release. The two-round subprocess tier
+  skips this check, since the median of two rounds is their mean.
 - **Interpreter-startup subtraction.** The `startup.*` metrics are dominated
   by Python's own process spawn and interpreter init, which cronstable cannot
   regress. Each side's `startup.python_baseline` is subtracted before the

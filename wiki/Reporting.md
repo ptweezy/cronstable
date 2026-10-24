@@ -146,8 +146,8 @@ Sends an email over SMTP with `aiosmtplib`. Reporting is enabled only when both
 | `to` | str (required in block) | `None` | Comma-separated recipient list, used directly as the `To` header. Required for mail reporting to occur. |
 | `smtpHost` | str (Opt) | `None` | SMTP server hostname. |
 | `smtpPort` | int (Opt) | `25` | SMTP server port. |
-| `tls` | bool (Opt) | `false` | Use TLS for the connection (`aiosmtplib` `use_tls`). |
-| `starttls` | bool (Opt) | `false` | Issue `STARTTLS` after connecting. |
+| `tls` | bool (Opt) | `false` | Use TLS from the start of the connection (implicit TLS, usually port 465). Mutually exclusive with `starttls`. |
+| `starttls` | bool (Opt) | `false` | Upgrade the connection with `STARTTLS` after connecting (usually port 587). The send fails if the server doesn't offer `STARTTLS`. Mutually exclusive with `tls`. |
 | `validate_certs` | bool (Opt) | `true` | Validate the server's TLS certificate. See the following note. |
 | `html` | bool (Opt) | `false` | Send the body as `text/html` (`set_content` subtype `html`) instead of plain text. |
 | `username` | str (Opt) | `None` | SMTP login username. The reporter attempts a login only when both `username` and a resolved `password` are present. |
@@ -162,17 +162,34 @@ a nonempty value.
 
 Notes on behavior:
 
+- **With `tls` and `starttls` both `false`, the connection is unencrypted**,
+  even when the server offers `STARTTLS`. The reporter sends the `username` and
+  `password` login in plain text, and the config load logs a warning for that
+  login unless `smtpHost` is unset, `localhost`, or a loopback address. The
+  login fails against a server that offers `AUTH` only over TLS.
+- **`tls` and `starttls` are mutually exclusive.** The config fails to load when
+  a mail block with `to` and `from` ends up with both set to `true`, including
+  when one of them comes from `defaults:`. Set the one you don't use to `false`.
 - **`validate_certs` defaults to `true`**. Unless you set `validate_certs: false`,
-  connections to servers with self-signed or otherwise untrusted certificates
-  fail.
+  TLS connections (`tls` or `starttls`) to servers with self-signed or otherwise
+  untrusted certificates fail.
 - The reporter sets an `RFC 5322` `Date` header
   (`email.utils.format_datetime(datetime.now(timezone.utc))`), for example
   `Wed, 18 Jun 2026 12:34:56 +0000`, not ISO-8601.
 - **Empty-body success emails are skipped.** On a success report, if the
   rendered body is empty after stripping whitespace, no email is sent. (Failure
   reports are sent even with an empty body.)
-- The reporter always closes the SMTP connection, even if `STARTTLS`, login, or
-  sending raises, so a misbehaving server cannot leak one connection per report.
+- The reporter always closes the SMTP connection, even if connecting (including
+  `STARTTLS`), login, or sending raises, so a misbehaving server cannot leak one
+  connection per report.
+- **Each report gets 60 seconds** for the whole SMTP conversation: connecting
+  (including `STARTTLS`), login, and sending. When a report runs longer, the
+  reporter logs an error and gives up on it.
+- When the system hostname contains a dot, such as `build-01.example.com`, the
+  `EHLO` greeting gives that name as is and skips the DNS lookup. For a
+  hostname without a dot, `aiosmtplib` looks up the full name with Python's
+  `socket.getfqdn()`, and that lookup counts toward the 60 seconds. If the host
+  can't resolve its own name, give it a hostname that includes its domain.
 - `html: true` uses `set_content(body, subtype="html")`, which sets the correct
   charset and transfer-encoding for non-ASCII HTML.
 
@@ -192,7 +209,6 @@ jobs:
           smtpHost: 127.0.0.1
           smtpPort: 25
           starttls: false
-          validate_certs: false
 ```
 
 HTML success mail with login (password from environment):

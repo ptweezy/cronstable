@@ -460,11 +460,40 @@ with self-signed or otherwise invalid certificates fails.
 
 **Fix.** Fix the server certificate, or set `validate_certs: false` on the `mail`
 report block to skip certificate validation. Related mail TLS keys: `tls` (default
-`false`, implicit TLS), `starttls` (default `false`). See
-[reporting (mail, Sentry, shell, webhook)](Reporting).
+`false`, implicit TLS) and `starttls` (default `false`, upgrades the connection with
+STARTTLS). With both `false`, the connection is unencrypted and no certificate is
+checked. See [reporting (mail, Sentry, shell, webhook)](Reporting).
 
 Reporter exceptions are logged (`Problem reporting job <name> failure`) and never
 crash the scheduler. Reporters run concurrently with `return_exceptions=True`.
+
+### "sets both tls and starttls"
+
+**Symptom.** The config fails to load with
+`Job <name>: <hook>.report.mail sets both tls and starttls, which are mutually exclusive`
+(or `notify.report.mail ...` for the `notify:` block).
+
+**Cause.** A mail block with `to` and `from` has `tls: true` and `starttls: true`
+after `defaults:` is merged in. `tls` uses TLS from the start of the connection, and
+`starttls` upgrades a plain connection, so one connection can't do both.
+
+**Fix.** Keep the key that matches the server's port, usually `tls` for 465 and
+`starttls` for 587, and set the other to `false` in the block the error names.
+
+### "mail reporting sends its SMTP login unencrypted"
+
+**Symptom.** The config load logs the warning
+`mail reporting sends its SMTP login unencrypted to <host>:<port> as '<username>'`.
+
+**Cause.** A mail block with `to`, `from`, `username`, and a `password` source has
+`tls` and `starttls` both `false` after `defaults:` is merged in, so the reporter
+sends the login in plain text. Only an `smtpHost` that is unset, `localhost`, or a
+loopback address skips the warning. cronstable doesn't resolve names, so the
+warning also appears for a name that points at this machine. Each load logs one
+warning per host, port, and username, however many jobs share them.
+
+**Fix.** Set `starttls: true` if the server offers STARTTLS (usually port 587), or
+`tls: true` for implicit TLS (usually port 465).
 
 ### A report (Sentry / mail / shell / webhook) is silently skipped
 

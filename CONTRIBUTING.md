@@ -233,6 +233,38 @@ version, so the `isal` half of `tests/test_gzip.py` doesn't run there. The
 On an older glibc, installing the `dev` extra builds `orjson` from source,
 which requires a Rust toolchain.
 
+### Dependency floors
+
+Each `>=` version in `pyproject.toml` is a floor: the oldest release of that
+dependency that cronstable supports. pip installs the newest release a range
+allows, so a higher floor doesn't change what a new install gets. It only
+blocks users who keep an older release because another package needs it.
+Keep each floor as low as cronstable allows, and raise one only for one of
+these reasons:
+
+- A security fix for an advisory that affects how cronstable uses the
+  dependency.
+- A bug fix, an API, or (for `tzdata`) zone data that cronstable needs.
+- A release that PyPI withdrew or that can't be imported.
+- The first release with Python 3.10 wheels, or with a wheel for every target
+  that the requirement's marker lists.
+
+Write the reason in a comment beside the requirement, and give the `dev`
+extra's copy of the requirement the same floor. A new release on its own
+doesn't move a floor. Dependabot doesn't update `requirements/min.txt`, and
+it changes a range in `pyproject.toml` only when a new release falls outside
+it. When a Dependabot alert names a floor, raise the floor, or dismiss the
+alert with the reason the advisory doesn't affect cronstable. Never lower a
+floor that a security fix set.
+
+After you change a floor, regenerate the build files and run
+`tox -e mindeps` with Python 3.10. It installs the pins in
+`requirements/min.txt` and runs the test suite on them. The `dev` extra
+doesn't install `kubernetes` or `uvloop`, so `requirements/min.txt` has no pin
+for either, and you test a change to their floors by hand. For `kubernetes`,
+run `tests/test_backend_live.py` against an API server with that release
+installed.
+
 ## Running the checks
 
 `tox` drives the source tests and static checks. Before you open a pull

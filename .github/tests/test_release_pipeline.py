@@ -623,6 +623,356 @@ openssl() { echo "$OPENSSL_VERSION"; }
             assert version in result.stderr
 
 
+# Processes are files in $STATE/proc, named by pid and holding the parent
+# pid and the binary. When the supervisor's child exits, the supervisor
+# respawns it from the current binary. pkg(8) kills every process a package
+# script leaves running, so start, restart, onestart, onerestart, and
+# daemon(8) only record the call. pkg reads messages from fd $PKG_MSGFD.
+FREEBSD_PKG_STUBS = r"""
+alive() { [ -n "$1" ] && [ -f "$STATE/proc/$1" ]; }
+daemon() { echo "daemon $*" >> "$STATE/starts"; }
+supervisor() { cat "$RUN/cronstable.pid" 2>/dev/null; }
+service() {
+    case "$2" in
+        status) alive "$(supervisor)" ;;
+        enabled) [ -f "$STATE/enabled" ] ;;
+        stop)
+            s=$(supervisor)
+            alive "$s" || return 1
+            for f in "$STATE"/proc/*; do
+                read ppid bin < "$f"
+                if [ "$ppid" = "$s" ]; then rm "$f"; fi
+            done
+            rm -f "$STATE/proc/$s" "$RUN"/cronstable*.pid
+            ;;
+        start|restart|onestart|onerestart) echo "$2" >> "$STATE/starts" ;;
+        *) return 2 ;;
+    esac
+}
+ps() {
+    if [ "$#" -ne 4 ] || [ "$1 $2 $3" != "-o ppid= -p" ]; then
+        echo "ps: unexpected arguments: $*" >&2
+        return 2
+    fi
+    alive "$4" || return 1
+    read ppid bin < "$STATE/proc/$4"
+    printf '%5s\n' "$ppid"
+}
+kill() {
+    sig=TERM
+    case "$1" in
+        -s) sig=$2; shift 2 ;;
+        -*) sig=${1#-}; shift ;;
+    esac
+    if [ "$sig" = 0 ]; then alive "$1"; return; fi
+    echo "$sig $*" >> "$STATE/signals"
+    alive "$1" || return 1
+    read ppid bin < "$STATE/proc/$1"
+    rm "$STATE/proc/$1"
+    if [ "$ppid" = "$(supervisor)" ]; then
+        pid=$(($(cat "$STATE/lastpid") + 1))
+        printf %s "$pid" > "$STATE/lastpid"
+        echo "$ppid $(cat "$STATE/binary")" > "$STATE/proc/$pid"
+        printf %s "$pid" > "$RUN/cronstable-child.pid"
+    fi
+}
+pw() {
+    case "$1" in
+        *show) return 1 ;;
+    esac
+}
+exec 4>> "$STATE/messages"
+"""
+
+# The processes and child pidfile of each starting state. The supervisor
+# is pid 100 in every state but "stopped".
+FREEBSD_SERVICE_STATES = {
+    "stopped": ({}, None),
+    "running": ({"100": "1 daemon", "101": "100 old"}, "101"),
+    # The child exited and the supervisor waits to respawn it.
+    "empty": ({"100": "1 daemon"}, ""),
+    "missing": ({"100": "1 daemon"}, None),
+    "dead": ({"100": "1 daemon"}, "157"),
+    "reused": ({"100": "1 daemon", "157": "1 other"}, "157"),
+    "supervisor": ({"100": "1 daemon"}, "100"),
+}
+
+# The scripts pkg(8) runs, with PKG_UPGRADE.
+FREEBSD_PKG_STEPS = {
+    # An in-place upgrade.
+    "upgrade": [("preremove", "true"), ("postinstall", "true")],
+    # A fresh install, or pkg add of a newer package.
+    "install": [("postinstall", None)],
+    # A split upgrade deletes the old package, here before any script sets
+    # PKG_UPGRADE.
+    "split": [("preremove", None), ("postinstall", "true")],
+    "deinstall": [("preremove", None)],
+}
+
+
+@pytest.mark.parametrize(
+    "how,enabled,start,after,reminder",
+    [
+        ("upgrade", True, "running", "respawned", False),
+        ("install", True, "running", "respawned", False),
+        # Started with onestart while disabled.
+        ("upgrade", False, "running", "respawned", False),
+        ("install", False, "running", "respawned", False),
+        ("upgrade", True, "stopped", "unchanged", True),
+        ("install", True, "stopped", "unchanged", True),
+        ("upgrade", False, "stopped", "unchanged", False),
+        ("install", False, "stopped", "unchanged", False),
+        *(
+            ("upgrade", True, start, "unchanged", False)
+            for start in ("empty", "missing", "dead", "reused", "supervisor")
+        ),
+        ("split", True, "running", "stopped", True),
+        ("deinstall", True, "running", "stopped", False),
+    ],
+)
+def test_freebsd_package_scripts_manage_the_service(
+    how, enabled, start, after, reminder, tmp_path
+):
+    shell = shutil.which("sh")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/sh.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("POSIX sh required for the package script harness")
+    state = tmp_path / "state"
+    (state / "proc").mkdir(parents=True)
+    run = tmp_path / "run"
+    run.mkdir()
+    stubs = tmp_path / "stubs.sh"
+    stubs.write_bytes(FREEBSD_PKG_STUBS.encode())
+    # The rc.d script and service(8) share the service model.
+    commands = {
+        "/usr/local/etc/rc.d/cronstable": 'service cronstable "$@"',
+        "/usr/sbin/service": 'service "$@"',
+        "/usr/sbin/daemon": 'daemon "$@"',
+    }
+    (tmp_path / "bin").mkdir()
+    for command, body in list(commands.items()):
+        stub = tmp_path / "bin" / Path(command).name
+        stub.write_bytes(f'#!/bin/sh\n. "$STUBS"\n{body}\n'.encode())
+        stub.chmod(0o755)
+        commands[command] = stub.as_posix()
+    procs, child = FREEBSD_SERVICE_STATES[start]
+    for pid, entry in procs.items():
+        (state / "proc" / pid).write_bytes(entry.encode() + b"\n")
+    if procs:
+        (run / "cronstable.pid").write_bytes(b"100")
+    if child is not None:
+        (run / "cronstable-child.pid").write_bytes(child.encode())
+    (state / "binary").write_bytes(b"old")
+    (state / "lastpid").write_bytes(b"200")
+    if enabled:
+        (state / "enabled").touch()
+    for name, upgrade in FREEBSD_PKG_STEPS[how]:
+        if name == "postinstall":
+            (state / "binary").write_bytes(b"new")
+        script = (
+            (ROOT / "packaging/freebsd" / (name + ".sh"))
+            .read_text()
+            .replace("/var/run/", run.as_posix() + "/")
+        )
+        for command, stub in commands.items():
+            script = script.replace(command, stub)
+        env = {k: v for k, v in os.environ.items() if k != "PKG_UPGRADE"}
+        env.update(
+            STATE=state.as_posix(),
+            RUN=run.as_posix(),
+            STUBS=stubs.as_posix(),
+            PKG_MSGFD="4",
+        )
+        if upgrade is not None:
+            env["PKG_UPGRADE"] = upgrade
+        # pkg(8) runs a script as `sh -c` with "$@" set to name-version.
+        result = subprocess.run(
+            [shell, "-c", '. "$STUBS"\nset -- cronstable-1.2.3\n' + script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout == ""
+
+    def read(path):
+        return path.read_text().strip() if path.exists() else None
+
+    assert read(state / "starts") is None
+    final = {p.name: read(p) for p in (state / "proc").iterdir()}
+    if after == "respawned":
+        assert read(state / "signals") == "TERM 101"
+        assert final == {"100": "1 daemon", "201": "100 new"}
+        assert read(run / "cronstable.pid") == "100"
+        assert read(run / "cronstable-child.pid") == "201"
+    else:
+        assert read(state / "signals") is None
+        assert final == ({} if after == "stopped" else procs)
+    messages = read(state / "messages")
+    if reminder:
+        assert len(messages.splitlines()) == 1
+        assert "service cronstable start" in messages
+    else:
+        assert messages == ""
+
+
+# The ${name}_ suffixes that run_rc_command reads itself, in rc.subr on
+# releng/14.2, 14.3, 15.0, and main.
+RC_SUBR_SUFFIXES = (
+    "program chroot chdir cpuset flags env env_file fib nice oomprotect"
+    " umask user group groups prepend setup login_class limits offcmd"
+    " audit_user svcj svcj_options svcj_ipaddrs"
+).split()
+
+
+def rc_subr_reserved(suffix):
+    # _enable is the rcvar. rc.subr also reads ${name}_<command>_svcj_enable.
+    return suffix in RC_SUBR_SUFFIXES or suffix.endswith("_svcj_enable")
+
+
+def test_freebsd_rc_knobs_avoid_rc_subr_names():
+    # cronstable_user would run daemon(8) through su(1), and
+    # cronstable_flags would reach daemon(8) as well as cronstable. The
+    # script check covers its assignments, defaults, and knob list, so the
+    # start warning can still read those two. The wiki check covers its
+    # settings table.
+    script = (ROOT / "packaging/freebsd/cronstable.rc").read_text()
+    wiki = (ROOT / "wiki/Installation.md").read_text()
+    section = wiki.split("## Install using a FreeBSD package\n", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    for patterns, text, expected in (
+        (
+            (
+                r"(?:\bcronstable|\$\{name\})_(\w+):?=",
+                r"(?m)^#\s+cronstable_(\w+)\s",
+            ),
+            script,
+            {"enable", "runas", "statedir", "config", "args"},
+        ),
+        (
+            (r"(?m)^\| `cronstable_(\w+)`",),
+            section,
+            {"runas", "statedir", "config", "args"},
+        ),
+    ):
+        names = {n for p in patterns for n in re.findall(p, text)}
+        assert sorted(n for n in names if rc_subr_reserved(n)) == []
+        assert expected <= names
+
+
+# run_rc_command records what rc.subr would read. id(1) knows cronstable
+# and root, whose primary group is wheel.
+FREEBSD_RC_SUBR = r"""
+load_rc_config() { . "@RC_CONF@"; }
+id() {
+    case "$1 $2" in
+        "-gn cronstable") echo cronstable ;;
+        "-gn root") echo wheel ;;
+        *) echo "id: $2: no such user" >&2; return 1 ;;
+    esac
+}
+install() { echo "INSTALL:$*"; }
+warn() { echo "WARN:$*"; }
+run_rc_command() {
+    for _v in @SUFFIXES@; do
+        if eval "[ -n \"\${${name}_${_v}+set}\" ]"; then
+            echo "SET:$_v"
+        fi
+    done
+    echo "COMMAND:$command"
+    echo "ARGS:$command_args"
+    eval "$start_precmd"
+    echo "PRECMD:$?"
+}
+"""
+
+
+def run_freebsd_rc(tmp_path, rc_conf):
+    shell = shutil.which("sh")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/sh.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("POSIX sh required for the rc.d script harness")
+    conf = tmp_path / "rc.conf"
+    conf.write_text(rc_conf)
+    stub = tmp_path / "rc.subr"
+    stub.write_text(
+        FREEBSD_RC_SUBR.replace("@RC_CONF@", conf.as_posix()).replace(
+            "@SUFFIXES@", " ".join(RC_SUBR_SUFFIXES)
+        )
+    )
+    script = tmp_path / "cronstable"
+    script.write_text(
+        (ROOT / "packaging/freebsd/cronstable.rc")
+        .read_text()
+        .replace(". /etc/rc.subr\n", f". {stub.as_posix()}\n")
+    )
+    result = subprocess.run(
+        [shell, script.as_posix(), "start"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.splitlines()
+
+
+@pytest.mark.parametrize(
+    "rc_conf,user,group,extra",
+    [
+        ("", "cronstable", "cronstable", []),
+        (
+            'cronstable_runas=root\ncronstable_args="--log-level DEBUG"\n',
+            "root",
+            "wheel",
+            ["--log-level", "DEBUG"],
+        ),
+        ("cronstable_runas=ghost\n", "ghost", None, []),
+    ],
+)
+def test_freebsd_rc_script_drops_privileges_in_daemon(
+    rc_conf, user, group, extra, tmp_path
+):
+    out = run_freebsd_rc(tmp_path, rc_conf)
+    assert [line for line in out if line.startswith("SET:")] == []
+    assert [line for line in out if line.startswith("WARN:")] == []
+    assert "COMMAND:/usr/sbin/daemon" in out
+    args = next(line for line in out if line.startswith("ARGS:"))
+    args = args.removeprefix("ARGS:").split()
+    binary = args.index("/usr/local/bin/cronstable")
+    daemon = args[:binary]
+    assert daemon[0] == "-P"
+    assert daemon[daemon.index("-u") + 1] == user
+    assert args[binary + 1 :] == ["-c", "/usr/local/etc/cronstable.d", *extra]
+    install = [line for line in out if line.startswith("INSTALL:")]
+    if group is None:
+        assert install == []
+        assert "PRECMD:1" in out
+    else:
+        assert install == [
+            f"INSTALL:-d -o {user} -g {group} -m 0750 /var/db/cronstable"
+        ]
+        assert "PRECMD:0" in out
+
+
+@pytest.mark.parametrize(
+    "setting,value,instead",
+    [("user", "root", "runas"), ("flags", '"--log-level DEBUG"', "args")],
+)
+def test_freebsd_rc_script_warns_on_rc_subr_settings(
+    setting, value, instead, tmp_path
+):
+    # rc.subr applies cronstable_user and cronstable_flags to daemon(8).
+    out = run_freebsd_rc(tmp_path, f"cronstable_{setting}={value}\n")
+    warnings = [line for line in out if line.startswith("WARN:")]
+    assert len(warnings) == 1, out
+    assert f"cronstable_{setting}" in warnings[0]
+    assert f"cronstable_{instead}" in warnings[0]
+    assert "PRECMD:0" in out
+
+
 @pytest.mark.parametrize(
     "name,job,field",
     [

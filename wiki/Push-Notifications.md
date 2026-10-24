@@ -170,13 +170,17 @@ month without a subscription, and without bound for devices with a
 Cronstable Pro subscription for iOS. Only alerts that reach APNs count;
 coalesced, suppressed, and rate-limited envelopes do not. Past the bound
 the relay answers the daemon with `{"outcome": "digested"}` (a 2xx, so
-the daemon logs no failure) and sends the device at most one fixed
-"alerts are waiting" digest per hour; the app keeps polling its servers
-directly. The device proves its plan to the relay itself, with the App
-Store's signed transaction; the daemon takes no part beyond naming the
-relay in `pairLinkBase`. A self-hosted relay applies whatever policy it
-runs, and the reference relay's bound is the `RELAY_FREE_MONTHLY_FORWARDS`
-knob. The wire details are in the
+the daemon logs no failure) and, in place of the alerts, sends the device
+one fixed "alerts are waiting" digest at most once an hour; the app keeps
+polling its servers directly. On any plan, a flood that empties one of
+the device's rate buckets (job alerts and daemon events each have one)
+folds into a digest the same way, and these burst digests can arrive as
+often as every 5 minutes while the flood lasts. The device proves its
+plan to the relay itself, with the App Store's signed transaction; the
+daemon takes no part beyond naming its relay in `pairLinkBase`, where
+the app reads the device's plan and quota. A self-hosted relay applies
+whatever policy it runs, and the reference relay's bound is the
+`RELAY_FREE_MONTHLY_FORWARDS` knob. The wire details are in the
 [relay protocol](https://github.com/ptweezy/cronstable/blob/main/docs/relay-protocol.md#delivery-quota).
 
 ## Pairing devices
@@ -466,12 +470,20 @@ The relay implementation lives in the separate
 repository; that file is the contract any implementation must satisfy.
 
 The trust model: the relay is not a trusted party. It receives ciphertext
-and routing metadata only (device token, coalescing hash, priority, event
-flag), and owns deduplication, rate limiting, and flap suppression,
-coalescing on the hash without learning what it hashes. The per-installation
-salt keys that hash, so the hash stays opaque even for guessable job names.
-It forwards to APNs with `mutable-content` set so the app decrypts and
-renders the notification on the device.
+and routing metadata only (device token, coalescing and flap-suppression
+hashes, priority, event flag), and owns deduplication, rate limiting, and
+flap suppression. It keys deduplication and flap suppression on those
+hashes without learning what they hash. The coalescing hash names one
+alert of one run. The flap-suppression hash names the source that keeps
+alerting across runs: one job's failures or its successes on one node, one
+SLA check of a job on one node, or one DAG or node event. A cluster node
+goes by its `nodeName` there, and a standalone daemon by its hostname, so
+nodes that share a hostname keep separate hashes as long as their
+`nodeName`s differ. An approval gate carries no flap-suppression hash,
+because the daemon announces each gate only once. The per-installation
+salt keys both hashes, so they stay opaque even for guessable job names.
+The relay forwards to APNs with `mutable-content` set so the app decrypts
+and renders the notification on the device.
 
 ## Related pages
 

@@ -591,7 +591,10 @@ secret-bearing (`PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`,
 credentials embedded in URLs and connection strings
 (`scheme://user:password@host`, including the user-less
 `redis://:password@host` form), and well-known token formats (cloud keys,
-GitHub personal access tokens, JWTs, private key blocks).
+GitHub personal access tokens, JWTs, private key blocks). A line longer than
+1,048,576 characters (1 MiB of ASCII text), or one that redaction grows past
+that length, is replaced whole with `***REDACTED***`. This caps how much text
+each secret pattern scans.
 
 Job output routinely embeds credentials by accident; a crashed script echoing
 its environment is the classic case. An archive multiplies the exposure, so

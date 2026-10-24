@@ -4,6 +4,7 @@ import gc
 import logging
 import os
 import signal
+import socket
 import sys
 import tempfile
 import threading
@@ -31,7 +32,8 @@ from tests._commands import (
     cmd_write_env,
     yaml_command,
 )
-from tests._helpers import _wait_until
+from tests._fake_http import server_ssl_context
+from tests._helpers import _wait_until, _write_tls
 
 
 def _argv(*parts):
@@ -679,7 +681,9 @@ jobs:
         (False, "out", None, "Cron job 'test' failed", "out\n"),
     ],
 )
-async def test_report_mail(success, stdout, stderr, subject, body):
+async def test_report_mail(
+    smtp_client_name, success, stdout, stderr, subject, body
+):
     conf = cronstable.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
     print(job_config.onSuccess["report"])
@@ -737,11 +741,14 @@ async def test_report_mail(success, stdout, stderr, subject, body):
             "hostname": "smtp1",
             "port": 1025,
             "use_tls": False,
+            "start_tls": True,
             "validate_certs": True,
+            "local_hostname": smtp_client_name,
         },
     )
     assert len(connect_calls) == 1
-    assert len(start_tls_calls) == 1
+    # connect() performs the upgrade
+    assert start_tls_calls == []
     assert login_calls == [("thisisme", "foobar")]
     assert len(messages_sent) == 1
     message = messages_sent[0]
@@ -3218,8 +3225,10 @@ async def test_stop_telemetry_runtime_error_does_not_propagate(
     assert "failed to send statsd job_stopped metric" in caplog.text
 
 
-async def test_report_mail_closes_connection_on_error():
-    # if sending fails, the SMTP connection must still be closed (no leak).
+@pytest.mark.parametrize("failing", ["connect", "send_message"])
+async def test_report_mail_closes_connection_on_error(failing):
+    # if connecting (which includes STARTTLS) or sending fails, the SMTP
+    # connection must still be closed (no leak).
     conf = cronstable.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
     job = Mock(
@@ -3237,26 +3246,21 @@ async def test_report_mail_closes_connection_on_error():
     mail = cronstable.job.MailReporter()
     close_calls = []
 
-    async def connect(self):
+    async def ok(self, *args):
         pass
 
-    async def starttls(self):
-        pass
-
-    async def login(self, username, password):
-        pass
-
-    async def send_message(self, message):
+    async def boom(self, *args):
         raise RuntimeError("smtp boom")
 
     def close(self):
         close_calls.append(self)
 
+    stubs = {"connect": ok, "login": ok, "send_message": ok}
+    stubs[failing] = boom
     with (
-        patch("aiosmtplib.SMTP.connect", connect),
-        patch("aiosmtplib.SMTP.starttls", starttls),
-        patch("aiosmtplib.SMTP.login", login),
-        patch("aiosmtplib.SMTP.send_message", send_message),
+        patch("aiosmtplib.SMTP.connect", stubs["connect"]),
+        patch("aiosmtplib.SMTP.login", stubs["login"]),
+        patch("aiosmtplib.SMTP.send_message", stubs["send_message"]),
         patch("aiosmtplib.SMTP.close", close),
     ):
         with pytest.raises(RuntimeError):
@@ -4035,9 +4039,6 @@ async def _run_mail_capturing(report, job, success=False):
     async def connect(self):
         pass
 
-    async def starttls(self):
-        pass
-
     async def login(self, username, password):
         login_calls.append((username, password))
 
@@ -4049,7 +4050,6 @@ async def _run_mail_capturing(report, job, success=False):
 
     with (
         patch("aiosmtplib.SMTP.connect", connect),
-        patch("aiosmtplib.SMTP.starttls", starttls),
         patch("aiosmtplib.SMTP.login", login),
         patch("aiosmtplib.SMTP.send_message", send_message),
         patch("aiosmtplib.SMTP.close", close),
@@ -4678,6 +4678,188 @@ async def test_mail_report_times_out(monkeypatch, caplog):
     assert any(
         "did not complete within" in rec.getMessage() for rec in caplog.records
     )
+
+
+class _FakeEsmtpServer:
+    """A loopback ESMTP server that accepts any message.
+
+    ``commands`` records each command verb; ``ehlo_names`` records the name
+    each EHLO gives; ``messages`` records each message's data and whether it
+    arrived over TLS.  STARTTLS is offered only when ``material``
+    (``_write_tls`` output) is given.
+    """
+
+    def __init__(self, material=None):
+        self.ssl_context = material and server_ssl_context(material)
+        self.commands = []
+        self.ehlo_names = []
+        self.messages = []
+        self.upgrades = []
+        self.port = None
+        self._server = None
+
+    async def __aenter__(self):
+        self._server = await asyncio.get_running_loop().create_server(
+            lambda: _FakeEsmtp(self), "127.0.0.1", 0
+        )
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *exc_info):
+        await asyncio.gather(*self.upgrades, return_exceptions=True)
+        self._server.close()
+        await self._server.wait_closed()
+
+
+class _FakeEsmtp(asyncio.Protocol):
+    """One connection to a :class:`_FakeEsmtpServer`."""
+
+    def __init__(self, server):
+        self.server = server
+        self.transport = None
+        self.buffer = b""
+        self.data = None  # message lines, inside DATA
+        self.tls = False
+        self.upgrading = False
+
+    def connection_made(self, transport):
+        self.transport = transport
+        self._reply(b"220 fake ESMTP")
+
+    def connection_lost(self, exc):
+        # 3.10 marks a TLS transport closed only in close()
+        self.transport.close()
+
+    def data_received(self, data):
+        self.buffer += data
+        self._drain()
+
+    def _drain(self):
+        # lines that arrive mid-handshake wait for the TLS transport
+        while not self.upgrading and b"\r\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\r\n", 1)
+            self._handle(line)
+
+    def _handle(self, line):
+        if self.data is not None:
+            if line == b".":
+                self.server.messages.append(
+                    (b"\r\n".join(self.data), self.tls)
+                )
+                self.data = None
+                self._reply(b"250 queued")
+            else:
+                self.data.append(line)
+            return
+        word, _, argument = line.partition(b" ")
+        verb = word.upper().decode()
+        self.server.commands.append(verb)
+        if verb == "EHLO":
+            self.server.ehlo_names.append(argument.decode())
+        if verb == "EHLO" and self.server.ssl_context and not self.tls:
+            self._reply(b"250-fake\r\n250 STARTTLS")
+        elif verb == "STARTTLS":
+            self._reply(b"220 ready")
+            self.upgrading = True
+            self.server.upgrades.append(
+                asyncio.ensure_future(self._upgrade())
+            )
+        elif verb == "DATA":
+            self.data = []
+            self._reply(b"354 go ahead")
+        else:
+            self._reply(b"250 ok")
+
+    def _reply(self, text):
+        self.transport.write(text + b"\r\n")
+
+    async def _upgrade(self):
+        self.transport = await asyncio.get_running_loop().start_tls(
+            self.transport, self, self.server.ssl_context, server_side=True
+        )
+        self.tls = True
+        self.upgrading = False
+        self._drain()
+
+
+@pytest.fixture
+def smtp_client_name(monkeypatch):
+    """Pin the dotted host name mail reports give in EHLO.
+
+    A report then skips the lookup of the runner's own name, which takes 35
+    seconds or more on GitHub's macOS runners.
+    """
+    monkeypatch.setattr(cronstable.job, "gethostname", lambda: "client.test")
+    return "client.test"
+
+
+@pytest.mark.parametrize(
+    ("system_name", "ehlo_name", "lookups"),
+    [
+        # A dotted hostname goes out as is, without a lookup.
+        ("client.example.test", "client.example.test", []),
+        # aiosmtplib looks up a hostname without a dot, which can qualify it.
+        ("client", "client.example.test", [""]),
+    ],
+)
+async def test_mail_report_ehlo_names_the_host(
+    monkeypatch, system_name, ehlo_name, lookups
+):
+    looked_up = []
+
+    def getfqdn(name=""):
+        looked_up.append(name)
+        return "client.example.test"
+
+    monkeypatch.setattr(cronstable.job, "gethostname", lambda: system_name)
+    monkeypatch.setattr(socket, "getfqdn", getfqdn)
+    job_config, report = _mail_report_config()
+    job = _mail_job_mock(job_config)
+    async with _FakeEsmtpServer() as server:
+        report["mail"].update(smtpHost="127.0.0.1", smtpPort=server.port)
+        await cronstable.job.MailReporter().report(False, job, report)
+
+    assert server.ehlo_names == [ehlo_name]
+    assert looked_up == lookups
+    assert len(server.messages) == 1
+
+
+@pytest.mark.parametrize("starttls", [False, True])
+async def test_mail_report_starttls_follows_the_config_key(
+    tmp_path, smtp_client_name, starttls
+):
+    # The real connect() runs against a server that offers STARTTLS, so
+    # aiosmtplib's own connect-time upgrade is under test too.
+    job_config, report = _mail_report_config()
+    job = _mail_job_mock(job_config)
+    material = _write_tls(tmp_path, cn="smtp-ca")
+    async with _FakeEsmtpServer(material) as server:
+        report["mail"].update(
+            smtpHost="127.0.0.1",
+            smtpPort=server.port,
+            starttls=starttls,
+            validate_certs=False,
+        )
+        await cronstable.job.MailReporter().report(False, job, report)
+
+    assert server.commands.count("STARTTLS") == int(starttls)
+    assert [tls for _data, tls in server.messages] == [starttls]
+    assert b"To: to@example.com" in server.messages[0][0]
+
+
+async def test_mail_report_starttls_fails_without_server_support(
+    smtp_client_name,
+):
+    job_config, report = _mail_report_config()
+    job = _mail_job_mock(job_config)
+    async with _FakeEsmtpServer() as server:
+        report["mail"].update(
+            smtpHost="127.0.0.1", smtpPort=server.port, starttls=True
+        )
+        with pytest.raises(aiosmtplib.SMTPException, match="STARTTLS"):
+            await cronstable.job.MailReporter().report(False, job, report)
+
+    assert server.messages == []
 
 
 # ---------------------------------------------------------------------------

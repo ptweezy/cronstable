@@ -244,7 +244,9 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[],
+    # Keeps a running binary reading its own modules after a package
+    # upgrade renames a new one over it.
+    runtime_hooks=[os.path.join(SPECPATH, "pyi_rth_pin_pyz.py")],
     excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

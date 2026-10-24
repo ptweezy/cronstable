@@ -10105,6 +10105,7 @@ def bench_webapi_fleet_bytes():
             "distribution": "spread",
             "electLeader": True,
             "interval": 5,
+            "connectTimeout": 10,
             "tls": {"ca": ca, "cert": cert, "key": key},
         }
         try:
@@ -10446,6 +10447,8 @@ def _cluster_manager_50():
             "driftAfter": 3,
             "distribution": "spread",
             "electLeader": True,
+            "interval": 5,
+            "connectTimeout": 10,
             "tls": {"ca": ca, "cert": cert, "key": key},
         }
         try:
@@ -10660,10 +10663,11 @@ def bench_cluster_fleet_view():
             "driftAfter": 3,
             "distribution": "spread",
             "electLeader": True,
-            # fleet_view reads the poll cadence (it publishes it, and scales
-            # the node-stats staleness window by it); the ownership fixture
-            # never touches it, which is why only this one sets it
+            # ClusterManager reads both when it is built (the distrust
+            # window), and fleet_view also publishes the poll cadence and
+            # scales the node-stats staleness window by it
             "interval": 5,
+            "connectTimeout": 10,
             "tls": {"ca": ca, "cert": cert, "key": key},
         }
         try:
@@ -10767,6 +10771,7 @@ def _gossip_manager(members, prefix):
         "distribution": "spread",
         "electLeader": True,
         "interval": 5,
+        "connectTimeout": 10,
         "tls": {"ca": ca, "cert": cert, "key": key},
     }
     try:

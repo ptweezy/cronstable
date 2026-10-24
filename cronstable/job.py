@@ -1016,17 +1016,21 @@ class MailReporter(Reporter):
         # that never sends a mail report never pays the aiosmtplib import cost.
         import aiosmtplib
 
+        # start_tls stays explicit: aiosmtplib's default (None) upgrades
+        # whenever the server offers STARTTLS.
         smtp = aiosmtplib.SMTP(
             hostname=smtp_host,
             port=smtp_port,
             use_tls=mail["tls"],
+            start_tls=bool(mail["starttls"]),
             validate_certs=mail["validate_certs"],
+            local_hostname=_smtp_local_hostname(),
         )
         # One overall bound on the whole conversation; see
         # MAIL_REPORT_TIMEOUT.
         try:
             await asyncio.wait_for(
-                self._converse(smtp, mail, username, password, message),
+                self._converse(smtp, username, password, message),
                 MAIL_REPORT_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -1040,25 +1044,35 @@ class MailReporter(Reporter):
     @staticmethod
     async def _converse(
         smtp: Any,
-        mail: dict[str, Any],
         username: str | None,
         password: str | None,
         message: EmailMessage,
     ) -> None:
-        await smtp.connect()
         # close() (sync, idempotent) guarantees the socket is released even if
-        # starttls/login/send raises (including the CancelledError a
-        # wait_for timeout injects), so a failing SMTP server can't leak a
-        # connection per report.
+        # connect (with its STARTTLS upgrade), login or send raises
+        # (including the CancelledError a wait_for timeout injects), so a
+        # failing SMTP server can't leak a connection per report.
         try:
-            if mail["starttls"]:
-                await smtp.starttls()
+            await smtp.connect()
             if username and password:
                 # aiosmtplib >=2 takes username/password as positional args.
                 await smtp.login(username, password)
             await smtp.send_message(message)
         finally:
             smtp.close()
+
+
+def _smtp_local_hostname() -> str | None:
+    """The name a mail report gives in EHLO; None leaves it to aiosmtplib.
+
+    A system hostname with a dot goes out as is. aiosmtplib's default,
+    socket.getfqdn(), looks the host's own name up on every connection,
+    inside MAIL_REPORT_TIMEOUT. On a host whose name does not resolve, such
+    as GitHub's macOS runners, each lookup can take 35 seconds or more. A
+    hostname without a dot keeps that lookup, since it can qualify the name.
+    """
+    name = gethostname()
+    return name if "." in name else None
 
 
 def _limits_env(job: Any) -> dict[str, str]:

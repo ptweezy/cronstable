@@ -19,14 +19,23 @@ updates:
       github-actions:
         patterns: ["*"]
 
-  # pyproject.toml owns dependency floors: apply a requirements/min.txt bump
-  # there (extras too), then run scripts/generate_build_files.py. Keep
-  # requirements/min.txt scanned; excluding it leaves the dependency graph
-  # reporting obsolete vulnerable pins. Dependabot reads requirements files
-  # one directory below `directory`, so "/" covers requirements/.
+  # A floor in pyproject.toml is the oldest release cronstable supports, and
+  # it moves only for a reason its comment names, never to follow a new
+  # release (see "Dependency floors" in CONTRIBUTING.md). With
+  # increase-if-necessary, a version update changes a range only when a new
+  # release falls outside it, such as a major release past an upper cap;
+  # keep the floor when you accept one. requirements/min.txt pins the floors,
+  # so version updates skip it. exclude-paths applies to version updates
+  # only, and Dependabot alerts still cover the floors: when one names a
+  # floor, raise it in pyproject.toml and regenerate, or dismiss the alert
+  # with the reason the advisory doesn't affect cronstable. Dependabot reads
+  # requirements files one directory below `directory`, so "/" covers
+  # requirements/.
   - package-ecosystem: pip
     directory: "/"
+    versioning-strategy: increase-if-necessary
     exclude-paths:
+      - "requirements/min.txt"
       - "requirements/dev-freethreaded.txt"
       - "pyinstaller/requirements/**"
     schedule:

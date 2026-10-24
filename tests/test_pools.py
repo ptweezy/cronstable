@@ -616,6 +616,26 @@ async def test_tick_stops_trying_when_the_last_slot_is_taken(
     await _reap_running(cron)
 
 
+async def test_waiting_reason_counts_slots_in_words(dag_cron, monkeypatch):
+    cron = await make(dag_cron, monkeypatch)
+    tickets = await _fill_pool(cron)
+
+    async def head_reason():
+        entries = (await cron._pools.snapshot())[0]["entries"]
+        (head,) = [e for e in entries if e["state"] == "queued"]
+        return head["id"], head["waitingReason"]
+
+    await cron._pools.enqueue(cron.cron_jobs["one"])
+    entry_id, reason = await head_reason()
+    assert reason == "Needs 1 slot; 0 available"
+    await cron._pools.cancel("database", entry_id)
+    cron.cron_jobs["two"].poolSlots = 2
+    await cron._pools.enqueue(cron.cron_jobs["two"])
+    assert (await head_reason())[1] == "Needs 2 slots; 0 available"
+    for ticket in tickets:
+        await cron._pools.finish(ticket)
+
+
 async def test_tick_tries_nothing_behind_a_head_that_does_not_fit(
     dag_cron, monkeypatch
 ):

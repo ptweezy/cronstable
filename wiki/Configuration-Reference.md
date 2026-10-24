@@ -682,8 +682,8 @@ blocks in full; their schema and `_REPORT_DEFAULTS` are summarized here.
 | `body` | `Str` | jinja2 default body template | Email body (jinja2). |
 | `username` | `Str` | `None` | SMTP login username (enables login with `password`). |
 | `password` | `Map` with `value`/`fromFile`/`fromEnvVar` (each `EmptyNone() \| Str`) | all `None` | SMTP login password source. |
-| `tls` | `Bool` | `false` | Use implicit TLS. |
-| `starttls` | `Bool` | `false` | Use STARTTLS. |
+| `tls` | `Bool` | `false` | Use implicit TLS. Mutually exclusive with `starttls`. |
+| `starttls` | `Bool` | `false` | Upgrade the connection with STARTTLS after connecting; the send fails if the server doesn't offer it. Mutually exclusive with `tls`. With both `false`, the connection is unencrypted, login included. |
 | `validate_certs` | `Bool` | `true` | Validate TLS certificates. |
 | `html` | `Bool` | `false` | Send the body as HTML. |
 

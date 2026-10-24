@@ -22,6 +22,7 @@ from email.message import Message
 import pytest
 
 from cronstable import _cliargs, webclient
+from tests._helpers import LoopbackHTTPServer
 
 BASE = "http://cron.example.test:8080"
 WHAT = "the cronstable server at " + BASE
@@ -282,7 +283,7 @@ def test_malformed_redirect_target_from_a_real_server_is_reported(status):
         def log_message(self, *args):
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Redirect)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), _Redirect)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -472,7 +473,7 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
 def recorder():
     """A real HTTP server on loopback; its URL and what it received."""
     _Recorder.seen = []
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Recorder)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), _Recorder)
     # a short poll, so that shutdown returns at once
     thread = threading.Thread(
         target=server.serve_forever, args=(0.01,), daemon=True

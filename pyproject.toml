@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=84.0.0", "setuptools_scm>=10.3.4"]
+# setuptools 83.0.0 fixes CVE-2026-59890, which lets an sdist built on macOS
+# include files that MANIFEST.in excludes. setuptools_scm 8.0.0 adds the
+# version_file option.
+requires = ["setuptools>=83.0.0", "setuptools_scm>=8.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -39,21 +42,37 @@ keywords = [
     "asyncio",
 ]
 dynamic = ["version"]
+# Each floor here and in the extras is the oldest release cronstable
+# supports, and its comment names the reason, such as a security fix or an
+# API that cronstable calls. pip installs the newest release anyway, so a
+# higher floor only blocks users who hold a package back for another
+# dependency. See "Dependency floors" in CONTRIBUTING.md.
 dependencies = [
     # Require an importable release when testing minimum dependencies.
     # PyPI withdrew 1.7.0 because it causes an import error.
     "strictyaml>=1.7.3,<2",
-    "aiohttp>=3.14.5,<4",
-    "sentry-sdk>=2.71.0,<3",
+    # The web dashboard is an aiohttp server. 3.14.3 fixes the newest
+    # published advisories, and 3.14.4 hardens request parsing and closes
+    # idle and stalled connections.
+    "aiohttp>=3.14.4,<4",
+    # 2.8.0 fixes CVE-2024-40647, which can expose environment variables to
+    # subprocesses.
+    "sentry-sdk>=2.8.0,<3",
+    # 5.1.3 carries the SMTP command-injection and STARTTLS
+    # response-injection fixes (CVE-2026-53533, CVE-2026-55558).
     "aiosmtplib>=5.1.3,<6",
+    # 3.1.6 carries the fixes for the published Jinja2 advisories, through
+    # CVE-2025-27516.
     "jinja2>=3.1.6,<4",
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
-    # that don't ship the system tzdata.
-    "tzdata>=2026.5",
+    # that don't ship the system tzdata. The package has no API, so any
+    # release works; the floor keeps zone rules from 2024 or later.
+    "tzdata>=2024.1",
     # Per-run CPU/memory accounting (opt-in `monitorResources`; see
     # cronstable.resources). The feature is off by default, but the import is
     # unconditional so `cronstable --help` and mypy resolve it everywhere.
-    "psutil>=7.2.2",
+    # 5.9.0 is the first release with Python 3.10 wheels.
+    "psutil>=5.9.0",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -93,32 +112,36 @@ cronstable = "cronstable.__main__:main"
 # Official Kubernetes client for the `kubernetes` leadership backend. Without
 # it (or where its grpc/protobuf wheels are missing) the backend falls back to
 # its own apiserver REST transport over aiohttp. The etcd backend needs none.
-kubernetes = ["kubernetes>=36.0.3"]
+# 27.2.0 is the oldest release tested with the backend's Lease calls.
+kubernetes = ["kubernetes>=27.2.0"]
 # uvloop's faster event loop; cronstable falls back to stock asyncio without
 # it. Windows has no uvloop build (and needs the Proactor loop for
-# subprocesses), so the marker skips it there.
+# subprocesses), so the marker skips it there. cronstable calls only
+# uvloop.new_event_loop(); 0.19.0 is the oldest release tested with it.
 speedups = [
-    "uvloop>=0.22.1; sys_platform != 'win32'",
+    "uvloop>=0.19.0; sys_platform != 'win32'",
     # orjson speeds the state-persistence and cluster-gossip JSON paths
     # (cronstable._json falls back to stdlib json). Optional because some
     # targets have no wheel: riscv64, armv6, ppc64le, s390x, musl armv7,
     # musl i686, and 32-bit Windows. The line has no marker because 64-bit
     # Windows has a wheel. The cp315 glibc wheels require glibc 2.39 or
     # later, which a marker cannot see, so pip builds from source on an
-    # older glibc.
-    "orjson>=3.12.0",
+    # older glibc. 3.11.6 fixes CVE-2025-67221, unbounded recursion on
+    # deeply nested documents.
+    "orjson>=3.11.6",
     # isal (ISA-L) gzips web and cluster responses with SIMD deflate
     # (cronstable._gzip falls back to stdlib zlib). The marker lists only
     # targets with a wheel, so pip never tries the sdist, which builds ISA-L
     # and needs nasm on x86. There is no cp315 wheel yet. Linux stops at
     # x86_64 and aarch64, with the same 32-bit userland caveat as the push
-    # extra's cryptography line.
+    # extra's cryptography line. 1.7.0 is the first release with a wheel
+    # for every target the marker lists.
     # TODO: https://github.com/pycompression/python-isal/issues/247 - When
     # isal publishes cp315 wheels, drop `python_version < '3.15'` from this
     # marker and the dev extra's, and regenerate the build files. Then
     # remove the 3.15 gate in tests/test_dev_deps_parity.py and the isal
     # notes for Python 3.15 in CONTRIBUTING.md and wiki/Installation.md.
-    "isal>=1.8.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
+    "isal>=1.7.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
 ]
 # End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
 # PyNaCl seals `x25519` and fails closed: a config with a `push:` section
@@ -143,8 +166,10 @@ push = [
 ]
 # Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
 # cronstable.discovery). Same fail-closed contract: web.bonjour without this
-# installed is a ConfigError, never a silent no-advert.
-discovery = ["zeroconf>=0.151.5"]
+# installed is a ConfigError, never a silent no-advert. 0.149.16 fixes the
+# LAN-side denial-of-service and cache-corruption advisories through
+# CVE-2026-48487.
+discovery = ["zeroconf>=0.149.16"]
 dev = [
     # Canonical dev list: tox and pip install this extra, and
     # scripts/generate_build_files.py derives requirements/min.txt and
@@ -157,12 +182,12 @@ dev = [
     # 2.39, which a marker cannot see (see the speedups extra). py314t and
     # py315t use a generated list without it, because no marker can detect
     # the free-threaded ABI that orjson rejects.
-    "orjson>=3.12.0; platform_machine != 'ARM64' or sys_platform != 'win32'",
+    "orjson>=3.11.6; platform_machine != 'ARM64' or sys_platform != 'win32'",
     # isal reuses the speedups marker; tests/test_gzip.py covers both
     # backends wherever it installs.
-    "isal>=1.8.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
+    "isal>=1.7.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
     "pynacl>=1.6.2",
-    "zeroconf>=0.151.5",
+    "zeroconf>=0.149.16",
     # Browser-backed tests require a separate `playwright install chromium`
     # step after pip installs the library. No wheel/sdist exists on win-arm64.
     "playwright; platform_machine != 'ARM64' or sys_platform != 'win32'",

@@ -681,7 +681,7 @@ declared JSON type, and the answer lists the values the run takes:
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
 applies. If an instance is already running, `Allow` starts another and
 `Replace` cancels the running instance(s) first. `Forbid` starts nothing and
-answers `409` with the reason.
+answers `409` with the reason in the JSON error.
 
 When another node holds the job's
 [cluster concurrency slot](Concurrency-and-Timeouts#concurrency-across-a-cluster),
@@ -695,8 +695,9 @@ Nothing runs yet. This node asks the holder to yield, and the run starts with
 the values in the answer when the slot frees. The pending run does not start
 if a newer launch of the job comes first, if the holder keeps the slot for
 twice `slotTtlSeconds`, or if a reload leaves the job with a `params`
-declaration that the values in the answer do not fit. If the state store
-cannot answer for the slot and
+declaration that the values in the answer do not fit. The claim waits at most
+10 seconds for the state store that holds the slot. If the store doesn't
+answer in that time and
 [`onStoreUnavailable`](Durable-State#when-the-store-is-unavailable-onstoreunavailable)
 is `fail-closed`, the request starts nothing and answers `503`. A `200`
 without `pending` means that a run started. See
@@ -1105,9 +1106,12 @@ running job's new lines live, and finishes with an `end` event:
 
 - Each line arrives as an `event: line` whose `data` is a JSON object
   `{"stream": "stdout"|"stderr", "line": "..."}`.
-- When the run finishes, the server sends `event: end` with data `{}`. If the
-  job has no captured output at all yet, the stream ends immediately with
-  `event: end` and data `{"reason": "no-output"}`.
+- When the run finishes, the server sends `event: end` with data
+  `{"started_at": "<ISO 8601>"}`, the start time of the run the stream
+  showed. A run without a start time, such as a slot that a pause skipped,
+  ends with data `{}`. If the job has no running instance and no recorded
+  run, the stream ends immediately with `event: end` and data
+  `{"reason": "no-output"}`.
 - During quiet periods the server writes an SSE comment (`: ping`) every 15
   seconds as a keep-alive, which also detects disconnected clients.
 

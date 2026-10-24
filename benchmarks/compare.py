@@ -4,8 +4,7 @@
 Consumes JSON documents written by benchmarks/bench.py.  Both sides accept
 several files (the CI job runs the suites in interleaved rounds on one
 runner); per metric the rounds are merged with the metric's own estimator
-("min" for time, "median" for memory) so a single noisy round cannot fake or
-mask a regression.
+("min" for time, "median" for memory).
 
 Outputs:
   --md PATH          markdown summary (release-notes section)
@@ -15,9 +14,12 @@ Outputs:
 Gating: a metric fails when its slowdown exceeds all three limits at once:
 the declared gate percentage, the absolute floor, and a couple of its
 measured noise bands (the round-to-round scatter of the two sides, so
-measurement noise on a jittery metric never gates).  Failures exit 1 unless
---warn-only (ordinary commits) or --accept (an acknowledged, intentional
-regression).
+measurement noise on a jittery metric never gates).  A "min" metric with three
+or more rounds on each side must also exceed the gate percentage and the
+floor in the median of its rounds, so a single round that ran fast on the
+baseline side cannot fake a regression.  Failures
+exit 1 unless --warn-only (ordinary commits) or --accept (an acknowledged,
+intentional regression).
 
 Usage:
     python benchmarks/compare.py \
@@ -325,6 +327,19 @@ def _rel_cov(entry):
     return scatter / center
 
 
+def _round_median(entry):
+    """The median of a side's per-round values, or None when the side has
+    fewer than three rounds or a round isn't finite.
+
+    The median of two rounds is their mean, which a single outlying round
+    moves halfway.
+    """
+    rounds = entry.get("round_values") or []
+    if len(rounds) < 3 or not all(math.isfinite(v) for v in rounds):
+        return None
+    return statistics.median(rounds)
+
+
 def _baseline_of(side_map):
     """The interpreter-startup floor (``startup.python_baseline``) measured on
     one side, or None if it was not run (older release, filtered run) or
@@ -534,34 +549,75 @@ def _compare(baseline, current):
             and delta > gate_pct
             and (adj_cur - adj_base) > floor_used
         )
-        if over_gate and significant:
+        # A "min" metric merges to its fastest round, and from three rounds
+        # the robust noise band ignores a lone outlying round, so one fast
+        # baseline round sets the baseline without widening the band. The
+        # median of the rounds must clear the same limits. It takes the
+        # startup adjustment only when the fastest round did, so floor_used
+        # fits both. An unknown median never suppresses.
+        median_delta = None
+        median_change = None
+        typical = True
+        if cur.get("compare") == "min":
+            med_base, med_cur = _round_median(base), _round_median(cur)
+            if med_base is not None and med_cur is not None:
+                if (adj_base, adj_cur) == (base["value"], cur["value"]):
+                    adj_med_base, adj_med_cur = med_base, med_cur
+                else:
+                    adj_med_base, adj_med_cur = _adjusted_values(
+                        name,
+                        {"value": med_base},
+                        {"value": med_cur},
+                        base_floor,
+                        cur_floor,
+                    )
+                median_delta = _delta_pct(adj_med_base, adj_med_cur)
+                median_change = adj_med_cur - adj_med_base
+                typical = median_delta is None or (
+                    gate_pct is not None
+                    and median_delta > gate_pct
+                    and median_change > floor_used
+                )
+        if over_gate and significant and typical:
             gated = True
             violations.append(
-                "%s increased by %.1f%% (%s to %s; declared limit %.0f%%; "
+                "%s increased by %.1f%% (%s to %s; %sdeclared limit %.0f%%; "
                 "noise: %s)"
                 % (
                     name,
                     delta,
                     _fmt(base["value"], cur["unit"]),
                     _fmt(cur["value"], cur["unit"]),
+                    "median of rounds %+.1f%%; " % median_delta
+                    if median_delta is not None
+                    else "",
                     gate_pct,
                     "±%.1f%%" % (noise * 100)
                     if noise is not None
                     else "not available",
                 )
             )
+        # A change that cleared the raw gate but not the noise band or the
+        # median of the rounds: reported, but explicitly not gated.
+        suppressed_by = None
+        if over_gate and not significant:
+            suppressed_by = "noise"
+        elif over_gate and not typical:
+            suppressed_by = "median"
         rows.append(
             {
                 "name": name,
                 "entry": cur,
                 "base_value": base["value"],
                 "delta_pct": delta,
+                "median_delta_pct": median_delta,
+                "median_change": median_change,
+                "floor_used": floor_used,
                 "noise_pct": noise * 100 if noise is not None else None,
                 "significant": significant,
                 "effective_pct": effective_pct,
-                # a change that cleared the raw gate but not the noise band:
-                # reported, but explicitly not gated.
-                "suppressed": over_gate and not significant,
+                "suppressed": suppressed_by is not None,
+                "suppressed_by": suppressed_by,
                 "gated": gated,
             }
         )
@@ -605,6 +661,94 @@ def _short_sides(rows, baseline, current):
                     "%s was compared with a short %s side: %s"
                     % (row["name"], side, "; ".join(short))
                 )
+    return out
+
+
+def _suppressed_md(rows):
+    """Report lines naming each change that cleared its raw limit but did
+    not gate, grouped by the check that held it back."""
+    suppressed = sorted(
+        (r for r in rows if r.get("suppressed")),
+        key=lambda r: -r["delta_pct"],
+    )
+    noisy = [r for r in suppressed if r.get("suppressed_by") != "median"]
+    atypical = [r for r in suppressed if r.get("suppressed_by") == "median"]
+    lines = []
+    if noisy:
+        lines.append(
+            "These increases exceeded the regression limit but stayed "
+            "within the measurement noise threshold, so they did not "
+            "fail the check: %s."
+            % ", ".join(
+                "%s (%+.1f%%; noise ±%.1f%%)"
+                % (r["name"], r["delta_pct"], r["noise_pct"] or 0.0)
+                for r in noisy
+            )
+        )
+        lines.append("")
+    if atypical:
+        lines.append(
+            "These increases exceeded the regression limits in the "
+            "fastest round but not in the median of the rounds, so they "
+            "did not fail the check: %s."
+            % ", ".join(
+                "%s (%+.1f%%; median of rounds %s)"
+                % (r["name"], r["delta_pct"], _median_detail(r))
+                for r in atypical
+            )
+        )
+        lines.append("")
+    return lines
+
+
+def _median_detail(row):
+    """The median-of-rounds change of a row the median check suppressed,
+    naming the absolute floor when that is the limit the median missed."""
+    detail = "%+.1f%%" % row["median_delta_pct"]
+    gate_pct = row["entry"].get("gate_pct")
+    if gate_pct is not None and row["median_delta_pct"] > gate_pct:
+        unit = row["entry"]["unit"]
+        detail += "; %s is under the %s minimum change" % (
+            _fmt(row["median_change"], unit),
+            _fmt(row["floor_used"], unit),
+        )
+    return detail
+
+
+def _suppressed_warnings(rows):
+    """Job log warnings for the changes :func:`_suppressed_md` reports.
+
+    A change that cleared its raw limit but sat inside the noise band, or
+    showed only in the fastest round, is deliberately not gated, but it must
+    reach the job log and not only the rendered report: a +18% move printing
+    as "0 gate violation(s)" with no other output reads as a clean pass.
+    """
+    out = []
+    for row in rows:
+        if row.get("suppressed_by") == "median":
+            out.append(
+                "::warning::perf gate: %s regressed %+.1f%% (over its "
+                "%.4g%% limit) in its fastest round, but not in the median "
+                "of its rounds (%s); reported, not gated"
+                % (
+                    row["name"],
+                    row["delta_pct"],
+                    row["entry"].get("gate_pct") or 0.0,
+                    _median_detail(row),
+                )
+            )
+        elif row.get("suppressed"):
+            out.append(
+                "::warning::perf gate: %s regressed %+.1f%% (over its "
+                "%.4g%% limit) but within the noise band (+-%.1f%%); "
+                "reported, not gated"
+                % (
+                    row["name"],
+                    row["delta_pct"],
+                    row["entry"].get("gate_pct") or 0.0,
+                    row.get("noise_pct") or 0.0,
+                )
+            )
     return out
 
 
@@ -915,19 +1059,7 @@ def build_md(
             "memory; positive changes mean more."
         )
         lines.append("")
-        suppressed = [r for r in rows if r.get("suppressed")]
-        if suppressed:
-            lines.append(
-                "These increases exceeded the regression limit but stayed "
-                "within the measurement noise threshold, so they did not "
-                "fail the check: %s."
-                % ", ".join(
-                    "%s (%+.1f%%; noise ±%.1f%%)"
-                    % (r["name"], r["delta_pct"], r["noise_pct"] or 0.0)
-                    for r in sorted(suppressed, key=lambda r: -r["delta_pct"])
-                )
-            )
-            lines.append("")
+        lines.extend(_suppressed_md(rows))
 
         comparable = [r for r in rows if r["delta_pct"] is not None]
         comparable.sort(key=lambda r: -abs(r["delta_pct"]))
@@ -941,9 +1073,12 @@ def build_md(
             "`Noise (±)` estimates run-to-run variation across both "
             "versions. A result fails the regression check only if the "
             "increase exceeds its percentage limit, its minimum absolute "
-            "change, and %.0f times the noise estimate. `n/a` means too few "
-            "rounds to estimate noise; the other limits still apply."
-            % _SIG_SIGMA
+            "change, and %.0f times the noise estimate. When a result uses "
+            "the lowest runtime and each version has three or more rounds, "
+            "the median of the rounds must also increase by more than the "
+            "percentage limit and the minimum absolute change. `n/a` means "
+            "too few rounds to estimate noise; the other limits still "
+            "apply." % _SIG_SIGMA
         )
         lines.append("")
         lines.append(
@@ -968,6 +1103,8 @@ def build_md(
             entry = row["entry"]
             if row["gated"]:
                 mark = " **(regression)**"
+            elif row.get("suppressed_by") == "median":
+                mark = " (median of rounds within limits)"
             elif row.get("suppressed"):
                 mark = " (within noise threshold)"
             else:
@@ -1213,23 +1350,8 @@ def main(argv=None):
             print("::warning::perf gate: %s" % violation)
         else:
             print("::error::perf gate: %s" % violation)
-    # A regression that cleared its raw limit but sat inside the noise band
-    # is deliberately not gated, but it must reach the job log and not only
-    # the rendered report: a +18% move printing as "0 gate violation(s)"
-    # with no other output reads as a clean pass.
-    for row in rows:
-        if row.get("suppressed"):
-            print(
-                "::warning::perf gate: %s regressed %+.1f%% (over its "
-                "%.4g%% limit) but within the noise band (+-%.1f%%); "
-                "reported, not gated"
-                % (
-                    row["name"],
-                    row["delta_pct"],
-                    row["entry"].get("gate_pct") or 0.0,
-                    row.get("noise_pct") or 0.0,
-                )
-            )
+    for warning in _suppressed_warnings(rows):
+        print(warning)
     for name in budget_unmeasured:
         print(
             "::warning::perf budget: %s has an absolute budget but was not "

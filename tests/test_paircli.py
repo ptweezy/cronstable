@@ -33,6 +33,7 @@ from cronstable import (
     qr,
     webclient,
 )
+from tests._helpers import LoopbackHTTPServer
 from tests.test_netutil import (
     _lenient_getaddrinfo,
     _socket_layer,
@@ -1329,7 +1330,7 @@ def _listening(handler):
         def log_message(self, *args):
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Quiet)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), _Quiet)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

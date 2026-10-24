@@ -635,8 +635,10 @@ def test_approve_token_decides_a_gate_but_cannot_act(browser, tmp_path):
 
 def test_full_token_shows_gate_decisions_and_pair_warning(browser, tmp_path):
     daemon, _ = _gate_daemon(tmp_path, "scoped")
+    # the pairing panel draws a code only on a page that is not loopback
+    url = e2e.lan_url(daemon.url)
     try:
-        with e2e.open_page(browser, daemon.url, token=e2e.FULL_TOKEN) as page:
+        with e2e.open_page(browser, url, token=e2e.FULL_TOKEN) as page:
             _open_gate(page)
             assert page.query_selector("#dgTasks [data-approve='gate']")
             assert page.query_selector("#dgTasks [data-reject='gate']")
@@ -650,7 +652,7 @@ def test_full_token_shows_gate_decisions_and_pair_warning(browser, tmp_path):
                 "document.getElementById('pairWarn').style.display === ''"
             )
             assert not _shown(page, "pairHint")
-        with e2e.open_page(browser, daemon.url, token=e2e.VIEW_TOKEN) as page:
+        with e2e.open_page(browser, url, token=e2e.VIEW_TOKEN) as page:
             page.faults.record()
             _click(page, "#settingsBtn")
             _click(page, "#openPair")
@@ -668,7 +670,7 @@ def test_full_token_shows_gate_decisions_and_pair_warning(browser, tmp_path):
 def test_public_view_reads_without_a_token_and_says_so(browser, tmp_path):
     with e2e.Daemon(tmp_path, auth="public") as daemon:
         daemon.run_and_wait("beta-fail", e2e.FULL_TOKEN)
-        with e2e.open_page(browser, daemon.url) as page:
+        with e2e.open_page(browser, e2e.lan_url(daemon.url)) as page:
             requests = page.faults.record()
             assert page.inner_text("#authLabel") == "view only"
             assert page.evaluate(
@@ -752,7 +754,10 @@ def test_changing_the_token_leaves_no_copy_in_the_page(
     """Clear and Save rebuild or blank every value derived from the token."""
     with e2e.Daemon(tmp_path, auth="public") as daemon:
         with e2e.open_page(
-            browser, daemon.url, token=e2e.FULL_TOKEN, prefs={"week": True}
+            browser,
+            e2e.lan_url(daemon.url),
+            token=e2e.FULL_TOKEN,
+            prefs={"week": True},
         ) as page:
             page.wait_for_function(
                 "(t) => document.getElementById('icsLink')"

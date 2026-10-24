@@ -778,7 +778,7 @@ def verdict_info(
             sub += " within %ds" % max(1, round(corr["span"] / 1000))
         sub += " — may share a cause"
     else:
-        sub = "no matching failure details found"
+        sub = "no two share an exit code and reason"
     return ({"sev": "crit", "glyph": "▲", "head": head, "sub": sub}, incident)
 
 
@@ -4888,6 +4888,9 @@ class AppActions(App):
             self.open("token")
             self.focus = "token"
             return False
+        except asyncio.TimeoutError:
+            self.toast("fail", "start %s: no answer from the daemon" % name)
+            return False
         except Exception as exc:  # noqa: BLE001 - toast + carry on
             self.toast("fail", "start %s: %s" % (name, exc))
             return False
@@ -8864,9 +8867,8 @@ class AppDrawers(AppOverlays):
         if tail.error:
             suffix.append(paint.style("  ⚠ %s" % tail.error, "fail"))
         elif tail.ended == "no-output":
-            suffix.append(
-                paint.style("  ── end of run output (no-output) ──", "dim")
-            )
+            # the job has no running instance and no recorded run
+            suffix.append(paint.style("  ── no run recorded yet ──", "dim"))
         if wrap:
             rows.extend(
                 self._wrapped_window(
@@ -9133,7 +9135,8 @@ class AppDrawers(AppOverlays):
             if dur is not None and top:
                 filled = max(1, int((dur / top) * bar_w))
                 bar = "▪" * filled
-            started = run.get("started_at")
+            # a skipped slot never started, so it shows its due time
+            started = run.get("started_at") or run.get("finished_at")
             stamp = ""
             t = parse_iso(started)
             if t is not None:
@@ -9153,6 +9156,9 @@ class AppDrawers(AppOverlays):
                 exit_code = run.get("exit_code")
                 detail = " exit %s" % ("?" if exit_code is None else exit_code)
                 reason = run.get("fail_reason")
+            elif outcome == "skipped":
+                detail = " skipped"
+                reason = run.get("skip_reason")
             for mark in marks[1:]:
                 detail += " · %s" % mark
             if reason:

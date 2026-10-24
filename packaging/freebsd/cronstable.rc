@@ -12,11 +12,15 @@
 #
 # Knobs, all settable in /etc/rc.conf:
 #
-#     cronstable_enable     NO by default; the package never starts anything
+#     cronstable_enable     NO by default, so installing starts nothing
 #     cronstable_config     -c argument, default /usr/local/etc/cronstable.d
-#     cronstable_user       account the daemon runs as, default cronstable
+#     cronstable_runas      account the daemon runs as, default cronstable
 #     cronstable_statedir   durable store, default /var/db/cronstable
-#     cronstable_flags      extra arguments appended to the command line
+#     cronstable_args       extra arguments for cronstable
+#
+# rc.subr acts on the _user and _flags suffixes itself: it runs daemon(8)
+# through su(1) and passes the flags to daemon(8), so start warns when either
+# is set. Apart from _enable, no knob here uses a suffix that rc.subr reads.
 
 . /etc/rc.subr
 
@@ -28,7 +32,7 @@ load_rc_config $name
 
 : ${cronstable_enable:="NO"}
 : ${cronstable_config:="/usr/local/etc/cronstable.d"}
-: ${cronstable_user:="cronstable"}
+: ${cronstable_runas:="cronstable"}
 : ${cronstable_statedir:="/var/db/cronstable"}
 
 # cronstable runs in the foreground, so daemon(8) does the backgrounding, the
@@ -44,8 +48,8 @@ cpidfile="/var/run/${name}-child.pid"
 command="/usr/sbin/daemon"
 procname="/usr/sbin/daemon"
 command_args="-P ${pidfile} -p ${cpidfile} -r -f -S -T ${name} \
-	-u ${cronstable_user} /usr/local/bin/cronstable \
-	-c ${cronstable_config} ${cronstable_flags}"
+	-u ${cronstable_runas} /usr/local/bin/cronstable \
+	-c ${cronstable_config} ${cronstable_args}"
 
 start_precmd="cronstable_precmd"
 
@@ -55,9 +59,22 @@ start_precmd="cronstable_precmd"
 extra_commands="reload"
 reload_cmd="cronstable_reload"
 
+# The state directory takes the account's primary group: a group named after
+# the account need not exist, and root's is wheel.
 cronstable_precmd()
 {
-	install -d -o "${cronstable_user}" -g "${cronstable_user}" -m 0750 \
+	local _group
+
+	if [ -n "${cronstable_user}" ]; then
+		warn "rc.subr runs daemon(8) as cronstable_user;" \
+		    "unset it and set cronstable_runas"
+	fi
+	if [ -n "${cronstable_flags}" ]; then
+		warn "rc.subr passes cronstable_flags to daemon(8);" \
+		    "unset it and set cronstable_args"
+	fi
+	_group=$(id -gn "${cronstable_runas}") || return 1
+	install -d -o "${cronstable_runas}" -g "${_group}" -m 0750 \
 		"${cronstable_statedir}"
 }
 

@@ -1,5 +1,130 @@
 # History
 
+## 1.2.72
+
+- The push reporter gives each alert a `flapId` beside its `collapseId`, so
+  a relay can suppress a job that fails on every run. A `collapseId` names
+  one run. A `flapId` names the source that keeps alerting: a job's
+  failures or its successes on one node, one SLA check of a job on one
+  node, or one DAG or node event. A cluster node goes by its `nodeName` and
+  a standalone daemon by its hostname, so nodes built from one image keep
+  separate ids as long as their `nodeName`s differ. Test alerts and
+  `approval_waiting` events carry no `flapId`, because each of them has to
+  arrive. The id is a keyed hash under the same per-installation salt as
+  the `collapseId`, so the relay learns that two alerts share a source but
+  not what the source is. A relay that predates the field ignores it.
+- Through the hosted relay, a job that fails on every run pages six times
+  within 30 minutes, then sends one reminder every 30 minutes until it has
+  been quiet for 2 hours. The relay deduplicates one alert that several
+  nodes report by its `collapseId`.
+- `docs/relay-protocol.md` specifies flap identity and how the hosted relay
+  handles a flood. An envelope over a device's rate limit gets a 2xx
+  `digested` answer and folds into a burst digest, sent at most every 5
+  minutes. Daemon events draw from a rate bucket of their own, so job
+  alerts can't hold back an approval gate. The hosted relay answers 429
+  only from its edge limiter (6000 POSTs a minute from one IPv4 address or
+  IPv6 /64, shared by every daemon behind that address) and when APNs
+  throttles the device. It retries a transient APNs failure once and
+  spends at most 8 seconds on a send, inside the default 10-second
+  `push.relay.timeout`. The document also covers the app's subscription
+  proof: its 16-day grace, refunds and revocations, and where and how often
+  the app sends it.
+
+## 1.2.71
+
+- A manual start of a deferred `@reboot` job that arrives while the
+  scheduler is launching another deferred `@reboot` job leaves the daemon
+  running. The manual start counts as that job's boot run, and the scheduler
+  doesn't run the job again.
+- The FreeBSD package's `rc.d` script starts the service. In `/etc/rc.conf`,
+  `cronstable_runas` sets its account (whose primary group owns the state
+  directory) and `cronstable_args` adds `cronstable` arguments; `start` warns
+  while `cronstable_user` or `cronstable_flags` is set. An upgrade restarts a
+  running service once its running jobs finish. An upgrade from 1.2.70 or
+  earlier stops it, and the package reminds you to start an enabled, stopped
+  service.
+- A mail report with `starttls: true` upgrades the connection with STARTTLS
+  and fails when the server doesn't offer it. With `tls` and `starttls` both
+  `false` (the default), mail and its login go unencrypted even when the
+  server offers STARTTLS, and the config load warns about such a login to
+  any host but `localhost` or a loopback address. A mail block with `to` and
+  `from` that sets both, directly or through `defaults:`, is a config error.
+- When the system hostname contains a dot, a mail report's `EHLO` greeting
+  gives that name as is and skips the DNS lookup, so a host that can't
+  resolve its own name still sends its reports within the 60-second limit.
+  For a hostname without a dot, the greeting carries the name that Python's
+  `socket.getfqdn()` finds.
+- Secret redaction finds JWTs in time proportional to a line's length, so the
+  daemon keeps scheduling and serving requests while it archives an output
+  line made of many hyphen-joined `eyJ` runs. With `redactArchivedSecrets`
+  on (the default), an archived line longer than 1,048,576 characters (1 MiB
+  of ASCII text) is stored as `***REDACTED***`.
+- An included file changes only the defaults that its own `defaults:` block
+  or the files it includes set, and the other defaults of earlier includes
+  stay in effect. A jobs-only YAML file or a classic crontab changes none.
+- A daemon running from a release binary reads its modules from that binary
+  after a package upgrade replaces or deletes it, so it keeps sending reports
+  until it restarts on the new binary, including while it finishes its
+  running jobs.
+
+## 1.2.70
+
+- cronstable requires `aiohttp` 3.14.4, `sentry-sdk` 2.8.0, `tzdata` 2024.1,
+  and `psutil` 5.9.0 or newer, so it installs next to packages that hold
+  those dependencies at older releases. A comment in `pyproject.toml` gives
+  the reason for each minimum, and a new release of a dependency doesn't
+  raise it.
+- The extras require `kubernetes` 27.2.0, `uvloop` 0.19.0, `orjson` 3.11.6,
+  `isal` 1.7.0, and `zeroconf` 0.149.16 or newer. Building from source
+  requires `setuptools` 83.0.0 and `setuptools_scm` 8.0.0 or newer.
+- The Nix flake builds with the `sentry-sdk` and `tzdata` that nixpkgs ships.
+- On the gossip backend, a `PreferLeader` job whose owner stops moves to a
+  surviving node as soon as that node's own poll of the owner fails, even
+  while its peers' last reports still list the owner. For a few poll rounds
+  after a node loses its link to a peer that other nodes still reach, both
+  ends of the link can run that peer's `PreferLeader` jobs.
+- On a page opened at a loopback address, the web dashboard's Pair a device
+  panel draws no code, since a phone can't dial that address. It names any
+  listener with the page's scheme that is bound to a specific address a phone
+  can dial, and points to `cronstable pair --public-url`.
+- The web dashboard's open History tab adds each new run in place, and a
+  workflow's recovery card follows its runs until they finish. The History
+  tab of both dashboards gives `paused` as the reason for a slot that a pause
+  skipped.
+- When the daemon has recorded nothing for a job, the Logs tab of both
+  dashboards says so. The web dashboard's open Logs tab also shows a run that
+  starts and finishes between two refreshes. When failures don't correlate,
+  the verdict bar reads `no two share an exit code and reason`. A pool's
+  waiting reason reads `Needs 1 slot` for a one-slot entry, and the job
+  filter's placeholder fits beside a full toolbar.
+- An overlap that `concurrencyPolicy: Allow` permits logs at INFO, and an
+  overlap under `Forbid` or `Replace` logs a warning.
+- `web.tls.clientCa`, `cluster.tls`, the job CLI's `CRONSTABLE_STATE_CACERT`,
+  and the CLI clients' `--cacert` verify certificates in OpenSSL's strict
+  X.509 mode on every Python version, as Python 3.13 and later do by default.
+  With OpenSSL 3.0 or later, a CA certificate needs a critical
+  `basicConstraints`, a key usage, and a Subject Key Identifier, and a
+  certificate it issues needs an Authority Key Identifier. A trust file that
+  holds an intermediate CA or a single certificate trusts it directly.
+  Listener TLS lists the requirements.
+- The web, cluster, and job state API listeners log a warning with the reason
+  when a TLS handshake fails, such as a client certificate without an
+  Authority Key Identifier or a browser that rejects the listener's own
+  certificate. Each logs at most one such line a minute.
+- When `concurrencyPolicy: Forbid` starts nothing, because an instance is
+  still running or another node holds the job's cluster slot,
+  `POST /jobs/{name}/start` answers `409` with the reason, and the
+  `cron_run_job` MCP tool returns the reason as a tool error. Under
+  `onStoreUnavailable: fail-closed`, a slot store that can't be used, such as
+  one that doesn't answer within 10 seconds, gives `503`. Both dashboards show
+  the reason.
+- The `end` event of `GET /jobs/{name}/logs` carries the `started_at` of the
+  run that the stream showed.
+- The release performance check fails a timing benchmark measured in three
+  or more rounds only when the median of its rounds also exceeds the
+  benchmark's limits, so one round that runs unusually fast on the previous
+  release can't block a release.
+
 ## 1.2.69
 
 - Secret redaction treats a quoted value as ended only when whitespace, a

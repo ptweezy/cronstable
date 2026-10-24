@@ -42,7 +42,7 @@ To extend or change a pause, pause the job again. An unknown job returns `404`. 
 
 ## What a pause does
 
-- **Scheduled fires are skipped, visibly.** Each due slot gets a synthetic row in the run ledger with outcome `skipped` and `skip_reason: "paused"` (no `started_at`, no `exit_code`), so the history records a due fire that was deliberately not run, instead of a silent gap. The dashboards show these rows neutrally, and they stamp no success or failure state.
+- **Scheduled fires are skipped, visibly.** Each due slot gets a synthetic row in the run ledger with outcome `skipped` and `skip_reason: "paused"` (no `started_at`, no `exit_code`), so the history records a due fire that was deliberately not run, instead of a silent gap. The dashboards show these rows neutrally, and they stamp no success or failure state. In the History tab of both dashboards, a skipped row gives `paused` as its reason.
 - **Pending retries defer.** A pending [retry](Failure-Detection-and-Retries) waits until the job resumes, preserving its attempt number and retry budget.
 - **Catch-up skips the pause window.** [Missed-run catch-up](Durable-State) excludes slots within recorded pause windows, including daemon downtime, and covers slots after expiry. If the job is paused during boot evaluation, catch-up waits with its pre-pause watermark saved in an open checkpoint. After resume, it replays the backlog from before the pause or closes the checkpoint if nothing is owed. Disabling the job or setting `onMissed: skip` also closes the checkpoint; later catch-up starts from the run ledger.
 - **Manual start still works.** `POST /jobs/{name}/start` can launch a paused job; a disabled job returns `409`. Cancellation also remains available.

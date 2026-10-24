@@ -14,10 +14,12 @@ import ast
 import asyncio
 import datetime
 import errno
+import http.server
 import importlib.util
 import json
 import os
 import socket
+import socketserver
 import zlib
 from zoneinfo import ZoneInfo
 
@@ -419,6 +421,19 @@ def _free_port():
         if port not in _handed_out_ports:
             _handed_out_ports.add(port)
             return port
+
+
+class LoopbackHTTPServer(http.server.HTTPServer):
+    """An ``http.server.HTTPServer`` that skips the lookup of its own name.
+
+    ``HTTPServer.server_bind`` fills ``server_name``, which no test reads,
+    with ``socket.getfqdn`` of the bound address. On GitHub's macOS runners
+    the first such lookup in a process takes about 35 seconds.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def _gen_ca(cn):

@@ -1817,6 +1817,228 @@ def test_include_cycle_below_a_shared_file_is_detected(
     )
 
 
+# --- defaults merged across includes ----------------------------------------
+
+_RUNTIME_DEFAULTS = (
+    "  shell: /bin/bash\n"
+    "  timezone: Europe/Berlin\n"
+    "  concurrencyPolicy: Forbid\n"
+)
+_REPORTING_DEFAULTS = (
+    "  onFailure:\n"
+    "    retry:\n"
+    "      maximumRetries: 3\n"
+    "      initialDelay: 1\n"
+    "      maximumDelay: 30\n"
+    "      backoffMultiplier: 2\n"
+    "    report:\n"
+    "      sentry:\n"
+    "        dsn:\n"
+    "          value: https://k@e/1\n"
+    "      mail:\n"
+    "        from: a@b.com\n"
+    "        to: ops@example.com\n"
+)
+_INCLUDED_SETTINGS = {
+    "shell": "/bin/bash",
+    "timezone": "Europe/Berlin",
+    "concurrencyPolicy": "Forbid",
+    "maximumRetries": 3,
+    "dsn": "https://k@e/1",
+    "mailTo": "ops@example.com",
+}
+
+
+def _inline_settings(tmp_path, includes, extra=""):
+    """The settings the inline job of main.yaml inherits."""
+    entry = tmp_path / "main.yaml"
+    entry.write_text(
+        _job_text(
+            "inline",
+            "echo x",
+            "include:\n"
+            + "".join("  - {}\n".format(name) for name in includes)
+            + extra,
+        )
+    )
+    conf = config.parse_config(str(entry))
+    job = next(job for job in conf.jobs if job.name == "inline")
+    report = job.onFailure["report"]
+    return {
+        "shell": job.shell,
+        "timezone": str(job.timezone),
+        "concurrencyPolicy": job.concurrencyPolicy,
+        "maximumRetries": job.onFailure["retry"]["maximumRetries"],
+        "dsn": report["sentry"]["dsn"]["value"],
+        "mailTo": report["mail"]["to"],
+    }
+
+
+def _write_defaults_fragment(tmp_path):
+    (tmp_path / "_defaults.yaml").write_text(
+        "defaults:\n" + _RUNTIME_DEFAULTS + _REPORTING_DEFAULTS
+    )
+
+
+@pytest.mark.parametrize(
+    "name, text",
+    [
+        ("jobs.yaml", _job_text("other", "echo y")),
+        ("legacy.crontab", "0 0 * * * included\n"),
+    ],
+    ids=["yaml", "crontab"],
+)
+def test_include_without_defaults_keeps_earlier_included_defaults(
+    tmp_path, name, text
+):
+    _write_defaults_fragment(tmp_path)
+    (tmp_path / name).write_text(text)
+    settings = _inline_settings(tmp_path, ["_defaults.yaml", name])
+    assert settings == _INCLUDED_SETTINGS
+
+
+@pytest.mark.parametrize(
+    "includes",
+    [
+        ["_runtime.yaml", "_reporting.yaml"],
+        ["_reporting.yaml", "_runtime.yaml"],
+    ],
+    ids=["runtime-first", "reporting-first"],
+)
+def test_defaults_only_includes_merge_in_either_order(tmp_path, includes):
+    (tmp_path / "_runtime.yaml").write_text("defaults:\n" + _RUNTIME_DEFAULTS)
+    (tmp_path / "_reporting.yaml").write_text(
+        "defaults:\n" + _REPORTING_DEFAULTS
+    )
+    assert _inline_settings(tmp_path, includes) == _INCLUDED_SETTINGS
+
+
+def _write_overlapping_defaults(directory, first, second):
+    # Both set onFailure, environment, and verify; second has a bare verify:
+    (directory / first).write_text(
+        "defaults:\n"
+        "  environment:\n"
+        "    - key: FOO\n"
+        "      value: a\n"
+        "    - key: KEEP\n"
+        "      value: a\n"
+        "  verify:\n"
+        "    command: check\n" + _REPORTING_DEFAULTS
+    )
+    (directory / second).write_text(
+        "defaults:\n"
+        "  environment:\n"
+        "    - key: FOO\n"
+        "      value: b\n"
+        "    - key: BAR\n"
+        "      value: b\n"
+        "  verify:\n"
+        "  onFailure:\n"
+        "    report:\n"
+        "      mail:\n"
+        "        from: a@b.com\n"
+        "        to: oncall@example.com\n"
+    )
+
+
+def _assert_overlapping_defaults_merged(on_failure, environment, verify):
+    assert on_failure["retry"]["maximumRetries"] == 3
+    assert on_failure["report"]["sentry"]["dsn"]["value"] == "https://k@e/1"
+    assert on_failure["report"]["mail"]["to"] == "oncall@example.com"
+    assert {e["key"]: e["value"] for e in environment} == {
+        "FOO": "b",
+        "KEEP": "a",
+        "BAR": "b",
+    }
+    assert verify["command"] == "check"
+
+
+def test_sibling_include_defaults_merge_deeply(tmp_path):
+    _write_overlapping_defaults(tmp_path, "_a.yaml", "_b.yaml")
+    entry = tmp_path / "main.yaml"
+    entry.write_text(
+        _job_text("inline", "echo x", "include:\n  - _a.yaml\n  - _b.yaml\n")
+    )
+    (job,) = config.parse_config(str(entry)).jobs
+    _assert_overlapping_defaults_merged(
+        job.onFailure, job.environment, job.verify
+    )
+
+
+def test_config_dir_defaults_merge_deeply(tmp_path):
+    _write_overlapping_defaults(tmp_path, "10-a.yaml", "20-b.yaml")
+    defaults = config.parse_config(str(tmp_path)).job_defaults
+    _assert_overlapping_defaults_merged(
+        defaults["onFailure"], defaults["environment"], defaults["verify"]
+    )
+
+
+def test_own_defaults_override_included_defaults(tmp_path):
+    _write_defaults_fragment(tmp_path)
+    (tmp_path / "jobs.yaml").write_text(_job_text("other", "echo y"))
+    settings = _inline_settings(
+        tmp_path,
+        ["_defaults.yaml", "jobs.yaml"],
+        "defaults:\n"
+        "  timezone: Asia/Tokyo\n"
+        "  onFailure:\n"
+        "    report:\n"
+        "      mail:\n"
+        "        from: a@b.com\n"
+        "        to: oncall@example.com\n",
+    )
+    assert settings == dict(
+        _INCLUDED_SETTINGS, timezone="Asia/Tokyo", mailTo="oncall@example.com"
+    )
+
+
+@pytest.mark.parametrize(
+    "own, overrides",
+    [("", {}), ("defaults:\n  shell: /bin/zsh\n", {"shell": "/bin/zsh"})],
+    ids=["no-own-defaults", "own-defaults"],
+)
+def test_nested_include_defaults_reach_the_top_file(tmp_path, own, overrides):
+    # main.yaml includes a.yaml, which includes b.yaml and a crontab
+    (tmp_path / "b.yaml").write_text(
+        "defaults:\n" + _RUNTIME_DEFAULTS + _REPORTING_DEFAULTS
+    )
+    (tmp_path / "legacy.crontab").write_text("0 0 * * * included\n")
+    (tmp_path / "a.yaml").write_text(
+        "include:\n  - b.yaml\n  - legacy.crontab\n" + own
+    )
+    settings = _inline_settings(
+        tmp_path, ["a.yaml"], "defaults:\n  concurrencyPolicy: Replace\n"
+    )
+    assert settings == dict(
+        _INCLUDED_SETTINGS, concurrencyPolicy="Replace", **overrides
+    )
+
+
+def test_warm_include_tree_keeps_the_included_defaults(tmp_path, monkeypatch):
+    _small_dir_file_cache(monkeypatch)
+    (tmp_path / "_runtime.yaml").write_text("defaults:\n" + _RUNTIME_DEFAULTS)
+    (tmp_path / "a.yaml").write_text(
+        "include:\n  - _runtime.yaml\ndefaults:\n" + _REPORTING_DEFAULTS
+    )
+    (tmp_path / "jobs.yaml").write_text(_job_text("other", "echo y"))
+    includes = ["a.yaml", "jobs.yaml"]
+    assert _inline_settings(tmp_path, includes) == _INCLUDED_SETTINGS
+
+    parsed = _record_file_parses(monkeypatch)
+    assert _inline_settings(tmp_path, includes) == _INCLUDED_SETTINGS
+    assert parsed == ["main.yaml"]
+
+
+def test_config_dir_defaults_keep_earlier_files_defaults(tmp_path):
+    (tmp_path / "10-defaults.yaml").write_text(
+        "defaults:\n" + _RUNTIME_DEFAULTS
+    )
+    (tmp_path / "20-jobs.yaml").write_text(_job_text("other", "echo y"))
+    job_defaults = config.parse_config(str(tmp_path)).job_defaults
+    assert job_defaults["shell"] == "/bin/bash"
+    assert job_defaults["concurrencyPolicy"] == "Forbid"
+
+
 def test_environ_file_utf8(tmp_path):
     # env files are decoded as UTF-8 regardless of the system locale.
     env = tmp_path / "vars.env"
@@ -4562,6 +4784,426 @@ def test_onlate_with_no_reporter_configured_needs_no_sla():
         "          to:\n"
     )
     assert job.sla["lateAfterSeconds"] is None
+
+
+# --- mail tls and starttls ---------------------------------------------------
+
+_MAIL_SENDER = "          from: a@b.com\n          to: c@d.com\n"
+
+
+@pytest.mark.parametrize(
+    "hook", ["onFailure", "onPermanentFailure", "onSuccess", "onLate"]
+)
+def test_mail_tls_with_starttls_is_rejected(hook):
+    # The aiosmtplib client constructor refuses the pair, so every send fails
+    with pytest.raises(
+        ConfigError,
+        match=r"Job sla-job: {}\.report\.mail sets both tls and "
+        "starttls".format(hook),
+    ):
+        _sla_job(
+            "    sla:\n"
+            "      maxRuntimeSeconds: 600\n"
+            "    {}:\n"
+            "      report:\n"
+            "        mail:\n".format(hook)
+            + _MAIL_SENDER
+            + "          tls: true\n"
+            "          starttls: true\n"
+        )
+
+
+def _mail_job_over_defaults(defaults_key, job_keys):
+    return parse_config_string(
+        "defaults:\n"
+        "  onFailure:\n"
+        "    report:\n"
+        "      mail:\n"
+        "        from: a@b.com\n"
+        "        to: c@d.com\n"
+        "        {}: true\n"
+        "jobs:\n"
+        "  - name: backup\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+        "    onFailure:\n"
+        "      report:\n"
+        "        mail:\n".format(defaults_key)
+        + _MAIL_SENDER
+        + "".join("          {}\n".format(key) for key in job_keys),
+        "",
+    )
+
+
+@pytest.mark.parametrize(
+    "inherited, own", [("tls", "starttls"), ("starttls", "tls")]
+)
+def test_mail_tls_with_starttls_is_rejected_when_one_is_inherited(
+    inherited, own
+):
+    with pytest.raises(
+        ConfigError,
+        match=r"Job backup: onFailure\.report\.mail sets both tls and "
+        "starttls",
+    ):
+        _mail_job_over_defaults(inherited, ["{}: true".format(own)])
+
+
+def test_mail_job_can_switch_off_an_inherited_tls():
+    conf = _mail_job_over_defaults("tls", ["tls: false", "starttls: true"])
+    mail = conf.jobs[0].onFailure["report"]["mail"]
+    assert (mail["tls"], mail["starttls"]) == (False, True)
+
+
+@pytest.mark.parametrize(
+    "sender,recipient", [("", ""), ("a@b.com", ""), ("", "c@d.com")]
+)
+def test_mail_tls_with_starttls_is_accepted_while_mail_is_off(
+    sender, recipient
+):
+    # without both from and to the reporter never connects
+    job = _sla_job(
+        "    onFailure:\n"
+        "      report:\n"
+        "        mail:\n"
+        f"          from: {sender}\n"
+        f"          to: {recipient}\n"
+        "          tls: true\n"
+        "          starttls: true\n"
+    )
+    assert job.onFailure["report"]["mail"]["tls"] is True
+
+
+def test_mail_tls_with_starttls_is_rejected_on_dag_tasks():
+    with pytest.raises(
+        ConfigError,
+        match=r"dag 'etl': task 'load': .*onFailure\.report\.mail sets "
+        "both tls and starttls",
+    ):
+        parse_config_string(
+            "defaults:\n"
+            "  onFailure:\n"
+            "    report:\n"
+            "      mail:\n"
+            "        from: a@b.com\n"
+            "        to: c@d.com\n"
+            "        tls: true\n"
+            "dags:\n"
+            "  - name: etl\n"
+            "    tasks:\n"
+            "      - id: load\n"
+            "        command: echo hi\n"
+            "        onFailure:\n"
+            "          report:\n"
+            "            mail:\n"
+            "              from: a@b.com\n"
+            "              to: c@d.com\n"
+            "              starttls: true\n",
+            "",
+        )
+
+
+def test_mail_tls_with_starttls_is_rejected_in_notify():
+    with pytest.raises(
+        ConfigError,
+        match=r"notify\.report\.mail sets both tls and starttls",
+    ):
+        parse_config_string(
+            "notify:\n"
+            "  report:\n"
+            "    mail:\n"
+            "      from: a@b.com\n"
+            "      to: c@d.com\n"
+            "      tls: true\n"
+            "      starttls: true\n",
+            "",
+        )
+
+
+# --- mail login without tls or starttls --------------------------------------
+
+_PLAIN_LOGIN = "mail reporting sends its SMTP login unencrypted"
+
+
+def _plain_login_message(destination, username="alerts"):
+    return (
+        "{} to {} as {!r}, because tls and starttls are both false; set "
+        "starttls: true if the server offers STARTTLS".format(
+            _PLAIN_LOGIN, destination, username
+        )
+    )
+
+
+def _login_mail(pad, password="value: hunter2", **keys):
+    """A sending mail block with a login; ``keys`` override its fields.
+
+    ``password`` is the source line under ``password:``. A ``None`` key or
+    password is left out.
+    """
+    fields = {
+        "from": "a@b.com",
+        "to": "c@d.com",
+        "smtpHost": "smtp.example.com",
+        "smtpPort": "587",
+        "username": "alerts",
+    }
+    fields.update(keys)
+    text = pad + "mail:\n"
+    for key, value in fields.items():
+        if value is not None:
+            text += "{}  {}: {}\n".format(pad, key, value)
+    if password is not None:
+        text += "{0}  password:\n{0}    {1}\n".format(pad, password)
+    return text
+
+
+def _login_jobs(*mails):
+    """One job per mail block, each reporting onFailure with it."""
+    return "jobs:\n" + "".join(
+        "  - name: job{}\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+        "    onFailure:\n"
+        "      report:\n".format(index) + mail
+        for index, mail in enumerate(mails)
+    )
+
+
+def _plain_login_warnings(caplog, path):
+    """The plaintext-login warnings one parse_config of ``path`` logs."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        config.parse_config(str(path))
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith(_PLAIN_LOGIN)
+    ]
+
+
+def _plain_login_file(tmp_path, caplog, text):
+    path = tmp_path / "cronstable.yaml"
+    path.write_text(text, encoding="utf-8")
+    return _plain_login_warnings(caplog, path)
+
+
+@pytest.mark.parametrize(
+    "source, secret",
+    [
+        ("value: hunter2", "hunter2"),
+        ("fromEnvVar: SMTP_PASSWORD", "SMTP_PASSWORD"),
+        ("fromFile: /run/secrets/smtp", "/run/secrets/smtp"),
+    ],
+    ids=["value", "fromEnvVar", "fromFile"],
+)
+def test_mail_login_without_tls_warns_once_for_inherited_defaults(
+    tmp_path, caplog, source, secret
+):
+    text = (
+        "defaults:\n  onFailure:\n    report:\n"
+        + _login_mail("      ", password=source)
+        + "jobs:\n"
+        + "".join(
+            "  - name: job{}\n"
+            "    command: echo hi\n"
+            '    schedule: "* * * * *"\n'.format(index)
+            for index in range(3)
+        )
+    )
+    warnings = _plain_login_file(tmp_path, caplog, text)
+    assert warnings == [_plain_login_message("smtp.example.com:587")]
+    assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "second, destination, username",
+    [
+        ({"smtpHost": "mail2.example.com"}, "mail2.example.com:587", "alerts"),
+        ({"smtpPort": "2525"}, "smtp.example.com:2525", "alerts"),
+        ({"username": "backup"}, "smtp.example.com:587", "backup"),
+    ],
+    ids=["host", "port", "username"],
+)
+def test_mail_login_without_tls_warns_per_destination(
+    tmp_path, caplog, second, destination, username
+):
+    text = _login_jobs(
+        _login_mail("        "),
+        _login_mail("        ", **second),
+        _login_mail("        "),
+    )
+    assert _plain_login_file(tmp_path, caplog, text) == [
+        _plain_login_message("smtp.example.com:587"),
+        _plain_login_message(destination, username),
+    ]
+
+
+def test_mail_login_without_tls_compares_host_names_case_insensitively(
+    tmp_path, caplog
+):
+    text = _login_jobs(
+        _login_mail("        ", smtpHost="SMTP.Example.com"),
+        _login_mail("        ", smtpHost="smtp.example.com."),
+    )
+    assert _plain_login_file(tmp_path, caplog, text) == [
+        _plain_login_message("SMTP.Example.com:587")
+    ]
+
+
+@pytest.mark.parametrize(
+    "host, destination",
+    [
+        ("10.0.0.5", "10.0.0.5:587"),
+        ("'2001:db8::5'", "[2001:db8::5]:587"),
+        # names are never resolved, so this counts as remote
+        ("relay", "relay:587"),
+    ],
+)
+def test_mail_login_without_tls_warns_for_a_remote_host(
+    tmp_path, caplog, host, destination
+):
+    text = _login_jobs(_login_mail("        ", smtpHost=host))
+    warnings = _plain_login_file(tmp_path, caplog, text)
+    assert warnings == [_plain_login_message(destination)]
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        {"smtpHost": "localhost"},
+        {"smtpHost": "LOCALHOST"},
+        {"smtpHost": "localhost."},
+        {"smtpHost": "127.0.0.1"},
+        {"smtpHost": "127.3.4.5"},
+        {"smtpHost": "'::1'"},
+        {"smtpHost": None},
+        {"tls": "true", "smtpPort": "465"},
+        {"starttls": "true"},
+        {"username": None},
+        {"password": None},
+        {"to": ""},
+        {"from": ""},
+    ],
+    ids=[
+        "localhost",
+        "localhost-uppercase",
+        "localhost-trailing-dot",
+        "ipv4-loopback",
+        "ipv4-loopback-range",
+        "ipv6-loopback",
+        "host-unset",
+        "tls",
+        "starttls",
+        "no-username",
+        "no-password",
+        "mail-off-no-to",
+        "mail-off-no-from",
+    ],
+)
+def test_mail_login_without_tls_stays_quiet(tmp_path, caplog, keys):
+    text = _login_jobs(_login_mail("        ", **keys))
+    assert _plain_login_file(tmp_path, caplog, text) == []
+
+
+@pytest.mark.parametrize(
+    "hook", ["onFailure", "onPermanentFailure", "onSuccess", "onLate"]
+)
+def test_mail_login_without_tls_warns_for_every_report_hook(
+    tmp_path, caplog, hook
+):
+    text = (
+        "jobs:\n"
+        "  - name: job\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+        "    sla:\n"
+        "      maxRuntimeSeconds: 600\n"
+        "    {}:\n"
+        "      report:\n".format(hook) + _login_mail("        ")
+    )
+    warnings = _plain_login_file(tmp_path, caplog, text)
+    assert warnings == [_plain_login_message("smtp.example.com:587")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "state:\n"
+        "  path: /tmp/x\n"
+        "dags:\n"
+        "  - name: etl\n"
+        "    tasks:\n"
+        "      - id: load\n"
+        "        command: echo hi\n"
+        "        onFailure:\n"
+        "          report:\n" + _login_mail(" " * 12),
+        "state:\n"
+        "  path: /tmp/x\n"
+        "dags:\n"
+        "  - name: etl\n"
+        "    tasks:\n"
+        "      - id: load\n"
+        "        command: echo hi\n"
+        "        onSuccess:\n"
+        "          report:\n" + _login_mail(" " * 12),
+        "notify:\n  report:\n" + _login_mail("    "),
+    ],
+    ids=["dag-task-onFailure", "dag-task-onSuccess", "notify"],
+)
+def test_mail_login_without_tls_warns_for_dag_tasks_and_notify(
+    tmp_path, caplog, text
+):
+    warnings = _plain_login_file(tmp_path, caplog, text)
+    assert warnings == [_plain_login_message("smtp.example.com:587")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # a DAG task sends only onFailure and onSuccess reports
+        "defaults:\n"
+        "  onPermanentFailure:\n"
+        "    report:\n" + _login_mail("      ") + "state:\n"
+        "  path: /tmp/x\n"
+        "dags:\n"
+        "  - name: etl\n"
+        "    tasks:\n"
+        "      - id: load\n"
+        "        command: echo hi\n",
+        # an approval gate starts no process, so it sends no report
+        "state:\n"
+        "  path: /tmp/x\n"
+        "dags:\n"
+        "  - name: etl\n"
+        "    tasks:\n"
+        "      - id: gate\n"
+        "        type: approval\n"
+        "        onFailure:\n"
+        "          report:\n" + _login_mail(" " * 12),
+    ],
+    ids=["dag-task-onPermanentFailure", "approval-gate"],
+)
+def test_mail_login_without_tls_skips_reports_a_dag_never_sends(
+    tmp_path, caplog, text
+):
+    assert _plain_login_file(tmp_path, caplog, text) == []
+
+
+@pytest.mark.parametrize("layout", ["config-dir", "include"])
+def test_mail_login_without_tls_warns_once_per_load(tmp_path, caplog, layout):
+    defaults = "defaults:\n  onFailure:\n    report:\n" + _login_mail("      ")
+    include = "include:\n  - 10-a.yaml\n" if layout == "include" else ""
+    (tmp_path / "10-a.yaml").write_text(
+        _job_text("a", "echo hi", defaults), encoding="utf-8"
+    )
+    (tmp_path / "20-b.yaml").write_text(
+        _job_text("b", "echo hi", include + defaults), encoding="utf-8"
+    )
+    path = tmp_path / "20-b.yaml" if include else tmp_path
+    expected = [_plain_login_message("smtp.example.com:587")]
+    assert _plain_login_warnings(caplog, path) == expected
+    # a reload parses again and warns once more
+    assert _plain_login_warnings(caplog, path) == expected
 
 
 # --- ${ENV} interpolation over the validated config document -----------------
