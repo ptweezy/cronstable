@@ -105,6 +105,8 @@ from cronstable.config import (
 )
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (
+    PRESSURE_DEFAULT_HOURS,
+    PRESSURE_MAX_HOURS,
     ScheduleEntry,
     describe_cron,
     duplicate_schedules,
@@ -372,6 +374,12 @@ PAUSE_DEFAULT_SECONDS = 3600
 PAUSE_MAX_SECONDS = 2592000
 PAUSE_NOTE_MAX = 500
 PAUSE_BY_MAX = 100
+# Recovery request caps: tasks listed per request, and the plan token's
+# length (a SHA-256 hex digest).
+RECOVERY_TASKS_MAX = 2000
+PLAN_TOKEN_LENGTH = 64
+# Most upcoming runs a schedule preview lists per request.
+PREVIEW_COUNT_MAX = 60
 # Durable pause stream, newest wins; expiry is reader-enforced (see
 # _pause_active) and every node sharing the store honors a pause.
 PAUSE_STREAM_PREFIX = "paused/"
@@ -526,7 +534,7 @@ WEB_ROUTES: "tuple[tuple[str, str, str, str | None], ...]" = (
         "_web_dag_decision",
         None,
     ),
-    # durable state inspector (metadata-only)
+    # durable state inspector (KV values redacted, records in full)
     ("GET", "/state", "_web_state", None),
     ("GET", "/state/documents", "_web_state_documents", None),
     ("GET", "/state/records", "_web_state_records", None),
@@ -4586,7 +4594,12 @@ class Cron:
                 {"error": tz_error}, status=400, headers=headers
             )
         count = self._web_int_query(
-            request, "limit", default=12, lo=1, hi=60, alias="count"
+            request,
+            "limit",
+            default=12,
+            lo=1,
+            hi=PREVIEW_COUNT_MAX,
+            alias="count",
         )
         payload = self.schedule_preview_payload(
             expr, tz, count, request.query.get("seed")
@@ -4782,7 +4795,7 @@ class Cron:
 
     def schedule_pressure_payload(
         self,
-        hours: int = 24,
+        hours: int = PRESSURE_DEFAULT_HOURS,
         tz_name: str | None = None,
         entries: list[ScheduleEntry] | None = None,
     ) -> dict[str, Any]:
@@ -4871,7 +4884,9 @@ class Cron:
         )
 
     async def schedule_pressure_payload_async(
-        self, hours: int = 24, tz_name: str | None = None
+        self,
+        hours: int = PRESSURE_DEFAULT_HOURS,
+        tz_name: str | None = None,
     ) -> dict[str, Any]:
         """Executor-offloaded :meth:`schedule_pressure_payload`."""
         return await self._schedule_payload_offload(
@@ -4896,7 +4911,13 @@ class Cron:
         self, request: web.Request
     ) -> web.Response:
         headers = self._web_headers()
-        hours = self._web_int_query(request, "hours", default=24, lo=1, hi=168)
+        hours = self._web_int_query(
+            request,
+            "hours",
+            default=PRESSURE_DEFAULT_HOURS,
+            lo=1,
+            hi=PRESSURE_MAX_HOURS,
+        )
         tz = request.query.get("tz") or None
         # Validate up front and answer 400 from the requested name, so the
         # builder's exception text never reaches the response body.
@@ -6798,7 +6819,7 @@ class Cron:
             )
         return _json_response(result, headers=self._web_headers())
 
-    # --- durable state inspector (metadata-only) --------------------------
+    # --- durable state inspector -------------------------------------------
 
     async def _web_state(self, request: web.Request) -> web.Response:
         return _json_response(
@@ -6868,7 +6889,7 @@ class Cron:
         """Documents of one KV/cursor/idempotency namespace, redacted.
 
         KV values are stripped to a ``valueSize``/``valueType`` summary
-        (metadata-only stance); cursor watermarks and idempotency claim
+        (a KV value is job data); cursor watermarks and idempotency claim
         metadata are returned verbatim (no user secret there).  Behind
         ``GET /state/documents`` and MCP ``cron_inspect_state``.  Raises
         :class:`ApiActionError` when there is no store or ``ns`` is not an
@@ -6921,10 +6942,12 @@ class Cron:
     async def state_records_payload(
         self, stream: str, limit: int = 100
     ) -> dict[str, Any]:
-        """Newest records of one stream, metadata-only.
+        """Newest records of one stream, each its full stored body.
 
+        A ``runs/`` record carries what ``GET /jobs/{name}/runs`` and
+        ``GET /jobs/{name}/resources`` already serve to the ``view`` scope.
         Archived-output (``logs/``) streams are refused: they carry raw job
-        output, which the metadata-only stance keeps off this surface.  Behind
+        output, which this surface never returns.  Behind
         ``GET /state/records`` and MCP ``cron_inspect_state``.  Raises
         :class:`ApiActionError` for a missing store, empty stream, or a log
         stream.
@@ -6935,8 +6958,7 @@ class Cron:
         if not stream:
             raise ApiActionError("a stream is required", status=400)
         if stream.startswith("logs/") or stream == "logs":
-            # archived job output: raw content, excluded from the metadata
-            # inspector on purpose.
+            # archived job output: raw content, excluded on purpose.
             raise ApiActionError(
                 "log streams carry raw output and are not inspectable",
                 status=403,
@@ -7082,13 +7104,16 @@ class Cron:
         if (
             not isinstance(mode, str)
             or not isinstance(tasks, list)
-            or len(tasks) > 2000
+            or len(tasks) > RECOVERY_TASKS_MAX
             or any(not isinstance(t, str) for t in tasks)
             or not isinstance(dry_run, bool)
             or not isinstance(allow_change, bool)
             or (
                 not dry_run
-                and (not isinstance(token, str) or len(token) != 64)
+                and (
+                    not isinstance(token, str)
+                    or len(token) != PLAN_TOKEN_LENGTH
+                )
             )
         ):
             raise _api_error(web.HTTPBadRequest, "invalid recovery request")
@@ -7129,7 +7154,10 @@ class Cron:
             or not isinstance(allow_change, bool)
             or (
                 not dry_run
-                and (not isinstance(token, str) or len(token) != 64)
+                and (
+                    not isinstance(token, str)
+                    or len(token) != PLAN_TOKEN_LENGTH
+                )
             )
         ):
             raise _api_error(
@@ -7759,22 +7787,18 @@ class Cron:
             return running[-1]
         return self.last_run.get(name)
 
-    def _job_output(self, name: str) -> JobOutputStream | None:
-        run = self._job_tail_run(name)
-        return run.output if run is not None else None
-
-    def _dag_task_output(
+    def _dag_task_run(
         self, dag_name: str, run_key: str, taskkey: str
-    ) -> JobOutputStream | None:
-        """The live output stream of a DAG task instance, or ``None``.
+    ) -> "RunningJob | None":
+        """The running instance of a DAG task, or ``None``.
 
         A DAG task runs as a :class:`RunningJob` under the template name
         ``<dag>.<task_id>`` (its instances share that key), so locate the one
         whose ``dag_ref`` matches this run + instance key.  Only a *currently
-        running* instance has a reachable buffer: a finished DAG task's
-        output is not retained under the template name (its completion routes
-        to the DAG driver, not the per-job last_run), so this returns ``None``
-        once the task is done.
+        running* instance is reachable: a finished DAG task's output is not
+        retained under the template name (its completion routes to the DAG
+        driver, not the per-job last_run), so this returns ``None`` once the
+        task is done.
         """
         # the base task id: a mapped instance key is ``id#<index>``.
         task_id = taskkey.split("#", 1)[0]
@@ -7786,8 +7810,15 @@ class Cron:
                 and dref.run_key == run_key
                 and dref.taskkey == taskkey
             ):
-                return running.output
+                return running
         return None
+
+    def _dag_task_output(
+        self, dag_name: str, run_key: str, taskkey: str
+    ) -> JobOutputStream | None:
+        """The live output stream of a DAG task instance, or ``None``."""
+        running = self._dag_task_run(dag_name, run_key, taskkey)
+        return running.output if running is not None else None
 
     def _web_protocol(self) -> asyncio.BaseProtocol:
         """The current runner's protocol for a held listener's connection."""
@@ -7919,33 +7950,56 @@ class Cron:
         The non-streaming counterpart of :meth:`_pump_output`, backing the MCP
         log-tail tools (a client polls with the returned ``cursor`` to fetch
         only newly appended lines).  Without a ``cursor`` returns the last
-        ``tail`` lines; with one, the lines after that offset (capped at
-        ``tail``).  ``cursor`` is a line offset into the bounded in-memory
-        buffer, so after the buffer rotates it can only ever skip forward,
-        never resurrect dropped lines.
+        ``tail`` lines; with one, the lines after it (capped at ``tail``).
+
+        ``cursor`` is an absolute line number in the run's output (the
+        stream's ``published`` count), not a slot in the bounded ring, so it
+        keeps advancing after the ring fills.  ``skipped`` counts the lines
+        after the cursor that the ring dropped before this poll.  A cursor
+        past everything the stream has published came from another run, or
+        from a run whose stream is gone (an ended DAG task, or a run
+        rehydrated after a restart): ``reset`` is set and the page starts at
+        the oldest retained line.
         """
         # `lines` aliases the live ring: safe only on the event loop, where
         # the len and the islice run with nothing rotating between them
         lines = output.lines if output is not None else ()
-        total = len(lines)
+        end = output.published if output is not None else 0
+        # the absolute number of the oldest retained line
+        first = end - len(lines)
+        skipped = 0
+        reset = False
         if cursor is None:
-            start = max(0, total - tail)
+            start = max(first, end - tail)
+        elif cursor > end:
+            start, reset = first, True
         else:
-            start = min(max(cursor, 0), total)
-        stop = min(start + max(tail, 0), total)
+            cursor = max(cursor, 0)
+            start = max(cursor, first)
+            skipped = start - cursor
+        stop = min(start + max(tail, 0), end)
         # older retained lines exist above what we returned (only
         # meaningful on a cursor-less "give me the tail" call).
-        truncated = cursor is None and start > 0
-        if stop <= start:
-            return {"lines": [], "cursor": start, "truncated": truncated}
+        truncated = cursor is None and start > first
+        page = (
+            itertools.islice(lines, start - first, stop - first)
+            if stop > start
+            else ()
+        )
         return {
             "lines": [
-                {"stream": stream, "line": line}
-                for stream, line in itertools.islice(lines, start, stop)
+                {"stream": stream, "line": line} for stream, line in page
             ],
-            "cursor": stop,
+            "cursor": max(start, stop),
             "truncated": truncated,
+            "skipped": skipped,
+            "reset": reset,
         }
+
+    @staticmethod
+    def _started_iso(run: Any) -> str | None:
+        started = getattr(run, "started_at", None)
+        return started.isoformat() if started is not None else None
 
     def job_logs_tail_payload(
         self, name: str, tail: int = 100, cursor: int | None = None
@@ -7953,13 +8007,18 @@ class Cron:
         """Last retained log lines of a job, or ``None`` if unknown.
 
         Behind MCP ``cron_tail_job_logs``, the poll/cursor projection of the
-        SSE stream at ``GET /jobs/{name}/logs``.
+        SSE stream at ``GET /jobs/{name}/logs``.  ``started_at`` names the
+        run the lines belong to, so a poller can see the page switch to
+        another run, newer or older.
         """
         if name not in self.cron_jobs:
             return None
-        payload = self._tail_payload(self._job_output(name), tail, cursor)
+        run = self._job_tail_run(name)
+        output = run.output if run is not None else None
+        payload = self._tail_payload(output, tail, cursor)
         payload["name"] = name
         payload["running"] = bool(self.running_jobs.get(name))
+        payload["started_at"] = self._started_iso(run)
         return payload
 
     def dag_task_logs_tail_payload(
@@ -7974,15 +8033,20 @@ class Cron:
 
         Behind MCP ``cron_tail_dag_task_logs``.  Only a currently-running
         instance has a reachable buffer (a finished task's output is not
-        retained under the template name), so ``lines`` is empty once it ends.
+        retained under the template name), so ``lines`` is empty and
+        ``running`` false after it ends.  ``started_at`` is when that running
+        instance started.
         """
         if dag not in self.cron_dags:
             return None
-        output = self._dag_task_output(dag, run_key, taskkey)
+        running = self._dag_task_run(dag, run_key, taskkey)
+        output = running.output if running is not None else None
         payload = self._tail_payload(output, tail, cursor)
         payload["dag"] = dag
         payload["run_key"] = run_key
         payload["taskkey"] = taskkey
+        payload["running"] = running is not None
+        payload["started_at"] = self._started_iso(running)
         return payload
 
     async def _web_job_logs(self, request: web.Request) -> web.StreamResponse:

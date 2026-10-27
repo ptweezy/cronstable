@@ -261,6 +261,19 @@ def _parse_str_list(
     return out
 
 
+# The signed 64-bit range. A generated client decodes a JSON integer into a
+# 64-bit integer and discards the whole /cluster or /fleet answer when one
+# value falls outside it, so a peer's integer outside this range counts as
+# malformed.
+_WIRE_INT_MIN = -(2**63)
+_WIRE_INT_MAX = 2**63 - 1
+
+
+def _wire_int(value: int) -> bool:
+    """Whether ``value`` fits the signed 64-bit range (see _WIRE_INT_MAX)."""
+    return _WIRE_INT_MIN <= value <= _WIRE_INT_MAX
+
+
 def _finite_number(value: Any) -> float | None:
     """An untrusted JSON value as a finite float, else ``None``.
 
@@ -335,6 +348,7 @@ def _parse_job_summaries(raw: Any) -> dict[str, dict[str, Any]] | None:
                         exit_code
                         if isinstance(exit_code, int)
                         and not isinstance(exit_code, bool)
+                        and _wire_int(exit_code)
                         else None
                     ),
                 }
@@ -391,8 +405,15 @@ def _parse_node_stats(raw: Any) -> dict[str, Any] | None:
         if value is None:
             continue
         # cpu_count is a whole number of cores; keep it integral so the fleet
-        # JSON reads naturally. The rest stay floats.
-        out[field] = int(value) if field == "cpu_count" else value
+        # JSON reads naturally, and drop a count outside the 64-bit range.
+        # The rest stay floats.
+        if field == "cpu_count":
+            count = int(value)
+            if not _wire_int(count):
+                continue
+            out[field] = count
+        else:
+            out[field] = value
     return out or None
 
 
@@ -2046,12 +2067,15 @@ class ClusterManager(LeadershipBackend):
         # version-skew residual.
         size = data.get("cluster_size")
         if size is not None and (
-            not isinstance(size, int) or isinstance(size, bool) or size < 1
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 1
+            or not _wire_int(size)
         ):
             self.view.record_failure(
                 host,
                 "malformed /peer response: cluster_size is not a positive "
-                "integer",
+                "64-bit integer",
                 untrusted=False,
             )
             return

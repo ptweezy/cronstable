@@ -1367,10 +1367,11 @@ configured.
 
 ### State inspector endpoints
 
-Three **metadata-only** routes feed the dashboard's
-[durable state](Durable-State) inspector: record payloads, KV values, and
-archived output never cross this surface. All are token-gated like the job
-endpoints.
+Three routes feed the dashboard's [durable state](Durable-State) inspector.
+`GET /state` returns inventory metadata, `GET /state/documents` returns
+documents with KV values redacted, and `GET /state/records` returns full
+record bodies. Archived output never crosses this surface. All three are
+token-gated like the job endpoints and need only the `view` scope.
 
 #### `GET /state`
 
@@ -1391,11 +1392,16 @@ stateless install, this route (and `/state/records`) returns `404`
 
 #### `GET /state/records?stream=<stream>&limit=<n>`
 
-The newest records of one stream, newest first (default 100, max 500).
-Archived-output `logs/` streams are refused with `403`: they carry raw job
-output, which the metadata-only stance keeps off this surface. A missing or
-empty `stream` parameter is a `400`; a stateless install is a `404`
-(`state store is not configured`), as for `/state/documents`.
+The newest records of one stream, newest first (default 100, max 500). Each
+record is its full stored body: a `runs/<job>` record carries the run's
+verification output and chart series, the same data that
+[`GET /jobs/{name}/runs`](#get-jobsnameruns) and
+[`GET /jobs/{name}/resources`](#get-jobsnameresources) serve to the `view`
+scope, and an `artifacts/` record carries its `meta`. Archived-output `logs/`
+streams, and `logs` itself, are refused with `403`, because they carry raw
+job output. A missing or empty `stream` parameter is a `400`; a stateless
+install is a `404` (`state store is not configured`), as for
+`/state/documents`.
 
 ### `GET /whoami`
 

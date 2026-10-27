@@ -6,19 +6,26 @@ openapi: 3.0.3
 # This is the machine-readable contract for the aiohttp control API cronstable
 # serves when a `web:` section is configured (see the Web Dashboard and the
 # HTTP-API wiki page). It is the source a generated client (e.g. the iOS app,
-# via swift-openapi-generator) is built from. Two checks keep it honest:
+# via swift-openapi-generator) is built from. Three checks keep it honest:
 # .github/scripts/check_openapi.py (structure: schema validity, refs,
-# path/parameter agreement, duplicate path keys) and tests/test_openapi.py
+# path/parameter agreement, duplicate path keys), tests/test_openapi.py
 # (drift: every path+method here must match cronstable.cron.WEB_ROUTES, the
-# table the aiohttp app is built from, in both directions).
+# table the aiohttp app is built from, in both directions), and
+# tests/test_openapi_payload_keys.py (fields: every key the payload builders
+# emit, nested objects included, is a declared property of its schema).
 #
 # It documents the *shape* of every endpoint: its path, method, parameters,
-# auth, and the top-level fields of each response. Rich nested payloads that
-# move quickly with the code (resource series, DAG run documents, cluster
-# views) are typed at the top level and left open (additionalProperties) below
-# that, so the contract stays a brake on breaking changes without becoming a
-# second copy of the code that rots. The prose reference for every field lives
-# on the wiki HTTP-API page.
+# auth, and the fields of each response. A newer daemon's extra key or value
+# never breaks a generated client: no response object sets
+# `additionalProperties: false`, and a response vocabulary that can grow is
+# either an `anyOf` of its known values and a bare string, or a plain string
+# whose description lists the known values. A generated client discards a
+# whole response when one value fails to decode, so a type here is never
+# stricter than every value the builder can emit: `number` for anything that
+# can carry a fraction, and `format: date-time` only where the value is
+# always an ISO 8601 string. Payloads whose shape the writer chooses (state
+# records, fan-out items, cursor values) stay untyped. The wiki HTTP-API page
+# holds the prose reference for the routes it covers.
 # ---------------------------------------------------------------------------
 
 info:
@@ -83,7 +90,9 @@ tags:
   - name: badges
     description: SVG status badges to embed in a README, a wiki, or a dashboard.
   - name: state
-    description: Durable-state inspector (metadata only).
+    description: >-
+      Durable-state inspector: store inventory, documents with KV values
+      redacted, and full record bodies (archived output excluded).
   - name: push
     description: End-to-end encrypted push alerts and device pairing.
   - name: daemon
@@ -358,7 +367,12 @@ paths:
                     allOf: [{ $ref: "#/components/schemas/ResourceLimits" }]
                     nullable: true
                     description: The job's `resourceLimits`, or null.
-                  live: { type: array, items: { type: object, additionalProperties: true } }
+                  live:
+                    type: array
+                    description: >-
+                      One entry per running instance that is monitored and
+                      has a sample or a series point.
+                    items: { $ref: "#/components/schemas/LiveRunResources" }
                   runs:
                     type: array
                     description: >-
@@ -366,7 +380,7 @@ paths:
                       or capped (the `JobRun` shape with its chart series).
                       `resources` is null for a capped run without
                       monitoring.
-                    items: { type: object, additionalProperties: true }
+                    items: { $ref: "#/components/schemas/JobRun" }
                 additionalProperties: true
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -688,7 +702,7 @@ paths:
           description: The XCom entries the run's tasks published.
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/DagXcomPage" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           description: >-
@@ -917,7 +931,11 @@ paths:
                 by: { type: string }
               required: [decision]
       responses:
-        "200": { description: The decision was recorded. }
+        "200":
+          description: The decision was recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DagDecision" }
         "400":
           description: A bad decision value.
           content:
@@ -960,7 +978,7 @@ paths:
             ETag: { $ref: "#/components/headers/ETag" }
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/FleetView" }
         "304": { description: Not modified (matching `If-None-Match`). }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
@@ -1311,13 +1329,13 @@ paths:
           description: "Store health and topology (`enabled: false` when stateless)."
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/StateInventory" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /state/documents:
     get:
       tags: [state]
-      summary: State documents (metadata only)
+      summary: State documents (KV values redacted)
       operationId: getStateDocuments
       parameters:
         - name: ns
@@ -1334,7 +1352,7 @@ paths:
             `valueSize`/`valueType` summary.
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/StateDocumentsPage" }
         "400":
           description: "`ns` missing or not a `kv/`/`cursor/`/`idem/` namespace."
           content:
@@ -1350,7 +1368,7 @@ paths:
   /state/records:
     get:
       tags: [state]
-      summary: State records (metadata only)
+      summary: State records (full bodies)
       operationId: getStateRecords
       parameters:
         - name: stream
@@ -1365,10 +1383,13 @@ paths:
           schema: { type: integer, default: 100, minimum: 1, maximum: 500 }
       responses:
         "200":
-          description: "`{stream, records}` (payloads never crossed here)."
+          description: >-
+            `{stream, records}`, each record its full stored body. A `runs/`
+            record carries what `GET /jobs/{name}/runs` and
+            `GET /jobs/{name}/resources` already serve under `view`.
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/StateRecordsPage" }
         "400":
           description: "`stream` missing or empty."
           content:
@@ -1377,8 +1398,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: >-
-            `logs/` streams carry raw job output and are refused by the
-            metadata-only inspector.
+            A `logs/` stream, or `logs` itself. Archived output is raw job
+            output, which this route never returns.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1853,7 +1874,7 @@ paths:
           description: A replay preview or the new recovery run and its plan.
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/RecoveryRunResult" }
         "400":
           description: Invalid request fields.
           content:
@@ -1927,7 +1948,7 @@ paths:
           description: Plans for failed dates, or the resulting recovery run keys.
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema: { $ref: "#/components/schemas/RecoveryRangeResult" }
         "400":
           description: Invalid request fields.
           content:
@@ -2436,7 +2457,182 @@ components:
         limits:
           allOf: [{ $ref: "#/components/schemas/ResourceLimits" }]
           description: The job's `resourceLimits`; present only when set.
+        schedule_resolved:
+          type: string
+          description: >-
+            The plain crontab spelling that an `H` schedule resolves to.
+            Present only when it differs from `schedule`.
+        running_resources: { $ref: "#/components/schemas/RunningResources" }
+        retry: { $ref: "#/components/schemas/JobRetry" }
+        sla: { $ref: "#/components/schemas/JobSla" }
+        rebootPending:
+          type: boolean
+          description: >-
+            Present and true while an `@reboot` job waits for its boot run,
+            because no cluster owner existed at boot or a pause holds the
+            run.
+        concurrencyScope:
+          type: string
+          description: >-
+            An open string. The known value is `cluster`. Present only on a
+            job with `concurrencyScope: cluster`, together with `slot`.
+        slot: { $ref: "#/components/schemas/JobSlot" }
+        clusterPolicy:
+          type: string
+          description: >-
+            An open string. Known values are `Leader`, `PreferLeader`, and
+            `EveryNode`. Present only while `cluster.electLeader` is
+            configured.
+        clusterOwner:
+          type: string
+          nullable: true
+          description: >-
+            The node that owns the job under `spread` distribution. A
+            `Leader` job's owner is null while the cluster has no quorum. A
+            `PreferLeader` job's owner ignores quorum and is never null.
+            Present only under `spread`, on a job whose `clusterPolicy` is
+            not `EveryNode`.
+        priority:
+          type: string
+          description: >-
+            The job's process scheduling priority. An open string. Known
+            values are `idle`, `below-normal`, `above-normal`, and `high`.
+            Present only when the job sets a priority other than `normal`.
+            This string is a different setting from the integer queue
+            priority in `pool.priority`.
       required: [name, enabled, schedule, running]
+      additionalProperties: true
+
+    RunningResources:
+      type: object
+      description: >-
+        The live CPU and memory of a job's running instances, summed over
+        the instances that have a sample. Present only while the job runs
+        with `monitorResources` and at least one sample exists.
+      properties:
+        cpu_percent:
+          type: number
+          description: >-
+            CPU use since the previous sample, in percent of one core,
+            summed over the instances. It can exceed 100 when the instances
+            use more than one core.
+        cpu_seconds:
+          type: number
+          description: CPU time the instances have used so far, in seconds.
+        rss_bytes:
+          type: integer
+          format: int64
+          description: Current resident memory, in bytes.
+        instances:
+          type: integer
+          description: >-
+            The number of instances the sums cover. It can be lower than the
+            length of `pids`, because an instance without a sample is left
+            out.
+      required: [cpu_percent, cpu_seconds, rss_bytes, instances]
+      additionalProperties: true
+
+    JobRetry:
+      type: object
+      description: >-
+        The job's armed retry sequence. Present only after a failure armed a
+        retry, until the sequence ends.
+      properties:
+        attempt:
+          type: integer
+          description: >-
+            The number of the retry that is armed or running, starting at 1.
+        maxAttempts:
+          type: integer
+          nullable: true
+          description: >-
+            The job's `onFailure.retry.maximumRetries`: the retry budget, not
+            counting the first run. Null when the budget is unlimited.
+        nextRetryAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When the armed retry fires, as an ISO 8601 string. The value
+            stays after the retry fires, so it is in the past while that
+            retry runs.
+        delaySeconds:
+          type: number
+          nullable: true
+          description: The backoff delay before the armed retry, in seconds.
+      required: [attempt, maxAttempts, nextRetryAt, delaySeconds]
+      additionalProperties: true
+
+    JobSla:
+      type: object
+      description: >-
+        The job's SLA checks. Present only on a job that sets at least one
+        `sla` threshold.
+      properties:
+        thresholds:
+          type: object
+          description: >-
+            The configured thresholds, in seconds, keyed by their `sla`
+            setting name: `maxTimeSinceSuccessSeconds`, `lateAfterSeconds`,
+            or `maxRuntimeSeconds`. Only the thresholds that are set appear.
+          additionalProperties: { type: integer }
+        state:
+          type: string
+          description: >-
+            An open string. Known values are `ok` and `late`. The value is
+            `late` while `breaches` is not empty.
+        breaches:
+          type: array
+          description: The checks that are in breach.
+          items: { $ref: "#/components/schemas/JobSlaBreach" }
+      required: [thresholds, state, breaches]
+      additionalProperties: true
+
+    JobSlaBreach:
+      type: object
+      description: One SLA check that is in breach.
+      properties:
+        check:
+          type: string
+          description: >-
+            An open string. Known values are `maxTimeSinceSuccess`,
+            `lateAfter`, and `maxRuntime`: the threshold's setting name
+            without its `Seconds` suffix.
+        since:
+          type: string
+          format: date-time
+          description: When the breach began, as an ISO 8601 string.
+        observed_seconds:
+          type: number
+          description: >-
+            The measured value, in seconds, taken when the response is
+            built.
+        threshold_seconds:
+          type: integer
+          description: The configured threshold, in seconds.
+      required: [check, since, observed_seconds, threshold_seconds]
+      additionalProperties: true
+
+    JobSlot:
+      type: object
+      description: >-
+        This node's hold on the job's cluster concurrency slot. Present only
+        on a job with `concurrencyScope: cluster`.
+      properties:
+        held:
+          type: boolean
+          description: Whether this node holds the slot's lease.
+        holder:
+          type: string
+          nullable: true
+          description: >-
+            The lease holder, as `<host>#<process token>`, while this node
+            holds the slot. Null otherwise, so the value never names another
+            node.
+        refs:
+          type: integer
+          description: The number of this node's live instances that use the slot.
+      required: [held, holder, refs]
       additionalProperties: true
 
     ResourceLimits:
@@ -2532,11 +2728,35 @@ components:
         expiresAt: { type: number }
         position: { type: integer }
         waitingReason: { type: string }
-        reason: { type: string }
+        reason:
+          type: string
+          nullable: true
+          description: >-
+            Why the entry ended or waits, or null when its completion
+            recorded none.
         job: { type: string }
         dag: { type: string }
         runKey: { type: string }
         task: { type: string }
+        digest:
+          type: string
+          description: >-
+            The digest of the job definition that queued the entry. The
+            daemon cancels a queued job entry when the definition changes.
+        leaseUntil:
+          type: number
+          description: >-
+            When the running entry's admission lease lapses, in epoch
+            seconds. Present once the entry has been admitted.
+        finishedAt:
+          type: number
+          description: When the entry ended, in epoch seconds.
+        observed:
+          type: boolean
+          description: >-
+            Present and true once the scheduler has acknowledged the end of
+            a DAG task's entry.
+      additionalProperties: true
 
     JobPool:
       type: object
@@ -2579,6 +2799,134 @@ components:
           type: boolean
           default: false
           description: Acknowledge using the current configuration when it differs from the source run.
+
+    RecoveryPlan:
+      type: object
+      description: >-
+        What a recovery of one finished run replays and what it keeps.
+      properties:
+        sourceRunKey: { type: string }
+        sourceRunId: { type: string }
+        mode:
+          type: string
+          description: An open string. Known values are `failed` and `from`.
+        requestedTasks:
+          type: array
+          description: The task instance keys that the request named, sorted.
+          items: { type: string }
+        tasks:
+          type: array
+          description: >-
+            The task instance keys that the recovery runs again, sorted:
+            the selection plus everything downstream of it.
+          items: { type: string }
+        preserved:
+          type: array
+          description: >-
+            The task instance keys that the recovery keeps from the source
+            run, sorted.
+          items: { type: string }
+        resetMappings:
+          type: array
+          description: >-
+            The mapped tasks whose fan-out the recovery expands again,
+            sorted.
+          items: { type: string }
+        artifacts:
+          type: array
+          description: The XCom artifacts of the preserved tasks that the recovery copies.
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              sha256: { type: string }
+              size: { type: integer }
+              meta:
+                type: object
+                nullable: true
+                additionalProperties: true
+            additionalProperties: true
+        configurationRevision:
+          type: string
+          description: The digest of the DAG's current launch configuration.
+        sourceConfigurationRevision:
+          type: string
+          nullable: true
+          description: >-
+            The source run's `configurationRevision`, or null for a run
+            that records none.
+        configurationChanged:
+          type: boolean
+          description: >-
+            Whether the two revisions differ. Executing such a plan needs
+            `allowConfigChange`.
+        planToken:
+          type: string
+          description: >-
+            The 64-hex digest of the plan and its source, which an executing
+            request sends back.
+      additionalProperties: true
+
+    RecoveryRunResult:
+      description: >-
+        A recovery preview (`dryRun: true`), or the recovery run that an
+        executed plan created or found (`dryRun: false`).
+      allOf:
+        - $ref: "#/components/schemas/RecoveryPlan"
+        - type: object
+          properties:
+            dryRun: { type: boolean }
+            runKey:
+              type: string
+              description: >-
+                The recovery run's key, `recovery-<planToken>`. Present when
+                `dryRun` is false.
+            created:
+              type: boolean
+              description: >-
+                False when an earlier request already created the run.
+                Present when `dryRun` is false.
+          required: [dryRun]
+          additionalProperties: true
+
+    RecoveryRangeResult:
+      type: object
+      description: >-
+        A preview of the failed dates in a range (`dryRun: true`), or the
+        recovery runs that an executed batch created (`dryRun: false`).
+      properties:
+        dryRun: { type: boolean }
+        planToken:
+          type: string
+          description: The batch's token, which an executing request sends back.
+        dates:
+          type: integer
+          description: The number of failed dates that the batch covers, at most 100.
+        plans:
+          type: array
+          description: One plan per failed date, oldest first. Present when `dryRun` is true.
+          items: { $ref: "#/components/schemas/RecoveryPlan" }
+        from:
+          type: string
+          format: date-time
+          description: >-
+            The range's start as the daemon parsed it, read as UTC when the
+            request gave no offset. Present when `dryRun` is true.
+        to:
+          type: string
+          format: date-time
+          description: >-
+            The range's end, parsed the same way. Present when `dryRun` is
+            true.
+        runs:
+          type: array
+          description: The recovery runs' keys. Present when `dryRun` is false.
+          items: { type: string }
+        complete:
+          type: boolean
+          description: True once the batch has a run for every date. Present when `dryRun` is false.
+      required: [dryRun, planToken, dates]
+      additionalProperties: true
 
     VerificationResult:
       type: object
@@ -2631,13 +2979,96 @@ components:
         finished_at: { type: string, format: date-time, nullable: true }
         duration: { type: number, nullable: true }
         fail_reason: { type: string, nullable: true }
-        resources:
-          type: object
-          nullable: true
-          additionalProperties: true
+        resources: { $ref: "#/components/schemas/RunResources" }
         limits:
           allOf: [{ $ref: "#/components/schemas/LimitsRecord" }]
           description: Present only for a run of a job with `resourceLimits`.
+        skip_reason:
+          type: string
+          nullable: true
+          description: >-
+            Why a `skipped` row exists. An open string. The known value is
+            `paused`. Null on every other row.
+        ranAt:
+          type: string
+          format: date-time
+          description: >-
+            The same instant as `finished_at`. Present on every row except a
+            `skipped` one, so a pause never moves the last-ran watermark.
+      additionalProperties: true
+
+    RunResources:
+      type: object
+      nullable: true
+      description: >-
+        The CPU time and peak memory that a monitored run used, sampled
+        while it ran. Null for a run without `monitorResources`, and for a
+        monitored run that ended before its first sample.
+      properties:
+        cpu_user_seconds:
+          type: number
+          description: User-mode CPU time, in seconds.
+        cpu_system_seconds:
+          type: number
+          description: System-mode CPU time, in seconds.
+        cpu_total_seconds:
+          type: number
+          description: The sum of the user and system CPU time, in seconds.
+        max_rss_bytes:
+          type: integer
+          format: int64
+          description: The highest resident memory that a sample saw, in bytes.
+        samples:
+          type: integer
+          description: The number of samples taken.
+        series:
+          type: array
+          description: >-
+            The downsampled chart series, oldest first. Each point is
+            `[epoch seconds, CPU percent, resident bytes]`. Present only on
+            `GET /jobs/{name}/resources` and in the run ledger, and only when
+            the run recorded points.
+          items:
+            type: array
+            items: { type: number }
+      additionalProperties: true
+
+    LiveRunResources:
+      type: object
+      description: One running instance's CPU and memory so far.
+      properties:
+        started_at: { type: string, format: date-time, nullable: true }
+        pid: { type: integer, nullable: true }
+        current: { $ref: "#/components/schemas/ResourceSnapshot" }
+        series:
+          type: array
+          description: >-
+            The run-so-far chart series, oldest first, in the
+            `RunResources.series` point shape. Empty when the job's
+            `monitorResources.history` is 0.
+          items:
+            type: array
+            items: { type: number }
+      required: [started_at, pid, current, series]
+      additionalProperties: true
+
+    ResourceSnapshot:
+      type: object
+      nullable: true
+      description: >-
+        One running instance's latest sample, or null before its first
+        sample.
+      properties:
+        cpu_seconds:
+          type: number
+          description: CPU time used so far, in seconds.
+        cpu_percent:
+          type: number
+          description: CPU use since the previous sample, in percent of one core.
+        rss_bytes:
+          type: integer
+          format: int64
+          description: Current resident memory, in bytes.
       additionalProperties: true
 
     JobRuns:
@@ -2684,6 +3115,40 @@ components:
         min_duration: { type: number, nullable: true }
         max_duration: { type: number, nullable: true }
         last_duration: { type: number, nullable: true }
+        avg_cpu_seconds:
+          type: number
+          nullable: true
+          description: >-
+            Mean CPU time of the monitored runs, in seconds. Each CPU and
+            memory figure is null when no run in the window was monitored.
+        max_cpu_seconds:
+          type: number
+          nullable: true
+          description: Highest CPU time of a monitored run, in seconds.
+        last_cpu_seconds:
+          type: number
+          nullable: true
+          description: >-
+            CPU time of the newest run by finish time, in seconds. Null when
+            that run was not monitored, even when older runs were.
+        avg_rss_bytes:
+          type: number
+          nullable: true
+          description: >-
+            Mean peak resident memory of the monitored runs, in bytes. A
+            mean, so the value can be fractional.
+        max_rss_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Highest peak resident memory of a monitored run, in bytes.
+        last_rss_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            Peak resident memory of the newest run by finish time, in bytes.
+            Null when that run was not monitored.
       additionalProperties: true
 
     ScheduleFinding:
@@ -2719,6 +3184,24 @@ components:
         enabled: { type: boolean }
         scheduled: { type: boolean }
         schedule: { type: string }
+        retainRuns:
+          type: integer
+          description: >-
+            How many finished runs retention keeps, newest first. Retention
+            also keeps a finished run that a recovery references, and a run
+            that has not finished.
+        latestRun: { $ref: "#/components/schemas/DagLatestRun" }
+        runCounts:
+          type: object
+          description: >-
+            The retained runs counted by run state, such as `success` and
+            `failed`. Present together with `latestRun`.
+          additionalProperties: { type: integer }
+        totalRuns:
+          type: integer
+          description: >-
+            The number of retained runs, which can exceed `retainRuns`.
+            Present together with `latestRun`.
         tasks:
           type: array
           items:
@@ -2870,12 +3353,143 @@ components:
         taskStates:
           type: object
           additionalProperties: { type: integer }
+        createdAt:
+          type: number
+          nullable: true
+          description: When the run was created, in epoch seconds.
+        updatedAt:
+          type: number
+          nullable: true
+          description: >-
+            When the run document was last written, in epoch seconds. Close
+            to the finish time once the run has finished.
+      additionalProperties: true
+
+    DagLatestRun:
+      type: object
+      description: >-
+        The newest retained run, by creation time. Present only while a
+        `state:` store holds at least one run of the DAG and the read
+        succeeds.
+      properties:
+        runKey: { type: string, nullable: true }
+        state:
+          type: string
+          description: An open string. Known values are `running`, `success`, and `failed`.
+        kind:
+          type: string
+          nullable: true
+          description: >-
+            An open string. Known values are `scheduled`, `catchup`,
+            `manual`, `backfill`, and `recovery`.
+        createdAt:
+          type: number
+          nullable: true
+          description: When the run was created, in epoch seconds.
+        updatedAt:
+          type: number
+          nullable: true
+          description: When the run document was last written, in epoch seconds.
+      additionalProperties: true
+
+    DagXcomPage:
+      type: object
+      description: The XCom values that a run's tasks published.
+      properties:
+        dag: { type: string }
+        runKey: { type: string }
+        runId: { type: string, nullable: true }
+        entries:
+          type: array
+          description: >-
+            One entry per published name `<taskkey>/<key>`, sorted by that
+            name. At most 500.
+          items: { $ref: "#/components/schemas/DagXcomEntry" }
+        truncated:
+          type: boolean
+          description: True when the run published more than 500 names.
+      required: [dag, runKey, entries, truncated]
+      additionalProperties: true
+
+    DagXcomEntry:
+      type: object
+      description: >-
+        One published XCom value. A value of 65,536 bytes or less carries
+        `value` when it decodes as UTF-8 text and `binary` otherwise; a
+        larger one carries `oversize`. An entry whose stored value cannot
+        be read carries none of the three.
+      properties:
+        taskkey: { type: string }
+        key: { type: string }
+        sha256: { type: string, nullable: true }
+        size:
+          type: integer
+          nullable: true
+          description: The value's size, in bytes.
+        at:
+          type: number
+          nullable: true
+          description: When the task published the value, in epoch seconds.
+        value: { type: string }
+        binary: { type: boolean }
+        oversize: { type: boolean }
+      additionalProperties: true
+
+    DagDecision:
+      type: object
+      description: The result of a recorded approval decision.
+      properties:
+        ok: { type: boolean }
+        state:
+          type: string
+          description: >-
+            The gate's state after the decision. An open string. Known
+            values are `success`, `skipped`, and `failed`.
+      required: [ok, state]
       additionalProperties: true
 
     DagRunDocument:
       type: object
       description: The full durable run document (task states, timings, decisions, XCom).
       properties:
+        dag: { type: string }
+        runKey: { type: string }
+        runId:
+          type: string
+          description: >-
+            The run's ID, 32 hex characters. A recovery run uses its
+            64-character plan token.
+        logicalDate:
+          type: string
+          nullable: true
+          description: >-
+            The instant the run covers, as an ISO 8601 string: the scheduled
+            time, or the `logicalDate` from the trigger request. Null on a
+            manual run triggered without one.
+        kind:
+          type: string
+          description: >-
+            An open string. Known values are `scheduled`, `catchup`,
+            `manual`, `backfill`, and `recovery`.
+        state:
+          type: string
+          description: >-
+            An open string. Known values are `running`, `success`, and
+            `failed`. Once every task has ended, the run is `failed` when a
+            task ended `failed` or `upstream_failed`, and `success`
+            otherwise.
+        createdAt:
+          type: number
+          description: When the run was created, in epoch seconds.
+        updatedAt:
+          type: number
+          description: When the document was last written, in epoch seconds.
+        configurationRevision:
+          type: string
+          description: >-
+            The digest of the DAG's launch configuration when the run was
+            created. A recovery plan reads a document without one as a
+            changed configuration.
         engine:
           type: integer
           description: >-
@@ -2894,13 +3508,72 @@ components:
             The label of the token that asked for the run through a trigger
             or a backfill. Absent on a scheduled run and when no token
             authenticated the request.
+        mapped:
+          type: object
+          description: >-
+            Each mapped task's fan-out, keyed by task ID. Empty until an
+            upstream task publishes the items.
+          additionalProperties:
+            type: object
+            properties:
+              items:
+                type: array
+                description: The fan-out items, as JSON values.
+                items: {}
+              expandedAt:
+                type: number
+                description: When the fan-out expanded, in epoch seconds.
+            additionalProperties: true
+        recovery: { $ref: "#/components/schemas/DagRunRecovery" }
         tasks:
           type: object
           description: Task entries keyed by task instance key.
           additionalProperties:
             type: object
             properties:
-              state: { type: string }
+              state:
+                type: string
+                description: >-
+                  An open string. Known values are `pending`, `running`,
+                  `up_for_retry`, `success`, `failed`, `skipped`,
+                  `upstream_failed`, and `expanded`.
+              id:
+                type: string
+                description: The task ID. A mapped instance carries its base ID.
+              mapIndex:
+                type: integer
+                nullable: true
+                description: The instance's index in the fan-out, or null.
+              attempt:
+                type: integer
+                description: >-
+                  The number of failed attempts. A task that failed after
+                  its retries shows `retries + 1`.
+              proc:
+                type: string
+                nullable: true
+                description: The claiming process's token while the task runs.
+              pid:
+                type: integer
+                nullable: true
+                description: The process ID while the task runs, once known.
+              host:
+                type: string
+                nullable: true
+                description: >-
+                  The host of the node that claimed the task, which stays
+                  after the task ends. Null on an approval gate and on an
+                  entry that no node has claimed.
+              startedAt:
+                type: number
+                nullable: true
+                description: The first claim, in epoch seconds. Retries keep it.
+              finishedAt:
+                type: number
+                nullable: true
+                description: When the task ended, in epoch seconds.
+              exitCode: { type: integer, nullable: true }
+              failReason: { type: string, nullable: true }
               skipReason:
                 type: object
                 description: >-
@@ -2914,6 +3587,80 @@ components:
                       `upstream`, `trigger_rule`, `approval`, and
                       `condition`.
                   detail: { type: string }
+              resources: { $ref: "#/components/schemas/RunResources" }
+              updatedAt:
+                type: number
+                nullable: true
+                description: When the entry last changed, in epoch seconds.
+              mapped:
+                type: boolean
+                description: Present and true on the placeholder entry of a mapped task.
+              mapItem:
+                description: >-
+                  The instance's fan-out item, as a JSON value. Present only
+                  on a mapped instance.
+              pokeCount:
+                type: integer
+                description: The number of finished pokes. Present only on a sensor.
+              firstPokeAt:
+                type: number
+                description: >-
+                  The sensor's first claim, in epoch seconds, which its poke
+                  timeout counts from.
+              nextPokeAt:
+                type: number
+                nullable: true
+                description: >-
+                  When the sensor pokes next, in epoch seconds. Null while a
+                  poke runs and after the sensor succeeds.
+              approval:
+                type: object
+                nullable: true
+                description: >-
+                  The decision on an approval gate, or null until one is
+                  recorded. Present only on an approval gate.
+                properties:
+                  decision:
+                    type: string
+                    description: An open string. Known values are `approved` and `rejected`.
+                  by: { type: string }
+                  at:
+                    type: number
+                    description: When the decision was recorded, in epoch seconds.
+                additionalProperties: true
+              awaitingApproval:
+                type: boolean
+                description: >-
+                  Present and true while an approval gate waits for a
+                  decision. A waiting gate's `state` is `running`.
+              nextRetryAt:
+                type: number
+                nullable: true
+                description: >-
+                  When the next attempt can start, in epoch seconds (the job
+                  routes give their retry time as an ISO 8601 string
+                  instead). Present once the task has failed. Null after its
+                  last attempt fails.
+              queued:
+                type: object
+                description: >-
+                  The pool entry that a `pending` task waits in. Present
+                  only while the task waits for pool capacity.
+                properties:
+                  pool: { type: string }
+                  id: { type: string }
+                  since:
+                    type: number
+                    description: When the task joined the queue, in epoch seconds.
+                  reason: { type: string }
+                additionalProperties: true
+              verification: { $ref: "#/components/schemas/VerificationResult" }
+              limits: { $ref: "#/components/schemas/LimitsRecord" }
+              reusedFrom:
+                type: string
+                description: >-
+                  The source run's key, on an entry that a recovery run kept
+                  from its source.
               whenMet:
                 type: boolean
                 description: >-
@@ -2922,8 +3669,31 @@ components:
             additionalProperties: true
       additionalProperties: true
 
+    DagRunRecovery:
+      description: >-
+        The plan that created a recovery run, and how far its preparation
+        got. Present only on a `recovery` run.
+      allOf:
+        - $ref: "#/components/schemas/RecoveryPlan"
+        - type: object
+          properties:
+            status:
+              type: string
+              description: >-
+                An open string. Known values are `preparing`, `ready`, and
+                `failed`.
+            error:
+              type: string
+              description: Why the preparation failed. Present only when `status` is `failed`.
+          additionalProperties: true
+
     ClusterView:
       type: object
+      description: >-
+        This node's cluster view. An unclustered daemon, and a cluster whose
+        backend failed to start, answer `{"enabled": false, "peers": []}`.
+        The gossip backend and the lease backends (`kubernetes`, `etcd`,
+        and `filesystem`) send different subsets of the other keys.
       properties:
         enabled: { type: boolean }
         backend: { type: string }
@@ -2934,11 +3704,287 @@ components:
         elect_leader: { type: boolean }
         distribution: { type: string }
         quorate: { type: boolean }
-        leader: { type: string, nullable: true }
+        leader:
+          type: string
+          nullable: true
+          description: >-
+            The leader's node name, or null without quorum and under
+            `spread`, where each job has its own owner. A lease backend can
+            report `<unknown holder>` while the store does not say who
+            holds the lease.
         is_leader: { type: boolean }
         peers:
           type: array
-          items: { type: object, additionalProperties: true }
+          description: The configured gossip peers. Always empty on a lease backend.
+          items: { $ref: "#/components/schemas/ClusterPeer" }
+        conflict:
+          type: boolean
+          description: >-
+            True while a duplicate node name, a size conflict, or a policy
+            conflict holds. Until it clears, `Leader` jobs don't run on this
+            node, and `PreferLeader` jobs keep running. Always false on a
+            lease backend.
+        conflict_names:
+          type: array
+          description: The node names that more than one node uses, sorted.
+          items: { type: string }
+        size_conflict:
+          type: boolean
+          description: True while a reachable peer declares a different cluster size.
+        conflicting_sizes:
+          type: array
+          description: The cluster sizes that peers declare and that differ from this node's, sorted.
+          items: { type: integer }
+        policy_conflict:
+          type: boolean
+          description: >-
+            True while a reachable peer runs a different `distribution` or
+            `electLeader`.
+        conflicting_policies:
+          type: array
+          description: >-
+            One readable sentence per differing setting, sorted, such as
+            `distribution 'spread' != 'single-leader'` (the peer's value
+            first).
+          items: { type: string }
+        candidates_truncated:
+          type: integer
+          description: >-
+            Zero while the leader candidate set fits its gossip cap of 512
+            names, otherwise the full candidate count. Present only on the
+            gossip backend.
+        lease: { $ref: "#/components/schemas/ClusterLease" }
+        fleet:
+          type: boolean
+          description: >-
+            Whether the observability overlay serves `GET /fleet` for this
+            lease cluster. Present only on a lease backend.
+        node_stats: { $ref: "#/components/schemas/NodeStats" }
+      additionalProperties: true
+
+    ClusterPeer:
+      type: object
+      description: One configured gossip peer, as this node last saw it.
+      properties:
+        host:
+          type: string
+          description: The configured peer address, `host:port`.
+        status:
+          type: string
+          description: >-
+            An open string. Known values are `unknown`, `self`, `agreed`,
+            `syncing`, `drifted`, `unreachable`, `untrusted`, and `conflict`.
+        job_set_id:
+          type: string
+          nullable: true
+          description: >-
+            The peer's job-set ID from its last successful poll, kept after
+            a failed one. Null until the first success.
+        node_name:
+          type: string
+          nullable: true
+          description: The peer's node name, with the same lifetime as `job_set_id`.
+        last_seen:
+          type: string
+          format: date-time
+          nullable: true
+          description: The last successful contact, as an ISO 8601 string.
+        last_error:
+          type: string
+          nullable: true
+          description: >-
+            Why the last poll failed, why a reachable peer is `conflict`, or
+            the fingerprint-scheme mismatch that makes it `drifted`. Null
+            after any other successful poll.
+        mismatch_streak:
+          type: integer
+          description: >-
+            Consecutive polls that saw a different job-set ID. Only
+            `agreed` and `self` reset it.
+        node_stats: { $ref: "#/components/schemas/NodeStats" }
+      required: [host, status, job_set_id, node_name, last_seen, last_error, mismatch_streak, node_stats]
+      additionalProperties: true
+
+    ClusterLease:
+      type: object
+      description: >-
+        The leadership lease as this node last observed it. Present only on
+        a lease backend. Each backend sends its own subset of these keys.
+        Before the first observation, `holder` and `expiry` are null.
+      properties:
+        holder:
+          type: string
+          nullable: true
+          description: >-
+            The lease holder's identity, or `<unknown holder>` while the
+            store does not say who holds the lease. Null before the first
+            observation.
+        expiry:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When the lease lapses, as an ISO 8601 string. `kubernetes`
+            reports it only while this node leads. `etcd` keeps the value
+            after this node loses the lease, so compare `holder` with
+            `identity` before reading it as live.
+        identity: { type: string, description: This node's identity in the election. }
+        electionName: { type: string, description: The election's name (`etcd` and `filesystem`). }
+        fence:
+          type: integer
+          nullable: true
+          description: The holder's takeover counter (`filesystem`).
+        path: { type: string, description: The lease store's path (`filesystem`). }
+        name: { type: string, description: The Lease object's name (`kubernetes`). }
+        namespace: { type: string, nullable: true, description: The Lease object's namespace (`kubernetes`). }
+        leaseId:
+          type: string
+          nullable: true
+          description: The etcd lease ID, as a decimal string (`etcd`).
+      additionalProperties: true
+
+    NodeStats:
+      type: object
+      nullable: true
+      description: >-
+        A node's live CPU and memory. Null when the node cannot sample them
+        (no psutil, or a failed read). A peer's figures arrive through
+        gossip, so each key is present only when it passed validation, every
+        figure except `cpu_count` is a JSON number that can carry a fraction
+        (byte counts included), and the object expires to null after three
+        poll intervals without a fresh reading.
+      properties:
+        cpu_percent:
+          type: number
+          description: CPU use, 0 to 100.
+        cpu_count:
+          type: integer
+          description: >-
+            The number of logical CPUs. A peer's count outside the signed
+            64-bit range is dropped.
+        mem_percent: { type: number }
+        mem_used_bytes: { type: number, description: In bytes. }
+        mem_total_bytes: { type: number, description: In bytes. }
+        proc_rss_bytes:
+          type: number
+          description: The daemon's own resident memory, in bytes. Absent when the read is denied.
+        proc_cpu_percent:
+          type: number
+          description: The daemon's own CPU use. Absent when the read is denied.
+      additionalProperties: true
+
+    FleetView:
+      type: object
+      description: >-
+        Every node's per-job run summaries. A daemon with no cluster, or a
+        lease cluster without the observability overlay, answers
+        `{"enabled": false, "nodes": []}`. On a lease cluster the other keys
+        describe the overlay, whose backend is always `gossip`.
+      properties:
+        enabled: { type: boolean }
+        nodes:
+          type: array
+          description: This node first, then each distinct peer.
+          items: { $ref: "#/components/schemas/FleetNode" }
+        backend:
+          type: string
+          description: An open string. The known value is `gossip`.
+        node_name: { type: string }
+        distribution:
+          type: string
+          description: An open string. Known values are `single-leader` and `spread`.
+        elect_leader: { type: boolean }
+        interval:
+          type: number
+          description: >-
+            The gossip poll interval, in seconds: how stale a healthy
+            peer's `as_of` can be.
+      required: [enabled, nodes]
+      additionalProperties: true
+
+    FleetNode:
+      type: object
+      description: One node of the fleet view.
+      properties:
+        node_name:
+          type: string
+          nullable: true
+          description: Null on a peer until its first successful poll.
+        host:
+          type: string
+          nullable: true
+          description: The configured peer address. Null on this node's own entry.
+        self: { type: boolean }
+        status:
+          type: string
+          description: >-
+            `self` on this node's own entry. A peer carries the
+            `ClusterPeer.status` vocabulary. An open string.
+        as_of:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When the summaries were current: now for this node, the last
+            successful contact for a peer, or null when a peer was never
+            reached.
+        jobs:
+          type: object
+          nullable: true
+          description: >-
+            The node's job summaries keyed by job name. Null when no
+            snapshot ever arrived from the peer, which differs from `{}`, a
+            node with no jobs.
+          additionalProperties: { $ref: "#/components/schemas/FleetJobSummary" }
+        truncated:
+          type: boolean
+          description: True when the node advertises only the first 512 jobs by name.
+        node_stats: { $ref: "#/components/schemas/NodeStats" }
+      required: [node_name, host, self, status, as_of, jobs, truncated, node_stats]
+      additionalProperties: true
+
+    FleetJobSummary:
+      type: object
+      description: One job as a node of the fleet reports it.
+      properties:
+        running: { type: boolean }
+        enabled: { type: boolean }
+        scheduled_in:
+          type: number
+          nullable: true
+          description: >-
+            Seconds until the next fire, aged to the time of the response
+            for a peer. Null while the job runs, when it is disabled or
+            `@reboot`, and when it never fires.
+        last:
+          type: object
+          nullable: true
+          description: >-
+            The node's last finished run, or null when the node has no
+            record of one. A node without a `state:` store records only the
+            runs since it started. A peer reports only `success`, `failure`,
+            and `cancelled` runs, so its other outcomes read as null.
+          properties:
+            outcome:
+              type: string
+              description: >-
+                An open string. Known values are `success`, `failure`,
+                `cancelled`, `unknown`, and `skipped`.
+            finished_at:
+              type: string
+              description: >-
+                When the run finished. This node writes an ISO 8601 string,
+                and relays a peer's value unchecked, up to 64 printable
+                characters.
+            duration: { type: number, nullable: true, description: In seconds. }
+            exit_code:
+              type: integer
+              nullable: true
+              description: >-
+                The run's exit code. A peer's exit code outside the signed
+                64-bit range reads as null.
+          additionalProperties: true
+      required: [running, enabled, scheduled_in, last]
       additionalProperties: true
 
     NodeView:
@@ -2958,4 +4004,318 @@ components:
             proc_cpu_percent: { type: number }
           additionalProperties: true
         limits: { $ref: "#/components/schemas/LimitsCapability" }
+      additionalProperties: true
+
+    StateInventory:
+      type: object
+      description: >-
+        The state store's health, topology, and inventory. A daemon without
+        a store, and one whose store failed to start, answer
+        `{"enabled": false}`. When the inventory walk fails or times out,
+        the answer keeps `view`, `stats`, and `node`, and reports
+        `enumerable: false` with empty groups.
+      properties:
+        enabled: { type: boolean }
+        enumerable:
+          type: boolean
+          description: False when the store cannot list its contents or the walk failed.
+        view: { $ref: "#/components/schemas/StateView" }
+        stats: { $ref: "#/components/schemas/StateStats" }
+        records:
+          type: object
+          description: >-
+            Record streams grouped by prefix, the part of the stream name
+            before its first `/`, such as `runs` or `artifacts`.
+          additionalProperties: { $ref: "#/components/schemas/StateGroup" }
+        documents:
+          type: object
+          description: Document namespaces grouped by prefix, such as `kv` or `dagrun`.
+          additionalProperties: { $ref: "#/components/schemas/StateGroup" }
+        leases:
+          type: array
+          description: >-
+            The leases that are held or have lapsed without a release, at
+            most 200 in all.
+          items: { $ref: "#/components/schemas/StateLease" }
+        quarantine:
+          type: integer
+          description: The number of entries in the store's quarantine.
+        node: { $ref: "#/components/schemas/StateNode" }
+      required: [enabled]
+      additionalProperties: true
+
+    StateView:
+      type: object
+      description: >-
+        The store's backend and topology. `path`, `namespace`,
+        `shared_locking`, and `job_set_id` are present on the `filesystem`
+        backend.
+      properties:
+        backend:
+          type: string
+          description: An open string. The known value is `filesystem`.
+        topology:
+          type: string
+          description: >-
+            An open string. Known values are `shared`, `single-node`, and
+            `unknown` (before the store starts).
+        path: { type: string, description: The store's absolute path for this namespace. }
+        namespace:
+          type: string
+          description: The `deploymentId`, or `default`.
+        shared_locking:
+          type: boolean
+          description: True when a lease excludes across hosts (the `shared` topology).
+        job_set_id: { type: string }
+      required: [backend, topology]
+      additionalProperties: true
+
+    StateStats:
+      type: object
+      description: >-
+        The store's counters since the backend started. A reload that
+        changes the `state:` section starts a new backend with fresh
+        counters. Empty for a backend that keeps none.
+      properties:
+        ops:
+          type: object
+          description: >-
+            Per-operation counters keyed by operation name, such as `list`
+            or `doc-read`. An operation appears after its first run.
+          additionalProperties: { $ref: "#/components/schemas/StateOpStat" }
+        lock:
+          type: object
+          properties:
+            acquisitions:
+              type: integer
+              description: >-
+                Advisory file-lock acquisitions by the store, for documents,
+                leases, and garbage collection.
+            wait_seconds:
+              type: number
+              description: Total time spent waiting for the store's advisory locks, in seconds.
+          additionalProperties: true
+        throttle:
+          type: object
+          description: Operations that `maxOpsPerSecond` delayed. Lease operations bypass it.
+          properties:
+            count: { type: integer }
+            wait_seconds:
+              type: number
+              description: Total delay, in seconds.
+          additionalProperties: true
+        workers:
+          type: object
+          description: >-
+            Worker lane occupancy. An `*_inflight` value that stays at its
+            capacity across polls means the store is not answering.
+          properties:
+            bulk_inflight: { type: integer }
+            bulk_peak: { type: integer }
+            bulk_capacity: { type: integer }
+            lease_inflight: { type: integer }
+            lease_peak: { type: integer }
+            lease_capacity: { type: integer }
+          additionalProperties: true
+      additionalProperties: true
+
+    StateOpStat:
+      type: object
+      description: One store operation's counters.
+      properties:
+        count: { type: integer }
+        errors: { type: integer }
+        seconds:
+          type: number
+          description: >-
+            Total time in the store, in seconds, excluding queueing and
+            throttling. The mean is `seconds / count`.
+      required: [count, errors, seconds]
+      additionalProperties: true
+
+    StateGroup:
+      type: object
+      description: The streams or namespaces that share one prefix.
+      properties:
+        count:
+          type: integer
+          description: >-
+            The number of records or documents across every stream of the
+            prefix, listed or not.
+        streams:
+          type: integer
+          description: >-
+            The number of streams or namespaces, empty ones included. A
+            value above the length of `scopes` means the list is truncated.
+        scopes:
+          type: array
+          description: At most 200 scopes, sorted by their percent-encoded on-disk name.
+          items: { $ref: "#/components/schemas/StateScope" }
+      required: [count, streams, scopes]
+      additionalProperties: true
+
+    StateScope:
+      type: object
+      description: One stream or namespace of a prefix.
+      properties:
+        scope:
+          type: string
+          description: >-
+            The name after the prefix's first `/`, which can itself contain
+            `/`. Empty for a stream named by its prefix alone, such as
+            `meta`. A stream is `<prefix>/<scope>`, or the prefix alone when
+            the scope is empty.
+        count:
+          type: integer
+          description: The number of records or documents, which can be 0.
+      required: [scope, count]
+      additionalProperties: true
+
+    StateLease:
+      type: object
+      description: One lease in the store.
+      properties:
+        name:
+          type: string
+          description: The lease name, such as `slots/<job>` or `dagadvance/<dag>/<run key>`.
+        holder: { type: string }
+        fence: { type: integer }
+        expiresAt:
+          type: number
+          description: When the lease lapses, in epoch seconds.
+        expired:
+          type: boolean
+          description: True when `expiresAt` has passed without a release.
+      required: [name, holder, fence, expiresAt, expired]
+      additionalProperties: true
+
+    StateNode:
+      type: object
+      description: This node's own retry and slot state, read from memory.
+      properties:
+        host:
+          type: string
+          description: The host name that this node writes into its records.
+        retries:
+          type: array
+          description: This node's armed retry sequences.
+          items: { $ref: "#/components/schemas/StateRetry" }
+        slots:
+          type: array
+          description: The cluster concurrency slots that this node holds.
+          items: { $ref: "#/components/schemas/StateSlot" }
+      required: [host, retries, slots]
+      additionalProperties: true
+
+    StateRetry:
+      type: object
+      description: >-
+        One armed retry sequence, as in `Job.retry` without
+        `maxAttempts`.
+      properties:
+        job: { type: string }
+        attempt:
+          type: integer
+          description: The number of the retry that is armed or running, starting at 1.
+        nextRetryAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When the armed retry fires, as an ISO 8601 string. It stays in
+            the past while that retry runs.
+        delaySeconds:
+          type: number
+          nullable: true
+          description: The backoff delay before the armed retry, in seconds.
+      required: [job, attempt, nextRetryAt, delaySeconds]
+      additionalProperties: true
+
+    StateSlot:
+      type: object
+      description: One cluster concurrency slot that this node holds.
+      properties:
+        slot:
+          type: string
+          description: The job name. The slot's lease is `slots/<job>`.
+        holder:
+          type: string
+          description: The lease holder, as `<host>#<process token>`.
+        fence: { type: integer }
+        expiresAt:
+          type: number
+          description: When the lease lapses, in epoch seconds.
+        refs:
+          type: integer
+          description: The number of this node's live instances that use the slot.
+      required: [slot, holder, fence, expiresAt, refs]
+      additionalProperties: true
+
+    StateDocumentsPage:
+      type: object
+      description: >-
+        Every document of one namespace, in the store's listing order and
+        unpaginated. A store that fails or times out answers an empty list.
+      properties:
+        namespace:
+          type: string
+          description: The requested `ns`.
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/StateDocument" }
+      required: [namespace, documents]
+      additionalProperties: true
+
+    StateDocument:
+      type: object
+      description: >-
+        One document. A `kv/` document carries `key`, `updatedAt`,
+        `valueSize`, and `valueType` in place of its value. A `cursor/`
+        document carries `name`, `value`, and `updatedAt`. An `idem/`
+        document carries `key`, `claimedAt`, and, for a claim with a TTL,
+        `expiresAt`.
+      properties:
+        key: { type: string }
+        name: { type: string }
+        value:
+          description: A cursor's stored watermark, as a JSON value.
+        updatedAt:
+          type: number
+          description: When the document was last written, in epoch seconds.
+        valueSize:
+          type: integer
+          nullable: true
+          description: >-
+            The size of the KV value's JSON encoding, in bytes, measured
+            with ASCII escapes. An approximation of the stored size.
+        valueType:
+          type: string
+          description: >-
+            The KV value's type. An open string. Known values are `str`,
+            `int`, `float`, `bool`, `list`, `dict`, and `NoneType`.
+        claimedAt:
+          type: number
+          description: When the idempotency key was claimed, in epoch seconds.
+        expiresAt:
+          type: number
+          description: When the claim lapses, in epoch seconds.
+      additionalProperties: true
+
+    StateRecordsPage:
+      type: object
+      description: >-
+        The newest records of one stream, newest first. A store that fails
+        or times out answers an empty list.
+      properties:
+        stream:
+          type: string
+          description: The requested `stream`.
+        records:
+          type: array
+          description: >-
+            Full record bodies, without a record ID or write time. Each
+            prefix writes its own shape: a `runs/` record is a `JobRun`
+            with its chart series, for example.
+          items: { type: object, additionalProperties: true }
+      required: [stream, records]
       additionalProperties: true

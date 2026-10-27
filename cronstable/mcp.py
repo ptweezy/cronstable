@@ -56,16 +56,26 @@ from cronstable.cron import (
     _BACKFILL_UNAVAILABLE,
     _RECOVERY_UNAVAILABLE,
     PAUSE_BY_MAX,
+    PAUSE_DEFAULT_SECONDS,
+    PAUSE_MAX_SECONDS,
+    PAUSE_NOTE_MAX,
+    PLAN_TOKEN_LENGTH,
+    PREVIEW_COUNT_MAX,
+    RECOVERY_TASKS_MAX,
     WEB_ANON_REQUEST_KEY,
     WEB_TOKEN_REQUEST_KEY,
     ApiActionError,
     _load_index_bytes,
 )
+from cronstable.croninfo import PRESSURE_DEFAULT_HOURS, PRESSURE_MAX_HOURS
 from cronstable.dagrun import (
+    DAG_MAX_CATCHUP,
+    REQUEST_ID_MAX,
     DagScheduler,
     TriggerConflict,
     TriggerInputError,
 )
+from cronstable.job import LIVE_LOG_LIMIT
 from cronstable.params import ParamError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost / no cycle
@@ -348,6 +358,9 @@ class MCPHandler:
         }
         self._tools = self._build_registry()
         self._tool_by_name = {t["name"]: t for t in self._tools}
+        # the config is fixed for this handler's lifetime (a reload builds
+        # a new one), so only the caller's scopes vary per tools/list
+        self._served_tools = [t for t in self._tools if self._configured(t)]
         self._resources, self._templates = self._build_resources()
         self._resource_by_uri = {r["uri"]: r for r in self._resources}
         self._template_by_uri = {t["uriTemplate"]: t for t in self._templates}
@@ -455,10 +468,12 @@ class MCPHandler:
         return {}
 
     async def _m_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        # _permitted's check, with the caller read once for the whole list
+        caller = _caller.get()
         tools = [
             t["listing"]
-            for t in self._tools
-            if self._configured(t) and self._permitted(t)
+            for t in self._served_tools
+            if caller is None or t["scope"] in caller.scopes
         ]
         return {"tools": tools}
 
@@ -782,6 +797,11 @@ class MCPHandler:
 
     def _build_registry(self) -> list[dict[str, Any]]:
         obj = _obj_schema
+
+        def rows(what: str) -> dict[str, Any]:
+            return _rows_arg(what, self._max_rows)
+
+        tail = rows("Most lines to return, newest last")
         # every entry is a _tool(...) spec; see that factory for the defaults
         return [
             # ---- observe (read-only) ----
@@ -789,8 +809,16 @@ class MCPHandler:
                 "observe",
                 "cron_get_status",
                 "Job status",
-                "Show each job's status: running, disabled, or scheduled.",
-                obj({"offset": _INT, "limit": _INT}),
+                "Show each job's status: running, disabled, or scheduled, "
+                "one page at a time. Use it for a quick check of every job; "
+                "use cron_list_jobs for schedules, next runs, and last "
+                "outcomes, or cron_get_job for one job's details.",
+                obj(
+                    {
+                        "offset": _OFFSET_ARG,
+                        "limit": rows("Most jobs to return"),
+                    }
+                ),
                 self._t_get_status,
                 output=_STATUS_OUTPUT,
             ),
@@ -799,15 +827,26 @@ class MCPHandler:
                 "cron_list_jobs",
                 "List jobs",
                 "List jobs with schedule, enabled/running state, next run, "
-                "and last outcome. Optional name substring `filter` "
-                "and `state` "
-                "(running/disabled/scheduled).",
+                "and last outcome, one page at a time. Use it to find a "
+                "job's exact name or to survey schedules. Each row has the "
+                "same fields as cron_get_job, which fetches one job by "
+                "name.",
                 obj(
                     {
-                        "filter": _STR,
-                        "state": _enum(["running", "disabled", "scheduled"]),
-                        "offset": _INT,
-                        "limit": _INT,
+                        "filter": _arg(
+                            _STR,
+                            "Case-insensitive substring to match in job "
+                            "names.",
+                        ),
+                        "state": _arg(
+                            _enum(["running", "disabled", "scheduled"]),
+                            "Only jobs in this state. running means an "
+                            "instance is running now; scheduled means "
+                            "enabled and not running, including paused "
+                            "jobs.",
+                        ),
+                        "offset": _OFFSET_ARG,
+                        "limit": rows("Most jobs to return"),
                     }
                 ),
                 self._t_list_jobs,
@@ -818,8 +857,10 @@ class MCPHandler:
                 "cron_get_job",
                 "Get one job",
                 "Show details for one job (schedule, command, last run, live "
-                "resources, retry/slot state).",
-                obj({"name": _STR}, ["name"]),
+                "resources, retry/slot state). Use it when you know the "
+                "job's name; use cron_list_runs for its run history, or "
+                "cron_tail_job_logs for its output.",
+                obj({"name": _JOB_ARG}, ["name"]),
                 self._t_get_job,
             ),
             _tool(
@@ -827,9 +868,17 @@ class MCPHandler:
                 "cron_list_runs",
                 "Run history",
                 "Show saved run history, success rate, and duration "
-                "statistics for one job "
-                "(most recent `limit` runs).",
-                obj({"name": _STR, "limit": _INT}, ["name"]),
+                "statistics for one job, newest run last. Use it to "
+                "inspect individual runs; use cron_get_job_trends for "
+                "success rates over fixed windows, or cron_why_no_run when "
+                "an expected run is missing.",
+                obj(
+                    {
+                        "name": _JOB_ARG,
+                        "limit": rows("Most recent runs to return"),
+                    },
+                    ["name"],
+                ),
                 self._t_list_runs,
             ),
             _tool(
@@ -837,8 +886,11 @@ class MCPHandler:
                 "cron_get_job_trends",
                 "SLA trends",
                 "Per-window (1h/24h/7d/30d/all) success-rate and duration "
-                "statistics from the saved run history for one job.",
-                obj({"name": _STR}, ["name"]),
+                "statistics from the saved run history for one job. Use it "
+                "to see whether a job fails more often or runs longer than "
+                "it used to; use cron_list_runs for the runs behind the "
+                "numbers.",
+                obj({"name": _JOB_ARG}, ["name"]),
                 self._t_get_job_trends,
             ),
             _tool(
@@ -848,8 +900,16 @@ class MCPHandler:
                 "CPU/RSS time series for a job's live and recent runs "
                 "(monitorResources jobs), plus its resourceLimits caps and "
                 "each capped run's limits record, which says whether the "
-                "caps applied and whether the run hit its memory cap.",
-                obj({"name": _STR, "runs": _INT}, ["name"]),
+                "caps applied and whether the run hit its memory cap. Use "
+                "it for one job's resource use; use cron_get_node for the "
+                "whole host, or cron_query_metrics for Prometheus samples.",
+                obj(
+                    {
+                        "name": _JOB_ARG,
+                        "runs": rows("Most recent recorded runs to include"),
+                    },
+                    ["name"],
+                ),
                 self._t_get_job_resources,
             ),
             _tool(
@@ -858,7 +918,9 @@ class MCPHandler:
                 "Cluster view",
                 "This node's cluster/leadership view (peers, quorum, role, "
                 "live load). Returns enabled:false if no cluster is "
-                "configured.",
+                "configured. Use it to see which node leads and whether "
+                "quorum holds; use cron_get_fleet to compare each job's "
+                "runs across nodes.",
                 obj({}),
                 self._t_get_cluster,
             ),
@@ -867,7 +929,9 @@ class MCPHandler:
                 "cron_get_fleet",
                 "Fleet view",
                 "Run status for each job on each node. Returns enabled:false "
-                "when cluster peer communication is unavailable.",
+                "when cluster peer communication is unavailable. Use it to "
+                "check where each job last ran and how it ended; use "
+                "cron_get_cluster for leadership and quorum.",
                 obj({}),
                 self._t_get_fleet,
             ),
@@ -876,8 +940,19 @@ class MCPHandler:
                 "cron_get_node",
                 "Node resources",
                 "This node's live whole-host CPU/memory (optionally with the "
-                "recent history).",
-                obj({"history": _BOOL}),
+                "recent history). Use it to check host load; use "
+                "cron_get_job_resources for one job's share.",
+                obj(
+                    {
+                        "history": _arg(
+                            _BOOL,
+                            "Also return the retained CPU and memory "
+                            "history that the dashboard's node chart shows "
+                            "(the last hour by default).",
+                            default=False,
+                        )
+                    }
+                ),
                 self._t_get_node,
             ),
             _tool(
@@ -885,15 +960,33 @@ class MCPHandler:
                 "cron_query_metrics",
                 "Query metrics",
                 "Parsed samples from the Prometheus /metrics exposition, "
-                "optionally filtered by a metric-name substring `match`.",
-                obj({"match": _STR, "limit": _INT}),
+                "optionally filtered by metric name. Use it for counters "
+                "across all jobs, such as run outcomes, retries, and SLA "
+                "breaches; use cron_get_job_trends for one job's success "
+                "rate.",
+                obj(
+                    {
+                        "match": _arg(
+                            _STR,
+                            "Case-insensitive substring to match in metric "
+                            "names, such as job_runs_total. Omit it to "
+                            "match every sample.",
+                        ),
+                        "limit": rows("Most samples to return"),
+                    }
+                ),
                 self._t_query_metrics,
             ),
             _tool(
                 "observe",
                 "cron_get_version",
                 "Version",
-                "Show the server version, job-set ID, and job count.",
+                "Show the server version, job-set ID, and job count. Use it "
+                "to identify the daemon, or to compare job-set IDs across "
+                "replicas, which match when the replicas' jobs agree on the "
+                "configuration fields the ID covers, even if secret values "
+                "or host-specific settings differ; use cron_get_cluster for "
+                "the replicas' roles.",
                 obj({}),
                 self._t_get_version,
             ),
@@ -901,10 +994,19 @@ class MCPHandler:
                 "observe",
                 "cron_tail_job_logs",
                 "Tail job logs",
-                "Last retained stdout/stderr lines of a job, with a `cursor` "
-                "to poll for newly appended lines (the poll form of the live "
-                "log stream).",
-                obj({"name": _STR, "tail": _INT, "cursor": _INT}, ["name"]),
+                "Last retained stdout/stderr lines of a job's newest running "
+                "instance, or of its last finished run when none is running, "
+                "with a `cursor` to poll for newly appended lines (the poll "
+                "form of the live log stream). Use it to read what a job "
+                "printed; use cron_list_runs for exit status and timing.",
+                obj(
+                    {
+                        "name": _JOB_ARG,
+                        "tail": tail,
+                        "cursor": _CURSOR_ARG,
+                    },
+                    ["name"],
+                ),
                 self._t_tail_job_logs,
             ),
             _tool(
@@ -912,10 +1014,29 @@ class MCPHandler:
                 "cron_schedule_pressure",
                 "Schedule load",
                 "Upcoming runs for enabled schedules over the next `hours` "
-                "(default 24, max 168), grouped by hour and minute in `tz` "
+                "(default {}, max {}), grouped by hour and minute in `tz` "
                 "(default UTC). Shows when jobs are scheduled together "
-                "and which minute positions have no scheduled runs.",
-                obj({"hours": _INT, "tz": _STR}),
+                "and which minute positions have no scheduled runs. Use it "
+                "to see how busy each minute is; use cron_suggest_slot to "
+                "pick a time for a new job.".format(
+                    PRESSURE_DEFAULT_HOURS, PRESSURE_MAX_HOURS
+                ),
+                obj(
+                    {
+                        "hours": _arg(
+                            _INT,
+                            "Hours ahead to scan.",
+                            minimum=1,
+                            maximum=PRESSURE_MAX_HOURS,
+                            default=PRESSURE_DEFAULT_HOURS,
+                        ),
+                        "tz": _arg(
+                            _STR,
+                            "IANA time zone to group the runs in, such as "
+                            "America/New_York. Defaults to UTC.",
+                        ),
+                    }
+                ),
                 self._t_schedule_pressure,
             ),
             _tool(
@@ -923,8 +1044,11 @@ class MCPHandler:
                 "cron_schedule_duplicates",
                 "Duplicate schedules",
                 "Jobs with identical run times (for example, */5 and 0-59/5 "
-                "in the same time zone). Use this to find schedules "
-                "that could be spread out.",
+                "in the same time zone), among enabled jobs and workflow "
+                "schedules. Use this to find schedules that could be spread "
+                "out; use "
+                "cron_schedule_pressure for different schedules that "
+                "share some minutes.",
                 obj({}),
                 self._t_schedule_duplicates,
             ),
@@ -933,14 +1057,18 @@ class MCPHandler:
                 "cron_suggest_slot",
                 "Suggest a quieter run time",
                 "Suggest a time with fewer scheduled runs in the next "
-                "24 hours. "
-                "For `period`, 'hourly' picks a minute, "
-                "'daily' a minute and hour; returns the cron expression, two "
-                "alternatives, and the busiest time.",
+                "24 hours, as a cron expression with two alternatives and "
+                "the busiest time. Use it when adding a job, then check the "
+                "result with cron_validate_schedule.",
                 obj(
                     {
-                        "period": _enum(["hourly", "daily"]),
-                        "tz": _STR,
+                        "period": _arg(
+                            _enum(["hourly", "daily"]),
+                            "hourly picks a minute past each hour; daily "
+                            "picks a minute and an hour.",
+                            default="hourly",
+                        ),
+                        "tz": _TZ_ARG,
                     }
                 ),
                 self._t_suggest_slot,
@@ -957,11 +1085,20 @@ class MCPHandler:
                 "server's scheduling engine. The dialect includes L "
                 "(last day), L-n (n days before it), nW / LW (nearest / "
                 "last weekday) and Ln / d#n (last / nth weekday: L5 = last "
-                "Friday, 5#3 = third Friday). `tz` (IANA zone the job will "
-                "run in) enables the DST checks; `seed` (the prospective "
-                "job name) resolves Jenkins-style H slots.",
+                "Friday, 5#3 = third Friday). Use it before saving a new or "
+                "changed schedule; use cron_explain_schedule to list more "
+                "upcoming runs, or cron_why_no_run for a job that already "
+                "exists.",
                 obj(
-                    {"expression": _STR, "tz": _STR, "seed": _STR},
+                    {
+                        "expression": _EXPRESSION_ARG,
+                        "tz": _arg(
+                            _STR,
+                            "IANA time zone the job will run in. It turns "
+                            "on the daylight saving time checks.",
+                        ),
+                        "seed": _SEED_ARG,
+                    },
                     ["expression"],
                 ),
                 self._t_validate_schedule,
@@ -972,18 +1109,27 @@ class MCPHandler:
                 "cron_explain_schedule",
                 "Explain a schedule",
                 "Decode a cron expression into a plain-English description, "
-                "its next `count` run times (default 5, max 60) as ISO "
-                "timestamps "
-                "in `tz` (default UTC; pass the job's zone), and advisory "
-                "warnings from the server's scheduling engine. "
-                "`seed` (a job name) resolves "
-                "Jenkins-style H slots.",
+                "its next `count` run times as ISO timestamps in `tz`, and "
+                "advisory warnings from the server's scheduling engine. Use "
+                "it to read an expression or preview its runs; use "
+                "cron_validate_schedule for the check before saving, or "
+                "cron_why_no_run to test an existing job at a timestamp.",
                 obj(
                     {
-                        "expression": _STR,
-                        "count": _INT,
-                        "tz": _STR,
-                        "seed": _STR,
+                        "expression": _EXPRESSION_ARG,
+                        "count": _arg(
+                            _INT,
+                            "Upcoming runs to list.",
+                            minimum=1,
+                            maximum=PREVIEW_COUNT_MAX,
+                            default=_EXPLAIN_COUNT_DEFAULT,
+                        ),
+                        "tz": _arg(
+                            _STR,
+                            "IANA time zone to compute the runs in. Pass "
+                            "the job's zone. Defaults to UTC.",
+                        ),
+                        "seed": _SEED_ARG,
                     },
                     ["expression"],
                 ),
@@ -998,11 +1144,25 @@ class MCPHandler:
                 "select a timestamp ('day-of-week Tuesday is not in Monday "
                 "and Friday'), with the previous and next scheduled runs and "
                 "notes on this dialect's day-field AND rule and DST "
-                "effects. `at` is ISO 8601; timestamps without an offset use "
-                "the job's time zone. If the schedule does "
-                "match, the answer refers to execution history "
-                "(cron_list_runs) instead.",
-                obj({"name": _STR, "at": _STR}, ["name", "at"]),
+                "effects. Use it when an expected run is missing. If the "
+                "schedule does match, the answer refers to execution "
+                "history (cron_list_runs) instead.",
+                obj(
+                    {
+                        "name": _arg(
+                            _STR,
+                            "Exact job name, as cron_list_jobs returns it. "
+                            "A workflow's schedule is dag:<name>.",
+                        ),
+                        "at": _arg(
+                            _STR,
+                            "Timestamp to test, in ISO 8601, such as "
+                            "2026-10-26T09:00. Without an offset it uses "
+                            "the job's time zone.",
+                        ),
+                    },
+                    ["name", "at"],
+                ),
                 self._t_why_no_run,
                 output=_WHY_OUTPUT,
             ),
@@ -1010,7 +1170,10 @@ class MCPHandler:
                 "observe",
                 "cron_list_pools",
                 "List resource pools",
-                "Show pool capacity, queued work, and recent queue outcomes.",
+                "Show each pool's capacity, queued work, and recent queue "
+                "outcomes. Use it when jobs wait for pool capacity, or to "
+                "find the queue entry ID that cron_cancel_queued takes "
+                "when the act tools are on.",
                 obj({}),
                 self._t_list_pools,
             ),
@@ -1020,7 +1183,8 @@ class MCPHandler:
                 "cron_list_dags",
                 "List workflows",
                 "Configured workflows (DAGs) with their tasks and "
-                "dependencies.",
+                "dependencies. Use it to find a workflow's name and task "
+                "IDs; use cron_list_dag_runs for its runs.",
                 obj({}),
                 self._t_list_dags,
             ),
@@ -1028,24 +1192,43 @@ class MCPHandler:
                 "dags",
                 "cron_list_dag_runs",
                 "List workflow runs",
-                "Recent workflow runs with task counts for each status.",
-                obj({"dag": _STR, "limit": _INT}, ["dag"]),
+                "Recent workflow runs with task counts for each status. Use "
+                "it to find a run key; use cron_get_dag_run for one run's "
+                "tasks.",
+                obj(
+                    {
+                        "dag": _DAG_ARG,
+                        "limit": rows("Most recent runs to return"),
+                    },
+                    ["dag"],
+                ),
                 self._t_list_dag_runs,
             ),
             _tool(
                 "dags",
                 "cron_get_dag_run",
                 "Get workflow run",
-                "Workflow run details: task status, timing, and decisions.",
-                obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
+                "Workflow run details: task status, timing, and decisions. "
+                "Use it to see which task failed or waits at an approval "
+                "gate; use cron_get_dag_xcom for the values tasks passed, "
+                "or cron_tail_dag_task_logs for a running task's output.",
+                obj(
+                    {"dag": _DAG_ARG, "run_key": _RUN_KEY_ARG},
+                    ["dag", "run_key"],
+                ),
                 self._t_get_dag_run,
             ),
             _tool(
                 "dags",
                 "cron_get_dag_xcom",
                 "Workflow task outputs (XCom)",
-                "Output values (XCom) shared by tasks in a workflow run.",
-                obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
+                "Output values (XCom) shared by tasks in a workflow run. Use "
+                "it to check what one task handed to the next; use "
+                "cron_get_dag_run for task status.",
+                obj(
+                    {"dag": _DAG_ARG, "run_key": _RUN_KEY_ARG},
+                    ["dag", "run_key"],
+                ),
                 self._t_get_dag_xcom,
             ),
             _tool(
@@ -1053,14 +1236,17 @@ class MCPHandler:
                 "cron_tail_dag_task_logs",
                 "Read workflow task logs",
                 "Latest saved log lines for a running workflow task "
-                "instance, with a `cursor` to poll for more.",
+                "instance, with a `cursor` to poll for more. After the "
+                "instance ends, running is false and no lines remain. Use "
+                "it to follow a task's output; use cron_tail_job_logs for a "
+                "job outside a workflow.",
                 obj(
                     {
-                        "dag": _STR,
-                        "run_key": _STR,
-                        "taskkey": _STR,
-                        "tail": _INT,
-                        "cursor": _INT,
+                        "dag": _DAG_ARG,
+                        "run_key": _RUN_KEY_ARG,
+                        "taskkey": _TASKKEY_ARG,
+                        "tail": tail,
+                        "cursor": _CURSOR_ARG,
                     },
                     ["dag", "run_key", "taskkey"],
                 ),
@@ -1071,18 +1257,11 @@ class MCPHandler:
                 "cron_preview_recovery",
                 "Preview workflow recovery",
                 "Preview failed tasks or a selected task and its downstream "
-                "tasks. Supply run_key, or from and to for failed dates.",
-                obj(
-                    {
-                        "dag": _STR,
-                        "run_key": _STR,
-                        "from": _STR,
-                        "to": _STR,
-                        "mode": _STR,
-                        "tasks": {"type": "array", "items": _STR},
-                    },
-                    ["dag"],
-                ),
+                "tasks. Supply run_key, or from and to for failed dates. It "
+                "changes nothing; run it before cron_recover_dag (available "
+                "when readOnly is off), which takes the top-level planToken "
+                "of this result as plan_token.",
+                obj(dict(_RECOVERY_ARGS), ["dag"]),
                 self._t_preview_recovery,
             ),
             # ---- state (read-only inspector) ----
@@ -1090,12 +1269,28 @@ class MCPHandler:
                 "state",
                 "cron_inspect_state",
                 "Inspect state store",
-                "Inspect saved state without revealing values: overview "
-                "(default), one namespace's documents (`ns` "
-                "kv/|cursor/|idem/) or a stream's newest records (`stream`). "
-                "KV values and "
-                "secrets are redacted.",
-                obj({"ns": _STR, "stream": _STR, "limit": _INT}),
+                "Inspect saved state: overview (default), one namespace's "
+                "documents (`ns`), or a stream's newest records in full "
+                "(`stream`). KV values come back as a size and type. Use "
+                "it to check the progress cursors that jobs advance, "
+                "idempotency claims, stored keys, or stream records such as "
+                "catchup/<job>; use cron_list_runs for a job's run history.",
+                obj(
+                    {
+                        "ns": _arg(
+                            _STR,
+                            "Namespace whose documents to list, starting "
+                            "with kv/, cursor/, or idem/. Give ns or "
+                            "stream, not both.",
+                        ),
+                        "stream": _arg(
+                            _STR,
+                            "Stream whose newest records to list, such as "
+                            "runs/backup. Log streams are refused.",
+                        ),
+                        "limit": rows("Most stream records to return"),
+                    }
+                ),
                 self._t_inspect_state,
             ),
             # ---- act (mutating job control; readOnly:false to expose) ----
@@ -1103,9 +1298,20 @@ class MCPHandler:
                 "act",
                 "cron_cancel_queued",
                 "Cancel queued work",
-                "Cancel a waiting pool entry. Requires confirm=true.",
+                "Cancel a waiting pool entry. Requires confirm=true. Use it "
+                "to drop work that cron_list_pools shows as queued; use "
+                "cron_cancel_job to stop a run in progress.",
                 obj(
-                    {"pool": _STR, "id": _STR, "confirm": _BOOL},
+                    {
+                        "pool": _arg(
+                            _STR, "Pool name, as cron_list_pools returns it."
+                        ),
+                        "id": _arg(
+                            _STR,
+                            "Queue entry ID, as cron_list_pools returns it.",
+                        ),
+                        "confirm": _CONFIRM_ARG,
+                    },
                     ["pool", "id"],
                 ),
                 self._t_cancel_queued,
@@ -1117,13 +1323,19 @@ class MCPHandler:
                 "act",
                 "cron_run_job",
                 "Run job now",
-                "Launch a job immediately, following its concurrencyPolicy. "
-                "params supplies values for the run parameters the job "
-                "declares (see cron_list_jobs); without it the run uses "
-                "the defaults. With scoped web tokens, supplying params "
-                "needs the params scope. Requires confirm=true.",
+                "Launch a job immediately, following its concurrencyPolicy; "
+                "a job that names a pool joins that pool's queue instead, "
+                "and the result carries its queueId. Requires confirm=true. "
+                "Use it for a run "
+                "outside the schedule; use cron_resume_job to restart "
+                "scheduled runs.",
                 obj(
-                    {"name": _STR, "params": _OBJ, "confirm": _BOOL}, ["name"]
+                    {
+                        "name": _JOB_ARG,
+                        "params": _params_arg("job", "cron_list_jobs"),
+                        "confirm": _CONFIRM_ARG,
+                    },
+                    ["name"],
                 ),
                 self._t_run_job,
                 mutating=True,
@@ -1135,8 +1347,9 @@ class MCPHandler:
                 "cron_cancel_job",
                 "Cancel job",
                 "Terminate a job's running instances (graceful, then kill). "
-                "Requires confirm=true.",
-                obj({"name": _STR, "confirm": _BOOL}, ["name"]),
+                "Requires confirm=true. Use it to stop runs in progress; "
+                "use cron_pause_job to stop future scheduled runs.",
+                obj({"name": _JOB_ARG, "confirm": _CONFIRM_ARG}, ["name"]),
                 self._t_cancel_job,
                 mutating=True,
                 destructive=True,
@@ -1146,15 +1359,27 @@ class MCPHandler:
                 "act",
                 "cron_pause_job",
                 "Pause job",
-                "Pause scheduled runs until the pause expires "
-                "(durationSeconds, default 3600) or the job is resumed; "
-                "manual runs stay allowed. Requires confirm=true.",
+                "Pause scheduled runs until the pause expires or the job is "
+                "resumed; manual runs stay allowed, and pausing a paused "
+                "job replaces its pause. Requires confirm=true. Use it for "
+                "maintenance windows; use cron_cancel_job to stop a run in "
+                "progress.",
                 obj(
                     {
-                        "name": _STR,
-                        "durationSeconds": _INT,
-                        "note": _STR,
-                        "confirm": _BOOL,
+                        "name": _JOB_ARG,
+                        "durationSeconds": _arg(
+                            _INT,
+                            "How long to pause, in seconds.",
+                            minimum=1,
+                            maximum=PAUSE_MAX_SECONDS,
+                            default=PAUSE_DEFAULT_SECONDS,
+                        ),
+                        "note": _arg(
+                            _STR,
+                            "Reason to record with the pause.",
+                            maxLength=PAUSE_NOTE_MAX,
+                        ),
+                        "confirm": _CONFIRM_ARG,
                     },
                     ["name"],
                 ),
@@ -1167,8 +1392,10 @@ class MCPHandler:
                 "cron_resume_job",
                 "Resume job",
                 "Resume scheduled runs; has no effect when "
-                "the job is not paused. Requires confirm=true.",
-                obj({"name": _STR, "confirm": _BOOL}, ["name"]),
+                "the job is not paused. Requires confirm=true. Use it to "
+                "end a cron_pause_job pause early; a pause also ends on its "
+                "own when it expires.",
+                obj({"name": _JOB_ARG, "confirm": _CONFIRM_ARG}, ["name"]),
                 self._t_resume_job,
                 mutating=True,
                 idempotent=True,
@@ -1178,21 +1405,30 @@ class MCPHandler:
                 "dags",
                 "cron_trigger_dag",
                 "Run workflow now",
-                "Start a workflow run now. params supplies values for "
-                "the run parameters the workflow declares (see "
-                "cron_list_dags); without it the run uses the defaults. "
-                "With scoped web tokens, supplying params needs the params "
-                "scope. logical_date sets the run's logical date. "
-                "request_id makes the call repeatable: a second call with "
-                "the same request_id returns the first run. Requires "
-                "confirm=true.",
+                "Start a workflow run now. Requires confirm=true. Use it "
+                "for a run outside the schedule; use cron_backfill_dag for "
+                "past dates, or cron_recover_dag to rerun failed tasks.",
                 obj(
                     {
-                        "dag": _STR,
-                        "params": _OBJ,
-                        "logical_date": _STR,
-                        "request_id": _STR,
-                        "confirm": _BOOL,
+                        "dag": _DAG_ARG,
+                        "params": _params_arg("workflow", "cron_list_dags"),
+                        "logical_date": _arg(
+                            _STR,
+                            "Logical date the run records, stored in UTC. "
+                            "Without it, the run has no logical date. "
+                            + _ISO_UTC,
+                        ),
+                        "request_id": _arg(
+                            _STR,
+                            "Makes the call repeatable: a second call with "
+                            "the same request_id returns the first run while "
+                            "that run is retained, and returns an error if "
+                            "it asks for other params or another "
+                            "logical_date.",
+                            minLength=1,
+                            maxLength=REQUEST_ID_MAX,
+                        ),
+                        "confirm": _CONFIRM_ARG,
                     },
                     ["dag"],
                 ),
@@ -1205,20 +1441,45 @@ class MCPHandler:
                 "dags",
                 "cron_backfill_dag",
                 "Run workflow for past dates",
-                "Run a scheduled workflow for an ISO date range. params "
-                "supplies run parameter values for the runs this call "
-                "creates; a date that already has a run keeps its values. "
-                "With scoped web tokens, supplying params needs the params "
-                "scope. dry_run (default true) previews the runs. To start "
-                "them, set dry_run=false and confirm=true.",
+                "Run a scheduled workflow for each of its scheduled times "
+                "in a date range, earliest first, up to {} times per call. "
+                "Times that already have a run count toward that limit and "
+                "get no second run, so split a longer range into several "
+                "calls. By default it's a dry run that creates nothing; to "
+                "create the runs, set dry_run=false and confirm=true. Use "
+                "it for scheduled times the workflow missed; use "
+                "cron_recover_dag to rerun failed tasks in existing "
+                "runs.".format(DAG_MAX_CATCHUP),
                 obj(
                     {
-                        "dag": _STR,
-                        "from": _STR,
-                        "to": _STR,
-                        "params": _OBJ,
-                        "dry_run": _BOOL,
-                        "confirm": _BOOL,
+                        "dag": _DAG_ARG,
+                        "from": _arg(
+                            _STR,
+                            "Start of the range. The range includes both "
+                            "ends. " + _ISO_UTC,
+                        ),
+                        "to": _arg(
+                            _STR,
+                            "End of the range, read the same way as from.",
+                        ),
+                        "params": _params_arg(
+                            "workflow",
+                            "cron_list_dags",
+                            "They apply to the runs this call creates; a "
+                            "scheduled time that already has a run keeps "
+                            "that run's values.",
+                        ),
+                        "dry_run": _arg(
+                            _BOOL,
+                            "true returns the request without creating "
+                            "runs; false, with confirm=true, creates them.",
+                            default=True,
+                        ),
+                        "confirm": _arg(
+                            _BOOL,
+                            "Must be true with dry_run=false. A dry run "
+                            "ignores it.",
+                        ),
                     },
                     ["dag", "from", "to"],
                 ),
@@ -1233,19 +1494,29 @@ class MCPHandler:
                 "Recover workflow tasks",
                 "Execute a reviewed recovery plan. Requires plan_token and "
                 "confirm=true. Creates a new run preserving successful work. "
-                "With scoped web tokens, a plan whose params differ from "
-                "the declared defaults needs the params scope.",
+                "Run cron_preview_recovery first with the same arguments to "
+                "review the plan; its result's top-level planToken is the "
+                "plan_token. With scoped web tokens, a plan whose params "
+                "differ from the declared defaults needs the params scope.",
                 obj(
                     {
-                        "dag": _STR,
-                        "run_key": _STR,
-                        "from": _STR,
-                        "to": _STR,
-                        "mode": _STR,
-                        "tasks": {"type": "array", "items": _STR},
-                        "plan_token": _STR,
-                        "allow_config_change": _BOOL,
-                        "confirm": _BOOL,
+                        **_RECOVERY_ARGS,
+                        "plan_token": _arg(
+                            _STR,
+                            "The top-level planToken of the "
+                            "cron_preview_recovery result for the same "
+                            "arguments. The tokens nested in a date range's "
+                            "plans are rejected as stale.",
+                            minLength=PLAN_TOKEN_LENGTH,
+                            maxLength=PLAN_TOKEN_LENGTH,
+                        ),
+                        "allow_config_change": _arg(
+                            _BOOL,
+                            "Recover even though the workflow's "
+                            "configuration changed since the source run.",
+                            default=False,
+                        ),
+                        "confirm": _CONFIRM_ARG,
                     },
                     ["dag", "plan_token"],
                 ),
@@ -1261,15 +1532,26 @@ class MCPHandler:
                 "Decide approval gate",
                 "Approve or reject a workflow approval step. "
                 "Requires confirm=true; with scoped web tokens, the "
-                "presented token must hold the approve scope.",
+                "presented token must hold the approve scope. Use "
+                "cron_get_dag_run to find gates that wait for a decision.",
                 obj(
                     {
-                        "dag": _STR,
-                        "run_key": _STR,
-                        "taskkey": _STR,
-                        "decision": _enum(["approve", "reject"]),
-                        "by": _STR,
-                        "confirm": _BOOL,
+                        "dag": _DAG_ARG,
+                        "run_key": _RUN_KEY_ARG,
+                        "taskkey": _TASKKEY_ARG,
+                        "decision": _arg(
+                            _enum(["approve", "reject"]),
+                            "approve releases the downstream tasks; reject "
+                            "fails the gate, or skips it when the gate sets "
+                            "onReject: skip.",
+                        ),
+                        "by": _arg(
+                            _STR,
+                            "Name to record with the decision, after the "
+                            "token's label.",
+                            maxLength=PAUSE_BY_MAX,
+                        ),
+                        "confirm": _CONFIRM_ARG,
                     },
                     ["dag", "run_key", "taskkey", "decision"],
                 ),
@@ -1422,10 +1704,10 @@ class MCPHandler:
         self, args: dict[str, Any]
     ) -> dict[str, Any]:
         # no clamp here: croninfo.schedule_pressure clamps hours to
-        # [1, 168] authoritatively and echoes the clamped value back in
-        # the payload; only the default is applied at this layer.
+        # [1, PRESSURE_MAX_HOURS] authoritatively and echoes the clamped
+        # value back in the payload; only the default is applied here.
         hours = _opt_int(args.get("hours"))
-        hours = 24 if hours is None else hours
+        hours = PRESSURE_DEFAULT_HOURS if hours is None else hours
         tz = args.get("tz")
         if tz is not None and not isinstance(tz, str):
             raise _ToolInputError("`tz` must be an IANA timezone string")
@@ -1533,7 +1815,11 @@ class MCPHandler:
         expr = _req_str(args, "expression")
         tz, seed = self._preview_args(args)
         count = _opt_int(args.get("count"))
-        count = 5 if count is None else max(1, min(count, 60))
+        count = (
+            _EXPLAIN_COUNT_DEFAULT
+            if count is None
+            else max(1, min(count, PREVIEW_COUNT_MAX))
+        )
         try:
             payload = self._cron.schedule_preview_payload(
                 expr, tz, count=count, seed=seed
@@ -1783,10 +2069,10 @@ class MCPHandler:
         token = None
         if execute:
             token = _req_str(args, "plan_token")
-            if len(token) != 64:
+            if len(token) != PLAN_TOKEN_LENGTH:
                 raise _ToolInputError(
-                    "plan_token must be the 64-character token "
-                    "cron_preview_recovery returned"
+                    "plan_token must be the {}-character token "
+                    "cron_preview_recovery returned".format(PLAN_TOKEN_LENGTH)
                 )
         mode = args.get("mode", "failed")
         if not isinstance(mode, str):
@@ -1797,7 +2083,7 @@ class MCPHandler:
         tasks = args.get("tasks", [])
         if (
             not isinstance(tasks, list)
-            or len(tasks) > 2000
+            or len(tasks) > RECOVERY_TASKS_MAX
             or any(not isinstance(t, str) for t in tasks)
         ):
             raise _ToolInputError(
@@ -2266,10 +2552,10 @@ class MCPHandler:
             return (
                 "Diagnose the failed workflow run '{1}' of dag '{0}'. Use "
                 "cron_get_dag_run(dag='{0}', run_key='{1}') to find the "
-                "failed task(s), cron_tail_dag_task_logs(...) for their "
-                "output, and cron_get_dag_xcom(dag='{0}', run_key='{1}') for "
-                "the data they passed. Explain which task failed, why, and "
-                "what downstream tasks were blocked."
+                "failed task(s) with their exit codes and failure reasons, "
+                "and cron_get_dag_xcom(dag='{0}', run_key='{1}') for the "
+                "data they passed. Explain which task failed, why, and what "
+                "downstream tasks were blocked."
             ).format(a["dag"], a["run_key"])
 
         def blast(a: dict[str, str], present: frozenset) -> str:
@@ -2366,11 +2652,7 @@ class MCPHandler:
                     arg("dag", "the workflow name"),
                     arg("run_key", "the failed run key"),
                 ],
-                "requires": (
-                    "cron_get_dag_run",
-                    "cron_tail_dag_task_logs",
-                    "cron_get_dag_xcom",
-                ),
+                "requires": ("cron_get_dag_run", "cron_get_dag_xcom"),
                 "optional": (),
                 "complete": {
                     "dag": self._complete_dags,
@@ -2537,6 +2819,125 @@ _OBJ = {"type": "object"}
 
 def _enum(values: list[str]) -> dict[str, Any]:
     return {"type": "string", "enum": values}
+
+
+def _arg(
+    base: dict[str, Any], description: str, **constraints: Any
+) -> dict[str, Any]:
+    """An input property: ``base`` plus its description and constraints."""
+    return {**base, "description": description, **constraints}
+
+
+def _rows_arg(what: str, cap: int) -> dict[str, Any]:
+    """A count that defaults to, and is capped at, ``mcp.maxRows``."""
+    return _arg(
+        _INT,
+        "{} (default and maximum {}).".format(what, cap),
+        minimum=1,
+        maximum=cap,
+        default=cap,
+    )
+
+
+def _params_arg(subject: str, lister: str, *notes: str) -> dict[str, Any]:
+    """The ``params`` argument of a tool that starts runs."""
+    return _arg(
+        _OBJ,
+        " ".join(
+            (
+                "Values for the run parameters the {} declares, keyed by "
+                "name; {} lists them. A parameter left out takes its "
+                "default.".format(subject, lister),
+                *notes,
+                "With a scoped web token, supplying params needs the params "
+                "scope.",
+            )
+        ),
+    )
+
+
+# cron_explain_schedule's default run count: the handler applies it and
+# the input schema advertises it.
+_EXPLAIN_COUNT_DEFAULT = 5
+
+# Input properties that several tools share.
+_ISO_UTC = (
+    "Use ISO 8601, such as 2026-10-01T00:00+00:00 (write UTC as +00:00, "
+    "not Z). A value without an offset is read as UTC."
+)
+_JOB_ARG = _arg(
+    _STR,
+    "Exact job name, as cron_list_jobs returns it. An unknown name "
+    "returns an error.",
+)
+_OFFSET_ARG = _arg(
+    _INT,
+    "Rows to skip. Pass the previous page's nextOffset to get the next page.",
+    minimum=0,
+    default=0,
+)
+_TZ_ARG = _arg(
+    _STR, "IANA time zone, such as America/New_York. Defaults to UTC."
+)
+_EXPRESSION_ARG = _arg(_STR, "Cron expression, such as 0 3 * * 1-5.")
+_SEED_ARG = _arg(
+    _STR,
+    "Name of the job that will use the expression, which resolves "
+    "Jenkins-style H fields to that job's slot. For a workflow's "
+    "schedule, use dag:<name>. Required when the expression uses H.",
+)
+_CURSOR_ARG = _arg(
+    _INT,
+    "Omit it for the latest lines. To poll, pass the previous result's "
+    "cursor to get up to tail lines after it, and call again while pages "
+    "come back full. In the result, skipped counts lines after the cursor "
+    "that the {}-line buffer dropped. reset means the cursor is past this "
+    "run's output: it came from another run, or the run's lines are gone "
+    "(an ended workflow task, or a run from before a daemon restart). If "
+    "started_at changed, the lines come from another run, so call again "
+    "without a cursor.".format(LIVE_LOG_LIMIT),
+    minimum=0,
+)
+_CONFIRM_ARG = _arg(
+    _BOOL,
+    "Must be true. Without it the tool changes nothing and returns an error.",
+)
+_DAG_ARG = _arg(_STR, "Workflow name, as cron_list_dags returns it.")
+_RUN_KEY_ARG = _arg(
+    _STR, "Workflow run key, as cron_list_dag_runs returns it."
+)
+_TASKKEY_ARG = _arg(
+    _STR,
+    "Task instance key: the task ID, or for one instance of a mapped "
+    "task, the ID, #, and map index (for example, fetch#2).",
+)
+_RECOVERY_ARGS = {
+    "dag": _DAG_ARG,
+    "run_key": _arg(
+        _STR,
+        "Finished run to recover, as cron_list_dag_runs returns it. "
+        "Give run_key, or from and to.",
+    ),
+    "from": _arg(
+        _STR,
+        "Start of a date range whose failed runs to recover, used with "
+        "to instead of run_key. The range includes both ends. " + _ISO_UTC,
+    ),
+    "to": _arg(_STR, "End of the date range, read the same way as from."),
+    "mode": _arg(
+        _enum(["failed", "from"]),
+        "failed reruns the failed and upstream-failed tasks; from reruns "
+        "the tasks that `tasks` lists. Either way, everything downstream "
+        "of them reruns too. A date range supports failed only.",
+        default="failed",
+    ),
+    "tasks": _arg(
+        {"type": "array", "items": _STR},
+        "Task instance keys to rerun, with everything downstream of "
+        "them, for mode from.",
+        maxItems=RECOVERY_TASKS_MAX,
+    ),
+}
 
 
 def _obj_schema(

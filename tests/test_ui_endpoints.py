@@ -2,12 +2,12 @@
 
 Covers the new/extended web surface: the durable-retry / slot / reboot fields
 on ``/jobs``, the ``unknown`` bucket in run stats, the enriched ``/dags``
-summary, the DAG XCom read, and the metadata-only state inspector
-(``/state``, ``/state/documents``, ``/state/records``) with its redaction and
-guards.  Handlers are called directly with a small mock request, the same
-style as the ``test_cron_web.py`` web tests; the state/dag cases spin a
-real :class:`~cronstable.state.FilesystemStateBackend` in a temp dir like
-``test_state_dag_run.py``.
+summary, the DAG XCom read, and the state inspector (``/state`` inventory
+metadata, ``/state/documents`` with KV values redacted, and ``/state/records``
+full bodies) with its guards.  Handlers are called directly with a small
+mock request, the same style as the ``test_cron_web.py`` web tests; the
+state/dag cases spin a real :class:`~cronstable.state.FilesystemStateBackend`
+in a temp dir like ``test_state_dag_run.py``.
 """
 
 import asyncio
@@ -1085,8 +1085,8 @@ async def test_auth_middleware_accepts_query_token_on_ics_only():
 
 # ===========================================================================
 # Direct-call payload builders behind the web endpoints: schedule explainers,
-# fleet analysis, next-fire / never-fires helpers, the metadata-only state
-# inspector, and a handful of small web helpers.  Driven with a tiny in-memory
+# fleet analysis, next-fire / never-fires helpers, the state inspector, and
+# a handful of small web helpers.  Driven with a tiny in-memory
 # config and lightweight fakes -- no live cluster, lease, or network.
 # ===========================================================================
 

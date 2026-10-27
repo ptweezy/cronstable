@@ -119,6 +119,9 @@ GC_LEASE_BATCH = 32
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
 
+# The longest requestId a manual trigger accepts.
+REQUEST_ID_MAX = 200
+
 # Durable checkpoint stream for a dag's catch-up cycles, the dag twin of the
 # job engine's ``catchup/<job>`` stream (cron.CATCHUP_STREAM_PREFIX; a
 # distinct prefix because dag and job names would otherwise share one stream
@@ -3541,10 +3544,13 @@ class DagScheduler:
             return None
         resolved = self._resolve_params(dagcfg, params, scopes)
         if request_id is not None and not (
-            isinstance(request_id, str) and 1 <= len(request_id) <= 200
+            isinstance(request_id, str)
+            and 1 <= len(request_id) <= REQUEST_ID_MAX
         ):
             raise TriggerInputError(
-                "requestId must be a string of 1 to 200 characters"
+                "requestId must be a string of 1 to {} characters".format(
+                    REQUEST_ID_MAX
+                )
             )
         logical_iso = None
         if logical_date is not None:

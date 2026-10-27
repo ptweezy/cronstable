@@ -84,7 +84,7 @@ default) strips every mutating tool regardless of toolset.
 | --- | --- |
 | `observe` (read) | `cron_get_status`, `cron_list_jobs`, `cron_get_job`, `cron_list_runs`, `cron_get_job_trends`, `cron_get_job_resources`, `cron_get_cluster`, `cron_get_fleet`, `cron_get_node`, `cron_query_metrics`, `cron_get_version`, `cron_tail_job_logs`, `cron_schedule_pressure`, `cron_schedule_duplicates`, `cron_suggest_slot`, `cron_validate_schedule`, `cron_explain_schedule`, `cron_why_no_run`, `cron_list_pools` |
 | `dags` (read) | `cron_list_dags`, `cron_list_dag_runs`, `cron_get_dag_run`, `cron_get_dag_xcom`, `cron_tail_dag_task_logs`, `cron_preview_recovery` |
-| `state` (read) | `cron_inspect_state` (store overview / a namespace's documents / a stream's records; KV values and secrets redacted) |
+| `state` (read) | `cron_inspect_state` (store overview / a namespace's documents / a stream's records; KV values redacted, records in full) |
 | `act` (**mutating**) | `cron_run_job`, `cron_cancel_job`, `cron_pause_job`, `cron_resume_job`, `cron_cancel_queued` |
 | `dags` (**mutating**) | `cron_trigger_dag`, `cron_backfill_dag`, `cron_recover_dag`, `cron_decide_gate` |
 
@@ -106,6 +106,29 @@ name, and `state`: `running`, `disabled`, or `scheduled` (enabled and not
 running). The tool applies both before it pages, so `total` counts the
 matching jobs, and it builds full job rows for the returned page. On a large
 job set, a small `limit` or a `filter` keeps the result small.
+
+`cron_tail_job_logs` and `cron_tail_dag_task_logs` return a run's latest
+output lines, up to `tail`, and a `cursor`. Pass the cursor back to get the
+lines written after it, up to `tail` at a time; when a page is full, call
+again for the rest. The cursor counts the run's lines, so polling keeps
+working after the run's 1000-line buffer fills. `cron_tail_job_logs` reads
+the job's newest running instance, or its last finished run when none is
+running. Each result also has these fields:
+
+- `skipped`: the number of lines after the cursor that the buffer dropped
+  before this call.
+- `reset`: `true` when the cursor is past the end of this run's output. The
+  cursor came from another run, or the run's lines are gone: a workflow task
+  that ended, or a run from before a daemon restart. The page then starts at
+  the oldest line the buffer holds.
+- `started_at`: when the job run, or the running workflow task instance,
+  started. A value that differs from the previous call's means the lines come
+  from another run, newer or older, so start over without a cursor. For
+  example, an older run that is still going takes over after a newer
+  overlapping run ends.
+- `running`: for a job, whether any instance is running; for a workflow task,
+  whether the instance is still running. A workflow task's lines are gone
+  after it ends.
 
 Mutating tools require an explicit `confirm: true` argument and re-check the
 same authorization as the REST API. The tools that launch configured commands
@@ -404,9 +427,10 @@ The MCP surface matches cronstable's hardening and is safe by default:
   `cron_decide_gate` appends its optional `by` argument, up to 100
   characters, to the label as display text.
 
-- **Redaction.** `cron_inspect_state` mirrors the dashboard's metadata-only
-  stance: KV values become a size/type summary and secret **names** are shown
-  without values.
+- **Redaction.** `cron_inspect_state` returns what the
+  [state inspector endpoints](HTTP-API#state-inspector-endpoints) return: KV
+  values become a size/type summary, records come back as full bodies, and
+  archived-output `logs/` streams are refused.
 
 ## Trying it
 

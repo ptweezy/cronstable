@@ -378,9 +378,10 @@ splits into sub-tabs built from what the store holds:
   [state inspector endpoints](HTTP-API#state-inspector-endpoints)
   (`GET /state/documents` / `GET /state/records`).
 
-The inspector shows **metadata only**, including value types and sizes. It
-does not fetch record payloads, KV values, or archived output. After the
-startup probe, it polls only while open.
+A KV entry shows its value's type and size, never the value. **inspect** on
+a cursor tab shows each stored watermark, and on a record tab it shows the
+scope's newest records in full, as JSON. The inspector never fetches
+archived output. After the startup probe, it polls only while open.
 
 ## Cluster panel
 

@@ -1379,6 +1379,11 @@ class ScheduleEntry(NamedTuple):
 #: hundreds of jobs share one cell.
 _NAME_CAP = 10
 
+#: the window schedule_pressure scans by default, in hours (one day)
+PRESSURE_DEFAULT_HOURS = 24
+#: the longest window schedule_pressure scans, in hours (one week)
+PRESSURE_MAX_HOURS = 168
+
 #: what a fire walk actually depends on: the resolved schedule text and
 #: the resolved zone.  Everything else about an entry (its name above
 #: all) only decides which bucket the walk's result lands in.
@@ -1597,7 +1602,7 @@ def _fill_cell_jobs(
 def schedule_pressure(
     entries: Sequence[ScheduleEntry],
     start: datetime.datetime | None = None,
-    hours: int = 24,
+    hours: int = PRESSURE_DEFAULT_HOURS,
     tz: datetime.tzinfo | None = None,
 ) -> dict[str, Any]:
     """The fleet's collision heatmap: every fire over the next 24 hours.
@@ -1618,7 +1623,7 @@ def schedule_pressure(
     zone = tz or datetime.timezone.utc
     if start is None:
         start = datetime.datetime.now(datetime.timezone.utc)
-    hours = max(1, min(int(hours), 168))
+    hours = max(1, min(int(hours), PRESSURE_MAX_HOURS))
     grid, cell_jobs, minute_jobs = _fire_cells(entries, start, hours, zone)
     # zip(*grid) walks the 24x60 grid once, one column tuple per minute
     by_minute_fires = [sum(column) for column in zip(*grid, strict=True)]
