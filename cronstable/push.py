@@ -918,12 +918,30 @@ def fit_payload(payload: dict[str, Any], limit: int | None = None) -> bytes:
     return data
 
 
+def _keyed_id(ident: dict[str, Any], salt: str, domain: bytes) -> str:
+    """32 hex characters of SHA-256 over ``domain``, the salt, NUL, ``ident``.
+
+    JSON escapes control characters, so ``ident`` adds no NUL byte.  Under
+    one salt, two domains holding different numbers of NUL bytes never
+    produce the same input: the empty domain of :func:`collapse_id` and
+    the NUL-terminated one of :func:`flap_id` stay apart whatever the
+    salt holds.
+    """
+    blob = json.dumps(ident, sort_keys=True, separators=(",", ":"))
+    keyed = domain + salt.encode("utf-8") + b"\x00" + blob.encode("utf-8")
+    return hashlib.sha256(keyed).hexdigest()[:32]
+
+
 def collapse_id(payload: dict[str, Any], salt: str) -> str:
     """An opaque coalescing key for the relay: same alert, same id.
 
     A keyed hash of the alert's identity fields, so the relay can
     deduplicate the same (job, run) reported by several nodes without
-    learning the job name or run id.  ``salt`` is the per-installation
+    learning the job name or run id.  The id names one run wherever the
+    alert has one: ``run_id`` (job runs, DAG events) and ``run_key``
+    (DAG events) are identity fields, so each run of a job that fails in
+    a loop arrives under a fresh id.  Flap suppression across runs keys
+    on :func:`flap_id` instead.  ``salt`` is the per-installation
     secret kept beside the device registry (see ``ensure_salt`` on the
     stores): without it the identity fields are low-entropy (on a
     stateless install ``run_id`` is absent, leaving only kind + name),
@@ -945,9 +963,78 @@ def collapse_id(payload: dict[str, Any], salt: str) -> str:
         )
         if payload.get(key) not in (None, "")
     }
-    blob = json.dumps(ident, sort_keys=True, separators=(",", ":"))
-    keyed = salt.encode("utf-8") + b"\x00" + blob.encode("utf-8")
-    return hashlib.sha256(keyed).hexdigest()[:32]
+    return _keyed_id(ident, salt, b"")
+
+
+def flap_id(
+    payload: dict[str, Any], salt: str, node: str | None = None
+) -> str | None:
+    """An opaque flap key for the relay: same source, same id, every run.
+
+    :func:`collapse_id` names one run, so a job that fails every minute
+    reaches the relay under a fresh collapse id each time and never
+    trips flap suppression.  This id names the source that keeps
+    alerting instead: every per-run field is left out, so a job failing
+    in a loop shares one key.  The relay keys flap suppression on it
+    and keeps deduplication on the collapse id.  ``None`` means the
+    alert has no flap identity, and the relay keys its flap state on
+    the collapse id.
+
+    ``node`` is the reporting node's cluster ``nodeName``.  Without one
+    (a standalone daemon), the payload's ``host`` names the node.  The
+    sealed payload keeps ``host`` for display either way.
+
+    The identity fields, per alert family:
+
+    - Job runs: ``kind``, ``name``, and the node.  ``run_id`` goes: the
+      daemon mints one per launch whenever the job API is up, and a DAG
+      task carries its DAG run's id.  A DAG task reports as
+      ``<dag>.<task>``, the same name in every run.  ``kind`` keeps
+      ``failure`` and ``success`` apart, so a job that pushes on every
+      success spends its own flap budget and leaves the one its
+      failure pages need untouched.  The node keeps the nodes of an
+      ``EveryNode`` job apart, because each node runs its own instance
+      and fails for its own reasons.  The node is the ``nodeName``
+      rather than the hostname: nodes built from one image can share a
+      hostname, and such a cluster gives each node a distinct
+      ``nodeName``.  A ``Leader`` job that moves between nodes takes one
+      budget per node, which the cluster size bounds.
+    - SLA breaches: ``kind``, ``name``, ``sla_check``, and the node.  A
+      breach describes a job that did not run, so it has no per-run
+      field.  Each check of a job keeps a key of its own, and the node
+      stays in for the same reason as for job runs.
+    - ``approval_waiting``: no flap identity.  Each gate is a one-shot
+      request for a decision, and the daemon notifies it only once, so a
+      suppressed gate would wait unannounced.  The relay's rate bucket
+      and digest still bound a flood of gates.
+    - Other events: ``kind``, ``event``, ``name``, and ``dag``.
+      ``run_key`` names one DAG run (the scheduled logical instant, or
+      a random ``manual-`` key for a triggered run) and ``run_id`` is
+      that run's id, so both go.  The node goes too: a DAG runs on
+      whichever node leads, and the node events (``leader_change``,
+      ``quorum_loss``) already name their node.  ``leader_change``
+      covers both directions under one event name, and its ``role``
+      and ``leader`` fields stay out of the key.
+
+    The hash takes the same per-installation salt as
+    :func:`collapse_id`, under its own domain, so the two ids differ
+    even where the identities match (a quorum loss, a leadership
+    change).
+    """
+    kind = payload.get("kind")
+    if kind == "event" and payload.get("event") == "approval_waiting":
+        return None
+    ident = {
+        key: payload[key]
+        for key in ("kind", "name", "event", "dag", "sla_check")
+        if payload.get(key) not in (None, "")
+    }
+    # The node name and the hostname share one slot, so a cluster node on
+    # the default nodeName (its hostname) gets a standalone daemon's key.
+    where = node or payload.get("host")
+    if kind in ("failure", "success", "sla") and where not in (None, ""):
+        ident["host"] = where
+    return _keyed_id(ident, salt, b"flap\x00")
 
 
 def key_fingerprint(public_key_b64: str | None) -> str | None:
@@ -1456,11 +1543,16 @@ class PushService:
         relay_timeout: float,
         store: Any,
         host: str,
+        node: Callable[[], str | None] | None = None,
     ) -> None:
         self.relay_url = relay_url
         self.relay_timeout = relay_timeout
         self.store = store
         self.host = host
+        # The cluster nodeName for flap ids (see flap_id), or None on a
+        # standalone daemon.  A callable, read per alert: a config reload
+        # rebuilds the cluster manager and keeps an unchanged service.
+        self._node = node
         self._devices: dict[str, dict[str, Any]] = {}
         self._mirror_fresh_until = 0.0
         # Why the last read failed, or None while the mirror is trusted.
@@ -1809,10 +1901,18 @@ class PushService:
         # coalesce under a different id than the same alert reported by a
         # node whose copy happened to fit.  Per-device fitting would have
         # widened that into one id per suite; taking the id from the
-        # untrimmed payload removes the coupling entirely.
-        coalesce = collapse or collapse_id(
-            payload, self._collapse_salt or self._local_salt
-        )
+        # untrimmed payload removes the coupling entirely.  The flap id
+        # comes from the same untrimmed payload, so fitting touches
+        # neither id.
+        salt = self._collapse_salt or self._local_salt
+        coalesce = collapse or collapse_id(payload, salt)
+        # A caller that picks its own collapse id is sending a one-off
+        # (the test alert), and a one-off has no flap identity.  Keyed on
+        # the test alert's constant kind and name, a flap key would let
+        # the relay start suppressing a run of test sends, the one alert
+        # that has to arrive every time.
+        node = self._node() if self._node is not None else None
+        flap = None if collapse else flap_id(payload, salt, node)
         is_event = payload.get("kind") == "event"
         targets = [only] if only else list(self._devices.values())
 
@@ -1841,6 +1941,7 @@ class PushService:
                         coalesce,
                         priority,
                         is_event,
+                        flap=flap,
                     )
                     for device in targets
                 ),
@@ -1910,6 +2011,8 @@ class PushService:
         coalesce: str,
         priority: str,
         is_event: bool,
+        *,
+        flap: str | None = None,
     ) -> dict[str, Any]:
         """Seal and POST one alert; the outcome, never an exception."""
         outcome: dict[str, Any] = {
@@ -1936,6 +2039,11 @@ class PushService:
             # without either having to infer the algorithm from a length.
             "suite": suite,
         }
+        if flap is not None:
+            # The relay's flap-suppression key: the alert's source across
+            # runs, where collapseId names one run.  A relay that predates
+            # the field ignores it and keys flap state on collapseId.
+            body["flapId"] = flap
         await self._post_envelope(session, body, outcome)
         if not _relay_caps_below_ours(outcome, len(ciphertext)):
             return outcome

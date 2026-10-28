@@ -3922,12 +3922,10 @@ async def test_web_start_deferred_reboot_without_manager(reboot_cron):
 
 
 async def test_web_start_deferred_reboot_concurrent_requests(reboot_cron):
-    # Reviewer race: two concurrent POST /jobs/{name}/start for the SAME
-    # still-pending @reboot name can both pass the pending check before the
-    # awaited mark_reboot_ran yields (the gossip push awaits peers). The
-    # loser must not 500 on a KeyError retiring an entry the winner already
-    # retired: the entry is retired exactly once, and BOTH manual starts
-    # still launch -- exactly as two manual starts of any other job would.
+    # Two concurrent POST /jobs/{name}/start for the SAME pending @reboot
+    # name, while mark_reboot_ran yields (the gossip push awaits peers).
+    # Neither request 500s, the entry retires exactly once, and BOTH manual
+    # starts launch, as two manual starts of any other job would.
     cron, launched = reboot_cron(launch="maybe_launch_job", web=True)
     _pend_reboot(cron)
     mgr = _reboot_mgr(leader=None)
@@ -3950,6 +3948,90 @@ async def test_web_start_deferred_reboot_concurrent_requests(reboot_cron):
     assert launched == ["boot", "boot"]  # both operator actions ran the job
     assert "boot" not in cron._pending_reboot_jobs  # retired exactly once
     assert mgr.reboot_ran("boot") is True  # ...and recorded cluster-wide
+
+
+@pytest.mark.parametrize(
+    "election, policy, with_mgr",
+    [
+        pytest.param(True, "Leader", True, id="elected_owner"),
+        pytest.param(False, "Leader", False, id="election_removed"),
+        pytest.param(True, "PreferLeader", False, id="no_manager"),
+    ],
+)
+async def test_deferred_reboot_pass_skips_an_entry_a_manual_start_retired(
+    reboot_cron, monkeypatch, election, policy, with_mgr
+):
+    # A manual start of pending "b" lands while the pass awaits "a"'s
+    # launch. The pass must skip "b": a KeyError here would end run(), and
+    # a scheduled launch would run the one-shot a second time.
+    cron, manual = reboot_cron(election=election, launch="maybe_launch_job")
+    for name in ("a", "b"):
+        job = _reboot_job(name, policy=policy)
+        cron.cron_jobs[name] = job
+        cron._pending_reboot_jobs[name] = job
+    mgr = _reboot_mgr(leader="node-a") if with_mgr else None
+    cron.cluster_manager = mgr
+    scheduled = []
+
+    async def launch_scheduled(job):
+        scheduled.append(job.name)
+        if job.name == "a":
+            await cron.start_job_by_name("b")
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", launch_scheduled)
+    await cron._process_pending_reboots()
+    assert scheduled == ["a"]
+    assert manual == ["b"]
+    assert not cron._pending_reboot_jobs
+    if mgr is not None:
+        assert mgr.reboot_ran("a") and mgr.reboot_ran("b")
+
+
+@pytest.mark.parametrize(
+    "election, policy, teardown",
+    [
+        pytest.param(False, "Leader", False, id="election_removed"),
+        pytest.param(False, "PreferLeader", False, id="election_removed_pl"),
+        pytest.param(True, "PreferLeader", True, id="manager_torn_down"),
+    ],
+)
+async def test_deferred_reboot_pass_during_a_manual_start_push(
+    reboot_cron, monkeypatch, election, policy, teardown
+):
+    # A pass lands while a manual start of pending "boot" awaits the push
+    # in mark_reboot_ran (real backends record locally, then await peers or
+    # the store). The manual start holds the entry, so the pass must not
+    # launch the one-shot a second time.
+    cron, manual = reboot_cron(election=election, launch="maybe_launch_job")
+    _pend_reboot(cron, _reboot_job(policy=policy))
+    mgr = _reboot_mgr(leader="node-a")
+    record = mgr.mark_reboot_ran
+    parked, release = asyncio.Event(), asyncio.Event()
+
+    async def _parked_mark(name):
+        await record(name)
+        parked.set()
+        await release.wait()
+
+    mgr.mark_reboot_ran = _parked_mark
+    cron.cluster_manager = mgr
+    scheduled = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda job: scheduled.append(job.name) or _noop(),
+    )
+    start = asyncio.create_task(cron.start_job_by_name("boot"))
+    await parked.wait()
+    if teardown:
+        cron.cluster_manager = None  # a reload stopped the manager mid-push
+    await cron._process_pending_reboots()
+    release.set()
+    await start
+    assert scheduled == []
+    assert manual == ["boot"]
+    assert not cron._pending_reboot_jobs
+    assert mgr.reboot_ran("boot")
 
 
 async def test_cluster_start_survives_bad_cert_files(caplog):

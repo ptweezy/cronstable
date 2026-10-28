@@ -1,6 +1,6 @@
 """The DAG orchestration core: the state machine, as pure functions.
 
-This module is the *logic* half of the durable DAG tier -- the analogue of
+This module is the *logic* half of the durable DAG tier, the analogue of
 :mod:`cronstable.jobstate`.  It turns a static DAG definition plus the
 current durable ``dag_run`` document into the decisions the scheduler acts on:
 which tasks are ready, which to claim (``pending -> running``), how a finished
@@ -12,9 +12,9 @@ a backend, a clock, or a subprocess, and the cron wiring
 :meth:`cronstable.state.StateBackend.mutate_document`.
 
 A ``dag_run`` is stored as a single mutable *document* (see the layout in
-:func:`new_run_body`), not a record stream: the core operation -- "flip this
-task ``pending -> running`` only if it is still pending" -- is a
-compare-and-set, exactly what ``mutate_document`` (a flock-guarded
+:func:`new_run_body`), not a record stream: the core operation ("flip this
+task ``pending -> running`` only if it is still pending") is a
+compare-and-set, which ``mutate_document`` (a flock-guarded
 read-modify-write) provides, and modelling the whole run as one document lets a
 single atomic RMW claim every ready task at once.  The scheduler advances a run
 only while holding that run's advance lease, so a fleet never double-advances;
@@ -47,10 +47,10 @@ DAG_RUN_NS_PREFIX = "dagrun/"
 
 #: lease-name prefix the scheduler advances a run under (the TTL lease trio);
 #: one lease per run, distinct from every job/slot lease name.  The GC
-#: callers pass this prefix as the one EPHEMERAL lease class the backend may
+#: callers pass this prefix as the one ephemeral lease class the backend may
 #: reclaim: a ``dagadvance/<dag>/<run_key>`` name recurs only if the same
 #: run key is re-created after its run document was already GC'd, and no
-#: fence for it is persisted outside the run document's own lifetime --
+#: fence for it is persisted outside the run document's own lifetime,
 #: unlike slot/retry-claim leases, whose fences live on in durable slot
 #: cancel records.
 DAG_LEASE_PREFIX = "dagadvance/"
@@ -60,8 +60,8 @@ DAG_LEASE_PREFIX = "dagadvance/"
 XCOM_SCOPE_PREFIX = "dagxcom/"
 
 # Environment variables the daemon injects into every DAG task (on top of the
-# durable ``CRONSTABLE_STATE_*`` control-channel vars), so the task -- and the
-# ``cronstable xcom`` CLI it calls -- knows which run/task it is and where its
+# durable ``CRONSTABLE_STATE_*`` control-channel vars), so the task and the
+# ``cronstable xcom`` CLI it calls know which run/task it is and where its
 # XCom scope lives.  Defined here (a dependency-free module) so both the daemon
 # (:mod:`cronstable.dagrun`) and the offline CLI (:mod:`cronstable.jobcli`)
 # share the exact names without either pulling in the other's imports.
@@ -100,9 +100,8 @@ SUCCESS_STATES = frozenset({SUCCESS})
 #: terminal states that make a downstream ``all_success`` dependency fail.
 FAILURE_STATES = frozenset({FAILED, UPSTREAM_FAILED})
 #: the states a claim pass leaves untouched: terminal, plus the EXPANDED
-#: group placeholder whose instances carry the real work.  One membership
-#: test for what was a membership test plus a comparison, on the first line
-#: of the per-instance dispatch.
+#: group placeholder whose instances carry the real work.  Used on the first
+#: line of the per-instance dispatch.
 _INERT_TASK_STATES = TERMINAL_STATES | {EXPANDED}
 
 TASK = "task"
@@ -114,20 +113,20 @@ ALL_DONE = "all_done"
 
 #: Hard cap on a mapped task's fan-out: a cron daemon shares its host, so an
 #: unbounded XCom list must not become an unbounded instance set (run-document
-#: bloat, subprocess stampede); past the cap the mapped task FAILS with an
+#: bloat, subprocess stampede); past the cap the mapped task fails with an
 #: explanatory reason instead of expanding.
 MAX_MAPPED_ITEMS = 1000
 
 #: Byte ceiling on a mapped fan-out's serialized XCom blob, enforced by the
-#: consumer (:meth:`DagRunner._read_xcom_list`) BEFORE the blob is fetched or
-#: decoded.  MAX_MAPPED_ITEMS bounds the item COUNT but only after the list is
+#: consumer (:meth:`DagRunner._read_xcom_list`) before the blob is fetched or
+#: decoded.  MAX_MAPPED_ITEMS bounds the item count only after the list is
 #: in memory; a publisher that set ``maxArtifactBytes: 0`` (no publish-time
 #: limit) could otherwise hand the fan-out an arbitrarily large blob that OOMs
 #: the daemon during fetch/decode.  Sized generously above any legitimate
 #: MAX_MAPPED_ITEMS fan-out of small pointer-sized items (~16 KiB/item).
 MAX_MAPPED_XCOM_BYTES = 16 * 1024 * 1024
 
-#: At most this many instances are claimed -- and therefore launched -- by one
+#: At most this many instances are claimed and therefore launched by one
 #: advance pass; the rest stays claimable and the driver re-services promptly
 #: (``AdvanceResult.deferred``), bounding any single pass's spawn burst.
 MAX_CLAIMS_PER_PASS = 32
@@ -210,10 +209,8 @@ class DagValidationError(Exception):
 
 
 #: The characters :func:`validate_graph` bars from a task id: the C0 control
-#: range and DEL.  One precompiled scan per id, not a per-character generator:
-#: config load validates every task of every DAG, and the ``any(ord(ch) ...)``
-#: form paid a generator resume plus two ``ord`` calls for every character of
-#: every id (two thirds of the validation walk on a 10k-task graph).
+#: range and DEL.  One precompiled scan per id avoids a per-character
+#: generator resume and ``ord`` calls across every task of every DAG at load.
 _ID_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -296,25 +293,20 @@ def _validate_expand(task: TaskSpec, seen: dict[str, TaskSpec]) -> None:
 
 
 def _check_acyclic(spec: DagSpec) -> None:
-    # Kahn's algorithm over the DEDUPED edge set: a repeated dependsOn entry
+    # Kahn's algorithm over the deduped edge set: a repeated dependsOn entry
     # is one edge (counting it twice would leave a phantom indegree and a
     # false cycle verdict on an acyclic graph).
     #
     # Indegrees, the reverse adjacency and the initial ready set are built in
-    # ONE walk over the tasks (they were four passes, three of them re-walking
-    # the same tuple or re-reading the deduped map).  Popping a node then
-    # rescanning every task for it made the walk O(V^2) set tests (a 10k-task
-    # chain took seconds of the config load).  validate_graph has already
-    # rejected unknown deps, self-deps and duplicate ids above, so every dep
-    # here names a real node and the edge set is identical either way.
+    # one walk over the tasks.  validate_graph has already rejected unknown
+    # deps, self-deps and duplicate ids above, so every dep here names a real
+    # node.
     #
-    # Two allocations per node are dropped along the way: the dedupe set is
-    # skipped for the 0- and 1-dep shapes, which cannot repeat an entry (the
-    # common node in a chain or a wide DAG), and each dependents list is built
-    # on its first edge rather than through ``setdefault(dep, [])``, which
-    # constructed and discarded a list on EVERY edge.  ``ready`` keeps its old
-    # contents and order: both it and ``indeg`` are filled in spec.tasks
-    # order, exactly what iterating ``indeg`` afterwards yielded.
+    # The dedupe set is skipped for the 0- and 1-dep shapes, which cannot
+    # repeat an entry (the common node in a chain or a wide DAG), and each
+    # dependents list is built on its first edge rather than through
+    # ``setdefault(dep, [])``.  Both ``ready`` and ``indeg`` are filled in
+    # spec.tasks order.
     indeg: dict[str, int] = {}
     dependents: dict[str, list[str]] = {}
     ready: list[str] = []
@@ -524,8 +516,7 @@ class ReconcileAdvanceResult:
 
 #: Absent-key sentinel for the ``body["mapped"]`` lookups that ask both "is
 #: this task recorded as expanded?" and "give me its record": one ``.get``
-#: with the sentinel answers both, where a membership test followed by a
-#: ``.get`` hashed the id twice on paths that run once per task per advance
+#: with the sentinel answers both on paths that run once per task per advance
 #: pass.  Distinct from ``None``, which a damaged document can hold as a
 #: recorded value and which those paths already treat as "no instances".
 _UNSET = object()
@@ -536,23 +527,21 @@ def _fold_mapped_instances(
 ) -> tuple[bool, bool, bool]:
     """Reduce an expanded task's instances to ``(holds, failed, skipped)``.
 
-    THE one absent-entry rule (and the one WALK over it) shared by the
-    fan-in barrier (:func:`_mapped_group_state`) and the run terminaliser
+    The absent-entry rule and walk shared by the fan-in barrier
+    (:func:`_mapped_group_state`) and the run terminaliser
     (:func:`_maybe_terminalise`).  Expansion materialises every instance in
     the same RMW that records the item list, so an entry missing for a
     run-recorded index can only mean a foreign or damaged run document; it
-    reads as ``pending`` (non-terminal) in BOTH consumers.  The two once
-    disagreed (barrier held, terminaliser skipped), so the same document
-    could complete as a run while its group still read ``running`` to every
-    downstream; under the shared rule a hole holds the run open instead.
-    Holding it open is safe because the claim pass repairs it: the same
-    advance transform runs :func:`_propagate_and_claim` first, which
-    materialises a run-recorded index it finds missing and fails it (see
-    :func:`_resolve_missing_instance`), so the run terminalises on that
+    reads as ``pending`` (non-terminal) in both consumers, holding the run
+    open so the run cannot complete while its group still reads ``running``
+    to downstreams.  Holding it open is safe because the claim pass repairs
+    it: the same advance transform runs :func:`_propagate_and_claim` first,
+    which materialises a run-recorded index it finds missing and fails it
+    (see :func:`_resolve_missing_instance`), so the run terminalises on that
     very pass rather than wedging.
 
     ``holds`` is the barrier verdict: at least one instance is not terminal,
-    which BOTH consumers act on before anything else, so the walk returns on
+    which both consumers act on before anything else, so the walk returns on
     the first one and never builds the remaining keys.  Folding here rather
     than per instance keeps the two consumers call-free over a fan-out that
     can hold MAX_MAPPED_ITEMS entries.
@@ -563,14 +552,12 @@ def _fold_mapped_instances(
     for i in range(count):
         entry = tasks_get(prefix + str(i))
         state = PENDING if entry is None else entry.get("state", PENDING)
-        # An equality chain, not the TERMINAL_STATES/FAILURE_STATES
+        # An equality chain rather than TERMINAL_STATES/FAILURE_STATES
         # memberships: SUCCESS is the overwhelmingly common instance state of
-        # a fan-out being folded, and settling it takes ONE comparison here
-        # where the sets took a hash plus a lookup in each of two frozensets.
-        # It also drops the str() coercion the memberships needed: a
-        # damaged document's non-string (even unhashable) state compares
-        # unequal to all four and falls to the same "not terminal" arm the
-        # coercion produced, instead of hashing it inside a flock.
+        # a fan-out being folded, and settling it takes one comparison here.
+        # It also avoids str() coercion: a damaged document's non-string
+        # (even unhashable) state compares unequal to all four and falls to
+        # the "not terminal" arm instead of hashing inside a flock.
         if state == SUCCESS:
             continue
         if state == FAILED or state == UPSTREAM_FAILED:
@@ -588,7 +575,7 @@ def _mapped_group_state(body: dict[str, Any], task_id: str) -> str:
     Un-expanded -> the placeholder's own state (``pending`` normally, or a
     terminal ``upstream_failed`` / ``skipped`` if its upstream failed before it
     could expand); expanded to an empty list -> ``success``; otherwise the
-    reduction over its ``<id>#<i>`` instances -- but ONLY once every instance
+    reduction over its ``<id>#<i>`` instances, but only once every instance
     is terminal (the fan-in barrier): while any instance is still going the
     group reads ``running`` even if a sibling already failed, so a downstream
     (of either trigger rule) never starts against a half-finished fan-out.
@@ -603,10 +590,9 @@ def _mapped_group_state(body: dict[str, Any], task_id: str) -> str:
     items = mapped.get("items", [])
     if not items:
         return SUCCESS
-    # One pass with an early exit, not a materialised states list plus three
-    # scans: while a fan-out is in flight the FIRST instance is usually
-    # non-terminal, so building the other MAX_MAPPED_ITEMS-1 keys and lookups
-    # only to discard them is the bulk of this function's cost.
+    # One pass with an early exit: while a fan-out is in flight the first
+    # instance is usually non-terminal, avoiding building the remaining
+    # MAX_MAPPED_ITEMS-1 keys and lookups.
     holds, failed, skipped = _fold_mapped_instances(
         body["tasks"], task_id + "#", len(items)
     )
@@ -622,7 +608,7 @@ def _mapped_group_state(body: dict[str, Any], task_id: str) -> str:
 def effective_state(spec: DagSpec, body: dict[str, Any], task_id: str) -> str:
     """The state a dependency check should see for ``task_id``.
 
-    Keyed on the RUN's recorded expansion as well as the spec: a run whose
+    Keyed on the run's recorded expansion as well as the spec: a run whose
     task fanned out under an older spec keeps folding its instances even if
     a reload since removed ``expand:`` from the task. Its placeholder is
     parked in the non-terminal EXPANDED state, so consulting it instead
@@ -639,8 +625,8 @@ def effective_state(spec: DagSpec, body: dict[str, Any], task_id: str) -> str:
 def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
     """Resolve a task's upstreams into one of: ready / wait / fail / skip.
 
-    ``ready`` -- launch it; ``wait`` -- upstreams still running; ``fail`` --
-    an upstream failed (``all_success``); ``skip`` -- an upstream was skipped
+    ``ready``: launch it; ``wait``: upstreams still running; ``fail``:
+    an upstream failed (``all_success``); ``skip``: an upstream was skipped
     (``all_success``).  ``all_done`` only ever returns ready or wait.
     """
     if not task.depends_on:
@@ -653,10 +639,10 @@ def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
     tasks = body.get("tasks") or {}
     by_id = spec.by_id
     mapped_all = body.get("mapped")
-    # A dependency with NO entry in this run document was added to the DAG by a
-    # config reload AFTER the run was created (creation materialises every
+    # A dependency with no entry in this run document was added to the DAG by a
+    # config reload after the run was created (creation materialises every
     # then-current task): it is not part of this run's plan, so it cannot gate
-    # the dependent -- an ``effective_state`` of PENDING would leave the
+    # the dependent; an ``effective_state`` of PENDING would leave the
     # dependent, and the whole run, waiting forever.  Mirrors the same
     # "not materialised -> skip" rule in :func:`_maybe_terminalise`.
     failed = False
@@ -669,8 +655,7 @@ def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
             state = _mapped_group_state(body, dep)
         else:
             # effective_state's plain branch, inlined: the fan-out map and
-            # the dep's entry are both already in hand here, where the call
-            # re-resolved them from the body for every dependency.
+            # the dep's entry are both already in hand here.
             state = entry.get("state", PENDING)
         # The same equality chain :func:`_fold_mapped_instances` folds with,
         # for the same reasons: SUCCESS is the state an upstream reduction
@@ -776,8 +761,8 @@ def plan_and_claim(
     * parks a ready approval gate in ``running`` awaiting a decision;
     * terminalises the whole run once every task is terminal.
 
-    ``expansions[task_id] is None`` means "the upstream list could not be read
-    right now" -- the task is left for a later pass, never expanded to a guess.
+    ``expansions[task_id] is None`` means the upstream list could not be read
+    right now; the task is left for a later pass, never expanded to a guess.
 
     A read-only quiescence pre-scan (:func:`_is_quiescent`) runs before the
     deep copy: when it can prove nothing below would change the body, the
@@ -872,14 +857,10 @@ def _apply_expansions(
         if placeholder is not None:
             placeholder["state"] = EXPANDED
             placeholder["updatedAt"] = now
-        # Materialise the instances from ONE built entry: the rest are shallow
-        # copies carrying their own mapIndex/mapItem.  A fan-out can hold
-        # MAX_MAPPED_ITEMS instances, and this replaces that many entry builds
-        # (each re-deciding the mapped/sensor/approval keys, then popping the
-        # placeholder-only "mapped" flag straight back off) with that many
-        # dict.copy() calls.  Every template value is an immutable scalar, so
-        # the copies share nothing mutable, and copy-then-overwrite leaves the
-        # key order the per-instance build produced.
+        # Materialise the instances from one built entry: the rest are shallow
+        # copies carrying their own mapIndex/mapItem.  Every template value is
+        # an immutable scalar, so the copies share nothing mutable, and
+        # copy-then-overwrite preserves the key order.
         tasks = body["tasks"]
         prefix = task_id + "#"
         template = _new_task_entry(task, now)
@@ -906,11 +887,9 @@ def _instances_of(
     its ``expand:`` keeps dispatching its recorded instances, because its
     placeholder is parked EXPANDED and no path could ever advance it.
     """
-    # ONE sentinel-defaulted lookup answers both questions the two
-    # ``body["mapped"]`` reads used to ask separately ("is it recorded?", then
-    # "give me the record"), on a path that runs once per spec task per
-    # advance pass.  A recorded-but-null value still means "no instances",
-    # exactly as the second read's ``is None`` arm did.
+    # One sentinel-defaulted lookup answers both whether the task is recorded
+    # and what its record is, on a path that runs once per spec task per
+    # advance pass.  A recorded-but-null value still means "no instances".
     mapped_all: Any = body.get("mapped")
     mapped: Any = mapped_all.get(task.id, _UNSET) if mapped_all else _UNSET
     if mapped is _UNSET:
@@ -1036,12 +1015,10 @@ def _walk_and_claim(
     result: AdvanceResult,
 ) -> None:
     """Advance every task instance once, in declaration order."""
-    # Hoisted out of the loops: both were re-resolved once per TASK, and
-    # body["tasks"] again once per INSTANCE, so a wide DAG or a large fan-out
-    # repeated the same two lookups thousands of times per pass.  Both are
-    # safe to bind once: nothing below replaces either dict, it only mutates
-    # them (_resolve_missing_instance adds a task entry, and no path here
-    # records a fan-out), so the loop still sees every write.
+    # Hoisted out of the loops so a wide DAG or a large fan-out resolves
+    # both dicts once per pass.  Nothing below replaces either dict; it only
+    # mutates them (_resolve_missing_instance adds a task entry, and no path
+    # here records a fan-out), so the loop still sees every write.
     tasks = body["tasks"]
     mapped_all: Any = body.get("mapped")
     for task in spec.tasks:
@@ -1054,12 +1031,11 @@ def _walk_and_claim(
             _propagate_placeholder(spec, body, task, now, result)
             continue
         if not expanded:
-            # A plain task with no recorded fan-out is exactly one instance
-            # keyed by its id: :func:`_instances_of`'s single-instance
-            # branch, inlined because it is the node every non-mapped DAG is
-            # made of and the call built a one-tuple inside a one-list for
-            # each of them on every pass.  The mapped arm below still goes
-            # through _instances_of, which owns the recorded-fan-out rule.
+            # A plain task with no recorded fan-out is one instance keyed by
+            # its id (:func:`_instances_of`'s single-instance branch, inlined
+            # here to avoid allocating a single-element list per task).  The
+            # mapped arm below still goes through _instances_of, which owns
+            # the recorded-fan-out rule.
             entry = tasks.get(task.id)
             if entry is None:
                 # deliberately skipped: a task a reload added after the run
@@ -1091,20 +1067,20 @@ def _walk_and_claim(
                 verdict,
             )
             continue
-        # The deps verdict is a function of the TASK (all map instances
+        # The deps verdict is a function of the task (all map instances
         # share the same upstreams), and nothing this task's own instance
         # loop does can change it (a claim mutates only the instance's
         # entry, and a task cannot depend on itself).  Resolve it once per
         # task instead of once per instance: with N instances over a
-        # mapped upstream of M instances that is the difference between
-        # O(M) and O(N*M) state reductions per pass.  Computed lazily so
-        # a task with no pending instance skips it entirely.
+        # mapped upstream of M instances that is O(M) rather than O(N*M)
+        # state reductions per pass.  Computed lazily so a task with no
+        # pending instance skips it entirely.
         verdict = None
         for taskkey, map_index, item in _instances_of(spec, body, task):
             entry = tasks.get(taskkey)
             if entry is None:
                 if map_index is not None:
-                    # A HOLE: the run's own mapped item list records this
+                    # A hole: the run's own mapped item list records this
                     # index, so the entry should exist. Materialise it as
                     # failed rather than skipping, or the terminaliser's
                     # absent-instance rule (which reads a hole as pending,
@@ -1141,21 +1117,21 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
     if entry is None:
         return
     if entry.get("state") != PENDING:
-        # Not a fresh placeholder.  Terminal (or expanded) is fine -- but a
-        # NON-terminal, non-pending entry here is a task a config reload
+        # Not a fresh placeholder.  Terminal (or expanded) is fine, but a
+        # non-terminal, non-pending entry here is a task a config reload
         # retyped to mapped (gained ``expand:``) while it was mid-flight
-        # under its OLD shape: no path can ever advance it again (the
+        # under its unmapped shape: no path can ever advance it again (the
         # mapped dispatch never reaches _advance_task, so an elapsed
         # up_for_retry backoff is never re-claimed; tasks_awaiting_expansion
         # only offers PENDING placeholders; and _maybe_terminalise demands a
-        # terminal state) -- the run would hold its lease and defeat the
+        # terminal state), so the run would hold its lease and defeat the
         # pruner forever.  Resolve it so the run can finish.
         _resolve_stale_placeholder(task, entry, now, result)
         return
-    # A mapped task can only fan out once its expand source SUCCEEDS (that is
+    # A mapped task can only fan out once its expand source succeeds (that is
     # what produces the item list).  If the source is terminal-but-not-success
     # the fan-out can never be built, so resolve the placeholder rather than
-    # leaving it pending forever -- this fires regardless of the trigger rule,
+    # leaving it pending forever; this fires regardless of the trigger rule,
     # so an ``all_done`` mapped task (whose deps verdict is "ready", never
     # "fail"/"skip") does not wedge the run when its source fails/skips.
     if task.expand is not None:
@@ -1165,19 +1141,15 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
             mapped_all and from_task in mapped_all
         )
         if not in_run:
-            # The expand source has NO entry in this run document, so it was
+            # The expand source has no entry in this run document, so it was
             # added (or renamed into existence) by a config reload after the
             # run was created (run creation materialises every then-current
             # task).  It is not part of this run's plan and will never produce
-            # an item list, so the fan-out can never be built.  The same
-            # "not materialised" rule that _deps_verdict and _maybe_terminalise
-            # already apply, which this path was missing: effective_state
-            # defaults an absent entry to PENDING, so without this arm the
-            # placeholder waits on a task that will never appear.  Nothing
-            # then reaches a terminal state, so the dagadvance lease is
-            # renewed for the life of the daemon, retention GC can never
-            # collect the run, and every advance pass pays a full document
-            # deepcopy to change nothing.
+            # an item list, so the fan-out can never be built.  Applies the
+            # same "not materialised" rule as _deps_verdict and
+            # _maybe_terminalise: effective_state defaults an absent entry to
+            # PENDING, so without this arm the placeholder would wait on a
+            # task that will never appear.
             _resolve_unmaterialised_source(task, entry, now, result)
             return
         src = effective_state(spec, body, from_task)
@@ -1200,8 +1172,8 @@ def _resolve_unmaterialised_source(task, entry, now, result) -> None:
     Reached from :func:`_propagate_placeholder` when ``expand.fromTask`` names
     a task with no entry in the run document: a config reload renamed the
     source (or added it) after the run was created, and ``validate_graph``
-    accepts that because the NEW spec is internally consistent.  The source
-    will never run in THIS run, so its XCom item list will never exist and the
+    accepts that because the new spec is internally consistent.  The source
+    will never run in this run, so its XCom item list will never exist and the
     placeholder can never fan out.
 
     Failed rather than skipped, and with a reason, for the same purpose
@@ -1255,23 +1227,23 @@ def _resolve_missing_instance(
 
 
 def _resolve_stale_placeholder(task, entry, now, result) -> None:
-    """Fail an un-expanded mapped task's entry stranded in an OLD shape.
+    """Fail an un-expanded mapped task's entry stranded in an unmapped shape.
 
     Reached only from :func:`_propagate_placeholder` for an entry that is
     neither PENDING nor terminal: the task was retyped to mapped across a
     reload while parked ``up_for_retry`` (or similar).  Its recorded state
-    belongs to the old shape and cannot be meaningfully resumed under the
-    new one -- relaunching it as an unmapped instance would run the NEW
-    spec's command without the map item it may now expect -- so it is
+    belongs to the unmapped shape and cannot be meaningfully resumed under
+    the mapped one (relaunching it as an unmapped instance would run the
+    new spec's command without the map item it may expect), so it is
     terminalised as FAILED with an explanatory reason, letting the run
     reach a terminal state, release its lease and be pruned; the next run,
     created wholly under the new spec, expands cleanly.
 
     Two live sub-shapes are deliberately left alone: an entry with a
-    ``proc`` token (a genuinely in-flight attempt -- its completion or the
+    ``proc`` token (a genuinely in-flight attempt; its completion or the
     reconcile pass will move it to terminal or ``up_for_retry``, which the
     next advance resolves here) and a parked approval gate
-    (``awaitingApproval`` -- an operator decision can still resolve it).
+    (``awaitingApproval``, which an operator decision can still resolve).
     """
     state = entry.get("state")
     if state in _INERT_TASK_STATES:
@@ -1355,18 +1327,16 @@ def _advance_running(
     # A sensor sits in RUNNING across pokes; when a poke is due and no poke is
     # in flight (proc/pid cleared by its completion), claim the next poke.
     if task.type != SENSOR:
-        # RUNNING with nothing in flight is a shape only a SENSOR reaches
-        # legitimately.  If the CURRENT spec no longer types this task as a
+        # RUNNING with nothing in flight is a shape only a sensor reaches
+        # legitimately.  If the current spec no longer types this task as a
         # sensor, a config reload retyped it while it idled between pokes and
-        # every path now abandons the entry at once: this function returns,
+        # every path would otherwise abandon the entry: this function returns,
         # _reconcile_entries skips a proc-less entry (a skip justified only
-        # for sensors) and _maybe_terminalise sees a non-terminal state -- so
-        # the run never terminalises, is never pruned, and holds its
-        # dagadvance lease for the life of the daemon, paying a full document
-        # deepcopy on every advance to change nothing.  Fail it, exactly as
+        # for sensors) and _maybe_terminalise sees a non-terminal state, so
+        # the run would never terminalise or be pruned.  Fail it, just as
         # _resolve_stale_placeholder does for the mapped-retype case, so the
         # run can finish; the next run is created wholly under the new spec.
-        # An approval gate is left alone -- an operator can still resolve it.
+        # An approval gate is left alone; an operator can still resolve it.
         if (
             entry.get("proc") is None
             and entry.get("pid") is None
@@ -1491,7 +1461,7 @@ def _maybe_terminalise(spec, body, now, result) -> None:
     # task contributes its placeholder state (terminal only if its upstream
     # failed/skipped before it could expand); an expanded mapped task
     # contributes its instances (an empty map contributes nothing and is
-    # vacuously done).  A spec task with NO entry in this run document was
+    # vacuously done).  A spec task with no entry in this run document was
     # added to the DAG *after* this run was created (a config reload): it is
     # not part of this run, so it is skipped rather than blocking the run from
     # ever terminalising.
@@ -1504,7 +1474,7 @@ def _maybe_terminalise(spec, body, now, result) -> None:
     mapped_all = body.get("mapped")
     failed = False
     for task in spec.tasks:
-        # keyed on the RUN's recorded fan-out, not the spec: a task that
+        # keyed on the run's recorded fan-out, not the spec: a task that
         # expanded before a reload removed its `expand:` still contributes
         # its instances, never its placeholder (parked non-terminally in
         # EXPANDED, which would hold the run open forever).
@@ -1547,8 +1517,8 @@ def _maybe_terminalise(spec, body, now, result) -> None:
 
 # Per-entry verdicts of the pre-scan.  ACT: this pass could change the entry,
 # or the scan cannot prove it will not (any doubt lands here; the only cost
-# is running the full pass, which is exactly the pre-scan-less behavior).
-# BLOCKED: the entry is provably inert this pass AND its non-terminal state
+# is running the full pass, which is the pre-scan-less behavior).
+# BLOCKED: the entry is provably inert this pass and its non-terminal state
 # is consulted by _maybe_terminalise, so the run provably cannot terminalise
 # either.  INERT: the entry is inert but does not hold the run open (a
 # terminal instance, or an expanded group placeholder whose materialised
@@ -1567,7 +1537,7 @@ def _is_quiescent(
 ) -> bool:
     """Whether an advance pass over ``body`` provably cannot change it.
 
-    Called by :func:`plan_and_claim` and :func:`reconcile_and_plan` BEFORE
+    Called by :func:`plan_and_claim` and :func:`reconcile_and_plan` before
     the deep copy, so a quiescent run (typically: every instance in flight
     under this node's own proc token, nothing due) costs a read-only scan
     instead of a full copy and rewrite of a document that can hold up to
@@ -1588,8 +1558,8 @@ def _is_quiescent(
       itself uses), or its due instant is unreadable;
     * any idle sensor's next poke is due at ``now``, unscheduled, or
       unreadable;
-    * any running entry is claimed under a FOREIGN proc token (the
-      reconcile half may recover it; an entry holding OUR token is left
+    * any running entry is claimed under a foreign proc token (the
+      reconcile half may recover it; an entry holding our token is left
       alone by reconcile and claim alike);
     * any entry is in a state this scan does not recognize, belongs to a
       task no longer in the spec, or cannot be positively matched to a slot
@@ -1699,13 +1669,13 @@ def _entry_quiescence(
             return _Q_ACT
         return _q_blocked(mapped_all, task, taskkey, entry)
     if state == PENDING and task.expand is None:
-        # A pending PLAIN task whose upstreams are not all terminal is inert
-        # this pass exactly like an in-flight one: _advance_task returns on a
+        # A pending plain task whose upstreams are not all terminal is inert
+        # this pass just like an in-flight one: _advance_task returns on a
         # "wait" verdict without touching it, reconcile skips non-RUNNING
         # entries, and terminalisation only reads it.  This is the shape a
         # chain (or a fan-in sink) spends its whole life in, so without it the
         # pre-scan never fires for any DAG that has a downstream task.  The
-        # verdict cannot go stale mid-pass: a quiescent verdict requires NO
+        # verdict cannot go stale mid-pass: a quiescent verdict requires no
         # entry to be _Q_ACT, and every mutation path short-circuits on the
         # BLOCKED/INERT shapes, so no upstream state this reads can change.
         # A mapped placeholder is deliberately excluded: expansion and
@@ -1727,7 +1697,7 @@ def _q_blocked(
     inert entry, else ``_Q_ACT``.
 
     Being consulted is what makes an inert non-terminal entry hold the run
-    open: terminalisation walks the SPEC (a plain task's own key, a mapped
+    open: terminalisation walks the spec (a plain task's own key, a mapped
     task's ``id#i`` instances for its recorded item list), so an entry it
     never visits, however inert, cannot stop the run from finishing, and a
     quiescent verdict resting on such an entry could wedge the run.
@@ -1735,12 +1705,11 @@ def _q_blocked(
     back to the full pass.
 
     ``mapped_all`` is the body's recorded fan-out map, resolved once by
-    :func:`_is_quiescent` for the whole scan: this ran on nearly every entry
-    of the document and read ``body["mapped"]`` twice each time.
+    :func:`_is_quiescent` for the whole scan.
     """
     # one sentinel-defaulted lookup for the membership test and the record
     # alike; a non-dict (missing, or damaged) fails the isinstance below and
-    # lands on _Q_ACT, exactly as the separate reads did.
+    # lands on _Q_ACT.
     mapped = mapped_all.get(task.id, _UNSET) if mapped_all else _UNSET
     if task.expand is None and mapped is _UNSET:
         return _Q_BLOCKED if taskkey == task.id else _Q_ACT
@@ -1772,16 +1741,16 @@ def set_task_pid(
 ):
     """Transform recording the OS pid of a just-launched task instance.
 
-    The instance's ``proc`` token is stamped at CLAIM time (see
-    :func:`_claim_task`), so this only fills in the pid.  It FENCES that write
-    to the exact claim that launched the subprocess -- the same proc-token /
+    The instance's ``proc`` token is stamped at claim time (see
+    :func:`_claim_task`), so this only fills in the pid.  It fences that write
+    to the exact claim that launched the subprocess, the same proc-token /
     attempt identity :func:`mark_task_finished` and :func:`reconcile_crashed`
     fence on.  A superseded former owner (its lease lost, the task since
     reconciled -> re-claimed by another node with a fresh proc token / bumped
     attempt) whose launch loop only now reaches the pid write would otherwise
-    overwrite the LIVE claim's proc/pid -- fencing out the real attempt's
+    overwrite the live claim's proc/pid, fencing out the real attempt's
     completion and dropping its result.  When the stamped identity no longer
-    matches the entry, the write is dropped exactly like a duplicate.
+    matches the entry, the write is dropped like a duplicate.
     """
 
     def transform(body):
@@ -1809,29 +1778,28 @@ def set_task_pids(
     entries: list[tuple[str, str, int | None, int | None]],
     now: float,
 ):
-    """Transform recording a whole launch batch's OS pids in ONE RMW.
+    """Transform recording a whole launch batch's OS pids in one RMW.
 
     The batched form of :func:`set_task_pid`: ``entries`` is a list of
     ``(taskkey, proc, pid, attempt)`` tuples, one per just-launched task
     instance, and the whole list is applied by a single read-modify-write.
     An advance pass launches up to ``MAX_CLAIMS_PER_PASS`` instances, and a
     mapped fan-out's document can hold up to ``MAX_MAPPED_ITEMS`` task
-    entries, so stamping each pid through its own full-document RMW cost one
-    full parse plus rewrite plus fsync PER LAUNCH; one batch write makes it
-    one per pass.
+    entries, so one batch write replaces a full-document parse, rewrite,
+    and fsync per launch with one per pass.
 
     Batching is safe because it changes nothing about the fences: each entry
-    is checked independently against the current body with EXACTLY the
-    per-entry state, proc-token and attempt fences of :func:`set_task_pid`
-    (see its docstring for why a superseded owner's late pid write must be
-    dropped).  Every fence reads only its own task's entry and every apply
-    writes only its own task's ``pid``/``updatedAt``, so no entry's outcome
-    can depend on another's: applying the batch is equivalent to applying
-    the single-entry transforms sequentially, and a stale entry (its
-    instance re-claimed under a fresh proc token, or a newer attempt now
-    live) is dropped on its own while the rest of the batch still lands.
-    The result is the number of entries applied; zero keeps the document
-    untouched, exactly like a lone fenced-out pid write.
+    is checked independently against the current body with the per-entry
+    state, proc-token and attempt fences of :func:`set_task_pid` (see its
+    docstring for why a superseded owner's late pid write must be dropped).
+    Every fence reads only its own task's entry and every apply writes only
+    its own task's ``pid``/``updatedAt``, so no entry's outcome can depend
+    on another's: applying the batch is equivalent to applying the
+    single-entry transforms sequentially, and a stale entry (its instance
+    re-claimed under a fresh proc token, or a newer attempt now live) is
+    dropped on its own while the rest of the batch still lands.  The result
+    is the number of entries applied; zero keeps the document untouched,
+    like a lone fenced-out pid write.
     """
 
     def transform(body):
@@ -1942,33 +1910,33 @@ def mark_task_finished(
 
     ``resources`` is the finished instance's sampled CPU/memory usage as an
     already-serialised dict (``ResourceUsage.to_dict()``), recorded verbatim
-    on the entry -- this module stays a pure state machine and never touches
+    on the entry; this module stays a pure state machine and never touches
     the sampler.  ``None`` (monitoring off, or nothing captured) leaves the
     entry without stats; each plain-task attempt's completion overwrites the
     previous attempt's value, and a sensor records only its succeeding poke.
 
-    ``expected_proc`` / ``expected_attempt`` FENCE the completion to the exact
-    claim that produced it -- the same ``proc``-token identity
-    :func:`reconcile_crashed` already fences reconciliation on.  A completion
-    from a *superseded* attempt (a partitioned/evicted former owner whose
-    subprocess outlived its lease and finished only after another node
-    reconciled the task -> bumped its attempt -> re-claimed and re-launched it)
-    carries the old proc token / attempt; applying it would terminalise the
-    LIVE re-claimed instance with a dead attempt's exit code (double-advance /
+    ``expected_proc`` / ``expected_attempt`` fence the completion to the exact
+    claim that produced it, the same ``proc``-token identity
+    :func:`reconcile_crashed` fences reconciliation on.  A completion from a
+    *superseded* attempt (a partitioned/evicted former owner whose subprocess
+    outlived its lease and finished only after another node reconciled the
+    task -> bumped its attempt -> re-claimed and re-launched it) carries the
+    old proc token / attempt; applying it would terminalise the live
+    re-claimed instance with a dead attempt's exit code (double-advance /
     wrong outcome).  When the stamped identity no longer matches the entry, the
-    completion is dropped exactly like a duplicate.  ``None`` (the default)
-    disables the check, so pre-existing callers and tests are unaffected.
+    completion is dropped like a duplicate.  ``None`` (the default) disables
+    the check.
 
     ``expected_poke`` extends the fence to sensors, whose proc/attempt
-    identity does NOT change between pokes: a re-poke claim
-    (:func:`_advance_running`) re-stamps the SAME proc token and never bumps
-    ``attempt``, only ``pokeCount`` -- so a delayed retry of poke N's
+    identity does not change between pokes: a re-poke claim
+    (:func:`_advance_running`) re-stamps the same proc token and never bumps
+    ``attempt``, only ``pokeCount``, so a delayed retry of poke N's
     completion (a mutate that timed out but actually landed) would otherwise
-    pass the proc+attempt fence and clear the LIVE poke N+1's proc/pid under
+    pass the proc+attempt fence and clear the live poke N+1's proc/pid under
     its running subprocess.  The completion carries the ``pokeCount`` observed
     at its claim; when the entry's current count differs, a later poke is the
     live one and the stale completion is dropped.  ``None`` (plain tasks, and
-    pre-existing callers) disables the check.
+    callers that omit it) disables the check.
     """
 
     def transform(body):
@@ -2010,7 +1978,7 @@ def mark_task_finished(
 
 def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
     """Terminalise (or park-for-retry) a whole batch of finished instances in
-    ONE RMW.  The batched form of :func:`mark_task_finished`.
+    one RMW.  The batched form of :func:`mark_task_finished`.
 
     ``marks`` is a list of per-instance dicts, each carrying the same fields
     the single transform takes: ``taskkey``, ``success``, ``exit_code``,
@@ -2019,17 +1987,17 @@ def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
     optional serialised ``resources``, ``verification`` and ``limits``
     dicts; the last two enter the task entry only when present.
 
-    Batching is safe for exactly the reason :func:`set_task_pids` is: every
-    mark is fenced and applied against ONLY its own task's entry, so applying
+    Batching is safe for the same reason :func:`set_task_pids` is: every
+    mark is fenced and applied against only its own task's entry, so applying
     the batch is equivalent to applying the single-entry transforms in
     sequence.  A stale/duplicate/superseded completion (its instance
     re-claimed under a fresh proc token, a newer attempt or a later poke now
     live) is dropped on its own while the rest of the batch still lands.  A
-    reaper flush of a mapped fan-out that used to pay one full-document parse +
-    rewrite + fsync PER completion now pays one per run per flush.
+    reaper flush of a mapped fan-out pays one full-document parse, rewrite,
+    and fsync per run per flush rather than one per completion.
 
     Returns the list of taskkeys actually applied (empty -> document left
-    untouched, exactly like a lone fenced-out completion), so the caller can
+    untouched, like a lone fenced-out completion), so the caller can
     settle each applied entry's retry-queue copy and log the dropped ones.
     """
 
@@ -2193,16 +2161,15 @@ def reconcile_crashed(
     Called on rehydration, whenever a fresh dag_run lease is won, and at the
     top of every advance (the same seam the job reconciler uses).  A
     ``running`` instance is left alone when it belongs to *this* live process
-    (``proc ==
-    our token``) or to a live child on this host (``pid_alive``); otherwise its
-    owner is gone.  A plain task is then treated as an interrupted attempt --
-    retried if attempts remain, else failed.  A crashed sensor *poke* is
-    cleared so the next advance re-pokes it.  Skipped, and thus untouched: an
-    approval gate awaiting a decision, and a ``running`` task with no ``proc``
-    -- which is only ever a sensor *between* pokes, legitimately idle until its
-    ``nextPokeAt`` (a claim always persists the owning proc, so a proc-less
-    RUNNING plain task cannot arise), so reconciling it would defeat the poke
-    schedule.
+    (``proc == our token``) or to a live child on this host (``pid_alive``);
+    otherwise its owner is gone.  A plain task is then treated as an
+    interrupted attempt, retried if attempts remain or failed otherwise.  A
+    crashed sensor *poke* is cleared so the next advance re-pokes it.  Skipped
+    and left untouched: an approval gate awaiting a decision, and a ``running``
+    task with no ``proc``, which is only ever a sensor *between* pokes,
+    legitimately idle until its ``nextPokeAt`` (a claim always persists the
+    owning proc, so a proc-less RUNNING plain task cannot arise), so
+    reconciling it would defeat the poke schedule.
     """
 
     def transform(body):
@@ -2252,33 +2219,30 @@ def reconcile_and_plan(
 ):
     """Build the combined reconcile+claim transform for one advance pass.
 
-    The driver used to pay two full read-modify-writes per advance, one for
-    :func:`reconcile_crashed` and one for :func:`plan_and_claim`, even on a
-    completely quiescent run (and an owned run re-advances at least once a
-    minute, plus after every task completion).  This transform composes the
-    two into a single RMW for the common case.  The composition is safe
-    because both halves are pure functions of the same ``(body, now)``:
-    applying reconcile then claim inside one lock is observably identical to
-    running the old two RMWs back-to-back with no interleaved writer, which
-    is a schedule the two-RMW flow already had to be correct under (the
-    per-run lease and lock make interleaving rare, never impossible, and
-    every proc-token/attempt fence is evaluated here against the very body
-    it mutates).
+    Composes :func:`reconcile_crashed` and :func:`plan_and_claim` into a
+    single RMW for the common case, avoiding two full read-modify-writes per
+    advance (an owned run re-advances at least once a minute, plus after
+    every task completion).  The composition is safe because both halves are
+    pure functions of the same ``(body, now)``: applying reconcile then claim
+    inside one lock is observably identical to running two RMWs back-to-back
+    with no interleaved writer (the per-run lease and lock make interleaving
+    rare, never impossible, and every proc-token/attempt fence is evaluated
+    here against the very body it mutates).
 
     The one thing the claim half cannot do inside a transform is read XCom:
     the expansion lists live outside the document, and a transform must stay
     pure and free of I/O.  So after reconciling, the transform checks the
-    RECONCILED body for mapped tasks awaiting expansion.  When there are
+    reconciled body for mapped tasks awaiting expansion.  When there are
     none (the overwhelmingly common case) it continues straight into the
     propagate/claim/terminalise logic with an empty expansion set, and the
     whole advance is one RMW.  When some are awaiting, it applies only the
     reconcile half, flags ``expansions_needed`` on the result, and the
-    driver pre-reads the lists from the returned body and runs the existing
-    :func:`plan_and_claim` RMW as a second step, exactly the old shape.
+    driver pre-reads the lists from the returned body and runs the
+    :func:`plan_and_claim` RMW as a second step.
 
     The same read-only quiescence pre-scan as :func:`plan_and_claim` runs
     first; its foreign-proc-token rule covers the reconcile half (an entry
-    holding OUR token is trusted alive and never reconciled, so a quiescent
+    holding our token is trusted alive and never reconciled, so a quiescent
     body is one the reconcile loop would not touch either).
     """
 
@@ -2301,7 +2265,7 @@ def reconcile_and_plan(
         if tasks_awaiting_expansion(spec, working):
             # expansion needs out-of-band XCom reads the driver must do
             # between the halves: persist only the reconcile half and hand
-            # the decision back (advance=None says the claim half did NOT
+            # the decision back (advance=None says the claim half did not
             # run, so the driver never mistakes this for an empty claim).
             result.expansions_needed = True
             result.advance = None
@@ -2323,9 +2287,9 @@ def _has_live_process(entry, proc, host, is_pid_alive) -> bool:
     ep = entry.get("proc")
     if ep is None:
         # claimed but never recorded a pid (a crash between the claim RMW and
-        # the pid RMW): its owner is gone unless it is THIS process still
+        # the pid RMW): its owner is gone unless it is this process still
         # mid-launch, which the caller's per-run lock rules out at reconcile
-        # time -- so treat it as not-live.
+        # time, so treat it as not-live.
         return False
     if ep == proc:
         return True

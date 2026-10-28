@@ -5,7 +5,7 @@ configured peer, comparing job-set ids (:mod:`cronstable.fingerprint`).
 mTLS is the membership boundary; there is no shared state, each node keeps
 only its own view. Duplicate ``nodeName``s and divergent declared cluster
 sizes or coordination policies are ``conflict``s that fail the ``Leader``
-gate closed; a same-N membership swap is NOT caught, so change membership
+gate closed; a same-N membership swap is not caught, so change membership
 one node at a time. Drift is debounced over ``driftAfter`` rounds, and an
 unchanged round is a bodyless 304 via content-derived ETags. With
 ``electLeader`` the lowest mutually-attested, confirmed-quorate ``nodeName``
@@ -53,7 +53,7 @@ _UTC = datetime.timezone.utc
 
 # Per-peer status, as reported in the /cluster view.
 STATUS_UNKNOWN = "unknown"  # not yet contacted
-STATUS_SELF = "self"  # the peer reported our own node name AND instance id
+STATUS_SELF = "self"  # the peer reported our own node name and instance id
 STATUS_AGREED = "agreed"  # reachable, same job-set id
 STATUS_SYNCING = "syncing"  # reachable, id differs but within driftAfter
 STATUS_DRIFTED = "drifted"  # reachable, id has differed >= driftAfter rounds
@@ -99,8 +99,8 @@ MAX_PEER_RESPONSE_BYTES = 256 * 1024
 _READ_CHUNK = 8192
 
 # Per-field bounds on a CA-vouched-but-untrusted peer's /peer payload. The
-# @reboot-ran set is PERSISTENT and re-advertised, so without a per-set bound
-# a peer could grow OUR /peer response past the byte cap and drop us from
+# @reboot-ran set is persistent and re-advertised, so without a per-set bound
+# a peer could grow our /peer response past the byte cap and drop us from
 # honest peers' quorum (a cluster-wide availability DoS). Also rejects over-
 # long / control-character scalar identity fields (reflected into JSON/logs).
 MAX_PEER_FIELD_LEN = 256  # node_name, job_set_id, instance_id, ...
@@ -109,8 +109,8 @@ MAX_REBOOT_JOB_NAME_LEN = 128  # a single @reboot job name
 MAX_ADVERTISED_REBOOT_JOBS = 512  # ran-set cardinality stored + re-advertised
 
 # Bounds on the gossiped fleet-view job_summaries block. Absorbed peer
-# summaries are never re-advertised, so these bound what we EMIT (our own
-# /peer body must stay under MAX_PEER_RESPONSE_BYTES) and what we STORE from
+# summaries are never re-advertised, so these bound what we emit (our own
+# /peer body must stay under MAX_PEER_RESPONSE_BYTES) and what we store from
 # an untrusted peer.
 MAX_JOB_SUMMARY_NAME_LEN = 128  # a single job name in job_summaries
 MAX_ADVERTISED_JOB_SUMMARIES = 512  # per-node job_summaries cardinality
@@ -118,11 +118,11 @@ MAX_JOB_SUMMARY_TS_LEN = 64  # an ISO-8601 finished_at timestamp
 
 # Cap on the transitively-discovered candidate names this node derives and
 # re-advertises (_bridge_candidates, and quorate_vouched built on it): the
-# one re-broadcast path NOT bounded by our own config, so uncapped it is the
+# one re-broadcast path not bounded by our own config, so uncapped it is the
 # same re-advertised-set DoS the ran_reboot_jobs cap stops. Lists are sorted
-# ASCENDING before slicing, so every node keeps the same lowest-names prefix
+# ascending before slicing, so every node keeps the same lowest-names prefix
 # and truncation cannot change a single-leader election (elect_leader reads
-# ``min``). A truncation IS reported (log warning + `candidates_truncated`
+# ``min``). A truncation is reported (log warning + `candidates_truncated`
 # in /cluster): a fleet past this cap may drop a ``spread`` co-owner from
 # the tail and double-run its jobs. See ClusterManager._bridge_candidates.
 MAX_ADVERTISED_CANDIDATE_NAMES = 512
@@ -164,7 +164,7 @@ MIN_COMPRESS_BYTES = 1024  # smallest /peer body worth gzip-compressing
 # state is keyed exactly, so a view change invalidates immediately.
 PEER_RESPONSE_CACHE_TTL = 1.0
 
-# Gossiped node stats ride a /peer response HEADER, not the body: live
+# Gossiped node stats ride a /peer response header, not the body: live
 # values would roll the body's ETag every round and defeat the 304
 # optimisation. Travels on the 200 and the 304 alike; absence means "not
 # sharing right now". See _handle_peer / _observe_peer.
@@ -244,7 +244,7 @@ def _parse_str_list(
     for item in raw:
         if not isinstance(item, str):
             continue
-        # Drop the empty string: it sorts BELOW every real name, so folded
+        # Drop the empty string: it sorts below every real name, so folded
         # into mutual_agreeing it would make elect_leader's ``min`` pick ''
         # cluster-wide and stop every Leader job firing.
         if not item:
@@ -259,6 +259,19 @@ def _parse_str_list(
         if max_items is not None and len(out) >= max_items:
             break
     return out
+
+
+# The signed 64-bit range. A generated client decodes a JSON integer into a
+# 64-bit integer and discards the whole /cluster or /fleet answer when one
+# value falls outside it, so a peer's integer outside this range counts as
+# malformed.
+_WIRE_INT_MIN = -(2**63)
+_WIRE_INT_MAX = 2**63 - 1
+
+
+def _wire_int(value: int) -> bool:
+    """Whether ``value`` fits the signed 64-bit range (see _WIRE_INT_MAX)."""
+    return _WIRE_INT_MIN <= value <= _WIRE_INT_MAX
 
 
 def _finite_number(value: Any) -> float | None:
@@ -335,6 +348,7 @@ def _parse_job_summaries(raw: Any) -> dict[str, dict[str, Any]] | None:
                         exit_code
                         if isinstance(exit_code, int)
                         and not isinstance(exit_code, bool)
+                        and _wire_int(exit_code)
                         else None
                     ),
                 }
@@ -391,8 +405,15 @@ def _parse_node_stats(raw: Any) -> dict[str, Any] | None:
         if value is None:
             continue
         # cpu_count is a whole number of cores; keep it integral so the fleet
-        # JSON reads naturally. The rest stay floats.
-        out[field] = int(value) if field == "cpu_count" else value
+        # JSON reads naturally, and drop a count outside the 64-bit range.
+        # The rest stay floats.
+        if field == "cpu_count":
+            count = int(value)
+            if not _wire_int(count):
+                continue
+            out[field] = count
+        else:
+            out[field] = value
     return out or None
 
 
@@ -443,8 +464,8 @@ def _declares_divergent(
 
     The one spelling of the divergence test every gate runs
     (:meth:`ClusterManager._agreeing_peers`, ``conflicting_sizes``,
-    ``conflicting_policies``). ONE safety invariant: a peer the detectors
-    flag MUST also be dropped from the gossiped mutually agreeing set, or a
+    ``conflicting_policies``). One safety invariant: a peer the detectors
+    flag must also be dropped from the gossiped mutually agreeing set, or a
     third node could bridge-confirm it as quorate; fenced by
     ``test_declared_fields_gate_both_agreement_and_conflict``. ``None`` (a
     peer too old to declare) never diverges: absence is no evidence, and
@@ -546,7 +567,7 @@ def _hrw_owner_bytes(
     Identical result to ``_hrw_owner(job_name, members)``: the job prefix is
     absorbed once into a seed hash and cloned per member, and the 8-byte
     digest prefixes are compared raw (lexicographic bytes order on
-    equal-length slices IS big-endian unsigned order, preserving
+    equal-length slices is big-endian unsigned order, preserving
     :func:`_hrw_score`'s ordering and the name tie-break).
     """
     seed = hashlib.sha256(job_name.encode("utf-8") + b"\x00")
@@ -617,7 +638,7 @@ class PeerState:
     # benign self-listing from a duplicate nodeName (see record_success).
     # Deliberately not surfaced in to_dict (it is an internal liveness token).
     instance_id: str | None = None
-    # whether a successful poll has positively identified this host as THIS
+    # whether a successful poll has positively identified this host as this
     # node. Latched so transient self-poll failures keep the entry
     # STATUS_SELF (else cluster_size would flap N<->N+1 on the poll
     # interval); re-evaluated on every successful poll. Internal; not in
@@ -639,7 +660,7 @@ class PeerState:
     # build omits it and cannot attest us back, so _agreeing_peers falls
     # back to one-directional agreement for it (else a new node stands down
     # among legacy peers, a cluster-wide Leader halt). Defaults True, the
-    # STRICT direction: only _observe_peer POSITIVELY seeing no list marks a
+    # strict direction: only _observe_peer positively seeing no list marks a
     # peer legacy; record_failure resets it. Internal; not in to_dict.
     reports_members: bool = True
     # the cluster size (len(peers)+1) the peer last declared; a divergence
@@ -647,7 +668,7 @@ class PeerState:
     # result, or a peer too old to report it. Internal; not in to_dict.
     declared_size: int | None = None
     # the coordination policy the peer last declared (distribution +
-    # electLeader): behavior-affecting yet NOT in the fingerprint, so
+    # electLeader): behavior-affecting yet not in the fingerprint, so
     # divergent nodes still see each other AGREED; a divergence is a
     # first-class conflict (see conflicting_policies). None when no fresh
     # result or a peer too old. Internal; not in to_dict.
@@ -672,7 +693,7 @@ class PeerState:
     # peer (which then vouches nothing: it can only lean toward running).
     quorate_vouched: set[str] | None = None
     # the peer's advertised per-job run summaries, feeding GET /fleet.
-    # Observability only, never an election input, so deliberately NOT
+    # Observability only, never an election input, so deliberately not
     # cleared on a failed poll: the fleet view shows a briefly-unreachable
     # node's last-known state aged by last_seen rather than blanking it.
     # None = never reported. Internal; not in to_dict.
@@ -681,7 +702,7 @@ class PeerState:
     # cap, so the fleet view labels that node's column partial.
     job_summaries_truncated: bool = False
     # when the summaries snapshot was received. A 304 round refreshes
-    # last_seen but NOT this (the replay passes the original receipt time
+    # last_seen but not this (the replay passes the original receipt time
     # through record_success), so fleet_view ages each countdown by the
     # snapshot's true age instead of freezing it (see _aged_job_summaries).
     # Internal; not in to_dict.
@@ -704,7 +725,7 @@ class PeerState:
     _mutation_generation: ClassVar[int] = 0
 
     def __setattr__(self, name: str, value: Any) -> None:
-        # Bump the generation on EVERY field write so a memoized result can
+        # Bump the generation on every field write so a memoized result can
         # never outlive its inputs. Process-wide on purpose: an unrelated
         # view's bump only forces a spurious recompute, never staleness.
         # Caveat: this sees assignments, not in-place mutation of an
@@ -809,7 +830,7 @@ class ClusterView:
             peer.job_summaries = peer_job_summaries
             peer.job_summaries_truncated = peer_job_summaries_truncated
             # `now` for a freshly-parsed body; a conditional 304 replay
-            # passes the ORIGINAL receipt time so countdown ageing keeps the
+            # passes the original receipt time so countdown ageing keeps the
             # snapshot's true age instead of freezing every round.
             peer.job_summaries_at = (
                 peer_job_summaries_at
@@ -817,8 +838,8 @@ class ClusterView:
                 else now
             )
         # node stats: same None-keeps-last-known contract as job_summaries,
-        # but stamped with node_stats_at so a never-replaced reading EXPIRES
-        # (see fresh_node_stats). Freshness is per RESPONSE (the header
+        # but stamped with node_stats_at so a never-replaced reading expires
+        # (see fresh_node_stats). Freshness is per response (the header
         # rides the 200 and the 304 alike), so stamping `now` is always
         # correct and a conditional round cannot resurrect a discontinued
         # reading.
@@ -846,7 +867,7 @@ class ClusterView:
                 # nodeName: surface a hard conflict instead of masking it as
                 # 'self'; the leader gate then fails closed.
                 peer.status = STATUS_CONFLICT
-                # Do NOT reset mismatch_streak: only a confirmed AGREED/SELF
+                # Do not reset mismatch_streak: only a confirmed AGREED/SELF
                 # observation clears it (see record_failure); zeroing here
                 # would delay a genuinely drifting peer's DRIFTED by up to
                 # driftAfter rounds.
@@ -893,21 +914,21 @@ class ClusterView:
         peer = self.peers[host]
         peer.last_error = error
         if peer.self_confirmed:
-            # this host was positively identified as THIS node; a failed
+            # this host was positively identified as this node; a failed
             # poll (a hairpin/NAT quirk) does not change that. Keep it SELF
             # rather than flapping cluster_size on the poll interval.
             peer.status = STATUS_SELF
         else:
             peer.status = STATUS_UNTRUSTED if untrusted else STATUS_UNREACHABLE
         # no fresh observation this round, so drop the peer's last reported
-        # view as stale. The drift streak is deliberately NOT reset: it
+        # view as stale. The drift streak is deliberately not reset: it
         # counts *reachable* mismatches; only a confirmed AGREED (or SELF)
         # observation in record_success resets it.
         peer.members = None
         peer.ran_reboot_jobs = None
         peer.mutual_agreeing = None
         peer.quorate_vouched = None
-        # job_summaries is deliberately KEPT: observability-only, and the
+        # job_summaries is deliberately kept: observability-only, and the
         # fleet view shows last-known state aged by last_seen instead of
         # blanking it. reports_members is reset for tidiness (a failed peer
         # is not AGREED, so _agreeing_peers skips it regardless).
@@ -974,8 +995,8 @@ def build_client_ssl_context(tls: dict[str, str]) -> ssl.SSLContext:
 def build_server_ssl_context(tls: dict[str, str]) -> ssl.SSLContext:
     """Server context: require and verify a CA-signed client cert (mTLS).
 
-    SECURITY: this is the cluster's membership boundary. A server cannot do
-    hostname verification, so the CA file IS the allowlist: point it at a
+    Security: this is the cluster's membership boundary. A server cannot do
+    hostname verification, so the CA file is the allowlist: point it at a
     dedicated, single-purpose cluster CA, never a shared organisational CA,
     or any holder of any cert that CA ever signed can speak to ``/peer`` and
     ``/reboot-ran`` as a member. A hostile CA-signed member is out of scope
@@ -1011,12 +1032,12 @@ def gossip_tls_loadable(cluster_config: ClusterConfig) -> bool:
     """Whether the gossip backend's TLS material in ``cluster_config`` loads.
 
     A side-effect-free dry-run of the manager's context builds, used by
-    :meth:`cronstable.cron.Cron.start_stop_cluster` BEFORE it tears the
+    :meth:`cronstable.cron.Cron.start_stop_cluster` before it tears the
     running manager down for a config change (a config edit coinciding with
     an in-flight cert rotation would otherwise wedge ``Leader`` /
     ``PreferLeader`` closed). ``True`` for a non-gossip backend or no
     ``tls`` block. Unlike :meth:`ClusterManager.tls_files_loadable`, this
-    validates the INCOMING config, which may repoint at different files.
+    validates the incoming config, which may repoint at different files.
     """
     if cluster_config.get("backend", "gossip") != "gossip":
         return True
@@ -1064,10 +1085,10 @@ def _memoized_derived(
     :meth:`ClusterManager._derived_state_key`; any input change rolls the
     key and drops the whole cache at once.
 
-    The cached object is shared, so callers MUST treat a returned list as
+    The cached object is shared, so callers must treat a returned list as
     frozen (audited per site). The one deliberate exception is the owner
     memo the spread-ownership derivations hand back (_spread_owner_set): a
-    dict callers FILL, riding in the cache so the generation roll that
+    dict callers fill, riding in the cache so the generation roll that
     changes the member set drops it too. Nested memoized calls are safe:
     the derivations perform no writes and the manager runs on a single
     event loop, so the key cannot move mid-computation.
@@ -1148,7 +1169,7 @@ class ClusterManager(LeadershipBackend):
         # every round; created in start(), closed in stop().
         self._session: aiohttp.ClientSession | None = None
         self._stop = asyncio.Event()
-        # @reboot one-shots THIS node has run as the elected owner (plus any
+        # @reboot one-shots this node has run as the elected owner (plus any
         # learned via push), gossiped so peers retire their matching
         # deferred jobs without re-running them on failover. Scoped to the
         # current job-set: cleared when our job_set_id changes (see
@@ -1209,7 +1230,7 @@ class ClusterManager(LeadershipBackend):
         # build ("bridge": the transitive-confirmation derive, "advert": the
         # quorate_vouched union): the full candidate count at the last
         # overflow of the advertisement cap, else 0.  Kept per source because
-        # the two report DIFFERENT counts, and a shared scalar let the
+        # the two report different counts, and a shared scalar would let the
         # operator's own /cluster read cascade into the derive and zero the
         # flag the advert build had just set.  The /cluster
         # `candidates_truncated` flag reads the max (see the property).
@@ -1343,7 +1364,7 @@ class ClusterManager(LeadershipBackend):
             # (see _bridge_candidates). Distinct from the one-directional
             # ``agreed`` flags in ``members``.
             "mutual_agreeing": sorted(self._agreeing_peer_names()),
-            # the names WE can confirm are quorate (our _eligible_candidates):
+            # the names we can confirm are quorate (our _eligible_candidates):
             # a poller folds these, not the raw mutual_agreeing, into its
             # spread Leader-path owner set so it only defers a job to a node
             # vouched able to run it (see _unconfirmed_contenders). Capped
@@ -1354,7 +1375,7 @@ class ClusterManager(LeadershipBackend):
             "job_summaries": job_summaries,
             "job_summaries_truncated": summaries_truncated,
         }
-        # node stats deliberately do NOT ride this body: they travel as the
+        # node stats deliberately do not ride this body: they travel as the
         # NODE_STATS_HEADER sidecar so live values never roll the body's
         # ETag (keeps the idle-304 optimisation).
         return payload
@@ -1390,7 +1411,7 @@ class ClusterManager(LeadershipBackend):
         """Serialise a /peer payload to the bytes we will send.
 
         orjson-accelerated with a stdlib fallback. The ETag hashes a
-        canonical projection of the payload (see :meth:`_peer_etag`), NOT
+        canonical projection of the payload (see :meth:`_peer_etag`), not
         these bytes, so the encoder choice cannot affect 304 matching.
         """
         try:
@@ -1408,9 +1429,9 @@ class ClusterManager(LeadershipBackend):
 
         Deterministic across rounds while nothing real changed. One field
         needs normalising: ``scheduled_in`` is a live countdown, different
-        every round, yet DROPPING it would let pollers' derived countdowns
+        every round, yet dropping it would let pollers' derived countdowns
         freeze at zero after a fire; so the hash replaces it with the
-        ABSOLUTE next-fire time rounded to whole seconds, constant between
+        absolute next-fire time rounded to whole seconds, constant between
         fires and rolling exactly when the schedule does (pollers re-derive
         the countdown, see ``_aged_job_summaries``). Rounding can rarely
         cost one spurious full body, never a wrong 304.
@@ -1436,7 +1457,7 @@ class ClusterManager(LeadershipBackend):
         # steady-state 304 costs no election cascade or hashing. Bounded two
         # ways: the state key (_derived_state_key plus the components below)
         # covers every election-relevant input, so election staleness is
-        # exactly zero; PEER_RESPONSE_CACHE_TTL bounds inputs the key cannot
+        # zero; PEER_RESPONSE_CACHE_TTL bounds inputs the key cannot
         # observe (chiefly the summaries provider snapshot). The cached
         # payload dict is shared across requests and must never be mutated
         # per request; per-request live data (node stats) rides a response
@@ -1473,7 +1494,7 @@ class ClusterManager(LeadershipBackend):
                 # re-advertised set is capped). An oversized body would cost
                 # this node its place in the quorum, so drop job_summaries:
                 # the largest, observability-only field. Compare the
-                # UNCOMPRESSED length; the poller's cap applies to the
+                # uncompressed length; the poller's cap applies to the
                 # decompressed stream.
                 oversized = len(body_bytes)
                 if payload.get("job_summaries"):
@@ -1518,7 +1539,7 @@ class ClusterManager(LeadershipBackend):
             self._peer_response_cache = (state_key, now_mono, etag, body_bytes)
         headers = {"ETag": etag}
         # The node-stats sidecar rides a response header so it never rolls
-        # the ETag; attached to the 200 AND the 304 below. No header when
+        # the ETag; attached to the 200 and the 304 below. No header when
         # not sharing: absence is the signal.
         node_stats = self._advertised_node_stats()
         if node_stats is not None:
@@ -1534,7 +1555,7 @@ class ClusterManager(LeadershipBackend):
         resp = web.Response(
             body=body_bytes, headers=headers, content_type="application/json"
         )
-        # gzip is picked EXPLICITLY when the client advertises it: bare
+        # gzip is picked explicitly when the client advertises it: bare
         # enable_compression() lets aiohttp negotiate deflate first,
         # contradicting the documented gzip exchange. The size floor skips
         # bodies where the CPU spend outweighs the saved bytes.
@@ -1584,7 +1605,7 @@ class ClusterManager(LeadershipBackend):
                 max_len=MAX_REBOOT_JOB_NAME_LEN,
                 max_items=MAX_ADVERTISED_REBOOT_JOBS,
             )
-            # Bound the PERSISTENT set so a peer cannot grow it (and the /peer
+            # Bound the persistent set so a peer cannot grow it (and the /peer
             # response that re-advertises it) past the byte cap and collapse
             # quorum cluster-wide. Dropping excess marks only risks rerunning a
             # one-shot (the documented PreferLeader envelope), never an outage.
@@ -1630,7 +1651,7 @@ class ClusterManager(LeadershipBackend):
                 self.config["interval"],
             )
             # Run one full poll round up front so the never-skip available_*
-            # gates and reboot_ran() reflect a real read BEFORE the first
+            # gates and reboot_ran() reflect a real read before the first
             # spawn_jobs (mirrors the lease backends' inline store round):
             # without it every PreferLeader job runs on every node at boot
             # and deferred @reboot one-shots re-run. Best-effort and bounded
@@ -1719,7 +1740,7 @@ class ClusterManager(LeadershipBackend):
     def _reconcile_job_set_id(self, my_id: str) -> None:
         """Align the recorded-@reboot-runs set with the current job set.
 
-        Clears ``_ran_reboot_jobs`` when our job set CHANGED (a reload):
+        Clears ``_ran_reboot_jobs`` when our job set changed (a reload):
         old-set runs no longer apply, so a still-deferred @reboot may run
         again, the safe direction. The first observation only establishes
         the id. mark_reboot_ran / _handle_reboot_ran also call this
@@ -1857,7 +1878,7 @@ class ClusterManager(LeadershipBackend):
         quorum-2-of-2 mode the config-time size==2 refusal forbids.
 
         Returns whether the warning fired now (the caller then skips its
-        benign INFO line). Evaluated at the SELF transition AND at the end
+        benign INFO line). Evaluated at the SELF transition and at the end
         of every poll round: at the transition a multi-homed duplicate may
         not be deduped yet.
         """
@@ -1936,7 +1957,7 @@ class ClusterManager(LeadershipBackend):
         ) as ex:
             self.view.record_failure(host, str(ex), untrusted=False)
             return
-        # Timestamp at RECEIPT, not before the request: the peer computed
+        # Timestamp at receipt, not before the request: the peer computed
         # its countdowns while serving, so the pre-request instant would
         # overstate the snapshot's age by the round-trip latency, and a 304
         # replay would carry that skew for as long as the tag holds.
@@ -1955,11 +1976,11 @@ class ClusterManager(LeadershipBackend):
                     untrusted=False,
                 )
                 return
-            # The peer attests its payload is exactly the one we cached, so
-            # replay that observation with a fresh timestamp and the LIVE
+            # The peer attests its payload is the one we cached, so
+            # replay that observation with a fresh timestamp and the live
             # my_id: every gate advances as if the identical body had been
-            # re-sent. The cached kwargs carry the ORIGINAL job_summaries_at
-            # so countdowns keep ageing; node stats are NOT cached (this
+            # re-sent. The cached kwargs carry the original job_summaries_at
+            # so countdowns keep ageing; node stats are not cached (this
             # round's header supplies them), so a replay can never resurrect
             # a stale reading.
             self.view.record_success(
@@ -1985,7 +2006,7 @@ class ClusterManager(LeadershipBackend):
             data = _json.loads(raw)
         except (ValueError, RecursionError):
             # unparseable JSON or a deeply-nested document (RecursionError
-            # is NOT a ValueError): a failed observation; letting it escape
+            # is not a ValueError): a failed observation; letting it escape
             # would skip record_failure and freeze the peer's stale view.
             self.view.record_failure(
                 host, "invalid JSON in /peer response", untrusted=False
@@ -2042,16 +2063,19 @@ class ClusterManager(LeadershipBackend):
             fields[key] = value
         # cluster_size is an int (bool is an int subclass; reject
         # explicitly). None (a peer too old) skips the size check for that
-        # peer: a missing declared_size forgoes a fail-CLOSED guard, the
+        # peer: a missing declared_size forgoes a fail-closed guard, the
         # version-skew residual.
         size = data.get("cluster_size")
         if size is not None and (
-            not isinstance(size, int) or isinstance(size, bool) or size < 1
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 1
+            or not _wire_int(size)
         ):
             self.view.record_failure(
                 host,
                 "malformed /peer response: cluster_size is not a positive "
-                "integer",
+                "64-bit integer",
                 untrusted=False,
             )
             return
@@ -2068,8 +2092,8 @@ class ClusterManager(LeadershipBackend):
             return
         # The validated observation, built once: record_success consumes it
         # now and _peer_observation_cache keeps it for 304 replays.
-        # my_id/now/my_name/my_instance stay OUT (supplied live per call);
-        # peer_node_stats stays out (per-RESPONSE header; caching it would
+        # my_id/now/my_name/my_instance stay out (supplied live per call);
+        # peer_node_stats stays out (per-response header; caching it would
         # let a replay resurrect a stale reading).
         observation: dict[str, Any] = {
             "peer_name": fields["node_name"],
@@ -2152,7 +2176,7 @@ class ClusterManager(LeadershipBackend):
         Our own runs plus those reported by agreeing peers; re-advertising
         what we learned makes the fact survive the original owner's death
         (one-hop gossip). A peer's contribution is gated on its last
-        reported ``job_set_id`` matching our LIVE id, not merely on cached
+        reported ``job_set_id`` matching our live id, not merely on cached
         ``STATUS_AGREED``: after a local reload a peer's stale AGREED
         ran-set could otherwise retire a redefined @reboot one-shot without
         running the new definition. Mirrors :meth:`_handle_reboot_ran`'s
@@ -2161,10 +2185,10 @@ class ClusterManager(LeadershipBackend):
         """
         if my_id is None:
             my_id = self.get_job_set_id()
-        # Gate our OWN recorded runs on the live id too: they were recorded
+        # Gate our own recorded runs on the live id too: they were recorded
         # under _ran_jobs_job_set_id, which the poll reconciles only lazily;
         # between a reload and the next poll /peer would otherwise advertise
-        # the old set under the NEW id, retiring an agreed peer's redefined
+        # the old set under the new id, retiring an agreed peer's redefined
         # @reboot one-shot without running it. (None = no runs recorded yet.)
         ran_id = self._ran_jobs_job_set_id
         jobs = (
@@ -2211,7 +2235,7 @@ class ClusterManager(LeadershipBackend):
         backstop); it just shrinks the window in which we could run the job and
         then die before any peer observed it.
         """
-        # Reconcile to the live job set BEFORE adding, so the entry lands
+        # Reconcile to the live job set before adding, so the entry lands
         # under the current id and the poll loop waking during the push
         # cannot clear() it. _reconcile_job_set_id is await-free, so
         # reconcile+add cannot interleave.
@@ -2268,7 +2292,7 @@ class ClusterManager(LeadershipBackend):
     def cluster_size(self) -> int:
         """Total number of cluster members.
 
-        ``len(peers) + 1``, minus any entry that turns out to be THIS node
+        ``len(peers) + 1``, minus any entry that turns out to be this node
         listed in its own peer list (status ``self``). The config-load dedup
         (:func:`cronstable.config._is_self_listed`) catches literal and
         wildcard cases; this runtime subtraction is the backstop (e.g. a
@@ -2281,12 +2305,12 @@ class ClusterManager(LeadershipBackend):
             for peer in self.view.peers.values()
             if peer.status == STATUS_SELF
         )
-        # Two peer entries with the SAME observed instance_id (one node at
+        # Two peer entries with the same observed instance_id (one node at
         # two addresses) are one fault domain; counting both inflates N and
         # quorum, silently enabling the degenerate 2-real-node mode. Count
         # each observed instance_id once; an unidentified entry (None)
         # counts (the safe, higher-quorum direction). The address->instance
-        # binding is RETAINED while the peer is UNREACHABLE/UNTRUSTED:
+        # binding is retained while the peer is UNREACHABLE/UNTRUSTED:
         # dropping the dedup the moment the multi-homed node dies would
         # inflate quorum on every survivor for the whole outage. Self-
         # corrects: a successful poll of a reassigned address records the
@@ -2311,7 +2335,7 @@ class ClusterManager(LeadershipBackend):
         """Our own value for every coordination field a divergence gate reads.
 
         Keyed by the :class:`PeerState` attribute the peer's declaration
-        lands in. The single definition of WHICH fields are divergence-gated:
+        lands in. The single definition of which fields are divergence-gated:
         the :meth:`_agreeing_peers` exclude set iterates it, so adding a
         field here also stops us vouching a divergent peer to third nodes
         (see :func:`_declares_divergent`). The detectors still spell their
@@ -2336,7 +2360,7 @@ class ClusterManager(LeadershipBackend):
         majority), at the price of one extra poll round to converge.
 
         A peer that agrees on the job set but declares a different cluster
-        size or policy is also excluded. Load-bearing: these names ARE the
+        size or policy is also excluded. Load-bearing: these names are the
         gossiped ``mutual_agreeing``, so a divergent node is never vouched
         to a third node that cannot see the divergence. Detection
         (:meth:`conflicting_sizes` / :meth:`conflicting_policies`) is
@@ -2344,11 +2368,11 @@ class ClusterManager(LeadershipBackend):
         peer too old to declare a field is not excluded: the safe direction.
         """
         # our side of every divergence-gated field, hoisted out of the loop
-        # (see _our_declarations: its key set IS the exclude set below).
+        # (see _our_declarations: its key set is the exclude set below).
         my_declarations = self._our_declarations()
         agreeing: list[PeerState] = []
         # Dedup by instance_id: a node reachable at two listed addresses
-        # must count ONCE toward the live set, or the quorum check could be
+        # must count once toward the live set, or the quorum check could be
         # met by one physical peer counted twice. Mirrors cluster_size().
         seen_instances: set[str] = set()
         for peer in self.view.peers.values():
@@ -2356,7 +2380,7 @@ class ClusterManager(LeadershipBackend):
                 peer.status == STATUS_AGREED
                 and peer.node_name is not None
                 # mutual gate: count a current peer only if it sees us
-                # AGREED too. A LEGACY peer (no members field) cannot report
+                # AGREED too. A legacy peer (no members field) cannot report
                 # this; fall back to one-directional agreement, or a new
                 # node among legacy peers would halt every Leader job. The
                 # node still won't defer to a legacy peer: the documented
@@ -2365,8 +2389,8 @@ class ClusterManager(LeadershipBackend):
                     _peer_sees_me_agreed(peer.members, self.instance_id)
                     or not peer.reports_members
                 )
-                # a peer declaring ANY gated field differently is dropped;
-                # the gated fields are exactly the detectors' fields.
+                # a peer declaring any gated field differently is dropped;
+                # the gated fields are the detectors' fields.
                 and not any(
                     _declares_divergent(getattr(peer, field), mine)
                     for field, mine in my_declarations.items()
@@ -2443,8 +2467,8 @@ class ClusterManager(LeadershipBackend):
             # rather than leaving a double-run to be inferred from history.
             self._note_candidates_truncated("bridge", len(confirmed))
             return confirmed[:MAX_ADVERTISED_CANDIDATE_NAMES]
-        # clears this source's cell ONLY: the advert build owns its own,
-        # so a /cluster read cascading into this derive can no longer
+        # clears this source's cell only: the advert build owns its own,
+        # so a /cluster read cascading into this derive cannot
         # blank a truncation the advert side just observed.
         self._clear_candidates_truncated("bridge")
         return confirmed
@@ -2470,12 +2494,12 @@ class ClusterManager(LeadershipBackend):
 
         The largest full count any source last saw overflow the cap, 0 when
         every source last fit. A max over per-source cells rather than one
-        shared scalar, so the bridge derive clearing ITS observation cannot
+        shared scalar, so the bridge derive clearing its observation cannot
         blank a truncation the advert build observed on the larger union.
         """
         # The advert cell is only rewritten when a /peer poll rebuilds the
         # response (_capped_vouched), so on a node nobody polls it would
-        # otherwise report whatever the last build saw, in BOTH directions:
+        # otherwise report whatever the last build saw, in both directions:
         # a latched overflow forever, or a stale 0 while the union has since
         # outgrown the cap and every future advert would drop a co-owner.
         # Re-derive it here either way. The bridge cell cannot go stale that
@@ -2506,14 +2530,13 @@ class ClusterManager(LeadershipBackend):
         ``source`` is ``"bridge"`` or ``"advert"``. Both the view cell and
         the log limiter are per source: the two report different counts.
 
-        Logged once per oversize EPISODE per source, not once per distinct
-        count: keying on the exact count meant any membership churn in an
-        over-cap fleet (one node joining or leaving) changed the number and
-        re-fired the warning every poll round, which is the flood the
-        limiter exists to stop. The latch re-arms in
-        :meth:`_clear_candidates_truncated` when the source drops back
-        under the cap, so a genuinely new episode still warns. The current
-        count still rides the message body.
+        Logged once per oversize episode per source, not once per distinct
+        count: keying on the exact count would make any membership churn in
+        an over-cap fleet (one node joining or leaving) change the number
+        and re-fire the warning every poll round, flooding the log. The
+        latch re-arms in :meth:`_clear_candidates_truncated` when the source
+        drops back under the cap, so a genuinely new episode still warns.
+        The current count still rides the message body.
         """
         self._candidates_trunc_seen[source] = seen
         if self._candidates_trunc_logged.get(source):
@@ -2542,13 +2565,13 @@ class ClusterManager(LeadershipBackend):
     def _eligible_candidates(self) -> list[str]:
         """The names this node may actually *elect* as leader / job owner.
 
-        The quorum gate decides whether THIS node is quorate; this decides
-        which OTHER names it will defer to. Deferring to a node that cannot
+        The quorum gate decides whether this node is quorate; this decides
+        which other names it will defer to. Deferring to a node that cannot
         itself run would stand a healthy majority down, so we only elect a
         candidate we can confirm is quorate: a directly mutually-agreeing
         peer whose gossiped ``mutual_agreeing`` shows it at or above quorum,
         or a :meth:`_bridge_candidates` node. An unconfirmable peer (a
-        sub-quorum set, or an older build reporting none) is NOT elected:
+        sub-quorum set, or an older build reporting none) is not elected:
         in a converged uniform-version cluster a quorate node elects a
         runnable leader (the liveness choice). Residuals: a too-thin bridge
         may double-run; a candidate confirmed from now-stale gossip can
@@ -2570,7 +2593,7 @@ class ClusterManager(LeadershipBackend):
         never double-runs (nor zero-runs) a job.
 
         We fold a peer's ``quorate_vouched`` set (its own
-        :meth:`_eligible_candidates`), NOT its raw ``mutual_agreeing``: a
+        :meth:`_eligible_candidates`), not its raw ``mutual_agreeing``: a
         witness may have a single edge to a sub-quorum node, and folding
         that node would let the rendezvous pick an owner that then stands
         itself down on its own quorum gate, a silent cluster-wide zero-run.
@@ -2580,7 +2603,7 @@ class ClusterManager(LeadershipBackend):
         witness vouches Z quorate. A vouched name we do not already account
         for becomes a possible co-owner: one that out-scores us for a job
         makes us defer (fail closed); one scoring below us cannot displace
-        us. A name NO agreeing peer vouches is deliberately omitted: only
+        us. A name no agreeing peer vouches is deliberately omitted: only
         sub-quorum nodes are dropped, so a crashed or partitioned node
         never stands our jobs down.
         """
@@ -2610,7 +2633,7 @@ class ClusterManager(LeadershipBackend):
         gossiped ``members`` list (one-hop transitivity: two peers that
         each see one copy still let us spot the collision). Identity is the
         per-process ``instance_id`` (falling back to the peer's host); a
-        benign self-listing (same name AND instance id) is not a conflict,
+        benign self-listing (same name and instance id) is not a conflict,
         and stale peers contribute nothing.
 
         A members list is untrusted, so an instance counts only when
@@ -2623,7 +2646,7 @@ class ClusterManager(LeadershipBackend):
         peer can witness transitively is not flagged; and just after a node
         restart two not-yet-refreshed peers can still gossip the old
         instance, a transient fail-closed false positive for ~1-2 poll
-        intervals. Deliberately NOT fixed by letting a fresh first-party
+        intervals. Deliberately not fixed by letting a fresh first-party
         observation suppress a stale transitive one: the same rule would
         suppress a genuine partial-mesh duplicate.
         """
@@ -2637,17 +2660,17 @@ class ClusterManager(LeadershipBackend):
         )
         first_party[self.node_name][self.instance_id].add("self")
         for peer in self.view.peers.values():
-            # Skip STALE peers (no fresh identity) AND STATUS_SELF: a SELF
-            # peer is THIS node answering its own listed address, not
+            # Skip stale peers (no fresh identity) and STATUS_SELF: a SELF
+            # peer is this node answering its own listed address, not
             # independent evidence. A self-listing reporting no instance_id
             # is classified benign SELF by record_success; processed here it
-            # would synthesise a second "host:"+host instance for our OWN
+            # would synthesise a second "host:"+host instance for our own
             # nodeName and fabricate a phantom conflict. Mirrors
             # _agreeing_peers / cluster_size.
             if peer.status in _STALE_STATUSES or peer.status == STATUS_SELF:
                 continue
             if peer.node_name is not None:
-                # our own DIRECT observation of this peer's identity
+                # our own direct observation of this peer's identity
                 # (first-party evidence).
                 first_party[peer.node_name][
                     peer.instance_id or "host:" + peer.host
@@ -2700,13 +2723,12 @@ class ClusterManager(LeadershipBackend):
         and new-N sides see each other SYNCING or DRIFTED, never AGREED,
         while each still reaches quorum under its own N; a reachable
         peer's declared N is first-party evidence of a concurrent resize,
-        and a pure job-change roll declares one N everywhere. NOT caught: a
+        and a pure job-change roll declares one N everywhere. Not caught: a
         same-N membership swap; change membership one node at a time
-        (module docstring). Residual (pre-release version skew only): a
-        build from before the instance-id dedup declares raw
-        ``len(peers)+1``, so a multi-homed peer makes the two builds flag
-        each other mid upgrade; fail-closed and self-healing, accepted
-        because it cannot survive a release.
+        (module docstring). Residual (version skew only): a build without
+        instance-id dedup declares raw ``len(peers)+1``, so a multi-homed
+        peer makes the two builds flag each other mid upgrade; fail-closed
+        and self-healing.
         """
         my_size = self._our_declarations()["declared_size"]
         return sorted(
@@ -2762,7 +2784,7 @@ class ClusterManager(LeadershipBackend):
         A duplicate ``nodeName`` (:meth:`conflict_names`), a cluster-size
         disagreement (:meth:`conflicting_sizes`), or a policy divergence
         (:meth:`conflicting_policies`): all three fail the ``Leader`` gate
-        closed. The size/policy gates fail closed on a SINGLE reachable
+        closed. The size/policy gates fail closed on a single reachable
         peer's declaration (no corroboration), unlike the nodeName gate:
         a divergent size/policy is a first-party report about itself, and
         requiring corroboration would re-open the split-brain the gate
@@ -2805,7 +2827,7 @@ class ClusterManager(LeadershipBackend):
         A freshly built manager (boot, reload, TLS rotation) starts from a
         blank view and a new ``instance_id``: every peer is unknown, nobody
         attests us, the quorum-less election reduces to ``min([self])``,
-        and EVERY node would claim available ownership at once (running
+        and every node would claim available ownership at once (running
         each PreferLeader job and deferred @reboot one-shot on every node).
         The hold lasts only while the view is converging:
 
@@ -2896,7 +2918,7 @@ class ClusterManager(LeadershipBackend):
         not protect ``PreferLeader`` against, so two same-named processes
         would both run every job they own. The tie breaks on the
         per-process ``instance_id``: the lowest instance runs, the rest
-        defer. The deferral is gated on the lower twin ACTUALLY owning the
+        defer. The deferral is gated on the lower twin actually owning the
         job in its own gossiped view (``owns_for`` recomputes the election
         over the twin's ``mutual_agreeing``), not merely on its existence.
         Ceding only to a twin we can see will run
@@ -2933,7 +2955,7 @@ class ClusterManager(LeadershipBackend):
         """Quorum-gated owner of ``job_name`` (spread mode), else ``None``.
 
         The rendezvous winner over ourselves, the confirmed-quorate
-        candidates (:meth:`_eligible_candidates`), AND the contenders a
+        candidates (:meth:`_eligible_candidates`), and the contenders a
         witness vouches quorate (:meth:`_unconfirmed_contenders`): a
         thin-bridged node we cannot confirm would otherwise self-own a job
         we also claim (the winner is per-job, so a thin bridge that
@@ -2963,12 +2985,12 @@ class ClusterManager(LeadershipBackend):
         instead of rebuilt per job; :meth:`job_owner` then pays only the
         per-(job, node) rendezvous hash.
 
-        The memo is the ONLY mutable value in the derived cache: an
+        The memo is the only mutable value in the derived cache: an
         initially empty ``{job_name: owner}`` dict :meth:`job_owner` fills.
         It rides here precisely so the generation roll that swaps the
         member set drops it in the same ``_derived_cache.clear()``; a stale
         owner is not cosmetic, for a ``Leader`` job it is a double-run or a
-        zero-run. :meth:`available_job_owner` hashes over a DIFFERENT
+        zero-run. :meth:`available_job_owner` hashes over a different
         member set and keeps its own memo; sharing one dict would let
         whichever method asked first answer for the other.
         """
@@ -3000,7 +3022,7 @@ class ClusterManager(LeadershipBackend):
         on one owner per job.
 
         The ``PreferLeader`` analogue of :meth:`_unconfirmed_contenders`,
-        but folding the RAW ``mutual_agreeing`` edge, not quorate_vouched:
+        but folding the raw ``mutual_agreeing`` edge, not quorate_vouched:
         with no quorum gate a sub-quorum node still runs the jobs it owns,
         so it is a legitimate co-owner and must be in everyone's rendezvous
         set. A running winner has no quorum gate to stand down on, so it
@@ -3054,7 +3076,7 @@ class ClusterManager(LeadershipBackend):
         The job-independent rendezvous set of :meth:`available_job_owner`,
         derived once per generation with names pre-encoded. The duplicate-
         name tiebreak recomputes over a per-twin member set, so it keeps
-        the un-memoized module helper. The memo is this method's OWN (see
+        the un-memoized module helper. The memo is this method's own (see
         :meth:`_spread_owner_set`): this member set has no quorum gate and
         folds raw edges, so it answers differently from :meth:`job_owner`
         for the same name.
@@ -3202,7 +3224,7 @@ class ClusterManager(LeadershipBackend):
             # the bridge-confirmed candidate set outgrew its advertisement
             # cap, so a `spread` owner in the dropped tail may double-run
             # (see MAX_ADVERTISED_CANDIDATE_NAMES); zero when it fits, else
-            # the full count. NOT folded into "conflict": failing a fleet
+            # the full count. Not folded into "conflict": failing a fleet
             # closed for outgrowing a gossip budget would be worse than the
             # residual.
             "candidates_truncated": self._candidates_truncated,

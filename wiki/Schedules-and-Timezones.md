@@ -26,14 +26,14 @@ so `schedule` is either a string or an object. `JobConfig._parse_schedule` turns
 
 Any other value raises `ConfigError("invalid schedule: ...")`.
 
-The crontab dialect is implemented by cronstable's own built-in engine (`cronstable/cronexpr.py`, no third-party dependency). Field syntax is the dialect cronstable has always accepted, not the system `cron(5)` man page. It takes ranges `1-5`, steps `*/5` (and `5/15`: start plus step, running to the field's end), lists `1,15,30`, and case-insensitive names like `mon`/`jan`. The notable rules:
+The crontab dialect is implemented by cronstable's built-in engine (`cronstable/cronexpr.py`, with no third-party dependency). It takes ranges `1-5`, steps `*/5` (and `5/15`: start plus step, running to the field's end), lists `1,15,30`, and case-insensitive names like `mon`/`jan`. The notable rules:
 
-- **Day-of-week** accepts `0`–`7`, with both `0` and `7` meaning Sunday. A range ending in `0` wraps its end to Sunday-as-7, so `sat-sun` and `6-0` mean Saturday+Sunday.
+- **Day-of-week** accepts `0` to `7`, with both `0` and `7` meaning Sunday. A range ending in `0` wraps its end to Sunday-as-7, so `sat-sun` and `6-0` mean Saturday+Sunday.
 - **`L`** alone in day-of-month is the month's last day (`0 0 L * *`); `L<n>` (or a numeric range `L<a>-<b>`) in day-of-week is the month's *last* such weekday (`L5` = last Friday). No other field takes an `L`.
 - **Business-day forms**: in day-of-month, `L-<n>` counts back from the month's final day (`L-3` = three days before it), `<n>W` is the weekday nearest day *n* within the same month, and `LW` is the month's last weekday. In day-of-week, `<d>#<n>` is the month's *n*-th such weekday (`5#3` = third Friday, `mon#1` = first Monday). Exact edge rules, examples, and Quartz porting notes: [business-day schedules](Business-Day-Schedules).
 - **`?`** standing alone in day-of-month or day-of-week reads as `*` (the Quartz spelling of "unrestricted"), so a seven-field Quartz expression (whose column layout matches cronstable's) parses verbatim. `?` anywhere else is an error.
-- **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th). Vixie cron fires when *either* matches; cronstable deliberately keeps the AND rule its schedules have always had. The [schedule linter](Schedule-Linting) warns whenever a schedule uses the combination.
-- **`year`** accepts 1970–2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) never fires. It is legal (a fixed past year is a working idiom for parking a job), and it is reported: config load logs a `never-fires` warning, the scheduler warns once at seed time, and `/status` and `/jobs` report `never_fires` (see [schedule linting](Schedule-Linting)).
+- **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th), whereas Vixie cron fires when *either* matches. The [schedule linter](Schedule-Linting) warns whenever a schedule uses the combination.
+- **`year`** accepts 1970 to 2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) never fires. It is legal (a fixed past year is a working idiom for parking a job), and it is reported: config load logs a `never-fires` warning, the scheduler warns once at seed time, and `/status` and `/jobs` report `never_fires` (see [schedule linting](Schedule-Linting)).
 
 The built-in engine is behavior-compatible with the third-party parse-crontab library, vector-by-vector. See `tests/gen_cron_golden.py` and `tests/data/cron_golden.json` for the recorded compatibility corpus.
 
@@ -145,7 +145,7 @@ All values are typed `Str()` in the schema, so write `minute: "0"`, not `minute:
 
 ### The `year` key
 
-`year` restricts the schedule to specific years (the optional trailing column, 1970–2099). For example, this runs only during 2017:
+`year` restricts the schedule to specific years (the optional trailing column, 1970 to 2099). For example, this runs only during 2017:
 
 ```yaml
 schedule:
@@ -200,7 +200,7 @@ jobs:
 
 ## How the scheduler ticks
 
-The scheduler does not run a per-job timer, and it does not scan every job on a fixed tick either. It keeps a **next-fire index** and **sleeps until the soonest job is due** (`cronstable/cron.py`):
+Instead of running per-job timers or scanning every job on a fixed tick, the scheduler keeps a **next-fire index** and **sleeps until the soonest job is due** (`cronstable/cron.py`):
 
 - **The next-fire index.** Every enabled `CronTab` job carries the instant it next fires: an aware **UTC** datetime in `Cron._next_fire`, mirrored into the `_fire_heap` min-heap. Each instant is computed by `crontab.next()` in the job's *own* frame (its `timezone`, or `LOCAL_ZONE`, the host's local clock, when it has none) and stored back in UTC. So a job's DST offset is handled where it applies, and the heap still orders everything on one absolute timeline. `@reboot` and disabled jobs are not in the index.
 - **Sleep until the soonest fire.** Each iteration sleeps until the earliest instant in the heap, capped at the next whole UTC minute so housekeeping (described later) still runs about once a minute. On wake, `_due_names` pops only the jobs whose instant has arrived, and nothing else is touched. An idle wake over a large fleet is an O(1) heap peek, and a wake with a due cohort does crontab work only for that cohort. Cost scales with **jobs due**, not jobs configured.
@@ -208,7 +208,7 @@ The scheduler does not run a per-job timer, and it does not scan every job on a 
 - **Immune to clock steps.** The sleep length is derived from the wall clock but realized against the event loop's **monotonic** clock (`asyncio.wait_for`), and firing compares the wall clock against the fixed, forward-only instants in the heap. So a wall-clock or NTP step is absorbed on the next wake. A step **backward** defers the pending fire (it is not re-fired), and a step **forward** does not cause a catch-up storm (see the next item).
 - **Bounded catch-up.** If a job's due instant is less than `CATCHUP_LIMIT` (10 s) behind, as happens on a slow pass such as many simultaneous launches or the once-a-minute config reload, `_advance` replays each missed occurrence in the window. A gap of at least 10 s counts as a stall, suspend, or forward clock jump: the job resumes at the current slot (firing once only if *now* itself matches) and resyncs in O(1) with a warning. Stateful jobs with `onMissed: run-once` or `run-all` also queue background recovery for skipped slots, using the [durable catch-up safeguards](Durable-State#missed-run-catch-up). The scheduling pass never enumerates a long missed window. This applies to minute- and second-level jobs.
 - **No spurious run for the period in progress at startup.** At startup the index is seeded **strictly-future** (the first boundary *after* the start instant) for every scheduled job, so a job whose minute or second is already under way does not fire immediately. It first fires at the next matching boundary. `@reboot` jobs are unaffected and still fire once at startup.
-- **Reload keeps the index in step.** On a config reload, a job whose schedule is unchanged **keeps** its existing next-fire, so a reload landing on that job's own boundary minute cannot recompute a strictly-future fire and skip it. A job whose schedule changed, or a newly added one, is reseeded strictly-future. A removed or now-disabled job is dropped.
+- **Reload keeps the index in step.** On a config reload, a job whose schedule is unchanged **keeps** its existing next-fire, so a reload landing on that job's own boundary minute cannot recompute a strictly-future fire and skip it. A newly added job or a job with a modified schedule is reseeded strictly-future. Removed or disabled jobs are dropped.
 
 Implications:
 

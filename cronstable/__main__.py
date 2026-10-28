@@ -31,10 +31,10 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     actions = state.add_subparsers(dest="state_command", metavar="ACTION")
 
     def _with_config(sub_parser):
-        # SUPPRESS, not CONFIG_DEFAULT: a subparser default would otherwise
-        # OVERWRITE a root-level `cronstable -c X state ...` value (argparse
-        # applies subparser defaults after the root parse). The root parser
-        # already supplies the default.
+        # Use SUPPRESS so a subparser default does not overwrite a root-level
+        # `cronstable -c X state ...` value (argparse applies subparser
+        # defaults after the root parse). The root parser supplies the
+        # default.
         sub_parser.add_argument(
             "-c",
             "--config",
@@ -102,24 +102,21 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         "--dry-run", default=False, action="store_true"
     )
 
-    # The job-facing state commands. The KV actions (get/set/delete/
-    # keys) hang off the SAME `state` subparser as the admin actions above and
+    # The job-facing state commands. The KV actions (get/set/delete/keys)
+    # hang off the same `state` subparser as the admin actions above and
     # coexist with them (the action name routes); the other verbs (cursor/
     # lock/artifact/idempotent/secret) are their own top-level commands. Both
     # are thin clients of the daemon's loopback endpoint.
     #
-    # These (and `mcp` / `tui` / `pair`) all register from
-    # cronstable._cliargs, a stdlib-only leaf, NOT by importing
-    # cronstable.jobcli / cronstable.mcpcli / cronstable.tui /
-    # cronstable.paircli. Importing tui alone runs its ~7000-line module body
-    # and pulls unicodedata's C table plus dozens of other modules (~50ms),
-    # and jobcli drags urllib.request/ssl/email in for ~27ms; every
-    # job-spawned thin client (`state get`, `lock`, `xcom pull`) builds this
-    # parser first, and so does the daemon and `--version`, so an eager
-    # import would tax every invocation for commands almost never the one
-    # invoked. The real modules are imported only inside their dispatch
-    # branches (see main_loop); tests/test_cli_stubs.py pins the lazy-import
-    # property.
+    # These (and `mcp` / `tui` / `pair`) register from cronstable._cliargs,
+    # a stdlib-only leaf, keeping cronstable.jobcli, cronstable.mcpcli,
+    # cronstable.tui, and cronstable.paircli out of the parser-build import
+    # graph. Importing tui runs its module body and pulls unicodedata's C
+    # table (~50ms), and jobcli pulls urllib.request/ssl/email (~27ms);
+    # every job-spawned client (`state get`, `lock`, `xcom pull`), the
+    # daemon, and `--version` build this parser first. The implementation
+    # modules are imported inside their dispatch branches in main_loop
+    # (tested by tests/test_cli_stubs.py).
     _cliargs.add_state_job_actions(actions)
     _cliargs.add_job_commands(sub)
     _cliargs.add_mcp_command(sub)
@@ -341,7 +338,7 @@ def _init_restrict(target: str) -> None:
     per-user configuration a DACL naming only administrators would take it
     away from the person who wrote it.
 
-    Runs AFTER the starter is written, because a caller who is not an
+    Runs after the starter is written, because a caller who is not an
     administrator would otherwise be refused the write it just asked for.
     That order also covers the file: SetNamedSecurityInfoW propagates the
     new inheritable ACEs onto children whose own DACLs are unprotected.
@@ -425,7 +422,7 @@ def main_loop(loop=None):
     """Parse argv, dispatch, and (for the daemon) run the scheduler.
 
     ``loop`` is optional: passing one keeps it the caller's to close, while
-    omitting it defers building a loop -- and importing asyncio at all -- to
+    omitting it defers building a loop (and importing asyncio) to
     :func:`_run_daemon`, the only branch that needs either.
     """
     _answer_bare_version()
@@ -482,9 +479,9 @@ def main_loop(loop=None):
     # argparse cannot capture it portably: nargs=REMAINDER swallows our own
     # flags into the command list, while nargs="*" only picks up the tokens
     # after "--" on Python >= 3.13 (older argparse reports them as
-    # "unrecognized arguments"). So split the command off at the first "--"
-    # ourselves -- identical on every supported Python -- and hand argparse
-    # only the head, where our flags and NAME parse cleanly everywhere.
+    # "unrecognized arguments"). Split the command off at the first "--"
+    # before calling argparse (identical on every supported Python) and pass
+    # argparse only the head, where flags and NAME parse cleanly.
     argv = sys.argv[1:]
     trailing_command = None
     if "--" in argv:
@@ -519,9 +516,8 @@ def main_loop(loop=None):
     if command == "state":
         # `state get/set/delete/keys` are job-facing (they reach the running
         # daemon's loopback endpoint); everything else under `state` is offline
-        # store administration. Route by action name so the two coexist --
-        # off the leaf's set, not jobcli's re-export of it, so an admin action
-        # does not import jobcli's urllib/ssl/email graph to read a frozenset.
+        # store administration. Route by action name using _cliargs's set so
+        # an admin action does not import jobcli's urllib/ssl/email graph.
         if getattr(args, "state_command", None) in _cliargs.STATE_JOB_ACTIONS:
             from cronstable import jobcli
 
@@ -582,7 +578,7 @@ def main_loop(loop=None):
         # Before the configuration-not-found guard below: `service remove`
         # and `service status` have to keep working on a host whose config
         # was deleted, which is exactly when an operator reaches for them.
-        # _run_daemon and _new_event_loop are PASSED rather than imported by
+        # _run_daemon and _new_event_loop are passed rather than imported by
         # winservice: the ImagePath `install` writes for a source install is
         # `python -m cronstable`, and importing this module by name from
         # there would execute it a second time under its package name,
@@ -651,13 +647,11 @@ def main_loop(loop=None):
             logger.info("Configuration is valid.")
         sys.exit(0)
 
-    # Imported here, not at module top: this pulls in aiohttp, strictyaml,
-    # sentry_sdk and the rest of the daemon graph (~300ms of import). The
-    # branches that exit before this point -- --version, --job-set-id,
-    # --validate-config and the state / xcom / lock / cursor / artifact /
-    # idempotent / secret subcommands (thin urllib clients of the running
-    # daemon, routinely spawned from inside jobs) -- never touch Cron, so a
-    # job-facing CLI call no longer pays that cost. Only the daemon does.
+    # Import Cron here rather than at module top: it pulls in aiohttp,
+    # strictyaml, sentry_sdk, and the rest of the daemon graph (~300ms).
+    # Commands that exit earlier (--version, --job-set-id, --validate-config,
+    # and the state / xcom / lock / cursor / artifact / idempotent / secret
+    # client subcommands) avoid importing the daemon graph.
     from cronstable.cron import Cron
 
     try:
@@ -671,14 +665,13 @@ def main_loop(loop=None):
 
 #: Floor on the shared default executor's worker count.  CPython sizes it
 #: ``min(32, cpu_count + 4)``, i.e. 5-6 slots on the 1-2 vCPU containers
-#: cronstable is routinely deployed in -- and that one pool carries the config
+#: cronstable is routinely deployed in; that pool carries the config
 #: reparse, the leadership lease read/write, the per-completion archive redact
-#: and ResourceMonitor.stop(), the /jobs serialize and every getaddrinfo.  Its
+#: and ResourceMonitor.stop(), the /jobs serialize, and every getaddrinfo.  Its
 #: queue is unbounded, so a minute boundary that finishes hundreds of jobs can
 #: park a lease renewal behind them until its renewDeadlineSeconds expires and
-#: the node drops leadership.  A floor of 8 does not remove that ordering
-#: hazard (only a dedicated lease executor does), but it stops the smallest
-#: deployments from being the tightest.
+#: the node drops leadership.  A floor of 8 keeps 1-2 vCPU deployments from
+#: starving the pool alongside the dedicated lease executor.
 _MIN_EXECUTOR_WORKERS = 8
 
 #: Ceiling, kept at CPython's own so a many-core host does not grow an
@@ -741,7 +734,7 @@ def _warn_if_config_is_writable(config_arg: str | None) -> None:
 def _run_daemon(cron, loop=None, *, shutdown_handlers: bool = True) -> None:
     """Run the scheduler to completion, with shutdown signalling wired up.
 
-    The event loop is built HERE rather than in :func:`main` because asyncio
+    The event loop is built here rather than in :func:`main` because asyncio
     is a ~50ms import (and several MB of RSS) that only this branch needs:
     ``--version``, ``--third-party-licenses`` and every job-spawned thin
     client (`state get`, `lock`, `xcom pull`) have already exited by now.  A
@@ -752,16 +745,12 @@ def _run_daemon(cron, loop=None, *, shutdown_handlers: bool = True) -> None:
     (loop signal handlers on POSIX, signal.signal on Windows), so it lives
     behind platform.install_shutdown_handlers.
 
-    ``shutdown_handlers=False`` skips that wiring, for a caller that runs
-    this off the main thread and has its own stop surface.  It exists for
-    :mod:`cronstable.winservice`, whose loop runs on a thread the Service
-    Control Manager creates and whose stop request arrives as an SCM
-    control rather than a console event.  The flag is needed rather than
-    merely tidy: the Windows arm of install_shutdown_handlers reaches
-    ``signal.signal``, which the interpreter refuses anywhere but the main
-    thread, and the POSIX arm's ``loop.add_signal_handler`` refuses the
-    same way, so leaving it on would abort the run before the scheduler
-    ever started.
+    ``shutdown_handlers=False`` skips that wiring for callers that run off
+    the main thread with their own stop mechanism, such as
+    :mod:`cronstable.winservice`, whose loop runs on a Service Control
+    Manager thread and stops on an SCM control.  Both ``signal.signal`` on
+    Windows and ``loop.add_signal_handler`` on POSIX raise if called off the
+    main thread.
     """
     _warn_if_config_is_writable(cron.config_arg)
     owned = loop is None
@@ -797,16 +786,15 @@ def _new_event_loop():  # pragma: no cover
     otherwise stock asyncio.
 
     uvloop is a drop-in, libuv-based replacement for asyncio's selector loop
-    that runs cronstable's I/O paths -- cluster gossip/lease HTTP, the web
-    dashboard, the Prometheus scrape -- markedly faster. It is strictly
-    optional (install the ``speedups`` extra to pull it in): it has no Windows
-    build (where cronstable also needs the Proactor loop for subprocess
-    support)
-    and ships no wheels for some of the leaner architectures we target, so a
-    missing or unimportable uvloop silently falls back to stock asyncio with
-    identical behavior. Selecting the loop directly (rather than via
-    ``asyncio.set_event_loop_policy``) sidesteps the event-loop-policy API that
-    Python 3.14 deprecates.
+    that speeds up cronstable's I/O paths (cluster gossip/lease HTTP, the web
+    dashboard, and the Prometheus scrape). It is strictly optional (install
+    the ``speedups`` extra to pull it in): it has no Windows build (where
+    cronstable also needs the Proactor loop for subprocess support) and ships
+    no wheels for some target architectures, so a missing or unimportable
+    uvloop silently falls back to stock asyncio with identical behavior.
+    Selecting the loop directly rather than via
+    ``asyncio.set_event_loop_policy`` avoids the event-loop-policy API
+    deprecated in Python 3.14.
 
     ``asyncio.new_event_loop()`` yields the right stock loop per platform: a
     subprocess-capable Proactor loop on Windows (the default since 3.8) and a

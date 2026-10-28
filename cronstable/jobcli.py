@@ -32,7 +32,7 @@ from cronstable import webclient
 
 # The env vars the daemon injects (see cronstable.jobapi); the job CLI is the
 # consumer.  Hardcoded here rather than imported so the CLI never pulls aiohttp
-# into its import graph -- these three names are a stable wire contract.
+# into its import graph; these three names are a stable wire contract.
 ENV_URL = "CRONSTABLE_STATE_URL"
 ENV_TOKEN = "CRONSTABLE_STATE_TOKEN"
 # Injected too, but only when state.jobApi.tls.ca is set: the trust anchor to
@@ -41,7 +41,7 @@ ENV_TOKEN = "CRONSTABLE_STATE_TOKEN"
 # environment rather than a flag for two reasons: it is the same kind of fact
 # as the URL and the token (where the endpoint is, how to speak to it), and a
 # per-subcommand --cacert would have to be threaded through every job-facing
-# verb.  There is deliberately no way to switch verification OFF from in here:
+# verb.  There is deliberately no way to disable verification from here:
 # nothing running inside a job's environment should be able to downgrade the
 # channel that carries that job's own secrets.
 ENV_CACERT = "CRONSTABLE_STATE_CACERT"
@@ -49,7 +49,7 @@ ENV_CACERT = "CRONSTABLE_STATE_CACERT"
 # Injected into every DAG task so `cronstable xcom` knows this task's own
 # key and the run's shared XCom scope (an artifact scope; XCom is a thin,
 # task-keyed convention over the durable artifact store).  Hardcoded for the
-# same reason as above -- a stable wire contract (see cronstable.dag).
+# same reason as above: a stable wire contract (see cronstable.dag).
 ENV_DAG_XCOM_SCOPE = "CRONSTABLE_DAG_XCOM_SCOPE"
 ENV_DAG_TASKKEY = "CRONSTABLE_DAG_TASKKEY"
 
@@ -160,8 +160,8 @@ def _http(
 
     The single seam the whole CLI goes through, so a test monkeypatches this
     to drive every verb without a live server.  ``timeout`` overrides the
-    default deadline (the blocking lock acquire needs its long poll to be
-    ended by the server, not the socket).
+    default deadline so the server ends a blocking lock acquire's long poll
+    before the socket times out.
     """
     url, token = _endpoint()
     full = url.rstrip("/") + path
@@ -170,9 +170,9 @@ def _http(
         if pairs:
             # POSIX argv is decoded with surrogateescape, so a key sourced
             # from a filename or an upstream tool's output can hold lone
-            # surrogates; urlencode re-encodes with STRICT utf-8 and raises
-            # UnicodeEncodeError, which no arm below catches -- a traceback
-            # out of a CLI that promises a clean error instead.
+            # surrogates; urlencode re-encodes with strict utf-8 and raises
+            # UnicodeEncodeError, which no arm below catches: catch it here
+            # to report a clean CLI error instead of a traceback.
             try:
                 full += "?" + urllib.parse.urlencode(pairs)
             except UnicodeEncodeError as ex:

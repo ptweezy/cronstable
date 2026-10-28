@@ -985,7 +985,7 @@ def test_state_inspector_reads_the_real_store(browser, tmp_path):
             # drill into the run records of one job
             _click(page, '#stateTabs button[data-sttab="runs"]')
             page.wait_for_selector("#stateBody [data-stscope]")
-            assert "metadata only" in page.inner_text("#stateBody")
+            assert "records in full" in page.inner_text("#stateBody")
             scopes = page.evaluate(
                 "[...document.querySelectorAll('#stateBody [data-stscope]')]"
                 ".map((b) => b.getAttribute('data-stscope'))"

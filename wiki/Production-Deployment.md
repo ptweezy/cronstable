@@ -12,12 +12,10 @@ one-directory zip, or the standalone `.exe`), see
 
 ## Why cronstable fits a locked-down pod
 
-At runtime the daemon only *reads* its configuration and secrets and writes its
-output to stdout/stderr. It needs no writable working directory, no temp files,
-and no log files. It runs in the foreground, makes no exotic syscalls, and
-requires no special privileges. The published image runs under a restricted
-Kubernetes/container security context with no writable paths or elevated
-privileges required.
+At runtime, the daemon reads its configuration and secrets and writes output to
+stdout and stderr. It runs in the foreground in a restricted Kubernetes or
+container security context without writable paths, temporary files, log files,
+or elevated privileges.
 
 The single exception is the optional per-job `user`/`group` switching feature,
 which calls `os.initgroups`/`os.setgid`/`os.setuid` (`cronstable/job.py`) and so

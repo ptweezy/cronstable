@@ -928,7 +928,8 @@ jobs:
   # a different signature from the db outage, and MAILS on-call. This mail
   # authenticates to the SMTP server (username + password.fromEnvVar) and sends
   # an HTML body (html: true). Lands in the Mailpit inbox. starttls/tls +
-  # validate_certs are shown commented (Mailpit here accepts auth without TLS).
+  # validate_certs are shown commented (Mailpit here accepts auth without TLS),
+  # so loading this config logs a warning about the unencrypted login.
   - name: cert-expiry-check
     command: |
       m=$(date -u +%-M)

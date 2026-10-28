@@ -132,10 +132,10 @@ ONEDIR_RELEASE_ASSETS = (
 )
 
 #: How often the pending-state pumper reports progress, and the wait hint it
-#: reports.  The SCM's rule is not "start within 30 seconds": it is that
-#: while a state is pending, dwCheckPoint must advance before dwWaitHint
-#: elapses.  A pumper removes the guess entirely, so a scheduler whose
-#: config parse or whose job drain takes minutes is never declared hung.
+#: reports.  While a state is pending, the SCM requires dwCheckPoint to
+#: advance before dwWaitHint elapses.  Advancing it on a timer avoids
+#: guessing how long a config parse or a job drain takes, so the SCM never
+#: declares a slow start or stop hung.
 _STATUS_PUMP_INTERVAL = 2.0
 _STATUS_WAIT_HINT_MS = 10_000
 
@@ -176,13 +176,11 @@ def display_name(name: str) -> str:
 def frozen_layout(executable: str, meipass: str | None) -> str:
     """Which packaging shape this process is: source, onedir or onefile.
 
-    It decides whether ``install`` can succeed at all, so it is a three-way
-    answer rather than a bool: the refusal must not fire on a shape that
-    works, and the same value picks the sentence explaining the one that
-    does not.
+    Returns a three-way string so ``install`` only refuses the layout that
+    cannot host a service and selects the matching explanation.
 
     A one-file PyInstaller build extracts itself to a temporary directory
-    and runs the application in a CHILD process.  The SCM starts and watches
+    and runs the application in a child process.  The SCM starts and watches
     the parent bootloader, which never calls StartServiceCtrlDispatcherW, so
     the start fails on the SCM's timeout while the child's own dispatcher
     call is refused with error 1063.  A one-dir build has no such child, and
@@ -193,11 +191,10 @@ def frozen_layout(executable: str, meipass: str | None) -> str:
     """
     if not meipass:
         return "source"
-    # ntpath, not os.path: these are Windows paths by definition (the whole
-    # subcommand refuses to run anywhere else), and os.path on a POSIX box
-    # reads "C:\app\cronstable.exe" as one long filename with no
-    # directory, which quietly turns every layout into onedir. Being
-    # explicit also lets the decision be tested on any machine.
+    # Use ntpath because these are Windows paths (the subcommand refuses to
+    # run anywhere else), and os.path on POSIX reads "C:\app\cronstable.exe"
+    # as a single filename with no directory, which would misclassify every
+    # layout as onedir. Using ntpath also lets tests run on any OS.
     exe_dir = ntpath.normcase(ntpath.dirname(ntpath.normpath(executable)))
     bundle = ntpath.normcase(ntpath.normpath(meipass))
     if bundle == exe_dir or bundle.startswith(exe_dir + ntpath.sep):
@@ -218,22 +215,20 @@ def host_argv(
 ) -> list[str]:
     """The argv the SCM should launch, as a list.
 
-    ``-l`` comes BEFORE the ``service`` token because it is a root flag, and
-    argparse only accepts root flags ahead of the subcommand.  Getting that
-    wrong leaves every installed service pinned at INFO, with a hand edit of
-    the registry as the only way to raise it, in a feature whose bootstrap
-    log is the operator's sole diagnostic.
+    ``-l`` precedes the ``service`` token because it is a root flag, and
+    argparse only accepts root flags ahead of the subcommand.  Placing it
+    later would leave every installed service pinned at INFO unless edited
+    in the registry.
 
     ``executable`` is ``sys.executable``, which is the frozen program under
-    PyInstaller and the interpreter otherwise.  A source install is spelled
-    ``python -m cronstable`` rather than the ``Scripts\\cronstable.exe``
-    console-script shim: that shim launches the interpreter as a child
-    process and waits, which reproduces the one-file problem exactly.
+    PyInstaller and the interpreter otherwise.  A source install uses
+    ``python -m cronstable`` because the ``Scripts\\cronstable.exe``
+    console-script shim launches the interpreter as a child process and
+    waits, which reproduces the one-file bootloader problem.
 
-    ``config`` is always baked in absolute, never left to the platform
-    default, because that default is resolved from the *running* process's
-    environment and a service account's ``%APPDATA%`` points into an
-    invisible ``systemprofile`` directory nobody edits.
+    ``config`` is always baked in as an absolute path because the platform
+    default resolves from the running process's environment, and a service
+    account's ``%APPDATA%`` points into a ``systemprofile`` directory.
     """
     argv = [executable]
     if not frozen:
@@ -252,11 +247,11 @@ def host_argv(
 def image_path(argv: Sequence[str]) -> str:
     """``argv`` as the single command-line string the SCM stores.
 
-    ``subprocess.list2cmdline``, not a hand-rolled join: it emits the exact
-    CommandLineToArgvW form CPython itself re-parses, and it quotes any
-    argument containing a space.  That quoting is what closes the unquoted
-    service path hole, where ``C:\\Program Files\\...`` lets an unprivileged
-    ``C:\\Program.exe`` be started as LocalSystem instead.
+    Uses ``subprocess.list2cmdline`` so the string matches the
+    CommandLineToArgvW form CPython re-parses and quotes any argument
+    containing a space.  Quoting prevents the unquoted service path issue
+    where ``C:\\Program Files\\...`` would allow ``C:\\Program.exe`` to run
+    as LocalSystem.
     """
     return subprocess.list2cmdline(list(argv))
 
@@ -296,13 +291,10 @@ def control_action(control: int) -> str:
 def accepted_controls(state: int) -> int:
     """The dwControlsAccepted mask to report in ``state``.
 
-    Zero while pending, which is not a detail.  It is what makes the SCM
-    refuse a stop request during startup with "the service cannot accept
-    control messages at this time", and that removes the whole class of race
-    where a stop arrives before the event loop it would signal exists.
-    Accepting STOP while pending looks harmless and creates it.  The same
-    gate covers PARAMCHANGE: advertised only here, a reload can never
-    arrive before the loop it would wake exists.
+    Returns zero while pending so the SCM refuses stop and reload requests
+    during startup with "the service cannot accept control messages at this
+    time", preventing a stop or reload from arriving before the event loop
+    it signals exists.
     """
     if state == SERVICE_RUNNING:
         return (
@@ -347,8 +339,8 @@ def status_fields(
 def start_type_code(name: str) -> tuple[int, bool]:
     """``--start-type`` as its SCM code plus the delayed-start flag.
 
-    Two values because delayed auto-start is not a start type: it is
-    SERVICE_AUTO_START plus a separate configuration call.
+    Both ``auto`` and ``delayed`` map to ``SERVICE_AUTO_START``; delayed
+    auto-start adds a separate ``ChangeServiceConfig2W`` configuration call.
     """
     if name == "demand":
         return SERVICE_DEMAND_START, False
@@ -360,11 +352,10 @@ def failure_actions_plan(
 ) -> tuple[list[tuple[int, int]], int]:
     """Recovery actions: restart twice, then give up, resetting daily.
 
-    The two units in the return value are the point of this function.  An
-    SC_ACTION's delay is in MILLISECONDS while the failure-action reset
-    period is in SECONDS, so passing a caller's ``--restart-delay 60``
-    straight through as the action delay would produce a 60 millisecond
-    restart, which is a crash loop wearing a one minute label.
+    An SC_ACTION's delay is in milliseconds while the failure-action reset
+    period is in seconds, so ``restart_delay_s`` is converted to
+    milliseconds for the action delays and paired with an 86,400-second
+    reset period.
     """
     delay_ms = max(0, int(restart_delay_s * 1000))
     actions = [
@@ -411,11 +402,10 @@ _LOG_NAME = "cronstable-service.log"
 def config_is_user_scoped(config: str, user_profile: str | None) -> bool:
     """Whether ``config`` lives under the installing user's own profile.
 
-    A service runs as LocalSystem, whose profile is not this one, so a
-    per-user configuration path is a deployment that works when tested
-    interactively and finds nothing when the SCM starts it.  Whether that is
-    fatal depends on whether the operator CHOSE the path, which is the
-    caller's decision, not this function's.
+    A service runs as LocalSystem, whose profile differs from the installing
+    user's, so a default per-user configuration path resolves to a different
+    directory when the SCM starts the service.  The caller decides whether
+    to refuse (when left at the default) or warn (when explicitly chosen).
     """
     return platform.path_is_user_scoped(config, user_profile)
 
@@ -497,24 +487,19 @@ def state_name(state: int) -> str:
 
 # --- The OS seam -----------------------------------------------------------
 class WinApi:
-    """Every advapi32 and kernel32 call this module makes, and nothing else.
+    """Every advapi32 and kernel32 call this module makes.
 
-    A seam rather than an abstraction: there is one implementation, and its
-    reason for existing is that :class:`ServiceHost` can then be driven in
-    tests by a recording double.  Without it the status sequence, the
-    control mapping and the stop path could only be exercised by actually
-    installing a service, which needs Administrator and would make the whole
-    subsystem untested on every CI runner.
+    Isolates the Win32 calls so :class:`ServiceHost` can be driven in tests
+    by a recording double without Administrator privileges or a live SCM.
 
-    ctypes and ctypes.wintypes are imported inside the methods, never at
-    module scope: ``ctypes.wintypes`` cannot be imported on Linux at all, so
-    a module-level structure declaration would break ``cronstable service
-    --help`` and the POSIX refusal path, and would stop every test in this
-    file from even collecting there.
+    ``ctypes`` and ``ctypes.wintypes`` are imported inside the methods rather
+    than at module scope because ``ctypes.wintypes`` cannot be imported on
+    Linux, where ``cronstable service --help``, the POSIX refusal path, and
+    the unit tests still run.
 
-    Handles are 64 bit on Win64 and ctypes defaults every foreign function's
-    restype to ``c_int``, which truncates them silently.  Every prototype
-    here therefore sets ``restype`` and ``argtypes`` explicitly.
+    Handles are 64-bit on Win64 and ``ctypes`` defaults every foreign
+    function's ``restype`` to ``c_int``, which would truncate them.  Every
+    prototype here sets ``restype`` and ``argtypes`` explicitly.
     """
 
     def __init__(self) -> None:
@@ -531,26 +516,20 @@ class WinApi:
     def _libs(self) -> tuple[Any, Any]:  # pragma: no cover (windows)
         """advapi32 and kernel32, loaded once with every prototype declared.
 
-        ``ctypes.WinDLL(..., use_last_error=True)`` rather than
-        ``ctypes.windll``: the cached wrappers behind ``windll`` do not
-        snapshot the calling thread's last error around the call, and here
-        the error code IS the behavior, since every message this module
-        prints is chosen by it.
+        Uses ``ctypes.WinDLL(..., use_last_error=True)`` so ctypes snapshots
+        the calling thread's last error around each call; the cached wrappers
+        on ``ctypes.windll`` do not, and this module selects its error
+        messages from that error code.
 
-        Every prototype is declared HERE rather than at its call site, and
-        that is not tidiness.  ctypes defaults a foreign function's
-        ``restype`` to ``c_int``, so an undeclared call that takes or
-        returns a HANDLE truncates it to 32 bits on Win64.  Handing such a
-        handle back to Windows can address a different object; handing a
-        real one to an undeclared parameter raises ``OverflowError: int too
-        long to convert``, which is what this code did before, on the very
-        first ``CloseServiceHandle`` of an error path.  Declaring them one
-        by one at the call sites is how that gets missed, so there is one
-        list and it covers everything.
+        Declares prototypes centrally here because ctypes defaults a foreign
+        function's ``restype`` to ``c_int``, which truncates 64-bit HANDLE
+        values on Win64 and raises ``OverflowError`` when passing a 64-bit
+        handle to an undeclared parameter such as ``CloseServiceHandle``.
 
-        Three prototypes are NOT here, because their argument types are
-        built per call: the two callback registrations and SetServiceStatus,
-        which needs a structure defined alongside it.
+        Three prototypes are declared at their call sites instead because
+        their argument types are built per call: the two callback
+        registrations and ``SetServiceStatus``, which uses a structure
+        defined alongside it.
         """
         import ctypes
         from ctypes import wintypes
@@ -684,10 +663,9 @@ class WinApi:
     ) -> None:
         """Register the control handler and remember its status handle.
 
-        The callback takes FOUR parameters (control, event type, event data,
-        context) and returns a DWORD.  A two-parameter prototype is the
-        wrong callback type: it drops the trailing arguments and puts the
-        stdcall frame wrong.
+        The callback takes four parameters (control, event type, event data,
+        context) and returns a DWORD; a two-parameter prototype would drop
+        the trailing arguments and misalign the stdcall frame.
         """
         import ctypes
         from ctypes import wintypes
@@ -892,11 +870,10 @@ class WinApi:
     def set_failure_actions_flag(  # pragma: no cover (windows)
         self, name: str, on: bool
     ) -> None:
-        """Make recovery apply to a clean nonzero exit, not just a crash.
+        """Enable recovery actions on clean nonzero exits as well as crashes.
 
-        Without this flag the exit codes this host reports are decorative:
-        a service that stops itself after a failure has "stopped normally"
-        as far as the SCM is concerned, and no recovery action runs.
+        With this flag enabled, the SCM runs the configured recovery actions
+        whenever the service stops with a service-specific exit code.
         """
         import ctypes
         from ctypes import wintypes
@@ -1039,9 +1016,9 @@ class WinApi:
         stderr, and a job spawned without capture inherits whatever they are
         (CPython omits STARTF_USESTDHANDLES when none of the three is
         redirected).  An uncaptured job would then gain a console stdin that
-        blocks instead of reaching end of file.  This closes that half.  It
-        does NOT undo console membership, which is inherited separately and
-        is the entire reason for allocating the console.
+        blocks instead of reaching end of file.  Clearing the standard
+        handles prevents that while keeping console membership, which child
+        processes inherit separately for graceful CTRL_BREAK delivery.
         """
         _, kernel32 = self._libs()
         for handle_id in (
@@ -1059,12 +1036,11 @@ class WinApi:
     ) -> None:
         """Absorb control events on the console this process allocated.
 
-        The inverse of the handler cronstable.platform installs for an
-        interactive daemon, and for a reason: that one returns FALSE for
-        Ctrl-C and Ctrl-Break so the interpreter's signal chain sees them,
-        while a service deliberately installs no Python signal handlers at
-        all, which would leave the default action (terminate) in force for
-        any stray event on the allocated console.
+        Unlike the interactive handler in ``cronstable.platform`` (which
+        returns False for Ctrl-C and Ctrl-Break so Python's signal chain
+        sees them), a service installs no Python signal handlers and returns
+        True here so stray console events do not trigger the default
+        terminate action.
         """
         import ctypes
         from ctypes import wintypes
@@ -1158,11 +1134,10 @@ class ServiceHost:
     def _start_pump(self, state: int) -> None:
         """Report progress in a pending state until told to stop.
 
-        The SCM does not require a service to become ready within a fixed
-        time; it requires the checkpoint to keep advancing.  Pumping it
-        removes every guess about how long a config parse or a job drain
-        might take, which is the difference between a scheduler that may
-        take minutes to stop and one Windows kills for hanging.
+        The SCM requires the checkpoint to keep advancing while a service is
+        in a pending state.  Pumping it on a timer lets a slow config parse
+        or a multi-minute job drain complete without the SCM declaring the
+        service hung.
         """
         self._stop_pump()
         stop = threading.Event()
@@ -1183,12 +1158,11 @@ class ServiceHost:
         self._pump.start()
 
     def _stop_pump(self) -> None:
-        """Stop the pumper AND wait for it.
+        """Stop the pumper and wait for it to finish.
 
-        The join is load-bearing.  A tick that lands after the terminal
-        report would put the service back into a pending state seconds
-        after it said STOPPED, and the SCM would then wait out the whole
-        wait hint on a process that had already gone.
+        Joining ensures no tick lands after the terminal report: a late tick
+        would put the service back into a pending state after it reported
+        STOPPED, causing the SCM to wait out the full wait hint.
         """
         if self._pump_stop is not None:
             self._pump_stop.set()
@@ -1314,12 +1288,8 @@ class ServiceHost:
         loop = self._new_event_loop()
         self._loop = loop
         try:
-            # Queued BEFORE run_until_complete, so it runs on the loop's
-            # first tick: the loop is genuinely up by then, and nothing
-            # unbounded has happened yet. Reporting later would let a hung
-            # mount look like a failed start; reporting earlier would turn a
-            # startup crash into "terminated unexpectedly" rather than a
-            # start failure carrying a code.
+            # Queue before run_until_complete so it runs on the loop's first
+            # tick, once the loop is up and before any unbounded work runs.
             loop.call_soon(self._mark_running)
             self._run_daemon(self._cron, loop, shutdown_handlers=False)
         finally:
@@ -1507,11 +1477,10 @@ def install(args: Any, api: WinApi) -> int:
             "first with `cronstable init {}`.".format(config, config)
         )
     user_scoped = config_is_user_scoped(config, os.environ.get("USERPROFILE"))
-    # Left at the platform default, a per-user path is not a choice at
-    # all: it is the per-user fallback the resolver lands on, and a
-    # service running as LocalSystem resolves that same default somewhere
-    # else entirely, so installing it would produce a service that starts
-    # and schedules nothing.
+    # When config is left at the platform default, a per-user path is the
+    # fallback the resolver lands on, and a service running as LocalSystem
+    # resolves that default to its own systemprofile directory, so the
+    # installed service would schedule nothing.
     if user_scoped and config == platform.DEFAULT_CONFIG_PATH:
         return _fail(
             "cronstable service install: {} is your own per-user "

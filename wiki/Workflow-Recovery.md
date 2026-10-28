@@ -232,16 +232,14 @@ a request reads depend on its kind:
   does what a single-run execution does. It lists no runs.
 
 A date-range preview and the first execution of a date-range token list
-every run document of the workflow, inside the requested range or outside
-it. While one run document of the workflow cannot be read, both answer
-`503`, whatever the range. Recovery skips no unreadable document after a
-time, so the answer stays `503` until the file named in the daemon's
-warning can be read or is removed. A single-run recovery and a date-range
-execution whose batch is recorded are unaffected by an unreadable document
-of another run. Such an execution completes while the source run of a date
-that the batch has recovered cannot be read. It answers `503` while the
-batch document cannot be read, or while the recovery run or the source run
-of a date that it has yet to recover cannot be read.
+every run document of the workflow, inside or outside the requested range.
+If any run document of the workflow cannot be read, both answer `503`
+until the file named in the daemon's warning can be read or is removed.
+Single-run recoveries and date-range executions with an already-recorded
+batch document do not list the directory, so they are unaffected by
+unreadable documents from other runs; a recorded batch returns `503` only
+when the batch document itself or an unrecovered date's source or recovery
+run document cannot be read.
 
 When a request answers `503` because a run document or a batch document
 cannot be read, the daemon logs one warning from logger `cronstable.dagrun`:

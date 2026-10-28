@@ -1,5 +1,102 @@
 # History
 
+## 1.2.73
+
+- The MCP log-tail tools, `cron_tail_job_logs` and `cron_tail_dag_task_logs`,
+  keep returning new lines after a run's 1000-line output buffer fills: the
+  cursor counts the run's lines instead of buffer slots. Each result reports
+  `skipped` lines that the buffer dropped between polls, sets `reset` when
+  the cursor is past the run's output, and names the run in `started_at`.
+  `cron_tail_dag_task_logs` also reports `running`.
+- MCP tools describe each argument with its default and range, and say when
+  to use a related tool instead.
+- `docs/openapi.yaml` describes the fields inside the responses of the job,
+  run, resource, DAG, run document, XCom, approval decision, recovery,
+  cluster, fleet, and state inspector routes, so a generated client reads
+  them as typed fields: a job's retry, SLA, cluster slot and owner, and live
+  CPU and memory; a run's skip reason and resource totals; a DAG's latest
+  run and each task's trigger rule; every key of a run document's task
+  entries; a cluster's peers, conflicts, and lease; and the state store's
+  inventory, documents, and records. Every object stays open to keys a
+  newer daemon adds, and a test fails when a payload emits a key that its
+  schema does not declare. `GET /state/records` returns each record's full
+  stored body and refuses only archived-output `logs/` streams. A `runs/`
+  record carries the same data that `GET /jobs/{name}/runs` and
+  `GET /jobs/{name}/resources` serve. The dashboard's state inspector says
+  what each tab shows: KV values as a type and size, and records in full.
+- An integer that a cluster peer sends outside the signed 64-bit range
+  counts as malformed: an `exit_code` in its job summaries reads as null, a
+  `cpu_count` in its node stats is dropped, and a `cluster_size` fails the
+  poll, so a generated client can decode every integer in `/cluster` and
+  `/fleet`.
+
+## 1.2.72
+
+- The push reporter gives each alert a `flapId` beside its `collapseId`, so
+  a relay can suppress a job that fails on every run. A `collapseId` names
+  one run. A `flapId` names the source that keeps alerting: a job's
+  failures or its successes on one node, one SLA check of a job on one
+  node, or one DAG or node event. A cluster node goes by its `nodeName` and
+  a standalone daemon by its hostname, so nodes built from one image keep
+  separate ids as long as their `nodeName`s differ. Test alerts and
+  `approval_waiting` events carry no `flapId`, because each of them has to
+  arrive. The id is a keyed hash under the same per-installation salt as
+  the `collapseId`, so the relay learns that two alerts share a source but
+  not what the source is. A relay that predates the field ignores it.
+- Through the hosted relay, a job that fails on every run pages six times
+  within 30 minutes, then sends one reminder every 30 minutes until it has
+  been quiet for 2 hours. The relay deduplicates one alert that several
+  nodes report by its `collapseId`.
+- `docs/relay-protocol.md` specifies flap identity and how the hosted relay
+  handles a flood. An envelope over a device's rate limit gets a 2xx
+  `digested` answer and folds into a burst digest, sent at most every 5
+  minutes. Daemon events draw from a rate bucket of their own, so job
+  alerts can't hold back an approval gate. The hosted relay answers 429
+  only from its edge limiter (6000 POSTs a minute from one IPv4 address or
+  IPv6 /64, shared by every daemon behind that address) and when APNs
+  throttles the device. It retries a transient APNs failure once and
+  spends at most 8 seconds on a send, inside the default 10-second
+  `push.relay.timeout`. The document also covers the app's subscription
+  proof: its 16-day grace, refunds and revocations, and where and how often
+  the app sends it.
+
+## 1.2.71
+
+- A manual start of a deferred `@reboot` job that arrives while the
+  scheduler is launching another deferred `@reboot` job leaves the daemon
+  running. The manual start counts as that job's boot run, and the scheduler
+  doesn't run the job again.
+- The FreeBSD package's `rc.d` script starts the service. In `/etc/rc.conf`,
+  `cronstable_runas` sets its account (whose primary group owns the state
+  directory) and `cronstable_args` adds `cronstable` arguments; `start` warns
+  while `cronstable_user` or `cronstable_flags` is set. An upgrade restarts a
+  running service once its running jobs finish. An upgrade from 1.2.70 or
+  earlier stops it, and the package reminds you to start an enabled, stopped
+  service.
+- A mail report with `starttls: true` upgrades the connection with STARTTLS
+  and fails when the server doesn't offer it. With `tls` and `starttls` both
+  `false` (the default), mail and its login go unencrypted even when the
+  server offers STARTTLS, and the config load warns about such a login to
+  any host but `localhost` or a loopback address. A mail block with `to` and
+  `from` that sets both, directly or through `defaults:`, is a config error.
+- When the system hostname contains a dot, a mail report's `EHLO` greeting
+  gives that name as is and skips the DNS lookup, so a host that can't
+  resolve its own name still sends its reports within the 60-second limit.
+  For a hostname without a dot, the greeting carries the name that Python's
+  `socket.getfqdn()` finds.
+- Secret redaction finds JWTs in time proportional to a line's length, so the
+  daemon keeps scheduling and serving requests while it archives an output
+  line made of many hyphen-joined `eyJ` runs. With `redactArchivedSecrets`
+  on (the default), an archived line longer than 1,048,576 characters (1 MiB
+  of ASCII text) is stored as `***REDACTED***`.
+- An included file changes only the defaults that its own `defaults:` block
+  or the files it includes set, and the other defaults of earlier includes
+  stay in effect. A jobs-only YAML file or a classic crontab changes none.
+- A daemon running from a release binary reads its modules from that binary
+  after a package upgrade replaces or deletes it, so it keeps sending reports
+  until it restarts on the new binary, including while it finishes its
+  running jobs.
+
 ## 1.2.70
 
 - cronstable requires `aiohttp` 3.14.4, `sentry-sdk` 2.8.0, `tzdata` 2024.1,

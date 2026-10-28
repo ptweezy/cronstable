@@ -77,7 +77,7 @@ A run killed at its [`resourceLimits.memory`](Resource-Limits) cap adds one more
 
 `|c` is the statsd counter type. Every other run, capped or not, sends no such line.
 
-A run whose command never launches (the subprocess could not be spawned, or `resourceLimits.required` refused the run before the spawn; `start_failed` is set) emits neither metric. On that path, `wait()` returns early, `_on_stop` (hence `job_stopped`) is never called, and `_on_start` was likewise never reached. Separately, `job_stopped` itself guards on a recorded start time (`if self.start_time is None: return`). That guard suppresses a stop metric for a run stopped without a corresponding `job_started` (for example, the `cancel()`/`wait()` race under `concurrencyPolicy: Replace`).
+A run whose command never launches (the subprocess could not be spawned, or `resourceLimits.required` refused the run before the spawn; `start_failed` is set) emits neither metric. On that path, `wait()` returns early without calling `_on_start` or `_on_stop` (`job_stopped`). Separately, `job_stopped` itself guards on a recorded start time (`if self.start_time is None: return`). That guard suppresses a stop metric for a run stopped without a corresponding `job_started` (for example, the `cancel()`/`wait()` race under `concurrencyPolicy: Replace`).
 
 ## Best-effort delivery
 

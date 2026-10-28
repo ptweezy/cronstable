@@ -58,8 +58,8 @@ PARSED_SCHEDULE_KEY = "_parsed_schedule"
 #: The ``man 5 crontab`` schedule nicknames.  All are accepted;
 #: ``@midnight`` is rewritten to its synonym ``@daily`` (the cron
 #: expression engine understands every nickname except that one) and
-#: ``@reboot`` passes through untouched -- the scheduler, not the
-#: cron-expression parser, gives it meaning (JobConfig._parse_schedule).
+#: ``@reboot`` passes through untouched for the scheduler to interpret
+#: (JobConfig._parse_schedule).
 _NICKNAMES = frozenset(
     {
         "@reboot",
@@ -83,16 +83,15 @@ _ENV_LINE = re.compile(
 
 # Characters refused inside a live (non-blank, non-comment) crontab line:
 # the C0 controls except TAB (a legitimate field separator; LF cannot appear
-# -- lines are split on it), DEL, the C1 controls, and the U+2028/U+2029
+# because lines are split on it), DEL, the C1 controls, and the U+2028/U+2029
 # line separators.  A NUL builds a job the OS can never spawn (exec refuses
 # an argument carrying one) and the resulting ValueError would otherwise
-# escape the scheduler; the others are exactly the ``str.splitlines()``
-# family that renders as ONE line in an editor, ``cat``, ``git diff`` and a
-# code review -- silently truncating a command or smuggling a job into a
-# comment if honored as separators, and confusing the shell if passed
-# through.  Refusing with a file:line error follows the module's documented
-# bias: refuse rather than half-imitate.
-# Built from explicit code points rather than literal ``x-y`` ranges: a
+# escape the scheduler; the others are in the ``str.splitlines()`` family
+# that renders as one line in an editor, ``cat``, ``git diff``, and code
+# review, which would silently truncate a command or smuggle a job into a
+# comment if honored as separators, and confuse the shell if passed
+# through.  Refusing with a file:line error avoids half-imitating cron.
+# Built from explicit code points instead of literal ``x-y`` ranges: a
 # range spanning CR (0x0d) reads to static analysers (CodeQL
 # py/overly-large-range) as a possible typo, and enumerating the points
 # keeps the TAB/LF carve-out visible at the spot the class is defined.
@@ -110,15 +109,14 @@ _CONTROL_CHARS = re.compile(
 
 
 def _physical_lines(data: str) -> list[str]:
-    """``data`` split into physical lines, exactly as cron and editors do.
+    """``data`` split into physical lines, matching cron and text editors.
 
     A crontab is LF-delimited (``man 5 crontab``; cron splits on LF only),
     so this splits on ``"\\n"`` alone and strips one trailing ``"\\r"`` (a
-    CRLF file read in binary mode).  ``str.splitlines()`` is deliberately
-    NOT used: it additionally breaks on VT, FF, FS/GS/RS, NEL and
-    U+2028/U+2029, which turned text sitting inside a ``#`` comment into a
-    live job, silently truncated commands, and made every reported line
-    number drift from the file's physical lines.
+    CRLF file read in binary mode).  ``str.splitlines()`` also breaks on VT,
+    FF, FS/GS/RS, NEL, and U+2028/U+2029, which would turn text inside a
+    ``#`` comment into a live job, truncate commands, and make reported line
+    numbers drift from the file's physical lines.
     """
     return [
         line[:-1] if line.endswith("\r") else line for line in data.split("\n")
@@ -128,9 +126,9 @@ def _physical_lines(data: str) -> list[str]:
 class CrontabError(ValueError):
     """A classic crontab could not be parsed (message carries file:line).
 
-    Deliberately not ``config.ConfigError`` -- importing that here would
-    be circular.  The config module catches this and re-raises it as a
-    ConfigError, so callers outside the parsing pipeline never see it.
+    Kept separate from ``config.ConfigError`` to avoid a circular import.
+    The config module catches this and re-raises it as a ConfigError, so
+    callers outside the parsing pipeline never see it.
     """
 
 
@@ -146,13 +144,13 @@ def is_crontab_path(path: str) -> bool:
 def looks_like_crontab(data: str) -> bool:
     """Best-effort content sniff for files whose name decides nothing.
 
-    Judges only the FIRST meaningful (non-blank, non-comment) line, and
+    Judges only the first meaningful (non-blank, non-comment) line, and
     only accepts shapes no valid cronstable YAML document can open with: a
     ``NAME=value`` assignment (a YAML config opens with ``key:``), a
     leading ``@`` (a reserved YAML indicator, so no plain YAML scalar can
     start with it), or five valid cron fields followed by a command.
-    Anything inconclusive is NOT a crontab, so an extensionless YAML file
-    keeps its exact pre-crontab-support behavior and error messages.
+    Anything inconclusive is treated as YAML so an extensionless YAML file
+    goes through the YAML parser and produces YAML error messages.
     Lines are the same physical (LF-delimited) lines :func:`parse_crontab`
     reads, so the sniff and the parser can never judge different "first"
     lines of one file.
@@ -179,13 +177,12 @@ def looks_like_crontab(data: str) -> bool:
 def parse_crontab(data: str, path: str) -> list[dict[str, Any]]:
     """Lower classic crontab text into YAML-equivalent job dictionaries.
 
-    Each returned dict is shaped exactly like one ``jobs:`` entry out of
-    the YAML front end (name/command/schedule strings, plus environment /
-    shell / timezone when the crontab sets them), ready for the standard
-    defaults merge -- so a crontab job internally gets cronstable's standard
-    configuration, not an emulation of cron's.  The one addition is
-    :data:`PARSED_SCHEDULE_KEY`, carrying the CronTab this function already
-    had to build so the config loader does not build it twice.
+    Each returned dict is shaped like one ``jobs:`` entry out of the YAML
+    front end (name/command/schedule strings, plus environment / shell /
+    timezone when the crontab sets them), ready for the standard defaults
+    merge so a crontab job gets cronstable's standard configuration.  The
+    one addition is :data:`PARSED_SCHEDULE_KEY`, carrying the CronTab this
+    function already built so the config loader does not build it twice.
 
     Job names are ``<file name>:<line number>`` (``legacy.crontab:7``):
     unique within a file, stable across reloads while the file is
@@ -333,8 +330,8 @@ def _job_from_line(
         if environment.get("SHELL"):
             job["shell"] = environment["SHELL"]
         # cronie's CRON_TZ: evaluate the schedule in this zone.  Without
-        # it a crontab job keeps cronstable's standard default (UTC) -- NOT
-        # cron's localtime; a deliberate, documented deviation.
+        # it a crontab job keeps cronstable's standard default (UTC)
+        # instead of cron's localtime.
         if environment.get("CRON_TZ"):
             job["timezone"] = environment["CRON_TZ"]
     return job
@@ -342,7 +339,7 @@ def _job_from_line(
 
 def _unquote(value: str) -> str:
     # man 5 crontab: one pair of matching outer quotes may wrap the value
-    # (they exist to preserve leading/trailing blanks); strip exactly that.
+    # (they exist to preserve leading/trailing blanks); strip that pair.
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
         return value[1:-1]
     return value
@@ -365,12 +362,11 @@ def _unescape_percent(command: str, where: str) -> str:
     In ``man 5 crontab`` an unescaped ``%`` ends the command: it and the
     text after it become the command's standard input, with further ``%``
     signs acting as newlines.  cronstable does not feed stdin to jobs, and
-    the two silent alternatives are both worse than refusing -- running
-    the command without the input it expects, or leaving the input text
-    on the command line for the shell to execute.  So an unescaped ``%``
-    is a hard error with advice, while the escaped form ``\%`` --
-    overwhelmingly the common case, e.g. ``date +\%F`` -- becomes a
-    literal ``%`` exactly as cron would make it.
+    the two silent alternatives are both worse than refusing: running the
+    command without the input it expects, or leaving the input text on the
+    command line for the shell to execute.  So an unescaped ``%`` is a hard
+    error with advice, while the escaped form ``\%`` (the common case, e.g.
+    ``date +\%F``) becomes a literal ``%`` as in cron.
     """
     if "%" not in command:
         # a command without a percent is already its own literal form;

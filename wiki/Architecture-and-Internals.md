@@ -29,7 +29,7 @@ and the modules behind individual features.
 | `cronstable/__main__.py` | CLI entry point. Argument parsing, basic logging setup, event-loop creation, shutdown-handler registration (delegated to `platform.install_shutdown_handlers`), and process exit codes. |
 | `cronstable/platform.py` | The home for the per-OS branches outside the resource-limit backends: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, `suspend_at_spawn` (the `CREATE_SUSPENDED` start of a capped Windows run), and the `IS_WINDOWS` flag. The rest of the codebase, apart from `_cgroups` and `_jobobjects`, reads the same on every platform. |
 | `cronstable/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`. Configuration loading from a file or directory. Include handling and dict merging (`mergedicts`). `JobConfig` parsing/validation. `CronstableConfig` dataclass. |
-| `cronstable/cronexpr.py` | The built-in cron expression engine: `CronTab` parsing (5/6/7-field dialect, names, `L` forms, `@`-nicknames), `next()` (strictly-future, DST-correct, 2099 horizon), and `test()`. A stdlib-only leaf module, behavior-compatible with the parse-crontab library it replaced, enforced by the golden vectors in `tests/data/cron_golden.json`. See [schedules and time zones](Schedules-and-Timezones). |
+| `cronstable/cronexpr.py` | The built-in cron expression engine: `CronTab` parsing (5/6/7-field dialect, names, `L` forms, `@`-nicknames), `next()` (strictly-future, DST-correct, 2099 horizon), and `test()`. A stdlib-only leaf module whose behavior is enforced by the golden vectors in `tests/data/cron_golden.json`. See [schedules and time zones](Schedules-and-Timezones). |
 | `cronstable/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`reload_config` / `update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `cronstable/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`, `PushReporter`, `EventLogReporter`), and `JobRetryState`. |
 | `cronstable/fingerprint.py` | The order-independent **job-set ID**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and `cluster.py` (peer comparison). |
@@ -99,15 +99,14 @@ subcommands, so `state_admin` never enters the daemon's import graph.
 
 ## The event loop
 
-`main()` in `__main__.py` builds no event loop at all. It calls `main_loop()`
-with no argument, and the loop is created and closed inside `_run_daemon`, on
-the daemon branch only. That is deliberate: `asyncio` is a ~50 ms import (and
-several MB of RSS), and every branch that exits earlier (`--version`,
-`--third-party-licenses`, `--validate-config`, `--job-set-id`, and the
-job-spawned thin clients like `state get`, `lock` and `xcom pull`) must not pay
-it. `main_loop(loop)` still accepts a caller-supplied loop, which the test
-suite relies on. A loop passed in stays the caller's to close, while one built
-by `_run_daemon` is closed there.
+`main()` in `__main__.py` calls `main_loop()` with no argument, and the event
+loop is created and closed inside `_run_daemon` on the daemon branch only.
+`asyncio` is a ~50 ms import (and several MB of RSS), so every branch that
+exits earlier (`--version`, `--third-party-licenses`, `--validate-config`,
+`--job-set-id`, and the job-spawned thin clients like `state get`, `lock`, and
+`xcom pull`) avoids importing it. `main_loop(loop)` accepts a caller-supplied
+loop for the test suite. A loop passed in stays the caller's to close, while
+one built by `_run_daemon` is closed there.
 
 The daemon runs on Windows too. On POSIX the daemon runs on uvloop when the
 `speedups` extra is installed, and on stock asyncio otherwise; Windows uses the
@@ -190,22 +189,23 @@ often.
    Next, once per applied configuration, `_converge_limits` passes every job
    and DAG task template that sets `resourceLimits` to
    `limits.get_manager().converge` on a worker thread. That probes the host,
-   builds the Linux cgroup layout on first use, turns the cpu controller on
-   while one of them sets `cpu` and off otherwise, and logs whether the caps
-   can be enforced. It runs after the election gate is updated and before
-   `_service_slots`, so the pass that applies a configuration launches no
-   capped run before the layout exists. With no capped job, it only turns
-   the cpu controller off when `limits.weighting_active()` says it is on.
-   Off waits while a cgroup under `runs/` has a `cpu.max` other than `max`:
-   one of this daemon's live runs, or a cgroup that it did not make, which
-   may be another daemon's run. Such a cgroup counts while it holds
-   processes, and for 60 seconds after this daemon first sees it, which
-   covers a new run that waits for its child to join. This daemon's cgroups
-   that wait for `collect` do not count. The `finish` of the last such run,
-   or a later `collect`, then turns cpu off. A cpu-capped `prepare` while
-   cpu is off, such as a verify check under an older config, calls the
-   backend's `need_cpu`, which turns cpu on without changing what the
-   config wants.
+   builds the Linux cgroup layout on first use, enables the `cpu` controller
+   while at least one job or template sets `cpu` and disables it otherwise, and
+   logs whether the caps can be enforced. It runs after the election gate is
+   updated and before `_service_slots`, so the pass that applies a
+   configuration launches no capped run before the layout exists. With no
+   capped job, it only turns the `cpu` controller off when
+   `limits.weighting_active()` reports it is on. Disabling `cpu` waits while
+   any cgroup under `runs/` has a `cpu.max` other than `max`, whether it belongs
+   to one of this daemon's live runs or to an unrecognized cgroup (such as
+   another daemon's run). Such a cgroup keeps `cpu` enabled while it holds
+   processes and for 60 seconds after this daemon first sees it, covering a new
+   run waiting for its child to join. Cgroups belonging to this daemon that
+   await `collect` do not block disabling `cpu`; the `finish` of the last live
+   run, or a later `collect`, turns `cpu` off. A CPU-capped `prepare` while
+   `cpu` is off (such as a verify check under an older config) calls the
+   backend's `need_cpu`, which turns `cpu` on without changing the configured
+   target state.
 
    The same `try` block then reconciles the observability overlay
    (`start_stop_observability`), the state backend (`start_stop_state`), and
@@ -551,19 +551,19 @@ The scheduler checks whether a node may run a job through the
 selected by `cluster.backend`. It imports backend modules only when needed,
 so using gossip does not load the lease implementations:
 
-- **`gossip`** (default) -> `cluster.ClusterManager`, the mTLS,
+- **`gossip`** (default): `cluster.ClusterManager`, the mTLS,
   no-shared-state, best-effort quorum election (detailed later). Zero new
   dependencies.
-- **`kubernetes`** -> `backends.kubernetes.KubernetesBackend`, a
+- **`kubernetes`**: `backends.kubernetes.KubernetesBackend`, a
   `coordination.k8s.io/v1` `Lease`. Provides fenced leadership with a single
   lease holder while the store is reachable.
-- **`etcd`** -> `backends.etcd.EtcdBackend`, a lease-backed key/election against
-  an etcd cluster, same fenced guarantee.
-- **`filesystem`** -> `backends.filesystem.FilesystemBackend`, a flock-guarded,
+- **`etcd`**: `backends.etcd.EtcdBackend`, a lease-backed key/election against
+  an etcd cluster, with the same fenced guarantee.
+- **`filesystem`**: `backends.filesystem.FilesystemBackend`, a flock-guarded,
   fence-counted TTL lease on a shared POSIX mount, embedding the durable
   store's lease machinery (`state.FilesystemStateBackend`) as its store.
   Fenced, but lease expiry is judged across the participating hosts' wall
-  clocks, so unlike the kubernetes/etcd backends it requires NTP-bounded skew
+  clocks, so unlike the kubernetes and etcd backends it requires NTP-bounded skew
   on every node. Stdlib-only.
 
 The `LeadershipBackend` interface has three groups of methods, allowing lease
@@ -586,7 +586,7 @@ persists the ran-set in the lease store (a Lease annotation / etcd sibling key
 under `REBOOT_RAN_KEY`), scoped to the job-set ID, so a *failover* holder does
 not re-run a one-shot (see
 [clustering and leader election](Clustering-and-Leader-Election)). Gossip
-overrides these defaults to preserve its existing behavior.
+overrides these defaults to track `@reboot` runs across its peer set.
 
 The lease backends share `LeaseBackend`, which pins `distribution` to
 `"single-leader"` and provides the common lease status fields in `view_dict()`.
@@ -801,8 +801,8 @@ the key when the list becomes empty), then:
 - If `job.replaced` is `True`, the run was a deliberate `concurrencyPolicy:
   Replace` termination: it is logged as replaced and **not** reported and does
   not trigger retries.
-- Otherwise it inspects `job.fail_reason`. `None` -> `handle_job_success`;
-  non-`None` -> `handle_job_failure`.
+- Otherwise it inspects `job.fail_reason`: `None` calls `handle_job_success`,
+  and a non-`None` value calls `handle_job_failure`.
 
 ## RunningJob lifecycle
 

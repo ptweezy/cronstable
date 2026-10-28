@@ -198,7 +198,7 @@ with no built-in rename:
   `quarantine/` on read and skipped, never guessed at and never fatal. A plain
   I/O error (a transient NFS failure) leaves the record in place and skips it
   for that read only. A well-formed record with an unrecognized
-  `schemaVersion`, which a newer build probably wrote, also stays in place:
+  `schemaVersion` also stays in place:
   each read logs a warning and skips it. The readers that would act on
   "absent" as permanent opt out of those two skips with a **strict** read
   that propagates the error instead: the DAG
@@ -367,7 +367,7 @@ than a long way back in the history.
 > **A different feature with a similar name:** the
 > [web dashboard's opt-in run ledger](Web-Dashboard#browser-run-history) records
 > finished runs into the *browser's* IndexedDB, per viewer, for the anomaly
-> heuristics. It predates durable state and stays browser-local. The
+> heuristics. It is separate from durable state and stays browser-local. The
 > durable run ledger on this page is server-side, shared by every viewer,
 > and feeds scheduling decisions.
 
@@ -591,7 +591,10 @@ secret-bearing (`PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`,
 credentials embedded in URLs and connection strings
 (`scheme://user:password@host`, including the user-less
 `redis://:password@host` form), and well-known token formats (cloud keys,
-GitHub personal access tokens, JWTs, private key blocks).
+GitHub personal access tokens, JWTs, private key blocks). A line longer than
+1,048,576 characters (1 MiB of ASCII text), or one that redaction grows past
+that length, is replaced whole with `***REDACTED***`. This caps how much text
+each secret pattern scans.
 
 Job output routinely embeds credentials by accident; a crashed script echoing
 its environment is the classic case. An archive multiplies the exposure, so
@@ -902,10 +905,10 @@ forever. The store cleans up after itself, conservatively, anchored on
   shared by several deployments is safe: each namespace GCs only itself, and
   anything GC does not positively recognize as garbage stays.
 * **Deferred until it can prove absence:** nothing is deleted until the
-  retained manifest history spans one full grace window. A fresh store, or
-  the first passes after upgrading a store that predates manifests,
-  therefore collects nothing for the first `gcGraceSeconds`, rather than
-  treating "nobody has manifested yet" as "nobody wants this".
+  retained manifest history spans one full grace window. A fresh store, or a
+  store with no retained manifests yet, therefore collects nothing for the
+  first `gcGraceSeconds`, rather than treating "nobody has manifested yet" as
+  "nobody wants this".
 
 The manifest-plus-grace design means a node that is only *down* does not
 lose its jobs' history (its last manifest stays recent for the grace period),
@@ -1221,19 +1224,9 @@ differences:
   records more than its names when it has fewer than eight, so one such name
   that is republished alone holds up to 9 records.
 
-Move the nodes that share a store to one build together. A node on an older
-build can answer not found, or leave a name out of a listing, when a newer
-node publishes the name twice, or publishes it and then cleans the scope,
-between the older node's directory read and its record read. The older node
-also reads up to twice as many records in a scope that a newer node
-republishes. That slows it once the scope passes about 1,000 republished
-names, where two records for each name outgrow the older build's cache of
-2,048 records. The older node's limit for workflow recovery, 10,000
-artifacts, counts records, and a newer node's limit counts names. The older
-node can therefore answer `409` with
-`recovery supports at most 10000 artifact records` for a run that holds
-between 5,001 and 10,000 artifact names that a newer node republished. A
-newer node accepts that run.
+Workflow recovery supports at most 10,000 artifact names per run. Keep nodes
+that share a store on the same cronstable version so they apply identical
+cleanup rules and recovery limits.
 
 ### Run-scoped secrets
 

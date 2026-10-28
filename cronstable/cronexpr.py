@@ -19,12 +19,11 @@ Supported syntax (see ``wiki/Schedules-and-Timezones.md``):
 - ``L`` alone in day-of-month: the month's last day.  ``L<n>`` or
   ``L<a>-<b>`` in day-of-week: the month's LAST such weekday (``L5`` =
   last Friday).  No other field takes an ``L``.
-- Extensions (each a parse error in the legacy dialect, so no old
-  schedule changed meaning): day-of-month ``L-<n>`` (n days before the
-  final day, n 1-30), ``<n>W`` (weekday Mon-Fri nearest day n, flipped
-  inward at month edges, no fire when the month lacks day n), ``LW``
-  (last weekday); day-of-week ``<d>#<n>`` (n-th such weekday, n 1-5, no
-  fire when absent).  All are ordinary list items under the AND rule.
+- Extensions: day-of-month ``L-<n>`` (n days before the final day, n
+  1-30), ``<n>W`` (weekday Mon-Fri nearest day n, flipped inward at
+  month edges, no fire when the month lacks day n), ``LW`` (last
+  weekday); day-of-week ``<d>#<n>`` (n-th such weekday, n 1-5, no fire
+  when absent).  All are ordinary list items under the AND rule.
 - ``@yearly``/``@annually``/``@monthly``/``@weekly``/``@daily``/``@hourly``
   expand to five-field forms; ``@reboot`` never reaches this parser;
   ``@midnight`` becomes ``@daily`` in the classic-crontab loader.
@@ -133,11 +132,11 @@ _MDAYS = (0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
 def _month_end(year: int, month: int) -> int:
     """The last day of ``month``, i.e. ``calendar.monthrange(y, m)[1]``.
 
-    Spelled out rather than delegated: this sits in the hottest civil walk
-    and ``calendar.monthrange`` is an order of magnitude dearer than the
+    Inlined for speed: this sits in the hottest civil walk and
+    ``calendar.monthrange`` is an order of magnitude dearer than the
     arithmetic.  ``month`` is always 1-12 by construction (the parser
     bounds the month column and every walk keeps it in range), so no
-    validation is owed.
+    validation is needed.
     """
     if month == 2 and year % 4 == 0 and (year % 100 != 0 or year % 400 == 0):
         return 29
@@ -666,8 +665,8 @@ def _parse_dow(text: str) -> _DowParse:
         if item.startswith("l"):
             # L<n> or L<a>-<b>, strictly numeric (no names, steps or `*`),
             # each value 0..7.  Unlike a plain range, a reversed L-range is
-            # NOT an error -- it is legal and matches nothing -- and an end
-            # of 0 stays 0 (no Sunday-as-7 wrap).  Preserved quirks.
+            # legal and matches nothing, and an end of 0 stays 0 (no
+            # Sunday-as-7 wrap).
             a, dash, b = item[1:].partition("-")
             if not a.isdigit() or (dash and not b.isdigit()):
                 raise ValueError(
@@ -1035,7 +1034,7 @@ class CronTab:
         self._resolved = self._source
         lowered = crontab.lower()
         fields = lowered.split()
-        # Skip the (not cheap) H expansion when no item opens with 'h',
+        # Skip the expensive H expansion when no item opens with 'h',
         # the only place it acts (``display is None`` means nothing to
         # resolve).  Substring test first, the regex only when it hits
         # (``thu``).
@@ -1208,8 +1207,8 @@ class CronTab:
             and self._years == other._years
         )
 
-    # __eq__ without __hash__ makes instances unhashable, matching the old
-    # class; nothing in cronstable keys on a CronTab.
+    # __eq__ without __hash__ makes instances unhashable; nothing in
+    # cronstable keys on a CronTab.
 
     # ------------------------------------------------------------------
     # Parsed field sets
@@ -1375,11 +1374,11 @@ class CronTab:
 
         Normally ``now``'s wall-clock label, but a spring-forward shortly
         before ``now`` moves every fire whose label sat inside the gap to
-        a REAL instant up to a full shift LATER, so such a fire can still
-        be in the FUTURE while its label is behind ``now``'s (a scan
+        a real instant up to a full shift later, so such a fire can still
+        be in the future while its label is behind ``now``'s (a scan
         seeded at now's label would walk past it to tomorrow).  When the
-        offset grew within :data:`_GAP_PROBE` AND shifted fires can still
-        be pending, rewind the seed by the jump so the walk GENERATES
+        offset grew within :data:`_GAP_PROBE` and shifted fires can still
+        be pending, rewind the seed by the jump so the walk generates
         those labels; the resolved-UTC guard in :meth:`next` /
         :meth:`occurrences` discards non-future candidates, so
         over-generation is never a wrong answer.  Callers skip this for a
@@ -1410,7 +1409,7 @@ class CronTab:
         now: datetime.datetime | None = None,
         default_utc: bool = False,
     ) -> float | None:
-        """Seconds until the next occurrence STRICTLY after ``now``.
+        """Seconds until the next occurrence strictly after ``now``.
 
         ``None`` when the schedule never occurs again (the search stops at
         year 2099).  For an aware ``now`` the result is true elapsed
@@ -1516,7 +1515,7 @@ class CronTab:
         return resolved_utc
 
     def next_local(self, now_utc: datetime.datetime) -> float | None:
-        """Seconds until the next occurrence STRICTLY after the aware
+        """Seconds until the next occurrence strictly after the aware
         instant ``now_utc`` on the host clock: what :meth:`next` answers
         for ``now_utc.astimezone(LOCAL_ZONE)``, taken on the fixed-offset
         path whenever :meth:`LocalZone.fixed_frame` vouches for the
@@ -1753,12 +1752,12 @@ class CronTab:
         now: datetime.datetime | None = None,
         default_utc: bool = False,
     ) -> float | None:
-        """Seconds since the most recent occurrence STRICTLY before ``now``.
+        """Seconds since the most recent occurrence strictly before ``now``.
 
         The mirror of :meth:`next`: ``None`` when the schedule has no
         occurrence at or after 1970 (the year column's floor).  For an
         aware ``now`` the result is true elapsed seconds since the most
-        recent REAL instant, under the same DST policy as
+        recent real instant, under the same DST policy as
         :meth:`occurrences`.  Callers use this for missed-run and late-run
         detection.
         """

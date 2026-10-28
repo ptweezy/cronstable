@@ -55,17 +55,17 @@ advisory form.
   in front of the daemon forwards an allowlist of those actions. The
   published view token grants the same access. The
   [demo instance README](https://github.com/ptweezy/cronstable/blob/main/example/demo-instance/README.md)
-  lists what the gateway allows. A visitor getting past the gateway is in
-  scope: for example, acting on a job outside the allowlist, reaching a route
-  that the gateway doesn't forward (device pairing, MCP, backfill, shutdown),
-  or recovering the private operator token.
+  lists what the gateway allows. Bypassing the gateway is in scope: for
+  example, acting on a job outside the allowlist, reaching a route that the
+  gateway blocks (device pairing, MCP, backfill, shutdown), or recovering the
+  private operator token.
 - A config that names a dangerous command, such as a crontab line that a
   local user can already edit. cronstable runs whatever command a config
   names. The trust boundary is who can write the config.
-- An API listener that a hostile network can reach while no token is
-  configured. The API is unauthenticated by default, and the
+- An unauthenticated API listener exposed to an untrusted network. The API is
+  unauthenticated by default; see the
   [authentication documentation](https://github.com/ptweezy/cronstable/wiki/HTTP-API#authentication)
-  tells you to restrict access or set a token.
+  to restrict access or require a token.
 - Automated scanner output with no working proof of concept.
 
 ## What to expect

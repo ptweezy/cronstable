@@ -26,15 +26,14 @@ retry policy. Retrying runs the command and verifier again. A failed or
 canceled main command skips verification. The verifier's timeout is
 separate from `executionTimeout`.
 
-The timeout covers the verifier's output as well as its process. A verifier
-that has exited, while a process that it started still holds its stdout or
-stderr open at `timeout`, fails the run as a timeout. After a timeout the
-daemon cancels the verifier with the job's
+The timeout covers both the verifier process and its output streams. If the
+verifier exits but a child process still holds its stdout or stderr open at
+`timeout`, the run fails as a timeout. On timeout, the daemon cancels the
+verifier using the job's
 [cancellation sequence](Concurrency-and-Timeouts#cancellation-and-killtimeout),
-and each of the verifier's two output streams then has 30 seconds to close
-before the daemon records the run. The verification `exit_code` is `-100`,
-and the run's `fail_reason` is
-`verification failed: command exited with code -100`.
+waits up to 30 seconds for each of the verifier's two output streams to
+close, and records the run with verification `exit_code: -100` and
+`fail_reason: "verification failed: command exited with code -100"`.
 
 A cancel during verification applies the same sequence to the verifier, and
 the run has ended when the sequence finishes.

@@ -64,10 +64,9 @@ that happened to a job", and daemon events start a fresh decade at 1010. The
 service host writes 1020 whenever it refuses a start before its log opens,
 whether or not any `report:` block enables the Event Log. Its source is the
 service's name, which is `cronstable` unless you installed the service under
-another name. An
-overdue job is a Warning rather than an Error on purpose. It has not failed,
-and an operator who pages on `Level=2` in the Application log should not be
-paged by a threshold they set to be advisory.
+another name. An overdue job logs a Warning (`Level=3`) rather than an Error
+(`Level=2`) because the job has not failed, avoiding false pages for operators
+who alert on `Level=2` in the Application log.
 
 The IDs are plain small integers with no severity or customer bits folded
 in. Event Viewer and the modern EventLog API report an ID masked to its low
@@ -102,11 +101,10 @@ event ID 1001 can still tell a failure from a permanent failure.
 
 Fields are capped so that a record can never exceed what the API accepts.
 Everything except `output` is capped at 1024 characters, and `output` at
-8000. A field cut short ends with `...[truncated]`. The cap is arithmetic
-rather than a runtime trim because of what happens otherwise: when the
-combined vector is too long, `ReportEventW` writes no record at all, so an
-uncapped reporter would drop precisely the alerts for the jobs that
-produced the most output.
+8000. A field cut short ends with `...[truncated]`. These per-field caps ensure
+the combined payload stays within the `ReportEventW` size limit; when the
+combined vector is too long, `ReportEventW` drops the entire record, which
+would otherwise lose alerts for the jobs that produced the most output.
 
 ## The "description not found" preamble
 
@@ -120,10 +118,9 @@ computer or the installation is corrupted. You can install or repair the
 component on the local computer.
 ```
 
-followed by the insertion strings themselves. That preamble costs the
-rendered prose and nothing else. The provider name, the event ID, the level,
-the timestamp, and every insertion string are all present and unchanged, so
-the XML view, `wevtutil`, `Get-WinEvent`, a Windows Event Forwarding
+followed by the insertion strings. Only the rendered prose is affected: the
+provider name, event ID, level, timestamp, and insertion strings remain
+intact, so the XML view, `wevtutil`, `Get-WinEvent`, a Windows Event Forwarding
 subscription, and every SIEM connector read the record exactly as they would
 a registered one.
 
@@ -182,13 +179,12 @@ so a busy Event Log service can never delay a job's completion handling. A
 graceful shutdown drains that queue with a five-second bound. An abrupt
 process exit drops whatever had not yet reached the service.
 
-**It complements a log file; it does not replace one.** The `logging:`
-section captures the daemon's own log (see
-[logging configuration](Logging-Configuration)). This reporter publishes
-per-run outcomes. An unattended deployment usually benefits from both. The
-standard library's `logging.handlers.NTEventLogHandler` is not an
-alternative, because it needs pywin32, which the frozen executable does not
-carry.
+**Use it alongside a log file.** The `logging:`
+section captures the daemon's own operational log (see
+[logging configuration](Logging-Configuration)), whereas this reporter
+publishes per-run outcomes. An unattended deployment usually benefits from both. The
+standard library's `logging.handlers.NTEventLogHandler` requires `pywin32`,
+which the frozen executable does not bundle.
 
 **On POSIX it does nothing**, and cronstable logs a warning on every
 configuration load, including `--validate-config`, naming every job, DAG
@@ -198,10 +194,8 @@ task, or `notify` block that enabled it:
 report.eventlog is enabled (job nightly-backup), but Windows Event Log is unavailable on this platform. Event Log reports will be skipped; other configured reporters still run normally
 ```
 
-A warning rather than a refusal, so one configuration directory can serve a
-mixed fleet. There is nothing an operator could install on Linux to satisfy
-a refusal, which is what separates this from the `user`/`group` rejection on
-Windows.
+Logging a warning instead of rejecting the configuration allows a single
+configuration directory to serve a mixed POSIX and Windows fleet.
 
 ## Related pages
 

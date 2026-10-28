@@ -11321,7 +11321,7 @@ var qrcode = function() {
   }
 
   // ===================================================================
-  //  durable state inspector  (metadata-only)
+  //  durable state inspector
   // ===================================================================
   function loadState() {
     // Probe once even while closed so the ⛁ toggle can appear when a state
@@ -11420,7 +11420,12 @@ var qrcode = function() {
       const bucket = isDoc ? docs[tab] : recs[tab];
       const scopes = (bucket && bucket.scopes) || [];
       const kind = isDoc ? "documents" : "records";
-      let h = '<div class="faint" style="margin-bottom:8px">metadata only — values are never fetched here</div>';
+      // what inspect shows: the daemon redacts KV values, and sends cursor
+      // and idem documents and records as stored
+      const note = tab === "kv" ? "KV values show as a type and size; the daemon never sends them"
+        : isDoc ? "inspect lists the namespace's documents"
+        : "inspect shows the scope's newest records in full";
+      let h = '<div class="faint" style="margin-bottom:8px">' + note + "</div>";
       h += '<table class="runtable"><thead><tr><th>Scope</th><th>Entries</th><th></th></tr></thead><tbody>' +
         scopes.map((s) =>
           "<tr><td><b>" + esc(s.scope || "(default)") + "</b></td><td class='muted'>" + esc(s.count) + "</td>" +

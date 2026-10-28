@@ -406,7 +406,7 @@ built on the same musl base.
 ## Install using a FreeBSD package
 
 Releases attach a `.pkg` for amd64, amd64v3 and arm64, built by FreeBSD's own `pkg` in a
-FreeBSD 14 virtual machine and installed there as part of the build:
+FreeBSD 14 virtual machine, then installed, started, and upgraded there as part of the build:
 
 | Path | Contents |
 | --- | --- |
@@ -433,9 +433,24 @@ service cronstable start
 service cronstable status
 ```
 
+On an upgrade, a running service restarts on the new binary after its running
+jobs finish, and starts no new scheduled runs in the meantime. A service that
+is enabled but stopped stays stopped, and the package prints a reminder to
+start it.
+
 `service cronstable reload` sends `SIGHUP` to reparse the configuration in
-place. Settings live in `/etc/rc.conf`: `cronstable_config`, `cronstable_user`,
-`cronstable_statedir` and `cronstable_flags`.
+place. Settings live in `/etc/rc.conf`:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `cronstable_config` | `/usr/local/etc/cronstable.d` | The `-c` argument: a configuration file or directory. |
+| `cronstable_runas` | `cronstable` | The account the daemon runs as. |
+| `cronstable_statedir` | `/var/db/cronstable` | The durable store directory. The `rc.d` script creates it on start, owned by that account and its primary group. Set it to the same path as `state.path`. |
+| `cronstable_args` | None | Extra arguments for `cronstable`, such as `--log-level DEBUG`. |
+
+Leave `cronstable_user` and `cronstable_flags` unset. `rc.subr` reads them
+itself: it runs `daemon(8)` through `su(1)` as that user and passes the flags
+to `daemon(8)`. The `rc.d` script prints a warning on start when either is set.
 
 FreeBSD has neither cgroup v2 nor Job Objects, so
 [`resourceLimits`](Resource-Limits) caps are not enforced there, and each

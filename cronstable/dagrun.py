@@ -23,7 +23,7 @@ back here by the reaper, recorded, and triggers a fresh advance.  Because the
 lease gates who advances *and* who reconciles, and the RMW claim is atomic, the
 fleet never double-advances or double-launches a task; on a crash the durable
 per-task state is the source of truth and a resumed (or adopting) node
-reconciles interrupted tasks from it -- at-least-once, never at-most-once.
+reconciles interrupted tasks from it: at-least-once, never at-most-once.
 """
 
 import asyncio
@@ -69,14 +69,14 @@ SCHEDULE_CHECK_INTERVAL = 20.0
 ADOPT_SCAN_INTERVAL = 30.0
 GC_INTERVAL = 3600.0
 
-# How often the adopt scan does a FULL body listing instead of the cheap
+# How often the adopt scan does a full body listing instead of the cheap
 # keys-only pass.  Terminality is monotonic, so the per-dag terminal-key cache
 # lets the ordinary scan skip re-reading runs already known finished (with
-# retainRuns: 50 the old scan re-read and re-parsed all ~50 documents per dag
-# every 30s mostly to rediscover that).  The periodic full pass, plus the
+# retainRuns: 50 a full scan would re-read and re-parse all ~50 documents per
+# dag every 30s mostly to rediscover that).  The periodic full pass, plus the
 # hourly GC's full listing, rebuilds the cache from actual bodies, bounding
 # how long the one known stale-cache corner (a terminal run GC-deleted and
-# re-created under the SAME key by an operator backfill within a single scan
+# re-created under the same key by an operator backfill within a single scan
 # interval, then orphaned) can delay that run's adoption.
 ADOPT_FULL_REFRESH = 600.0
 
@@ -111,10 +111,10 @@ DAG_MAX_CATCHUP = 100
 # Durable checkpoint stream for a dag's catch-up cycles, the dag twin of the
 # job engine's ``catchup/<job>`` stream (cron.CATCHUP_STREAM_PREFIX; a
 # distinct prefix because dag and job names would otherwise share one stream
-# namespace).  An ``open`` record persists the owed watermark BEFORE the
+# namespace).  An ``open`` record persists the owed watermark before the
 # jitter sleeper is spawned: the replay targets live only in task memory
 # across the sleep, while the scheduled path (and _fire_past_gap's
-# current-slot create) keeps landing NEWER run documents, so a restart
+# current-slot create) keeps landing newer run documents, so a restart
 # mid-jitter would otherwise recompute "nothing missed" from the advanced
 # document watermark and the backfill would vanish without a log line.  The
 # boot-time _catch_up hoists its watermark back to an open checkpoint's,
@@ -127,7 +127,7 @@ DAG_CATCHUP_STREAM_KEEP = 8
 # occurrence, mirroring cron.CATCHUP_LIMIT for jobs: a gap within this bound
 # is tick overhead (a slow advance pass, many simultaneous fires) and every
 # occurrence in it is fired so a frequent DAG is not silently dropped; a
-# larger gap is a stall/suspend/clock jump WHILE RUNNING, and replaying it
+# larger gap is a stall/suspend/clock jump while running, and replaying it
 # blind would stampede backdated runs the operator's onMissed policy never
 # asked for. Such a gap is instead resumed past like a boot outage: fire the
 # current slot if it matches, resync strictly future, and leave the gap to
@@ -136,7 +136,7 @@ DAG_CATCHUP_LIMIT = datetime.timedelta(seconds=10)
 
 # When an advance cannot proceed (a failed pass, or a lapsed lease that cannot
 # be verified against the store), re-check after this long instead of leaving
-# a due wake in place -- a fast-failing store must not spin the main loop.
+# a due wake in place; a fast-failing store must not spin the main loop.
 ADVANCE_RETRY_DELAY = 5.0
 
 # How often the main loop re-reads a wake hint whose advance is already in
@@ -144,11 +144,11 @@ ADVANCE_RETRY_DELAY = 5.0
 # the pass that will say when has not reported back yet": left due, it makes
 # next_wake_delay return 0.0 for the pass's whole duration, so the loop re-runs
 # its entire housekeeping block thousands of times a second.  Skipping it
-# outright is not an option either -- nothing wakes the loop when the pass
-# lands, and the fresh hint can be nearer than the sleep already committed to
-# (an approval poll, a due retry, a sensor poke) -- so it is POLLED at this
-# interval: the loop notices the pass's real hint within one poll of it being
-# written, and pays a bounded handful of passes a second meanwhile.
+# outright is not an option either (nothing wakes the loop when the pass
+# lands, and the fresh hint can be nearer than the sleep already committed to,
+# such as an approval poll, a due retry, or a sensor poke), so it is polled at
+# this interval: the loop notices the pass's real hint within one poll of it
+# being written, and pays a bounded handful of passes a second meanwhile.
 ADVANCE_POLL_FLOOR = 0.2
 
 # A failed completion RMW is re-attempted on later service passes with this
@@ -166,18 +166,17 @@ COMPLETION_RETRY_MAX_DELAY = 60.0
 #: cached) stays below this and reads only the few that changed.
 DAG_ROLLUP_BULK_THRESHOLD = 8
 
-#: How long one dag's run-summary LIST may be served from memory before the
+#: How long one dag's run-summary list may be served from memory before the
 #: store is listed again.  The per-run summary cache above already avoids
-#: re-PARSING terminal runs, but the keys listing itself still hit the store
-#: once per dag per request: with the dashboard's /dags poll (and any open
-#: run drawer) that was N_dags listings every ~3s per viewer, forever, on a
-#: quiescent store.  Every LOCAL write funnels through
+#: re-parsing terminal runs, and this memo avoids hitting the store for the
+#: keys listing on every request (such as the dashboard's /dags poll and any
+#: open run drawer).  Every local write funnels through
 #: _mutate/_delete_run_locked and pops the memo, so this-node changes render
 #: immediately; the TTL only
 #: bounds how late another node's writes appear in the index rollup, which is
 #: well inside the gossip staleness the fleet view already tolerates.  Sits
-#: beside the same tradeoff cron's per-job trends cache (5s TTL, busted on
-#: local completion) already made.
+#: beside the same tradeoff as cron's per-job trends cache (5s TTL, busted on
+#: local completion).
 DAG_SUMMARY_LIST_TTL = 5.0
 
 RunRef = tuple[str, str]  # (dag_name, run_key)
@@ -185,7 +184,7 @@ RunRef = tuple[str, str]  # (dag_name, run_key)
 #: XCom payload size at or above which a mapped fan-out's parse (and its
 #: portability walk) runs on a worker thread instead of the scheduler's
 #: event loop.  The payload cap is dag.MAX_MAPPED_XCOM_BYTES (16 MiB), and
-#: parsing a multi-MB list inline stalled every handler and heartbeat for
+#: parsing a multi-MB list inline would stall every handler and heartbeat for
 #: tens of ms per expansion; below this floor the parse is cheaper than the
 #: thread hop it would buy (a 64 KiB bytes-path parse is a few hundred us,
 #: about the hop's own dispatch cost).
@@ -196,10 +195,10 @@ def _parse_portable_xcom(data: bytes) -> Any:
     """Parse a mapped-task XCom payload; portability-check a usable list.
 
     Factored out of :meth:`DagScheduler._read_xcom_list` so the large-payload
-    branch can run the WHOLE thing on a worker thread.  The bytes go
-    straight to ``_json.loads``: the old ``data.decode()`` allocated a full
-    second copy and forced the str branch, whose wide-int prescan is a
-    whole-payload regex rather than the bytes branch's translate fast path.
+    branch can run the whole thing on a worker thread.  The bytes go
+    straight to ``_json.loads`` so the parser uses its bytes-branch
+    translate fast path for the wide-int prescan without allocating a decoded
+    str copy.
     An over-long list skips the portability walk on purpose:
     ``_apply_expansions`` rejects it at its own MAX_MAPPED_ITEMS check, so
     the O(len) walk would be pure waste on a list never embedded in the run
@@ -286,14 +285,14 @@ class _DagRef:
     run_id: str
     task_id: str
     taskkey: str
-    # the claim identity of THIS instance: the proc token that claimed it and
+    # the claim identity of this instance: the proc token that claimed it and
     # the attempt it is running.  Carried back to mark_task_finished so a
     # superseded attempt's late completion cannot terminalise a re-claimed one.
     proc: str
     attempt: int
     # for a sensor, the pokeCount observed at this poke's claim (None for a
     # plain task).  Extends the completion fence to pokes: a re-poke re-stamps
-    # the SAME proc token and never bumps attempt, so only the poke number
+    # the same proc token and never bumps attempt, so only the poke number
     # distinguishes a stale queued completion from the live in-flight poke.
     poke: int | None = None
 
@@ -316,10 +315,10 @@ class DagScheduler:
         # refs whose advance pass is in flight, refcounted (a periodic sweep
         # holds its whole due batch while each ref's own advance_one holds it
         # again).  A held ref's wake hint is polled at ADVANCE_POLL_FLOOR
-        # instead of read as due: the pass ALREADY under way is what decides
+        # instead of read as due: the pass already under way is what decides
         # when this run next wants advancing, so a hint left due until it
-        # reports back buys nothing and pins the main loop's sleep at zero --
-        # a full-core housekeeping spin for the pass's whole duration.  Every
+        # reports back buys nothing and pins the main loop's sleep at zero
+        # (a full-core housekeeping spin for the pass's whole duration).  Every
         # hold is paired with a drop in a ``finally``, so a failed or
         # cancelled advance cannot leave a run polling forever.
         self._advance_pending: dict[RunRef, int] = {}
@@ -327,7 +326,7 @@ class DagScheduler:
         # (see _catch_up); cancelled by shutdown() and forget(), since a
         # replay must never land on a torn-down or swapped store.
         self._catchup_tasks: set[asyncio.Task] = set()
-        # dag name -> run keys this node has SEEN terminal.  Terminality is
+        # dag name -> run keys this node has seen terminal.  Terminality is
         # monotonic, so the adopt scan skips re-reading these (see
         # _adopt_one_dag); pruned against each key listing, rebuilt from
         # bodies by every full adopt pass and every GC pass, and a key is
@@ -338,7 +337,7 @@ class DagScheduler:
         # never re-read; non-terminal (running/pending) runs are re-read each
         # call. Pruned against each key listing (GC'd runs drop out) and the
         # entry is evicted when a run is (re-)created under the key (see
-        # _create_doc). Note this is only PART of _terminal_run_keys'
+        # _create_doc). Note this is only part of _terminal_run_keys'
         # invalidation: that one is additionally rebuilt from store bodies by
         # every full adopt and GC pass, whereas nothing rebuilds this cache on
         # a timer. A terminal entry therefore survives until something evicts
@@ -347,7 +346,7 @@ class DagScheduler:
         # would otherwise read the old store's cached terminal state.
         self._dag_summary_cache: dict[str, dict[str, dict[str, Any]]] = {}
         # dag name -> (monotonic stamp, summaries): the short-TTL memo over
-        # _run_summaries' RESULT, so the /dags + run-drawer poll traffic of
+        # _run_summaries' result, so the /dags + run-drawer poll traffic of
         # a quiescent dag costs zero store listings between local writes.
         # Popped by _mutate/_delete_run_locked (local changes must render
         # at once), swept with the summary cache in forget(), and pruned of
@@ -381,7 +380,7 @@ class DagScheduler:
         self._seeded: dict[str, str] = {}
         # dag name -> the schedule signature whose seed raised, so a poisoned
         # dag is logged once and skipped (a reload changing its schedule
-        # retries) instead of failing -- and spamming -- every seed cadence.
+        # retries) instead of failing and spamming every seed cadence.
         self._seed_failed: dict[str, str] = {}
         # (ref, taskkey) -> a completion whose RMW failed, queued for retry on
         # later service passes (see COMPLETION_RETRY_DELAY).
@@ -391,8 +390,9 @@ class DagScheduler:
         # run ref -> task completions the reaper has handed over but not yet
         # recorded. on_task_finished buffers here; flush_completions (called
         # once the reaper has drained a whole batch of finished jobs) records
-        # each run's buffered completions in ONE document RMW instead of one
-        # per task -- the win for a mapped fan-out finishing together.
+        # each run's buffered completions in one document RMW instead of one
+        # per task, so a mapped fan-out finishing together shares a single
+        # write.
         self._completion_buffer: dict[RunRef, list[dict[str, Any]]] = {}
         # run ref -> (taskkey, attempt, pokeCount) of every instance this
         # process claimed and was handed to launch, kept until its completion
@@ -470,7 +470,7 @@ class DagScheduler:
             # out by TTL. The bump is the half the pop cannot cover: it
             # voids a rebuild already in flight, whose entry is not there
             # to pop yet (see _summaries_gen). In a finally because a
-            # timed-out or raised write may still have LANDED: wait_for
+            # timed-out or raised write may still have landed: wait_for
             # abandons the worker thread, it does not undo it (see
             # state.py _call), so invalidating only on success could serve
             # a stale summary for the whole TTL.
@@ -533,7 +533,7 @@ class DagScheduler:
             if now >= self._next_sched_check:
                 self._next_sched_check = now + SCHEDULE_CHECK_INTERVAL
                 await self._seed_dags(now)
-            # fire due scheduled runs EVERY pass (a cheap in-memory index
+            # fire due scheduled runs every pass (a cheap in-memory index
             # walk), so a fire lands at its instant, not a cadence late.
             await self._fire_scheduled(now)
             if now >= self._next_adopt:
@@ -563,12 +563,12 @@ class DagScheduler:
             if ref not in self._owned:
                 del self._wake[ref]
         # prune per-run advance locks the same way: advance_one setdefaults
-        # an entry for every ref ever advanced here -- including peer-owned
-        # runs reached via an approval or a recorded completion -- and
+        # an entry for every ref ever advanced here (including peer-owned
+        # runs reached via an approval or a recorded completion) and
         # nothing else removes them (only a backend swap clears the map), so
         # a long-lived daemon would hold one Lock per run it ever touched.
         # Owned refs stay (they are hot), and a lock is never dropped while
-        # held or awaited: a waiter resumes holding the OLD object, so
+        # held or awaited: a waiter resumes holding the old object, so
         # dropping it would let the next arrival mint a fresh Lock and
         # advance the same run concurrently.  asyncio.Lock has no public
         # waiter count; if the private _waiters peek ever stops resolving,
@@ -584,7 +584,7 @@ class DagScheduler:
         candidates = [self._next_sched_check]
         # A hint whose advance is in flight is stale by construction (the pass
         # rewrites it on the way out), so it is polled rather than honored as
-        # due -- see ADVANCE_POLL_FLOOR.
+        # due; see ADVANCE_POLL_FLOOR.
         poll_floor = now + ADVANCE_POLL_FLOOR
         for ref, hint in self._wake.items():
             if ref in self._advance_pending and hint < poll_floor:
@@ -670,9 +670,9 @@ class DagScheduler:
 
         A schedule string the parser passes through verbatim (the documented
         "@reboot") has no computable occurrences; ``None`` (never fires) keeps
-        the service pass alive instead of crashing it -- the isinstance assert
-        inside ``_compute_next_fire`` is stripped in the -OO release binary,
-        leaving a raw AttributeError.
+        the service pass alive instead of crashing it, since the isinstance
+        assert inside ``_compute_next_fire`` is stripped in the -OO release
+        binary, leaving a raw AttributeError.
         """
         if not isinstance(sched.schedule, CronTab):
             return None
@@ -720,9 +720,9 @@ class DagScheduler:
             # replay loop below would fire a backdated run per missed
             # occurrence (per-pass capped, but every pass immediately due
             # again until the whole gap is drained) regardless of onMissed.
-            # Only the one-time boot seed honored that policy; a mid-life
-            # gap must too, or a laptop resume unleashes the exact stampede
-            # DAG_MAX_CATCHUP's cap claims to prevent.
+            # Both the boot seed and a mid-life gap honor that policy, so a
+            # laptop resume never unleashes the stampede DAG_MAX_CATCHUP's
+            # cap prevents.
             await self._fire_past_gap(dagcfg, stale, now_dt)
             return
         fired = 0
@@ -751,13 +751,13 @@ class DagScheduler:
         """Resume a dag whose next-fire fell far behind (see Cron._advance).
 
         The same decision the job scheduler makes for a stall: fire the
-        CURRENT slot only if now itself matches the schedule, resync to the
+        current slot only if now itself matches the schedule, resync to the
         first occurrence strictly after now, and hand the gap to the dag's
         ``onMissed`` policy: the boot catch-up, which already applies
         ``startingDeadlineSeconds``, the ``run-once`` coalesce and the
         ``DAG_MAX_CATCHUP`` bound, and whose create-if-absent dedup makes
         re-covering the current slot harmless. ``onMissed: skip`` (the
-        default) thus skips a mid-life gap exactly as it skips a boot gap.
+        default) thus skips a mid-life gap just as it skips a boot gap.
         """
         sched = dagcfg.schedule_job
         logger.warning(
@@ -783,7 +783,7 @@ class DagScheduler:
                 # renders now into the job's own frame (its zone, or the host
                 # clock as LOCAL_ZONE) and astimezone maps it back.
                 fired_now = now_slot.astimezone(datetime.timezone.utc)
-        # Create THEN resync, like the replay loop above: a create that
+        # Create then resync, like the replay loop above: a create that
         # raises (into _fire_scheduled's per-dag isolation) leaves the stale
         # index in place, so the next pass re-enters this branch and retries;
         # at most one scheduled run per pass by construction, so the
@@ -874,7 +874,7 @@ class DagScheduler:
             # Inline, on the service pass: no checkpoint needed for a fresh
             # cycle (creates ascend, so a crash mid-loop leaves the document
             # watermark at the last created target and the next boot's
-            # recompute covers the remainder), but a RESUMED cycle must
+            # recompute covers the remainder), but a resumed cycle must
             # close its checkpoint once the targets have all landed.
             for when in targets:
                 await self._create_run(dagcfg, when, "catchup")
@@ -884,7 +884,7 @@ class DagScheduler:
         # Deferred on a spawned task, like Cron._run_catch_up: the seed and
         # gap-resume paths run on the service pass, which walks every dag
         # serially and must not sleep out one dag's offset inline.
-        # Checkpoint the intent BEFORE spawning the sleeper (the job twin's
+        # Checkpoint the intent before spawning the sleeper (the job twin's
         # rule, cron._evaluate_catch_up): a crash/restart mid-jitter then
         # resumes from `watermark` instead of losing the owed slots to the
         # advancing run-document ledger.
@@ -905,7 +905,7 @@ class DagScheduler:
         """Create ``dagcfg``'s catch-up runs after its jitter offset.
 
         The dag twin of ``Cron._run_catch_up``'s deferred start.  The dag is
-        re-read after the sleep and REVALIDATED like the job twin: a reload
+        re-read after the sleep and revalidated like the job twin: a reload
         during the offset can remove or disable the dag, drop its schedule,
         or flip ``onMissed`` to ``skip`` (the operator saying "do not
         backfill"), and cluster ownership can move, in which case the new
@@ -914,7 +914,7 @@ class DagScheduler:
         the re-read object, not the one captured when the offset was
         scheduled: a reload can equally well rewrite the task graph, and
         creating from the captured config would seed runs against a spec the
-        daemon no longer has.  The missed INSTANTS still come from the
+        daemon no longer has.  The missed instants still come from the
         original computation, which is correct: the schedule they were
         derived from is what was actually missed.  The cycle's checkpoint is
         closed only after the last ``_create_run`` lands; every early return
@@ -924,7 +924,7 @@ class DagScheduler:
         """
         try:
             if offset > 0:
-                # interruptible, like the job twin: a bare sleep let a
+                # interruptible, like the job twin: a bare sleep would let a
                 # jitter elapsing during a graceful stop create runs and
                 # fork task subprocesses mid-shutdown. The early return
                 # leaves the checkpoint open, so the next boot resumes the
@@ -1002,7 +1002,7 @@ class DagScheduler:
         The dag twin of ``Cron._pending_catchup_watermark``: an ``open``
         without a following ``close`` means a previous deferred replay (here
         or on a crashed node) never completed, and catch-up should resume
-        from ITS watermark rather than the run documents': scheduled fires
+        from its watermark rather than the run documents': scheduled fires
         landing after that boot advanced the derived watermark past the
         still-unreplayed slots.
         """
@@ -1064,8 +1064,8 @@ class DagScheduler:
         # Canonicalise the instant to UTC before it becomes the run key. The
         # scheduled/catch-up paths already hand in UTC-aware instants, but
         # backfill preserves whatever offset the operator's ISO range carried,
-        # so 14:00Z and 09:00-05:00 (the SAME instant) would otherwise derive
-        # different keys and defeat the create-if-absent dedup -- re-running
+        # so 14:00Z and 09:00-05:00 (the same instant) would otherwise derive
+        # different keys and defeat the create-if-absent dedup, re-running
         # every task for an instant that already executed. A naive instant is
         # read as UTC (matching the scheduled path), never shifted by local
         # time.
@@ -1141,7 +1141,7 @@ class DagScheduler:
         """Take ``ref``'s advance lease; on success reconcile + advance it.
 
         A ``None`` from ``acquire_lease`` (held elsewhere, or the store could
-        not answer) means "not mine" -- fail closed and do not advance, exactly
+        not answer) means "not mine": fail closed and do not advance, just
         like the cluster slot claim.
         """
         if ref in self._owned:
@@ -1326,7 +1326,7 @@ class DagScheduler:
         due = [ref for ref in self._owned if self._wake.get(ref, 0.0) <= now]
         if not due:
             return
-        # Hold the WHOLE due batch, not one ref at a time: the walk is
+        # Hold the whole due batch, not one ref at a time: the walk is
         # sequential and every advance awaits the store, so each ref this pass
         # has not reached yet still carries a due wake and would keep
         # next_wake_delay pinned at 0 for the pass's whole duration.
@@ -1380,12 +1380,13 @@ class DagScheduler:
 
         Used by the completion and approval paths, which must not block the
         reaper (or an HTTP handler) on the per-run lock a periodic advance may
-        be holding.  The hint left behind is one poll out, not the "due now"
-        0.0 this used to write: the advance is already spawned, so the hint is
+        be holding.  The hint left behind is one poll out rather than 0.0
+        ("due now"): the advance is already spawned, so the hint is
         only the backstop for the window before that task starts (and for the
-        case where it never does -- ``_track_state_write`` sheds writes under
-        overload), whereas a due-now hint pinned :meth:`next_wake_delay` at 0
-        and spun the whole main loop until the advance rewrote it.
+        case where it never does because ``_track_state_write`` sheds writes
+        under overload), whereas a due-now hint would pin
+        :meth:`next_wake_delay` at 0 and spin the whole main loop until the
+        advance rewrote it.
         """
         self._wake[ref] = _now() + ADVANCE_POLL_FLOOR
         self._cron._track_state_write(self.advance_one(ref))
@@ -1396,7 +1397,7 @@ class DagScheduler:
             # not ours to advance (e.g. a decision/completion recorded
             # here for a run a peer owns): drop the wake hint too, or
             # next_wake_delay() would return 0.0 forever and busy-spin
-            # the main loop.  The durable record itself is safe -- the
+            # the main loop.  The durable record itself is safe; the
             # owner picks it up via its own poll/advance wakes.
             self._wake.pop(ref, None)
             return
@@ -1426,9 +1427,9 @@ class DagScheduler:
         ``ref in _owned`` alone is not enough: while the store is unreachable
         the renew loop cannot positively learn of a takeover (renew raises
         instead of returning ``None``), so a lapsed lease lingers in
-        ``_owned`` -- and advancing on it would reconcile-fail the new owner's
+        ``_owned``, and advancing on it would reconcile-fail the new owner's
         live tasks.  A lease past its ``expires_at`` is verified against the
-        store's fence (the field exists exactly for stale-holder detection):
+        store's fence (the field exists for stale-holder detection):
         positively superseded -> drop ownership; expired-but-untaken or
         unverifiable -> fail closed and skip the advance (renewing an expired
         lease nobody took over is still allowed, so the renew loop recovers).
@@ -1468,23 +1469,21 @@ class DagScheduler:
         now = _now()
         proc = self._cron._proc_token
         host = self._cron._state_host
-        # 1. reconcile AND claim in one RMW (dag.reconcile_and_plan): fail
+        # 1. reconcile and claim in one RMW (dag.reconcile_and_plan): fail
         # any task a crash left running with a dead process (protects our
         # own live tasks by proc token), then, unless mapped tasks are
         # awaiting expansion, continue straight into propagate/claim/
         # terminalise on the same body.  In the common case this is the
-        # advance's ONLY document RMW (and on a quiescent run it keeps the
-        # document without a rewrite); the old shape paid a reconcile RMW
-        # plus a claim RMW on every owned run's wake and after every task
-        # completion.
+        # advance's only document RMW (and on a quiescent run it keeps the
+        # document without a rewrite), avoiding separate reconcile and claim
+        # RMWs on every owned run's wake and after every task completion.
         transform = self._wrap(
             dag.reconcile_and_plan(spec, now, proc, host, platform.pid_alive)
         )
         body, combined = await self._mutate(ref[0], ref[1], transform)
         if body is None:
             # the run document does not exist (or no backend answered):
-            # nothing to advance, exactly like the old reconcile step
-            # observing no document.
+            # nothing to advance.
             await self._release(ref)
             return
         if combined.reconciled:
@@ -1501,8 +1500,8 @@ class DagScheduler:
         result = combined.advance
         if combined.expansions_needed:
             # 2. mapped tasks await their upstream lists: pre-read them from
-            # the reconciled body (outside any document lock, exactly as
-            # before), then run the classic claim RMW as the second step.
+            # the reconciled body (outside any document lock), then run the
+            # claim RMW as the second step.
             expansions = await self._read_expansions(dagcfg, run_id, body)
             now = _now()
             transform = self._wrap(
@@ -1551,15 +1550,12 @@ class DagScheduler:
                 if stamp is not None:
                     pid_stamps.append(stamp)
         if pid_stamps:
-            # 4. ONE RMW stamps every launched pid.  Per-launch stamping
-            # cost a full document parse+rewrite+fsync per subprocess, so a
-            # mapped fan-out paid up to MAX_CLAIMS_PER_PASS full rewrites of
-            # a document holding up to MAX_MAPPED_ITEMS entries per pass.
-            # Best-effort like the old per-task write: each task already
-            # owns its slot (proc was set at claim, so reconciliation
-            # protects it even without a pid), and the reaper will record
-            # its completion; a failed batch write must not fail
-            # already-running tasks.
+            # 4. One RMW stamps every launched pid instead of paying a full
+            # document parse+rewrite+fsync per subprocess on a mapped fan-out.
+            # Best-effort: each task already owns its slot (proc was set at
+            # claim, so reconciliation protects it even without a pid), and
+            # the reaper will record its completion; a failed batch write
+            # must not fail already-running tasks.
             try:
                 await self._set_pids(ref, pid_stamps)
             except Exception:  # noqa: BLE001 - the pids are an optimisation
@@ -1718,13 +1714,13 @@ class DagScheduler:
         the **empty list** (a mapped task with no items -> success), so a
         mis-publishing upstream cannot wedge the run forever.
 
-        A store failure that says nothing about what the upstream published --
-        a timeout, an I/O error, a record this build cannot read -- returns
+        A store failure that says nothing about what the upstream published
+        (a timeout, an I/O error, a record this build cannot read) returns
         ``None`` instead, leaving the task unexpanded to retry on a later pass.
         The distinction is the whole point: the expansion is recorded once and
         never recomputed, so guessing "empty" on a bad instant would silently
         skip the task's entire fan-out and still report success downstream.
-        Hence the strict read below -- best-effort, an unreadable record is
+        Hence the strict read below; under best-effort, an unreadable record is
         skipped, and absence becomes indistinguishable from a blip.
         """
         backend = self._backend()
@@ -1733,12 +1729,12 @@ class DagScheduler:
         scope = dag.xcom_scope(dag_name, run_id)
         name = dag.xcom_name(taskkey, key)
         try:
-            # strict: an unreadable record must NOT read back as "never
+            # strict: an unreadable record must not read back as "never
             # published". The expansion below is recorded once and never
             # recomputed, so a best-effort read that swallowed an ESTALE/EIO
             # blip would turn one bad instant into a permanent, vacuously
-            # successful empty fan-out -- the task's whole work silently
-            # skipped, with downstream tasks seeing success. Strict turns that
+            # successful empty fan-out, silently skipping the task's whole
+            # work with downstream tasks seeing success. Strict turns that
             # blip back into the exception this returns None for.
             got = await asyncio.wait_for(
                 jobstate.artifact_get(
@@ -1755,7 +1751,7 @@ class DagScheduler:
         except jobstate.JobStateError as ex:
             if getattr(ex, "status", None) == 413:
                 # the blob is larger than a fan-out can safely materialise
-                # (an upstream with maxArtifactBytes: 0): refuse it BEFORE it
+                # (an upstream with maxArtifactBytes: 0): refuse it before it
                 # is loaded rather than OOM the daemon, and map to empty like
                 # the other definitively-unusable-output cases below.  The
                 # blob was never fetched.
@@ -1783,7 +1779,7 @@ class DagScheduler:
             return []
         except Exception as ex:  # noqa: BLE001 - the store, not the xcom
             # A store that could not be read (an I/O error, a record only a
-            # newer node understands) leaves the fan-out UNKNOWN, never empty:
+            # newer node understands) leaves the fan-out unknown, never empty:
             # stay unexpanded and retry on a later pass.
             logger.warning(
                 "dag %s: xcom %r from %r could not be read (%s); leaving the "
@@ -1810,7 +1806,7 @@ class DagScheduler:
         except _json.UnsupportedValue as exc:
             # a value that parses but is not fleet-portable (an int outside
             # the 64-bit window, a non-finite float): embedding it in the
-            # run document would make _json.dumps_bytes raise on EVERY
+            # run document would make _json.dumps_bytes raise on every
             # advance, wedging the run forever. Treat a mis-published
             # upstream like the not-a-list case: warn and map to empty.
             # (Ordered before ValueError: UnsupportedValue subclasses it.)
@@ -1824,9 +1820,8 @@ class DagScheduler:
             )
             return []
         except ValueError:
-            # undecodable bytes land here too: the bytes-path loads folds
-            # what used to be the decode()'s UnicodeDecodeError into its
-            # own ValueError.
+            # undecodable bytes land here too: the bytes-path loads raises
+            # ValueError for both invalid UTF-8 and invalid JSON.
             logger.warning(
                 "dag %s: xcom %r from %r is not valid JSON; mapping it to an "
                 "empty fan-out",
@@ -1853,8 +1848,8 @@ class DagScheduler:
         """The soonest instant this run wants advancing again.
 
         The nearest due sensor poke or task retry; a short poll while a gate is
-        awaiting a decision (so an approval made on a *different* node -- which
-        cannot advance a run it does not own -- is picked up by the owner in a
+        awaiting a decision (so an approval made on a *different* node, which
+        cannot advance a run it does not own, is picked up by the owner in a
         few seconds, not a full idle cycle); a longer floor otherwise (each
         task completion on the owning node also forces an advance).
         """
@@ -1865,9 +1860,9 @@ class DagScheduler:
                 if entry.get("awaitingApproval"):
                     soonest = min(soonest, now + APPROVAL_POLL_INTERVAL)
                 elif entry.get("nextPokeAt") is not None:
-                    # only an IDLE sensor's due instant is a wake candidate:
+                    # only an idle sensor's due instant is a wake candidate:
                     # with a poke in flight (proc/pid set) a stale past
-                    # nextPokeAt -- written before claims cleared it -- would
+                    # nextPokeAt (written before claims cleared it) would
                     # pin the loop's sleep at 0 for the poke's whole
                     # duration.  The completion itself forces the next
                     # advance.
@@ -2106,7 +2101,7 @@ class DagScheduler:
             return None
         self._cron._add_running_instance(running)
         pid = running.proc.pid if running.proc is not None else None
-        # the pid is NOT stamped here: the caller collects every launched
+        # the pid is not stamped here: the caller collects every launched
         # (taskkey, proc, pid, attempt) and stamps the whole batch in one
         # RMW after the launch loop (see _do_advance), instead of one full
         # document rewrite per subprocess.  Deferring it is safe because the
@@ -2180,9 +2175,8 @@ class DagScheduler:
 
         ``stamps`` carries ``(taskkey, proc, pid, attempt)`` per launched
         instance; :func:`dag.set_task_pids` applies each under the same
-        per-entry proc-token/attempt fence the old per-task
-        :func:`dag.set_task_pid` write used, so batching only removes RMWs,
-        never a fence.
+        per-entry proc-token/attempt fence as :func:`dag.set_task_pid`, so
+        batching only removes RMWs, never a fence.
         """
         transform = self._wrap(dag.set_task_pids(stamps, _now()))
         await self._mutate(ref[0], ref[1], transform)
@@ -2228,7 +2222,7 @@ class DagScheduler:
         # Buffer, don't record: the reaper hands over each finished task one at
         # a time, and flush_completions (invoked once it has drained the whole
         # batch) folds a run's completions into a single RMW. Recording here
-        # would be one full-document write+fsync per task again.
+        # would require one full-document write+fsync per task.
         buffer = self._completion_buffer.get(ref)
         if buffer is None:
             buffer = self._completion_buffer[ref] = []
@@ -2332,10 +2326,10 @@ class DagScheduler:
         try:
             _, applied = await self._mutate(ref[0], ref[1], transform)
         except Exception:  # noqa: BLE001 - one failed RMW must not wedge the run
-            # Unlike a pid write, a lost completion is NOT best-effort:
+            # Unlike a pid write, a lost completion is not best-effort:
             # unrecorded, the entry stays RUNNING under our proc token, which
             # reconciliation trusts forever while this daemon lives (and the
-            # lease keeps peers out). So EVERY entry in the batch is queued for
+            # lease keeps peers out). So every entry in the batch is queued for
             # retry, not just one.
             self._requeue_entries(ref, live)
         else:
@@ -2401,7 +2395,7 @@ class DagScheduler:
         except Exception:  # noqa: BLE001 - one failed RMW must not wedge
             # the run: unrecorded, the entry stays RUNNING under our proc
             # token, which reconciliation trusts forever while this daemon
-            # lives (and the lease keeps peers out) -- so queue the
+            # lives (and the lease keeps peers out), so queue the
             # completion for retry on later service passes.
             self._queue_completion(
                 ref,
@@ -2501,7 +2495,7 @@ class DagScheduler:
         completion that landed despite the timeout bumped ``pokeCount``, so
         the queued copy fails the poke fence and is dropped instead of being
         applied to a later in-flight poke (proc/attempt alone cannot tell
-        pokes apart).  A settled entry (applied OR fenced out as stale) pops
+        pokes apart).  A settled entry (applied or fenced out as stale) pops
         the queue entry; another failure re-queues it with a bounded backoff.
         """
         if self._backend() is None:
@@ -2541,7 +2535,7 @@ class DagScheduler:
         Called from rehydration (after the job reconciler).  Lists every dag's
         active runs and tries to take each one's lease; a run still owned by a
         live peer stays with it, one whose owner is gone is adopted here and
-        its interrupted tasks reconciled from durable state -- the DAG analogue
+        its interrupted tasks reconciled from durable state, the DAG analogue
         of ``Cron._reconcile_inflight``.
         """
         backend = self._backend()
@@ -2577,8 +2571,8 @@ class DagScheduler:
                 except Exception as ex:  # noqa: BLE001 - degrade, never crash
                     # One stalled or strict-unreadable run document must not
                     # abort boot reconciliation: this loop runs inside the
-                    # state-rehydration tail, and an escaping raise skipped
-                    # every remaining run AND the _start_job_api call after
+                    # state-rehydration tail, and an escaping raise would skip
+                    # every remaining run and the _start_job_api call after
                     # it, for the life of the backend generation (the
                     # rehydrated latch is already set, so no later pass
                     # retries). The run stays unowned here; the next service
@@ -3141,8 +3135,8 @@ class DagScheduler:
 
         ``None`` for an unknown dag; raises when the run document could not
         be created (no state backend available), so the caller never gets a
-        run key for a run that does not exist -- the web handler surfaces the
-        exception instead of a false 200.
+        run key for a run that does not exist (the web handler surfaces the
+        exception instead of a false 200).
         """
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None:
@@ -3168,7 +3162,7 @@ class DagScheduler:
 
         A deliberate replay: it is bounded by ``DAG_MAX_CATCHUP`` but ignores
         the automatic catch-up deadline (the operator asked for it).
-        Idempotent -- each date's run key create-if-absents, so re-running a
+        Idempotent: each date's run key create-if-absents, so re-running a
         backfill does not duplicate runs.
 
         ``created`` counts the instants whose run the store holds: the runs
@@ -3188,8 +3182,9 @@ class DagScheduler:
             return {"ok": False, "reason": ("scheduled workflow not found")}
         sched = dagcfg.schedule_job
         if not isinstance(sched.schedule, CronTab):
-            # e.g. the literal "@reboot": no computable instants to replay --
-            # a clean refusal (-> 400), not a 500 out of _compute_next_fire.
+            # e.g. the literal "@reboot": no computable instants to replay, so
+            # return a clean refusal (-> 400), not a 500 out of
+            # _compute_next_fire.
             return {
                 "ok": False,
                 "reason": ("the workflow has no future scheduled run times"),
@@ -3226,7 +3221,7 @@ class DagScheduler:
 
         Carries the static graph (nodes + edges + per-task type/triggerRule/
         retries/fan-out marker) plus, when a backend is present, the latest
-        run's state and a run-state histogram -- enough to render a health
+        run's state and a run-state histogram, enough to render a health
         card without an N+1 of per-DAG ``/runs`` calls.  The durable read is
         best-effort: a slow/absent backend simply omits the run rollup rather
         than failing the whole index (mirrors ``_web_job_trends``).  The
@@ -3324,8 +3319,8 @@ class DagScheduler:
     ) -> list[dict[str, Any]] | None:
         """One list_documents sweep: rebuild the cache from every body. Used
         for the cold cache / large-delta case and when the backend cannot list
-        keys only. Returns None on a hiccup, matching the old degrade
-        behavior."""
+        keys only. Returns None on a hiccup so the caller degrades
+        gracefully."""
         gen = self._summaries_gen
         try:
             docs = await asyncio.wait_for(
@@ -3411,7 +3406,7 @@ class DagScheduler:
 
         Lists keys only, drops cache entries for GC'd runs, and re-reads just
         the new or still-running documents (terminal ones are served from
-        cache) -- so a ~3s /dags poll, and every run-list request, stop
+        cache), so a ~3s /dags poll and every run-list request avoid
         re-parsing every retained run of every dag. Falls back to a single
         full parse when the backend cannot list keys only or when many bodies
         need reading at once (cold cache). Best-effort: returns None (the
@@ -3557,9 +3552,8 @@ class DagScheduler:
 
         Served from the same per-key summary cache list_dags' rollup fills, so
         a drawer open (or an MCP run listing) re-reads only the runs that are
-        still going: reading and parsing all ``retainRuns`` documents cost
-        tens of milliseconds of CPU per request on a wide mapped fan-out, all
-        of it re-deriving summaries of runs that finished long ago.
+        still going, avoiding reading and parsing all ``retainRuns`` documents
+        for runs that finished long ago.
         """
         backend = self._backend()
         if backend is None or dag_name not in self._dags():
@@ -3567,8 +3561,7 @@ class DagScheduler:
         summaries = await self._run_summaries(backend, dag_name)
         if summaries is None:
             # the keys-only listing or a body read failed: take the plain
-            # full-listing path, which surfaces a store failure to the caller
-            # exactly as this method always has.
+            # full-listing path, which surfaces a store failure to the caller.
             docs = await asyncio.wait_for(
                 backend.list_documents(self._ns(dag_name)),
                 timeout=STATE_OP_TIMEOUT,
@@ -3807,7 +3800,7 @@ class DagScheduler:
         The stream's blobs become unreferenced once the records are gone;
         the state GC's orphan-blob sweep (cron._collect_state_garbage /
         `cronstable state gc`) reclaims them on its next pass.  Record order
-        matters: the document goes FIRST, so a crash between the two leaves
+        matters: the document goes first, so a crash between the two leaves
         a doc-less stream the stream GC ages out, never a live run whose
         XCom vanished.
         """
@@ -3837,7 +3830,7 @@ class DagScheduler:
             # have landed.
             self._summaries_memo.pop(name, None)
             self._summaries_gen += 1
-        # the discard stays on the SUCCESS path: _gc_one_dag rebuilds this
+        # the discard stays on the success path: _gc_one_dag rebuilds this
         # cache from truth, so a failed delete must leave the key known.
         known = self._terminal_run_keys.get(name)
         if known is not None:
@@ -3878,13 +3871,13 @@ class DagScheduler:
 
         Called from the daemon's state GC pass (cron._collect_state_garbage)
         with the dag names that exist in the store's ``dagrun/`` namespaces
-        but are in NEITHER this node's config NOR any recent manifest -- the
+        but are in neither this node's config nor any recent manifest, the
         same absence anchor job streams use, so a dag briefly removed during
         a config edit keeps its whole run history for a full gcGraceSeconds.
-        Belt and braces on top of that anchor: only a TERMINAL run whose
+        Belt and braces on top of that anchor: only a terminal run whose
         last update is itself older than ``grace`` is deleted; an active,
         owned, or undatable run is never touched, so a re-added dag resumes
-        it exactly where it stopped.
+        it where it stopped.
         """
         now = _now()
         for name in sorted(dag_names):
@@ -3944,7 +3937,7 @@ class DagScheduler:
         cancelled here, since renewing them against a dead store is pointless);
         the new store's active runs are re-adopted from scratch by
         :meth:`reconcile_on_boot`, which reruns because the backend swap
-        cleared ``_state_rehydrated``.  No store ops here -- the old backend is
+        cleared ``_state_rehydrated``.  No store ops here; the old backend is
         already gone.
 
         ``same_store``: the replacement backend serves the same documents
@@ -3989,15 +3982,15 @@ class DagScheduler:
         # store's runs collide with whatever the old store left cached here.
         # _dag_summary_cache is the load-bearing one: _dag_run_rollup skips
         # re-reading any key whose cached summary is terminal, and unlike
-        # _terminal_run_keys nothing rebuilds it on a timer -- so without this
-        # clear, /dags serves the OLD store's finished state for the NEW
+        # _terminal_run_keys nothing rebuilds it on a timer, so without this
+        # clear, /dags serves the old store's finished state for the new
         # store's live run until an unrelated eviction happens to knock the
         # key out. _terminal_run_keys would self-heal at the next full adopt
         # pass, but until then it suppresses adoption of the new store's runs,
         # so drop it here and bring that pass forward to now.
         self._dag_summary_cache.clear()
         self._summaries_memo.clear()
-        # a rebuild in flight across the swap read the OLD store; void it
+        # a rebuild in flight across the swap read the old store; void it
         # (see _summaries_gen).
         self._summaries_gen += 1
         self._terminal_run_keys.clear()

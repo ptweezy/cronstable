@@ -312,6 +312,9 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Every async fixture is function-scoped. Leaving this unset raises a
+# pytest-asyncio deprecation warning, which the "error" filter makes fatal.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests", ".github/tests"]
 # A wedged await dumps every thread's stack and fails the run before the
 # 30-minute CI job timeout cancels it. Armed per test; none comes near 300s.

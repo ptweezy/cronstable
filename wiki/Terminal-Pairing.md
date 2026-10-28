@@ -101,40 +101,29 @@ one address to check:
 | On loopback, on a link-local address (`fe80::/10` or `169.254.0.0/16`), or on every IPv6 address (`http://[::]:8080`) | None |
 
 This host's LAN address is the IPv4 address of the default route, or the
-address of the hostname on a host with no default route. The command waits
-up to three seconds for the hostname's address, and then goes on with no LAN
-address. A listener on `[::]` accepts IPv6 connections only, so it doesn't
-serve the LAN address. A link-local address works on one network link only,
-and its IPv6 form needs the name of the phone's own network interface, which
-the code can't supply.
+hostname's address if there is no default route (resolved with a 3-second
+timeout). A listener on `[::]` accepts IPv6 connections only, so it doesn't
+serve the IPv4 LAN address. Link-local addresses work on a single network link
+only, and IPv6 link-local addresses require the phone's interface zone ID,
+which the QR code cannot know.
 
-The command prefers the LAN address to a listener's own address. That
-address belongs to the network of the listener's interface, such as a VPN or
-a container bridge, and only a phone on that network can dial it.
+The command prefers the LAN address over a specific listener address, because a
+specific listener address may belong to a VPN or container bridge that only a
+phone on that network can reach.
 
-The command sends the token only to `--url`. It sends each address a request
-without the token, and the reply must carry the instance ID that the daemon
-reported at `--url`. A daemon puts its instance ID in the
-`Cronstable-Instance` header of every reply that its web API serves,
-including a `401`. A second daemon on the address has another ID, even when
-it shares the first daemon's configuration and tokens. The command reads the
-headers of the reply and leaves the body unread.
+The command sends the token only to `--url`. It probes candidate addresses
+concurrently without the token (waiting up to 3 seconds) and checks that the
+reply's `Cronstable-Instance` header matches the instance ID reported at
+`--url` (reading only response headers). Every web API reply includes
+`Cronstable-Instance`, including `401`, whereas a different daemon on that
+address reports a different ID even if it shares the same configuration and
+tokens. If no listener yields a candidate address, no probe is sent.
 
-When no listener gives an address, the command sends no request. A process
-that holds the LAN address while the daemon listens only on loopback
-receives nothing.
-
-On the LAN address, the command also checks the port of `--url`, ahead of
-every listener's address, because a published container port differs from
-the port that the daemon binds. It skips the port of `--url` when the daemon
-binds that port on other addresses only, such as loopback. The daemon
-doesn't serve the LAN address on that port, so a process that holds the port
-there receives nothing. A daemon that listens on port 8080 for loopback and
-on port 9090 for every address gets port 9090 in the code.
-
-The command checks the addresses at the same time and waits up to three
-seconds for the replies. The first address that passes, in the order of
-preference, goes into the code.
+On the LAN address, the command checks the port from `--url` ahead of the
+listeners' ports so published container port mappings work, unless the daemon
+binds the `--url` port only on other addresses (such as loopback). For example,
+a daemon listening on `127.0.0.1:8080` and `0.0.0.0:9090` puts port `9090` in
+the code. The first candidate address that passes in preference order is used.
 
 The instance ID is public, so on an `http://` listener it can't prove that a
 reply comes from the daemon. On an `https://` listener, the check also

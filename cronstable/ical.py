@@ -53,8 +53,8 @@ _MAX_BLOCK = 24 * 3600
 class CalendarEntry(NamedTuple):
     """One scheduled job, as the calendar renderer sees it.
 
-    ``timezone`` is the job's RESOLVED zone; ``None`` means the daemon's
-    local wall clock, exactly as in :class:`croninfo.ScheduleEntry`.
+    ``timezone`` is the job's resolved zone; ``None`` means the daemon's
+    local wall clock, matching :class:`croninfo.ScheduleEntry`.
     ``avg_duration`` is the mean runtime in seconds over retained run
     history, or ``None`` when no history exists.
     """
@@ -81,12 +81,12 @@ def _fold(line: str) -> str:
     """RFC 5545 line folding at 75 octets, never splitting a UTF-8 char.
 
     Continuation lines open with one space, so their content budget is 74
-    octets; the fold point backs up over UTF-8 continuation bytes rather
-    than cutting inside a multi-byte character.
+    octets; the fold point backs up over UTF-8 continuation bytes to avoid
+    cutting inside a multi-byte character.
     """
-    # for an ASCII line the character count IS the octet count, and
-    # ``isascii`` is a flag read: a real feed is short ASCII throughout,
-    # so this measures every line without encoding one to throw it away
+    # For an ASCII line the character count equals the octet count, and
+    # ``isascii`` is a flag read: a typical feed is short ASCII throughout,
+    # so this measures every line without encoding one to discard it.
     octets = len(line) if line.isascii() else len(line.encode("utf-8"))
     if octets <= 75:
         return line
@@ -148,7 +148,7 @@ def render_calendar(
 ) -> str:
     """The complete ``.ics`` text for ``entries`` over ``[start, start+days)``.
 
-    ``start`` must be aware; every fire STRICTLY after it and before the
+    ``start`` must be aware; every fire strictly after it and before the
     window's end becomes one event, at most ``per_job_cap`` per entry (a
     per-minute job would otherwise flood the feed; the cap is announced
     per event-starved entry via ``X-CRONSTABLE-TRUNCATED``).  ``now``
@@ -259,9 +259,9 @@ def render_calendar(
             )
             parts.append(head + stamp + middle + stamp + tail)
         if truncated:
-            # the cap rides as a property parameter, not in the value: a
-            # raw ';' inside a TEXT value is illegal per RFC 5545, and the
-            # job name (the value) must stay unambiguous
+            # The cap rides as a property parameter: a raw ';' inside a
+            # TEXT value is invalid per RFC 5545, and the job name (the
+            # value) must stay unambiguous.
             parts.append(
                 _fold(
                     "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(

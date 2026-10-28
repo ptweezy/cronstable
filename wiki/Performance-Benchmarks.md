@@ -83,9 +83,6 @@ Every comparison also renders `perf-chart.svg`, a diverging bar chart with a
 row for every compared metric. It ships in the `perf-report` artifact on the
 workflow run, alongside the same two files, and stays there for 30 days.
 
-The first release after the suite was introduced records numbers without a
-comparison. Every release after that diffs against the one before it.
-
 ## Accepting an intentional regression
 
 A feature can be worth a measured cost. To ship one, start a pushed commit's

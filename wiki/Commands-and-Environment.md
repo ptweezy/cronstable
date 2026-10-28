@@ -50,7 +50,7 @@ how cronstable launches the process (`RunningJob.start` in `cronstable/job.py`):
   - Windows naming `cmd`/`cmd.exe` is the exception (`shell_spawn` in
     `cronstable/job.py`). cmd.exe takes `/c` rather than `-c`, and it parses
     its command line by its own rules instead of the `CommandLineToArgvW`
-    rules that argv rendering is built to be undone by. A command with
+    rules that argv escaping targets. A command with
     embedded double quotes would therefore reach it with the escaping still in
     place. The daemon uses `asyncio.create_subprocess_shell` for it instead,
     which hands the command string to `%ComSpec% /c` untouched. An absolute
@@ -392,13 +392,13 @@ the work, but on Windows it does not raise a tree of helpers.
 Lowering a priority is always allowed. **Raising** one on POSIX (any level
 whose nice sits below cronstable's own; from the usual nice 0 that means
 `above-normal` and `high`) needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom, and
-cronstable cannot know at load whether the kernel will grant it. What it does
-instead:
+cronstable cannot know at load whether the kernel will grant it. Instead,
+cronstable:
 
 - at config load, if the level is a raise from cronstable's own nice and
-  cronstable is not root, it logs one `WARNING` naming the job, so the warning
+  cronstable is not root, logs one `WARNING` naming the job, so the warning
   lands on the deployment that introduces the raise;
-- at run time, a refusal from the kernel does **not** fail the run. The
+- at run time, if the kernel refuses the raise, does **not** fail the run. The
   job's processes keep the nice value they inherited, and cronstable logs
   the refusal at `DEBUG`. A minutely job on an unprivileged host would
   otherwise emit some 1,440 warnings a day about a condition that does not

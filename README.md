@@ -526,8 +526,9 @@ cronstable pair                                        # local daemon on port 80
 cronstable pair --public-url https://cron.example.net  # the address the phone uses
 ```
 
-The code contains the token that the command presents, so give the command the
-phone's [scoped token](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens).
+The code contains the token that `cronstable pair` uses, so pass a
+[scoped token](https://github.com/ptweezy/cronstable/wiki/HTTP-API#scoped-tokens-webauthtokens)
+for the phone.
 When `--url` is a loopback address, the command puts the host's LAN address in
 the code if the daemon answers there. Pass `--public-url` when the phone uses
 another address, such as a reverse proxy's. In the
@@ -570,11 +571,11 @@ jobs:
 By default, a job fails when it exits with a nonzero status or writes to a
 captured stderr. To change that for a job, use
 [`failsWhen`](#failure-detection-and-retries). The webhook's default body is
-Slack-compatible, and Mattermost and Teams accept it as is. Email, Sentry, and
-shell command reports each take one more block. Email and Sentry reports use
-Jinja2 templates over the run's name, output, and exit code, and a shell
-command receives the same details as `CRONSTABLE_*` environment variables. For
-details, see
+Slack-compatible, and Mattermost and Teams accept it as is. To report by email,
+Sentry, or a shell command, add the corresponding block under `report:`. Email
+and Sentry reports render Jinja2 templates with the run's name, output, and
+exit code, and shell command reports receive the same details as `CRONSTABLE_*`
+environment variables. For details, see
 [failure detection and retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries)
 and [reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the
 wiki.
@@ -988,9 +989,9 @@ jobs in that file. To share defaults across files, use [includes](#includes).
 
 ### Includes
 
-The `include` option takes a list of files, which cronstable parses and merges
-into the current configuration. It's how several files share defaults and
-other settings. For example, this is the main configuration:
+The `include` option merges a list of files into the current configuration so
+that multiple files can share defaults and other settings. For example, this is
+the main configuration:
 
 ```yaml
 include:
@@ -1490,8 +1491,8 @@ in the wiki.
 
 On Windows, the `eventlog` reporter writes each outcome to the Application
 event log, which Event Viewer, Windows Event Forwarding, SCOM, and SIEM
-connectors read. It needs no extra. Each record has a stable event ID and a
-fixed set of insertion strings for rules to match:
+connectors read. It requires no optional dependencies. Each record has a stable
+event ID and a fixed set of insertion strings for rules to match:
 
 ```yaml
 defaults:
@@ -1569,12 +1570,11 @@ Embed a badge with Markdown that links it to the job in the dashboard:
 A job's badge shows a verdict such as `passing`, `failing`, `overdue`, or
 `paused`, and the fleet badge at `/badge.svg` counts the jobs in the most
 urgent state, such as `2 failing`. The command palettes of the web and
-terminal dashboards copy this Markdown. A daemon that requires a token
-serves the badges only with it, and GitHub's image proxy can't send one. A
-browser also refuses to load a badge from the daemon into a page from
-another origin. Set `web.badges.public: true` to lift both limits; it
-exempts only the two badge routes from the token. For every verdict, the
-query parameters, and caching, see
+terminal dashboards copy this Markdown. When authentication is enabled, badge
+requests require a token, which GitHub's image proxy can't send. Browsers also
+block pages on other origins from embedding the badge. Set
+`web.badges.public: true` to allow unauthenticated, cross-origin requests to
+the two badge routes. For every verdict, the query parameters, and caching, see
 [status badges](https://github.com/ptweezy/cronstable/wiki/Status-Badges) in
 the wiki.
 
@@ -1688,9 +1688,9 @@ take matching `--cacert`, `--client-cert`, `--client-key`, and `--insecure`
 flags. The listeners, the cluster, the job CLI, and these clients verify
 certificates in OpenSSL's strict X.509 mode on every Python version. With
 OpenSSL 3.0 or later, a CA certificate needs critical `basicConstraints`, a
-key usage with `keyCertSign`, and a Subject Key Identifier. A certificate
-that a CA issues needs an Authority Key Identifier. A failed handshake logs
-its reason. For how to issue the certificates, the mTLS trust
+key usage with `keyCertSign`, and a Subject Key Identifier. Certificates
+issued by a CA need an Authority Key Identifier. Failed handshakes log
+the rejection reason. For how to issue the certificates, the mTLS trust
 model and how it combines with `web.authToken`, and how rotation works, see
 [listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS) in the
 wiki.
@@ -1757,12 +1757,12 @@ cluster:
   electLeader: true               # observe-only if false (the default)
 ```
 
-Each node independently chooses as leader the member with the lowest
-`nodeName` among the members that it sees agreeing on the job-set ID, and only
-when those members form a quorum (a strict majority) of the cluster. Because
-peer views can differ or become stale, multiple nodes can consider themselves
-leader, so the `gossip` election is best effort: it can duplicate or skip runs
-during failures or changes in cluster membership.
+Each node independently elects the member with the lowest `nodeName` among the
+peers that agree on the job-set ID, provided those peers form a quorum (a
+strict majority) of the cluster. Because peer views can differ or become stale,
+multiple nodes can consider themselves leader, so the `gossip` election is best
+effort: it can duplicate or skip runs during failures or changes in cluster
+membership.
 
 To coordinate leadership through a shared lease, set `cluster.backend` to
 `kubernetes` (a `coordination.k8s.io/v1` Lease), `etcd` (a lease-bound key), or

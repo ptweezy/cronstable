@@ -1,6 +1,13 @@
 """Secret scrubbing for archived job output (cronstable.redact)."""
 
+import time
+
+import pytest
+
 from cronstable.redact import (
+    _PATTERN_GATES,
+    _PATTERNS,
+    LINE_SCAN_LIMIT,
     REDACTED,
     _starts_mid_pem,
     redact_lines,
@@ -191,6 +198,82 @@ def test_cloud_and_service_tokens_redacted():
 def test_jwt_redacted():
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSM12345"
     assert REDACTED in redact_secrets(jwt)
+
+
+def test_jwt_redacted_with_or_without_a_prefix():
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSM12345"
+    assert redact_secrets(jwt) == REDACTED
+    assert redact_secrets("token-" + jwt) == "token-" + REDACTED
+    assert redact_secrets("id=" + jwt) == "id=" + REDACTED
+    assert (
+        redact_secrets("Authorization: Bearer " + jwt)
+        == "Authorization: Bearer " + REDACTED
+    )
+    # a header with "-" in it ({"alg":"RS256","kid":"k>~"})
+    jwt = "eyJhbGciOiJSUzI1NiIsImtpZCI6Ims-fiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
+    assert redact_secrets("jwt " + jwt) == "jwt " + REDACTED
+
+
+def _growth_ratio(func, builders):
+    """Return the summed runtime of the builders' 64k-char lines over 8k.
+
+    About 8 for a linear scan, about 64 when one builder is quadratic, since
+    that builder dominates the sum. Each line keeps its best of five
+    interleaved runs to absorb a scheduler stall on a shared CI runner. One
+    ratio per test keeps false failures rare.
+    """
+    lines = [(build(8_000), build(64_000)) for build in builders]
+    best = [[float("inf")] * 2 for _ in lines]
+    for _ in range(5):
+        for i, pair in enumerate(lines):
+            for j, line in enumerate(pair):
+                started = time.perf_counter()
+                func(line)
+                best[i][j] = min(best[i][j], time.perf_counter() - started)
+    small, large = (sum(times) for times in zip(*best, strict=True))
+    return large / max(small, 1e-6)
+
+
+def test_jwt_pattern_is_linear_not_quadratic():
+    # each "eyJ" after a "-" starts a match attempt; one that scans to the
+    # end of the run makes a single long line quadratic.
+    ratio = _growth_ratio(
+        redact_secrets,
+        [
+            lambda n: "-eyJ" * (n // 4),
+            lambda n: ("-eyJ" + "a" * 6) * (n // 10),
+            lambda n: "-".join(["eyJ" + "a" * 6] * (n // 10)) + ".bbbb",
+        ],
+    )
+    assert ratio < 24, ratio
+
+
+@pytest.mark.parametrize(
+    ("pattern", "repl", "gate"),
+    [
+        (pattern, repl, gate)
+        for (pattern, repl), gate in zip(
+            _PATTERNS, _PATTERN_GATES, strict=True
+        )
+    ],
+    ids=[g if isinstance(g, str) else g[0] for g in _PATTERN_GATES],
+)
+def test_every_pattern_is_linear_not_quadratic(pattern, repl, gate):
+    # sre keeps the GIL while it scans, so one quadratic pattern stalls the
+    # daemon on a single long line. A gate word repeated inside one run
+    # gives many match starts; one between two long runs catches an
+    # unanchored prefix.
+    words = (gate,) if isinstance(gate, str) else gate
+    builders = [
+        lambda n, w=w, sep=sep: (w + sep) * (n // (len(w) + 1))
+        for w in words
+        for sep in "- .a"
+    ]
+    builders += [
+        lambda n, w=w: "a" * (n // 2) + w + "a" * (n // 2) for w in words
+    ]
+    ratio = _growth_ratio(lambda line: pattern.sub(repl, line), builders)
+    assert ratio < 24, ratio
 
 
 def test_private_key_marker_redacted():
@@ -401,3 +484,70 @@ def test_a_second_pass_leaves_redacted_lines_unchanged():
         redact_secrets('password: "abc" and more text')
         == "password: " + REDACTED + " and more text"
     )
+
+
+# ---------------------------------------------------------------------------
+# LINE_SCAN_LIMIT: sre holds the GIL for a whole scan
+# ---------------------------------------------------------------------------
+
+
+def test_a_line_over_the_scan_limit_is_redacted_whole():
+    # wiki/Durable-State.md gives this length
+    assert LINE_SCAN_LIMIT == 1024 * 1024
+    line = "x" * (LINE_SCAN_LIMIT + 1)
+    assert redact_secrets(line) == REDACTED
+    # unscanned: a scan would keep the key
+    secret = "password=" + "x" * (LINE_SCAN_LIMIT - 8)
+    assert len(secret) == LINE_SCAN_LIMIT + 1
+    assert redact_secrets(secret) == REDACTED
+    assert redact_secrets(REDACTED) == REDACTED
+    assert redact_lines(["before", line, "after"]) == [
+        "before",
+        REDACTED,
+        "after",
+    ]
+
+
+def test_a_line_at_the_scan_limit_is_redacted_normally():
+    key = "AKIAIOSFODNN7EXAMPLE"
+    half = "x" * (LINE_SCAN_LIMIT // 2)
+    line = half + " " + key + " " + half[: -len(key) - 2]
+    assert len(line) == LINE_SCAN_LIMIT
+    out = redact_secrets(line)
+    assert out == line.replace(key, REDACTED)
+    assert redact_secrets(out) == out
+
+
+def test_a_line_redaction_grows_past_the_scan_limit_is_redacted_whole():
+    # REDACTED is longer than "x", and the next pattern scans the result
+    line = "x" * (LINE_SCAN_LIMIT - 10) + "password=x"
+    assert len(line) == LINE_SCAN_LIMIT
+    assert redact_secrets(line) == REDACTED
+    # also when a later pattern shrinks it back under the limit
+    head = "pwd=x," * (LINE_SCAN_LIMIT // 20)
+    head += "-----BEGIN RSA PRIVATE KEY-----"
+    line = head + "A" * (LINE_SCAN_LIMIT - len(head))
+    assert redact_secrets(line) == REDACTED
+    # a result exactly at the limit is kept
+    line = "x" * (LINE_SCAN_LIMIT - 23) + "password=x"
+    out = redact_secrets(line)
+    assert out == line[:-1] + REDACTED
+    assert len(out) == LINE_SCAN_LIMIT
+    assert redact_secrets(out) == out
+
+
+def test_pem_markers_on_a_line_over_the_scan_limit_still_count():
+    pad = "x" * LINE_SCAN_LIMIT
+    begin = "-----BEGIN RSA PRIVATE KEY-----"
+    end = "-----END RSA PRIVATE KEY-----"
+    for lines in [
+        [pad + " " + begin, "MIIbody", end, "after"],
+        [begin + pad, "MIIbody", end, "after"],
+        [begin, "MII" + pad, end, "after"],
+        [begin, "MIIbody", end + pad, "after"],
+        ["MIIbody", end + pad, "after"],
+        [begin, "MIIone", end + pad + begin, "MIItwo", end, "after"],
+    ]:
+        out = redact_lines(lines)
+        assert out == [REDACTED] * (len(lines) - 1) + ["after"]
+        assert [redact_secrets(line) for line in out] == out

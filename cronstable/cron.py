@@ -95,6 +95,8 @@ from cronstable.config import (
 )
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (
+    PRESSURE_DEFAULT_HOURS,
+    PRESSURE_MAX_HOURS,
     ScheduleEntry,
     describe_cron,
     duplicate_schedules,
@@ -177,14 +179,13 @@ _BACKFILL_UNAVAILABLE = (
 class _AiohttpDoor:
     """Stand-in for ``aiohttp`` / ``aiohttp.web`` that imports on first touch.
 
-    aiohttp is 144 ms and 14 MB of RSS, roughly half the TIME of importing
+    aiohttp is 144 ms and 14 MB of RSS, roughly half the time of importing
     this module and a bit under a third of its memory, and every one of its
-    consumers here is optional: the web
-    listener, the cluster gossip client, the push relay. A daemon with none of
-    them configured used to pay for the web stack anyway, and so did every
-    offline caller that merely reaches into this module for a constant or a
-    helper (``cronstable state gc`` and friends go through state_admin, which
-    imports the stream prefixes from here).
+    consumers here is optional: the web listener, the cluster gossip client,
+    the push relay. A daemon with none of them configured avoids loading the
+    web stack, as does every offline caller that merely reaches into this
+    module for a constant or a helper (``cronstable state gc`` and friends go
+    through state_admin, which imports the stream prefixes from here).
 
     A module-level ``__getattr__`` (PEP 562) cannot do this job: it is
     consulted for attribute access on the module object from outside, not for
@@ -353,6 +354,12 @@ PAUSE_DEFAULT_SECONDS = 3600
 PAUSE_MAX_SECONDS = 2592000
 PAUSE_NOTE_MAX = 500
 PAUSE_BY_MAX = 100
+# Recovery request caps: tasks listed per request, and the plan token's
+# length (a SHA-256 hex digest).
+RECOVERY_TASKS_MAX = 2000
+PLAN_TOKEN_LENGTH = 64
+# Most upcoming runs a schedule preview lists per request.
+PREVIEW_COUNT_MAX = 60
 # Durable pause stream, newest wins; expiry is reader-enforced (see
 # _pause_active) and every node sharing the store honors a pause.
 PAUSE_STREAM_PREFIX = "paused/"
@@ -497,7 +504,7 @@ WEB_ROUTES: "tuple[tuple[str, str, str, str | None], ...]" = (
         "_web_dag_decision",
         None,
     ),
-    # durable state inspector (metadata-only)
+    # durable state inspector (KV values redacted, records in full)
     ("GET", "/state", "_web_state", None),
     ("GET", "/state/documents", "_web_state_documents", None),
     ("GET", "/state/records", "_web_state_records", None),
@@ -795,11 +802,10 @@ def _maps_action_errors(
 ) -> Callable[["Cron", web.Request], Awaitable[web.Response]]:
     """Translate an escaping :class:`ApiActionError` into its HTTP response.
 
-    The ONE spelling of the ``except ApiActionError`` tail the action and
-    state-inspection handlers used to each repeat.  The status mapping and
-    the headers-on-409 rule live in :meth:`Cron._action_http_error` (the
-    state-inspection payloads never raise 409, so that rule is inert for
-    them).
+    Shared ``except ApiActionError`` wrapper for the action and
+    state-inspection handlers.  The status mapping and the headers-on-409
+    rule live in :meth:`Cron._action_http_error` (the state-inspection
+    payloads never raise 409, so that rule is inert for them).
     """
 
     @wraps(handler)
@@ -879,13 +885,13 @@ async def _error_envelope_middleware(request, handler):
             content_type="application/json",
         )
     except Exception:  # noqa: BLE001 - the envelope's last arm
-        # An unhandled error used to escape to aiohttp's own handler,
-        # which answers text/plain (or text/html on an Accept), so the ONE
-        # status a client could not parse uniformly was the 500. Message
-        # is fixed: the reason goes to the log, never to the caller (the
-        # rule _push_store_unavailable and the MCP/jobapi surfaces follow).
-        # aiohttp's own log_exception is lost once this arm handles it, so
-        # log here or the traceback disappears.
+        # Without this arm, an unhandled error would escape to aiohttp's
+        # own handler, which answers text/plain (or text/html on an Accept),
+        # leaving 500 as the one status a client could not parse uniformly.
+        # Message is fixed: the reason goes to the log, never to the caller
+        # (the rule _push_store_unavailable and the MCP/jobapi surfaces
+        # follow). aiohttp's own log_exception is lost once this arm handles
+        # it, so log here or the traceback disappears.
         logger.exception(
             "web: internal error serving %s", request.rel_url.path
         )
@@ -2539,12 +2545,12 @@ class Cron:
         # boot in-flight reconciliation (which leaves such records open).
         # The boot gate and the deferred-launch paths consult it: a boot
         # run that is literally still running must remain this boot's
-        # only copy, whatever the boot marker says -- the marker can be
-        # missing (written by an older build, or the boot instant was
-        # unknowable) while the process is plainly there. The start time
-        # (None when unreadable) pins the pid's identity so a recycled
-        # pid never counts. Declared above the config load and pruned in
-        # _apply_reload with the other per-job maps.
+        # only copy, whatever the boot marker says (the marker can be
+        # missing when the boot instant was unknowable while the process
+        # is plainly there). The start time (None when unreadable) pins
+        # the pid's identity so a recycled pid never counts. Declared
+        # above the config load and pruned in _apply_reload with the
+        # other per-job maps.
         self._boot_survivors: dict[str, tuple[int, float | None]] = {}
         self.config_arg = config_arg
         if config_arg is not None:
@@ -2566,7 +2572,7 @@ class Cron:
         self._wait_for_running_jobs_task: asyncio.Task | None = None
         # Every wake source for the run loop's sleep feeds this one
         # event: a shutdown (_stop_event mirrors its own set into it) and
-        # a reload request (signal_reload -- SIGHUP, or the Windows
+        # a reload request (signal_reload: SIGHUP, or the Windows
         # service's PARAMCHANGE), which wakes the sleep so the reload
         # happens now rather than at the next housekeeping minute; the
         # reparse itself is forced by voiding _config_sig.
@@ -3635,10 +3641,14 @@ class Cron:
     def _node_name(self) -> str:
         """The cluster node name when clustered, else the plain hostname the
         durable-state layer already uses as this node's identity."""
+        return self._cluster_node_name() or self._state_host
+
+    def _cluster_node_name(self) -> str | None:
+        """The running cluster manager's ``nodeName``, or None without one."""
         mgr = self.cluster_manager
         if mgr is not None and getattr(mgr, "node_name", None):
             return mgr.node_name
-        return self._state_host
+        return None
 
     def _node_history_block(self) -> dict[str, Any]:
         """The retained CPU/memory ring as its wire shape.
@@ -4330,6 +4340,10 @@ class Cron:
             relay_timeout=push_config["relay"]["timeout"],
             store=store,
             host=report_hostname(),
+            # a callable for the same reason: a reload rebuilds the
+            # cluster manager and keeps this service, and the flap ids
+            # follow the node name of whichever manager is running.
+            node=self._cluster_node_name,
         )
         await service.start()
         self._push_service = service
@@ -4511,7 +4525,12 @@ class Cron:
                 {"error": tz_error}, status=400, headers=headers
             )
         count = self._web_int_query(
-            request, "limit", default=12, lo=1, hi=60, alias="count"
+            request,
+            "limit",
+            default=12,
+            lo=1,
+            hi=PREVIEW_COUNT_MAX,
+            alias="count",
         )
         payload = self.schedule_preview_payload(
             expr, tz, count, request.query.get("seed")
@@ -4707,7 +4726,7 @@ class Cron:
 
     def schedule_pressure_payload(
         self,
-        hours: int = 24,
+        hours: int = PRESSURE_DEFAULT_HOURS,
         tz_name: str | None = None,
         entries: list[ScheduleEntry] | None = None,
     ) -> dict[str, Any]:
@@ -4796,7 +4815,9 @@ class Cron:
         )
 
     async def schedule_pressure_payload_async(
-        self, hours: int = 24, tz_name: str | None = None
+        self,
+        hours: int = PRESSURE_DEFAULT_HOURS,
+        tz_name: str | None = None,
     ) -> dict[str, Any]:
         """Executor-offloaded :meth:`schedule_pressure_payload`."""
         return await self._schedule_payload_offload(
@@ -4821,7 +4842,13 @@ class Cron:
         self, request: web.Request
     ) -> web.Response:
         headers = self._web_headers()
-        hours = self._web_int_query(request, "hours", default=24, lo=1, hi=168)
+        hours = self._web_int_query(
+            request,
+            "hours",
+            default=PRESSURE_DEFAULT_HOURS,
+            lo=1,
+            hi=PRESSURE_MAX_HOURS,
+        )
         tz = request.query.get("tz") or None
         # Validate up front and answer 400 from the requested name, so the
         # builder's exception text never reaches the response body.
@@ -5143,21 +5170,17 @@ class Cron:
         # run with the cluster, or _process_pending_reboots would run the
         # one-shot a second time (possibly on another node). Recording
         # BEFORE spawning mirrors the deferred-launch path's at-most-once
-        # ordering.
-        if name in self._pending_reboot_jobs:
+        # ordering. The pop precedes the await, so a scheduler pass or a
+        # second manual start during the push finds no entry.
+        if self._pending_reboot_jobs.pop(name, None) is not None:
+            logger.info(
+                "cluster: manual start of deferred @reboot job %s counts "
+                "as its boot run; retiring the pending entry",
+                name,
+            )
             mgr = self.cluster_manager
             if mgr is not None:
                 await mgr.mark_reboot_ran(name)
-            # pop, not del: a concurrent manual start can retire the entry
-            # while the await above yields, and the loser of that race must
-            # not 500 on a KeyError; mark_reboot_ran is idempotent and both
-            # requests still launch below.
-            if self._pending_reboot_jobs.pop(name, None) is not None:
-                logger.info(
-                    "cluster: manual start of deferred @reboot job %s counts "
-                    "as its boot run; retiring the pending entry",
-                    name,
-                )
         # Same for a boot run a pause deferred: the manual start IS it, so
         # record the boot marker (the deferral left it unwritten) or the
         # pause lifting would run the one-shot a second time.
@@ -6021,8 +6044,8 @@ class Cron:
         return _json_response({"paused": None}, headers=self._web_headers())
 
     def _action_http_error(self, ex: "ApiActionError") -> web.HTTPException:
-        # historical parity: web.headers ride the 409 conflict bodies of the
-        # start/cancel routes, but NOT their 404 (unknown job).
+        # web.headers ride the 409 conflict bodies of the start/cancel
+        # routes, but not their 404 (unknown job).
         headers = self._web_headers() if ex.status == 409 else None
         return _http_for_action_error(ex, headers)
 
@@ -6648,7 +6671,7 @@ class Cron:
             )
         return _json_response(result, headers=self._web_headers())
 
-    # --- durable state inspector (metadata-only) --------------------------
+    # --- durable state inspector -------------------------------------------
 
     async def _web_state(self, request: web.Request) -> web.Response:
         return _json_response(
@@ -6718,7 +6741,7 @@ class Cron:
         """Documents of one KV/cursor/idempotency namespace, redacted.
 
         KV values are stripped to a ``valueSize``/``valueType`` summary
-        (metadata-only stance); cursor watermarks and idempotency claim
+        (a KV value is job data); cursor watermarks and idempotency claim
         metadata are returned verbatim (no user secret there).  Behind
         ``GET /state/documents`` and MCP ``cron_inspect_state``.  Raises
         :class:`ApiActionError` when there is no store or ``ns`` is not an
@@ -6771,10 +6794,12 @@ class Cron:
     async def state_records_payload(
         self, stream: str, limit: int = 100
     ) -> dict[str, Any]:
-        """Newest records of one stream, metadata-only.
+        """Newest records of one stream, each its full stored body.
 
+        A ``runs/`` record carries what ``GET /jobs/{name}/runs`` and
+        ``GET /jobs/{name}/resources`` already serve to the ``view`` scope.
         Archived-output (``logs/``) streams are refused: they carry raw job
-        output, which the metadata-only stance keeps off this surface.  Behind
+        output, which this surface never returns.  Behind
         ``GET /state/records`` and MCP ``cron_inspect_state``.  Raises
         :class:`ApiActionError` for a missing store, empty stream, or a log
         stream.
@@ -6785,8 +6810,7 @@ class Cron:
         if not stream:
             raise ApiActionError("a stream is required", status=400)
         if stream.startswith("logs/") or stream == "logs":
-            # archived job output: raw content, excluded from the metadata
-            # inspector on purpose.
+            # archived job output: raw content, excluded on purpose.
             raise ApiActionError(
                 "log streams carry raw output and are not inspectable",
                 status=403,
@@ -6857,13 +6881,16 @@ class Cron:
         if (
             not isinstance(mode, str)
             or not isinstance(tasks, list)
-            or len(tasks) > 2000
+            or len(tasks) > RECOVERY_TASKS_MAX
             or any(not isinstance(t, str) for t in tasks)
             or not isinstance(dry_run, bool)
             or not isinstance(allow_change, bool)
             or (
                 not dry_run
-                and (not isinstance(token, str) or len(token) != 64)
+                and (
+                    not isinstance(token, str)
+                    or len(token) != PLAN_TOKEN_LENGTH
+                )
             )
         ):
             raise _api_error(web.HTTPBadRequest, "invalid recovery request")
@@ -6901,7 +6928,10 @@ class Cron:
             or not isinstance(allow_change, bool)
             or (
                 not dry_run
-                and (not isinstance(token, str) or len(token) != 64)
+                and (
+                    not isinstance(token, str)
+                    or len(token) != PLAN_TOKEN_LENGTH
+                )
             )
         ):
             raise _api_error(
@@ -7033,8 +7063,7 @@ class Cron:
             )
         # the same clamped `limit` the DAG runs route (and the MCP
         # cron_list_runs twin) applies; the retained history is bounded by
-        # RUN_HISTORY_LIMIT, so the default serves it whole, exactly the
-        # old unparameterised behavior.
+        # RUN_HISTORY_LIMIT, so the default serves it whole.
         limit = self._web_int_query(
             request,
             "limit",
@@ -7461,7 +7490,7 @@ class Cron:
             source = "durable"
             infos: list[JobRunInfo] = []
             # oldest first, matching the in-memory fallback's orientation
-            # below: _run_stats is order-independent now, so this is what
+            # below: _run_stats is order-independent, so this is what
             # the window bucketing's "same relative order" property and
             # _run_stats' equal-instant tiebreak read, not a correctness
             # requirement of the "last" fields.
@@ -7515,22 +7544,18 @@ class Cron:
             return running[-1]
         return self.last_run.get(name)
 
-    def _job_output(self, name: str) -> JobOutputStream | None:
-        run = self._job_tail_run(name)
-        return run.output if run is not None else None
-
-    def _dag_task_output(
+    def _dag_task_run(
         self, dag_name: str, run_key: str, taskkey: str
-    ) -> JobOutputStream | None:
-        """The live output stream of a DAG task instance, or ``None``.
+    ) -> "RunningJob | None":
+        """The running instance of a DAG task, or ``None``.
 
         A DAG task runs as a :class:`RunningJob` under the template name
         ``<dag>.<task_id>`` (its instances share that key), so locate the one
         whose ``dag_ref`` matches this run + instance key.  Only a *currently
-        running* instance has a reachable buffer: a finished DAG task's
-        output is not retained under the template name (its completion routes
-        to the DAG driver, not the per-job last_run), so this returns ``None``
-        once the task is done.
+        running* instance is reachable: a finished DAG task's output is not
+        retained under the template name (its completion routes to the DAG
+        driver, not the per-job last_run), so this returns ``None`` once the
+        task is done.
         """
         # the base task id: a mapped instance key is ``id#<index>``.
         task_id = taskkey.split("#", 1)[0]
@@ -7542,8 +7567,15 @@ class Cron:
                 and dref.run_key == run_key
                 and dref.taskkey == taskkey
             ):
-                return running.output
+                return running
         return None
+
+    def _dag_task_output(
+        self, dag_name: str, run_key: str, taskkey: str
+    ) -> JobOutputStream | None:
+        """The live output stream of a DAG task instance, or ``None``."""
+        running = self._dag_task_run(dag_name, run_key, taskkey)
+        return running.output if running is not None else None
 
     def _web_protocol(self) -> asyncio.BaseProtocol:
         """The current runner's protocol for a held listener's connection."""
@@ -7675,33 +7707,56 @@ class Cron:
         The non-streaming counterpart of :meth:`_pump_output`, backing the MCP
         log-tail tools (a client polls with the returned ``cursor`` to fetch
         only newly appended lines).  Without a ``cursor`` returns the last
-        ``tail`` lines; with one, the lines after that offset (capped at
-        ``tail``).  ``cursor`` is a line offset into the bounded in-memory
-        buffer, so after the buffer rotates it can only ever skip forward,
-        never resurrect dropped lines.
+        ``tail`` lines; with one, the lines after it (capped at ``tail``).
+
+        ``cursor`` is an absolute line number in the run's output (the
+        stream's ``published`` count), not a slot in the bounded ring, so it
+        keeps advancing after the ring fills.  ``skipped`` counts the lines
+        after the cursor that the ring dropped before this poll.  A cursor
+        past everything the stream has published came from another run, or
+        from a run whose stream is gone (an ended DAG task, or a run
+        rehydrated after a restart): ``reset`` is set and the page starts at
+        the oldest retained line.
         """
         # `lines` aliases the live ring: safe only on the event loop, where
         # the len and the islice run with nothing rotating between them
         lines = output.lines if output is not None else ()
-        total = len(lines)
+        end = output.published if output is not None else 0
+        # the absolute number of the oldest retained line
+        first = end - len(lines)
+        skipped = 0
+        reset = False
         if cursor is None:
-            start = max(0, total - tail)
+            start = max(first, end - tail)
+        elif cursor > end:
+            start, reset = first, True
         else:
-            start = min(max(cursor, 0), total)
-        stop = min(start + max(tail, 0), total)
+            cursor = max(cursor, 0)
+            start = max(cursor, first)
+            skipped = start - cursor
+        stop = min(start + max(tail, 0), end)
         # older retained lines exist above what we returned (only
         # meaningful on a cursor-less "give me the tail" call).
-        truncated = cursor is None and start > 0
-        if stop <= start:
-            return {"lines": [], "cursor": start, "truncated": truncated}
+        truncated = cursor is None and start > first
+        page = (
+            itertools.islice(lines, start - first, stop - first)
+            if stop > start
+            else ()
+        )
         return {
             "lines": [
-                {"stream": stream, "line": line}
-                for stream, line in itertools.islice(lines, start, stop)
+                {"stream": stream, "line": line} for stream, line in page
             ],
-            "cursor": stop,
+            "cursor": max(start, stop),
             "truncated": truncated,
+            "skipped": skipped,
+            "reset": reset,
         }
+
+    @staticmethod
+    def _started_iso(run: Any) -> str | None:
+        started = getattr(run, "started_at", None)
+        return started.isoformat() if started is not None else None
 
     def job_logs_tail_payload(
         self, name: str, tail: int = 100, cursor: int | None = None
@@ -7709,13 +7764,18 @@ class Cron:
         """Last retained log lines of a job, or ``None`` if unknown.
 
         Behind MCP ``cron_tail_job_logs``, the poll/cursor projection of the
-        SSE stream at ``GET /jobs/{name}/logs``.
+        SSE stream at ``GET /jobs/{name}/logs``.  ``started_at`` names the
+        run the lines belong to, so a poller can see the page switch to
+        another run, newer or older.
         """
         if name not in self.cron_jobs:
             return None
-        payload = self._tail_payload(self._job_output(name), tail, cursor)
+        run = self._job_tail_run(name)
+        output = run.output if run is not None else None
+        payload = self._tail_payload(output, tail, cursor)
         payload["name"] = name
         payload["running"] = bool(self.running_jobs.get(name))
+        payload["started_at"] = self._started_iso(run)
         return payload
 
     def dag_task_logs_tail_payload(
@@ -7730,15 +7790,20 @@ class Cron:
 
         Behind MCP ``cron_tail_dag_task_logs``.  Only a currently-running
         instance has a reachable buffer (a finished task's output is not
-        retained under the template name), so ``lines`` is empty once it ends.
+        retained under the template name), so ``lines`` is empty and
+        ``running`` false after it ends.  ``started_at`` is when that running
+        instance started.
         """
         if dag not in self.cron_dags:
             return None
-        output = self._dag_task_output(dag, run_key, taskkey)
+        running = self._dag_task_run(dag, run_key, taskkey)
+        output = running.output if running is not None else None
         payload = self._tail_payload(output, tail, cursor)
         payload["dag"] = dag
         payload["run_key"] = run_key
         payload["taskkey"] = taskkey
+        payload["running"] = running is not None
+        payload["started_at"] = self._started_iso(running)
         return payload
 
     async def _web_job_logs(self, request: web.Request) -> web.StreamResponse:
@@ -7966,8 +8031,8 @@ class Cron:
             # refused before auth or handlers run. An operator who explicitly
             # published the API cross-origin via a wildcard
             # Access-Control-Allow-Origin response header keeps that (loudly);
-            # a specific ACAO origin is folded into the allow-list so an
-            # existing deliberate cross-origin dashboard survives the upgrade.
+            # a specific ACAO origin is folded into the allow-list so a
+            # deliberate cross-origin dashboard passes the check.
             allowed_origins = set(web_config.get("allowedOrigins") or [])
             custom_headers = web_config.get("headers") or {}
             acao = next(
@@ -11001,9 +11066,10 @@ class Cron:
         Re-validates the reconciliation's finding at consult time: the
         pid must still exist AND still carry the start time captured when
         it was recorded, so a pid the OS recycled (this consult can come
-        long after boot -- a pause lifting, a deferred launch) never
-        counts. A dead or recycled survivor is forgotten, leaving the
-        caller's own dedupe to decide as if it had never survived.
+        long after boot, such as when a pause lifts or a deferred launch
+        runs) never counts. A dead or recycled survivor is forgotten,
+        leaving the caller's own dedupe to decide as if it had never
+        survived.
         """
         survivor = self._boot_survivors.get(name)
         if survivor is None:
@@ -11020,12 +11086,11 @@ class Cron:
         """Whether a surviving run makes launching ``name`` a double.
 
         True skips the launch: the survivor stays this boot's only copy,
-        whatever the boot marker says -- the marker can be absent while
-        the process is plainly there (an older build wrote none, or the
-        boot instant was unknowable). The skip leaves the marker stream
-        as it was: if the survivor dies and a LATER daemon start finds
-        neither marker nor survivor, re-running errs the documented
-        at-least-once way.
+        whatever the boot marker says (the marker can be absent while
+        the process is plainly there when the boot instant was
+        unknowable). The skip leaves the marker stream as it was: if the
+        survivor dies and a later daemon start finds neither marker nor
+        survivor, re-running errs the documented at-least-once way.
         """
         survivor = self._boot_survivor_running(name)
         if survivor is None:
@@ -11150,12 +11215,14 @@ class Cron:
     async def _process_pending_reboots(self) -> None:
         """Run each deferred @reboot job once the cluster has elected an owner.
 
-        A pending job retires only two ways: this node runs it as the
-        elected owner, or reboot_ran gossip positively confirms it ran
-        elsewhere. Never dropped because another node merely LOOKS like
-        the owner (never-lose). A name transiently absent from cron_jobs
-        stays pending; the launch is gated on presence and on still being
-        a deferrable @reboot, and always runs the CURRENT cron_jobs[name].
+        A pending job retires when this node runs it as the elected owner,
+        when reboot_ran gossip positively confirms it ran elsewhere, when a
+        manual start runs it, or when the job is disabled or its name is
+        reused for a job that is not a deferrable @reboot. Never dropped
+        because another node merely LOOKS like the owner (never-lose). A
+        name transiently absent from cron_jobs stays pending; the launch is
+        gated on presence and on still being a deferrable @reboot, and
+        always runs the CURRENT cron_jobs[name].
         A PAUSED job keeps its entry untouched on every branch: a pause
         defers the boot run, so neither the mark_reboot_ran token nor the
         entry is spent on a run the pause gate would skip.
@@ -11170,6 +11237,9 @@ class Cron:
             await self._process_pending_reboots_no_manager()
             return
         for name in list(self._pending_reboot_jobs):
+            if name not in self._pending_reboot_jobs:
+                # a manual start retired it during an earlier await
+                continue
             if name not in self.cron_jobs:
                 # transiently absent mid-reload: keep pending (never-lose);
                 # the launch below is gated on presence, so a genuinely
@@ -11179,7 +11249,7 @@ class Cron:
             if not self._is_deferrable_reboot(job) or not job.enabled:
                 # reused for a non-deferrable job, or disabled: retire the
                 # stale entry without running it.
-                del self._pending_reboot_jobs[name]
+                self._pending_reboot_jobs.pop(name, None)
                 continue
             try:
                 already_ran = mgr.reboot_ran(name)
@@ -11195,12 +11265,12 @@ class Cron:
                 continue
             if already_ran:
                 # positive confirmation -> retire without re-running.
-                del self._pending_reboot_jobs[name]
-                logger.info(
-                    "cluster: deferred @reboot job %s already ran in the "
-                    "cluster; standing down here",
-                    name,
-                )
+                if self._pending_reboot_jobs.pop(name, None) is not None:
+                    logger.info(
+                        "cluster: deferred @reboot job %s already ran in the "
+                        "cluster; standing down here",
+                        name,
+                    )
                 continue
             if self._pause_active(name) is not None:
                 # a pause DEFERS the boot run: keep pending; do not burn
@@ -11212,7 +11282,8 @@ class Cron:
             # so comparing names could make the holder fail to recognize
             # itself and never run the one-shot on any node.
             if self._cluster_allows(job):
-                del self._pending_reboot_jobs[name]
+                if self._pending_reboot_jobs.pop(name, None) is None:
+                    continue
                 if self._survivor_holds_boot_run(name):
                     # the surviving run IS the boot run: record it as ran
                     # so the cluster stands down, and skip the relaunch.
@@ -11241,6 +11312,8 @@ class Cron:
         without running.
         """
         for name in list(self._pending_reboot_jobs):
+            if name not in self._pending_reboot_jobs:
+                continue
             job = self.cron_jobs.get(name)
             if job is None:
                 continue  # transiently absent -> keep pending, re-check
@@ -11248,7 +11321,8 @@ class Cron:
                 # a pause DEFERS the boot run: keep it pending rather
                 # than retiring it unrun, and re-check next wakeup.
                 continue
-            del self._pending_reboot_jobs[name]
+            if self._pending_reboot_jobs.pop(name, None) is None:
+                continue
             # a disabled job retires without running, mirroring
             # job_should_run; enabled is checked last so a name reused
             # for a non-@reboot job short-circuits on the schedule
@@ -11273,17 +11347,20 @@ class Cron:
         mgr-is-None case.
         """
         for name in list(self._pending_reboot_jobs):
+            if name not in self._pending_reboot_jobs:
+                continue
             if name not in self.cron_jobs:
                 continue  # transiently absent -> keep pending (never-lose)
             job = self.cron_jobs[name]
             if not self._is_deferrable_reboot(job) or not job.enabled:
                 # reused or disabled -> retire without running.
-                del self._pending_reboot_jobs[name]
+                self._pending_reboot_jobs.pop(name, None)
                 continue
             if self._pause_active(name) is not None:
                 continue  # deferred by the pause; still owed
             if job.clusterPolicy == "PreferLeader":
-                del self._pending_reboot_jobs[name]
+                if self._pending_reboot_jobs.pop(name, None) is None:
+                    continue
                 if self._survivor_holds_boot_run(name):
                     continue
                 logger.info(
@@ -12668,13 +12745,13 @@ class Cron:
                     outcome = await step(name, job)
                 except Exception:  # noqa: BLE001 - degrade, never crash
                     # gather() without return_exceptions hands the first
-                    # exception to the awaiter but does NOT cancel the
-                    # siblings, so an unexpected error here used to abort
-                    # the boot tail (dag reconcile, retry re-arm, the job
-                    # API start) while the other workers kept mutating
+                    # exception to the awaiter but does not cancel the
+                    # siblings, so an unexpected error here would otherwise
+                    # abort the boot tail (dag reconcile, retry re-arm, the
+                    # job API start) while the other workers kept mutating
                     # scheduler state behind it. One bad job degrades to a
                     # logged skip, like the per-job arms inside the steps;
-                    # a sick STORE is the separate "timeout" verdict.
+                    # a sick store is the separate "timeout" verdict.
                     logger.exception(
                         "boot scan: job %s failed; skipping it", name
                     )
@@ -13303,15 +13380,14 @@ class Cron:
             info.resource_usage,
             limits=info.limits,
         )
-        # The three watermarks below ADVANCE rather than assign, for the
+        # The three watermarks below advance rather than assign, for the
         # reason last_run does (see _install_run_info): a completion can
         # land older than one already recorded. Their siblings elsewhere
-        # already fold this way (the rehydrate seeds are a max fold, and
-        # _reconcile_open_record advances _last_completed_at), so an
-        # unconditional assignment here was the odd one out: it could
-        # re-stale the SLA reference, reopen an onlyIfLastSucceeded gate a
-        # newer failure had closed, or rewind the retry ladder's
-        # supersede watermark.
+        # fold this way (the rehydrate seeds are a max fold, and
+        # _reconcile_open_record advances _last_completed_at), whereas an
+        # unconditional assignment here could re-stale the SLA reference,
+        # reopen an onlyIfLastSucceeded gate a newer failure had closed,
+        # or rewind the retry ladder's supersede watermark.
         #
         # the maxTimeSinceSuccess reference (see _sla_periodic): every
         # recorded success moves it, whatever path ran the job.
@@ -13560,10 +13636,10 @@ class Cron:
             return
         redact = job.redactArchivedSecrets
         if redact:
-            # Executor-offloaded: a pathological line must degrade THIS
-            # archive write, not stall dispatch/web/heartbeats. Patterns
-            # are linear (see cronstable.redact); this is defense in
-            # depth.
+            # Executor-offloaded, but sre keeps the GIL while it scans, so
+            # a scan stalls the event loop. Each pattern is linear and
+            # scans at most cronstable.redact.LINE_SCAN_LIMIT characters;
+            # only the PEM marker search reads a longer line.
             texts = await asyncio.get_running_loop().run_in_executor(
                 None, redact_lines, [line for _stream, line in raw]
             )
@@ -14141,16 +14217,17 @@ class Cron:
         return result if isinstance(result, str) else None
 
     async def durable_last_completed_at(self, name: str) -> str | None:
-        """The last ACTUAL-run timestamp for a job, from the durable ledger.
+        """The last actual-run timestamp for a job, from the durable ledger.
 
         durable_last_run_at's skip-blind twin, for the superseded-by-run
         guards. Folds ``ranAt`` (written on run rows only), never
         finished_at, which synthetic "skipped" rows also carry: folding
         that would let a pause settle every ladder it is only holding.
-        Pre-``ranAt`` records (finished_at only) are folded in by outcome
-        so an upgrade does not re-arm resolved ladders. Read by the claim
+        Records without ``ranAt`` (finished_at only) are folded in by
+        outcome so they do not re-arm resolved ladders. Read by the claim
         scan and the local retry rehydrate, so both paths see the same
-        truth; the deeper re-read fires only on the pre-ranAt None path.
+        truth; the deeper re-read fires only when the initial fold returns
+        None.
         """
         backend = self.state_backend
         if backend is None:
@@ -14163,9 +14240,8 @@ class Cron:
             records: list[dict[str, Any]], acc: str | None
         ) -> str | None:
             # A row with no ``ranAt`` and outcome != skipped is a real run
-            # from before ``ranAt`` existed (a pause-skip row never took that
-            # older shape); fold its finished_at, a row carrying ``ranAt`` is
-            # already in the derive_max above.
+            # carrying only finished_at; fold its finished_at, whereas a row
+            # carrying ``ranAt`` is already in the derive_max above.
             for rec in records:
                 if "ranAt" in rec or rec.get("outcome") == "skipped":
                     continue
@@ -14179,10 +14255,10 @@ class Cron:
         )
         best = _fold_pre_ranat(recs, best)
         if best is None:
-            # A pre-``ranAt`` ledger buried under RUN_HISTORY_LIMIT
+            # A ledger without ``ranAt`` buried under RUN_HISTORY_LIMIT
             # pause-skip rows folds to None and would re-arm a resolved
-            # ladder. Re-read ONCE, deeper, on this None path only; one
-            # post-upgrade real run keeps this off the steady state.
+            # ladder. Re-read once, deeper, on this None path only; one
+            # real run with ``ranAt`` keeps this off the steady state.
             deeper = max(SLA_SUCCESS_SCAN_LIMIT, self._state_max_runs)
             deep = await backend.list_records(
                 stream, limit=deeper, newest_first=True

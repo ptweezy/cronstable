@@ -36,14 +36,14 @@ from cronstable.state import (
     make_state_backend,
 )
 
-# what a backup/migration carries: the FULL durable state -- the immutable
-# records, the mutable job-state documents (idempotency keys, KV, cursors and
-# distributed-lock docs all live under docs/), the content-addressed artifact
-# payloads (blobs/), and the lease files (a lease file is its fence counter's
+# What a backup/migration carries: the full durable state, including
+# immutable records, mutable job-state documents (idempotency keys, KV,
+# cursors, and distributed-lock docs under docs/), content-addressed artifact
+# payloads (blobs/), and lease files (a lease file is its fence counter's
 # only home, so dropping it would re-issue fence values). Omitting docs/ or
 # blobs/ would silently lose idempotency/KV/cursor/lock state on restore (a
 # once-only guarded job would re-run) and orphan every artifact record (its
-# blob gone -> 410). Deliberately NOT carried: tmp/ (transient debris) and
+# blob missing, returning 410). Excluded: tmp/ (transient debris) and
 # quarantine/ (poison records; forensics stay with the source store).
 _CARRIED_DIRS = (RECORDS_DIR, DOCS_DIR, BLOBS_DIR, LEASES_DIR)
 
@@ -119,20 +119,19 @@ def cmd_backup(config_arg: str, output: str) -> int:
         )
         return 1
     count = 0
-    # The archive gets the store's own 0o600, not the default 0o644: it
-    # flattens records/docs/blobs -- captured job output, KV values,
-    # artifact payloads, exactly where secrets live -- into one file, so a
-    # world-readable archive would leak everything the store's 0o700/0o600
-    # tree keeps private.  os.open's mode only applies to a NEW file, so a
-    # pre-existing output is chmod'ed too, before any content is written.
-    # (On Windows the POSIX mode is mostly a no-op; POSIX is where the
-    # leak is.)
+    # Give the archive mode 0o600 to match the store: it flattens
+    # records/docs/blobs (captured job output, KV values, and artifact
+    # payloads where secrets live) into one file, and a world-readable
+    # archive would expose what the store's 0o700/0o600 tree keeps private.
+    # os.open's mode applies only to a new file, so chmod any pre-existing
+    # output before writing content. (On Windows the POSIX mode is mostly a
+    # no-op; POSIX is where the exposure would occur.)
     out_fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(out_fd, "wb") as out_fobj:
         os.chmod(output, 0o600)
         with tarfile.open(fileobj=out_fobj, mode="w:gz") as tar:
             for full, arcname in _walk_carried(base):
-                # Read the file fully BEFORE writing its tar header: tar.add
+                # Read the file fully before writing its tar header: tar.add
                 # streams header-then-data, so a read failing midway (a
                 # prune, a Windows sharing violation) would truncate the
                 # member and silently corrupt the whole archive. Records are
@@ -167,7 +166,7 @@ def _safe_members(
             inside = os.path.commonpath([real_dest, target]) == real_dest
         except ValueError:
             # commonpath raises on mixed drives/UNC roots (Windows): such a
-            # member cannot be inside dest -- skip it, never abort the
+            # member cannot be inside dest; skip it rather than aborting the
             # restore mid-extraction.
             continue
         if not inside:
@@ -186,14 +185,14 @@ def _lease_fence(payload: bytes) -> int | None:
 def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
     """Extract a backup archive into the configured store namespace.
 
-    Every member lands via a temp sibling + atomic replace (the same
-    pattern as :func:`cmd_migrate`), never a stream into the final path: a
-    concurrent reader of a half-written ``.json`` would see a torn record,
-    which the store QUARANTINES -- silently losing the restored record.
-    When merging into a populated store, a lease file only replaces the
-    current one if its archived fence is not older (fence-max merge): a
+    Every member lands via a temp sibling and atomic replace (the same
+    pattern as :func:`cmd_migrate`) rather than streaming into the final
+    path: a concurrent reader of a half-written ``.json`` would see a torn
+    record, which the store quarantines, silently losing the restored record.
+    When merging into a populated store, a lease file replaces the current
+    one only if its archived fence is at least as new (fence-max merge): a
     lease file is its fence counter's only home, and regressing it would
-    hand out already-issued fence values (double execution in a fleet).
+    re-issue fence values (double execution in a fleet).
     """
     backend = _load_state_backend(config_arg)
     base = backend.base
@@ -293,10 +292,10 @@ def cmd_migrate(
 
     A local directory and an Amazon S3 Files / EFS mount share one on-disk
     layout, so migration in either direction is a faithful file copy into
-    the destination namespace.  Each file lands via a temp sibling + atomic
-    rename, so a reader of the DESTINATION never observes a torn record --
-    important when cutting over to a shared mount that other nodes already
-    watch.  A POPULATED destination is refused without ``--force``: blindly
+    the destination namespace.  Each file lands via a temp sibling and atomic
+    rename so a reader of the destination never observes a torn record, which
+    matters when cutting over to a shared mount that other nodes already
+    watch.  A populated destination is refused without ``--force``: blindly
     overwriting its lease files would regress their fence counters (a
     lease file is its fence's only home) under any daemon already using
     that store.
@@ -321,7 +320,7 @@ def cmd_migrate(
     real_src = os.path.realpath(src_base)
     real_dest = os.path.realpath(dest_base)
     if real_dest == real_src or real_dest.startswith(real_src + os.sep):
-        # identical stores, or a destination nested INSIDE the source --
+        # identical stores, or a destination nested inside the source:
         # the copy walk would start finding its own output.
         print(
             "state: destination must be a store outside the source",
@@ -441,10 +440,10 @@ async def _gc_async(
         manifests, now, grace, names, hosts, art_scopes, live_dags
     )
     # artifact streams are managed only when (a) every recent manifest
-    # advertises its scopes/dags (an older node's silence proves nothing --
-    # mirrors the daemon's pass) and (b) every dagrun/<dag> namespace could
+    # advertises its scopes/dags (an older node's silence proves nothing,
+    # mirroring the daemon's pass) and (b) every dagrun/<dag> namespace could
     # be enumerated by name, so every live run's XCom scope is protectable.
-    # Run DOCUMENTS of removed dags are left to the daemon's DagScheduler,
+    # Run documents of removed dags are left to the daemon's DagScheduler,
     # which alone knows what it owns; once it deletes them, this pass
     # collects their aged streams too.
     if _manifests_cover_scopes(recent):
@@ -472,7 +471,7 @@ async def _gc_async(
         backend,
         grace,
         dry_run,
-        # dry run: collect_garbage only REPORTED these stream tokens, so
+        # dry run: collect_garbage only reported these stream tokens, so
         # their records still exist; exclude them from the reference walk
         # so the count matches what a real pass would free.
         set(result.get("removed") or []) if dry_run else set(),
@@ -491,7 +490,7 @@ async def _sweep_blobs_async(
 ) -> tuple[int, str | None]:
     """One orphan-blob sweep; ``(count, why-skipped-or-None)``.
 
-    Biased to KEEP on every doubt, exactly like the daemon's pass
+    Biased to keep on every doubt, matching the daemon's pass
     (Cron._sweep_orphan_artifact_blobs): skipped outright when any artifact
     stream is unenumerable or any record unreadable, and the backend's age
     guard keeps blobs younger than the grace.

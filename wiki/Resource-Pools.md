@@ -91,13 +91,12 @@ admitted again before its queue deadline. Commands must tolerate replay after
 a crash or loss of coordination.
 
 The lease also bounds a completion that the daemon cannot write to the
-store. The daemon keeps that completion and writes it again on its next
-passes, and it stops renewing the claim's lease. A write that lands before
-the lease lapses records the completion. Once the lease has lapsed, 30
-seconds after its last renewal, the entry returns to the queue with no
-completion recorded, and a job that has already finished can be admitted and
-run again. An entry whose queue deadline has passed by then expires and
-does not run.
+store. While retrying the write on subsequent passes, the daemon stops
+renewing the claim's lease. A write that succeeds before the lease expires
+records the completion. Once the lease expires (30 seconds after its last
+renewal), the entry returns to the queue with no completion recorded, and a
+finished job can be admitted and run again unless its queue deadline has
+already passed.
 
 Changing capacity lets existing work drain at the stored capacity before
 admission switches to the configured capacity. New enqueue requests fail

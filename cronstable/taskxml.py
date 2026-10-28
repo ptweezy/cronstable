@@ -40,12 +40,11 @@ from typing import Any, NamedTuple
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _NS = "{" + TASK_NS + "}"
 
-#: Largest export accepted, enforced on the READ rather than checked after
-#: it.  ``-`` reads standard input, and an unbounded read of a hostile
-#: stream is already resident by the time any length check could look at
-#: it.  A whole-machine export measured on a real Windows 11 box is 314 KB,
-#: so this is three orders of magnitude of headroom and exists only to stop
-#: a multi-gigabyte file, which no entity rule addresses.
+#: Largest export accepted, enforced during the read.  ``-`` reads standard
+#: input, and an unbounded read of a hostile stream would already be resident
+#: before a post-read length check could run.  A whole-machine export measured
+#: on a Windows 11 system is 314 KB, so 32 MB provides ample headroom while
+#: stopping multi-gigabyte inputs.
 MAX_DOCUMENT_BYTES = 32 * 1024 * 1024
 
 #: The year the cron engine stops searching at.  A one-shot beyond it would
@@ -60,12 +59,10 @@ _YEAR_FLOOR = 1970
 class TaskXmlError(ValueError):
     """An export could not be read (the message names the file).
 
-    Deliberately not ``config.ConfigError``, for the reason
-    :class:`cronstable.crontabs.CrontabError` is not either: importing the
-    config module here would be circular.  Unlike CrontabError, nothing
-    re-raises this as a ConfigError, because this module never runs inside
-    a config parse.  That difference is the converter-not-a-loader decision
-    showing up in the type.
+    Kept separate from ``config.ConfigError`` to avoid a circular import
+    with :mod:`cronstable.config`.  Unlike ``CrontabError``, nothing
+    re-raises this as a ``ConfigError`` because this module runs as a
+    standalone converter outside config parsing.
     """
 
 
@@ -130,7 +127,7 @@ def read_source(path: str) -> tuple[bytes, str]:
 
 
 def decode_task_xml(data: bytes, source: str) -> str:
-    """Decode an export to text, deciding the encoding from the BYTES.
+    """Decode an export to text, deciding the encoding from the bytes.
 
     Never hand these bytes to the parser directly.  expat honors an XML
     declaration only for byte input, and the declaration is routinely wrong:
@@ -175,13 +172,12 @@ def decode_task_xml(data: bytes, source: str) -> str:
 def strip_xml_declarations(text: str) -> str:
     """Remove every ``<?xml ... ?>`` run from ``text``.
 
-    Required to read the very command the migration path names.  Measured,
     ``schtasks /query /XML`` without ``ONE`` puts one declaration per task
-    inside a single ``<Tasks>`` root, and a parser stops at the second one
-    with "XML or text declaration not at start of entity".
+    inside a single ``<Tasks>`` root, and an XML parser stops at the second
+    one with "XML or text declaration not at start of entity".
 
-    Sound rather than a hack: ``<`` cannot appear literally in character
-    data, so any ``<?xml`` in the text really is a processing instruction.
+    Because ``<`` cannot appear literally in character data, any ``<?xml``
+    in the text is a processing instruction.
     """
     return re.sub(r"<\?xml[^>]*\?>", "", text)
 
@@ -189,27 +185,22 @@ def strip_xml_declarations(text: str) -> str:
 class _NoDoctype(ET.TreeBuilder):
     """A build target that refuses any DOCTYPE outright.
 
-    This is the whole XML hardening, and it is deliberately not the usual
-    list of incantations.  What is actually true, measured on this
-    interpreter rather than assumed:
+    XML hardening properties on CPython's ElementTree:
 
-    * external entities need no disabling.  ElementTree installs no expat
-      external-entity handler at all, so an external entity is simply
-      undefined and the parse fails;
-    * entity expansion (the billion-laughs class) IS the real risk, and
-      expat's own amplification cap is not ours to rely on: it belongs to
-      expat, not CPython, and a Linux build links the system expat, so
-      nothing lets us assert it across the supported interpreters;
-    * so the mitigation is refusing the DOCTYPE.  Every custom entity has
-      to be declared in the internal subset, and expat reports the start of
-      the doctype before parsing that subset, so raising here means no
-      entity is ever declared.  That is defusedxml's ``forbid_dtd`` without
-      the dependency.
+    * External entities need no disabling: ElementTree installs no expat
+      external-entity handler, so an external entity is undefined and the
+      parse fails.
+    * Entity expansion (the billion-laughs class) is the real risk, and
+      expat's own amplification cap belongs to the linked expat library,
+      which varies across Linux distributions and Python builds.
+    * Refusing the DOCTYPE prevents custom entity expansion: every custom
+      entity must be declared in the internal subset, and expat reports the
+      start of the doctype before parsing that subset, so raising here means
+      no entity is ever declared (matching ``defusedxml``'s ``forbid_dtd``
+      without the dependency).
 
-    Do not reach for defusedxml's spelling of it: ``ET.XMLParser`` has no
-    ``.parser`` attribute on current CPython, so setting a handler through
-    it is an AttributeError at run time.  The documented hook is a
-    ``TreeBuilder`` target with a ``doctype`` method, which is this.
+    ``ET.XMLParser`` has no ``.parser`` attribute on current CPython, so the
+    documented hook is a ``TreeBuilder`` target with a ``doctype`` method.
     """
 
     def doctype(self, name: str, pubid: str, system: str) -> None:
@@ -304,9 +295,8 @@ class Boundary(NamedTuple):
 def parse_boundary(text: str, where: str) -> Boundary:
     """Parse a ``StartBoundary``.
 
-    Hand-rolled rather than ``datetime.fromisoformat``, which does not
-    accept a trailing ``Z`` on the oldest interpreter this project supports,
-    and that is a live matrix row rather than a theoretical one.
+    Uses a explicit regex instead of ``datetime.fromisoformat``, which does
+    not accept a trailing ``Z`` on Python 3.10.
     """
     match = _BOUNDARY.match((text or "").strip())
     if match is None:
@@ -960,23 +950,17 @@ def lower_exec(
     """One ``Exec`` action as a command plus a working directory.
 
     Usually an argv list.  A command line carrying ``%VAR%`` comes back as
-    one STRING instead, and that is the whole reason this returns either.
-    Task Scheduler expands environment variables before it calls
-    ``CreateProcess``; cronstable expands nothing (``${VAR}`` interpolation
-    excludes ``command``, and no code here calls ``expandvars``), so an
-    argv whose first element is ``%SystemRoot%\\system32\\foo.exe`` reaches
-    ``create_subprocess_exec`` verbatim and fails with "the system cannot
-    find the file specified" on every single run.  It is not a small
-    corner: on a whole-machine export of this project's own dev box, 18 of
-    the 31 jobs that converted had one in ``argv[0]``.
+    one string instead.  Task Scheduler expands environment variables before
+    it calls ``CreateProcess``; cronstable does not expand ``%VAR%`` in
+    ``command``, so an argv whose first element is
+    ``%SystemRoot%\\system32\\foo.exe`` reaches ``create_subprocess_exec``
+    verbatim and fails with "the system cannot find the file specified" on
+    every run.  This case is common in real Task Scheduler exports.
 
     A string ``command`` with no ``shell:`` is spawned through
     :func:`asyncio.create_subprocess_shell`, which on Windows is
-    ``%ComSpec% /c``, so cmd.exe performs the expansion Task Scheduler
-    used to perform.  Emitting the string is therefore the conversion, not
-    a workaround: it keeps expansion at RUN time on the target host, where
-    baking in this machine's values at import time would be wrong for
-    every other machine in the estate.
+    ``%ComSpec% /c``, so ``cmd.exe`` performs the expansion at run time on
+    the target host.
 
     A ``%VAR%`` working directory has no such lowering (CreateProcess
     applies the cwd itself, before any shell), so it gets a blocking note.
@@ -1447,19 +1431,16 @@ def _double_quoted(text: str) -> str:
 
 
 def _scalar(value: Any, *, interpolated: bool = True) -> str:
-    """One YAML scalar, quoted the way a Windows path survives.
+    """One YAML scalar, quoted so Windows paths stay readable.
 
-    Single quotes rather than double, matching what the starter config
-    already tells users: in a double-quoted YAML string a backslash starts
-    an escape sequence, and every path here is full of them.  A value with
-    a character YAML cannot hold as written is double-quoted instead,
-    because only that style has escapes.
+    Uses single quotes by default, matching the starter config: in a
+    double-quoted YAML string a backslash starts an escape sequence, and
+    Windows paths contain backslashes.  A value with a character YAML cannot
+    hold as written is double-quoted instead, because only that style
+    supports escapes.
 
-    Hand-rolled rather than handed to strictyaml, which cannot interleave
-    the comments this emitter depends on.  What makes hand-rolling safe is
-    that every emitted document is fed back through the real config parser
-    in the tests, so a quoting mistake is a test failure and not a field
-    report.
+    Implemented directly so the emitter can interleave comments; tests feed
+    every emitted document back through the config parser to verify quoting.
     """
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -1518,16 +1499,15 @@ def _render_job(job: dict[str, Any], *, commented: bool) -> list[str]:
 def render_yaml(tasks: list[ConvertedTask], *, sources: list[str]) -> str:
     """The converted configuration, or the empty string.
 
-    The return value is either empty or a document with exactly one
-    top-level ``jobs:`` key and at least one live item.  That is not a style
-    choice, it is forced: two ``jobs:`` keys are a duplicate-key error, a
-    document of only comments is a parse error, and any unloadable file in a
-    config directory fails the load of every other file in that directory.
-    So when nothing converted, nothing is written, and the whole inventory
-    reaches the operator through the report instead.
+    The return value is either empty or a document with one top-level
+    ``jobs:`` key and at least one live item: two ``jobs:`` keys are a
+    duplicate-key error, a document of only comments is a parse error, and
+    any unloadable file in a config directory fails the load of every other
+    file in that directory.  When nothing converts, nothing is written, and
+    the full inventory reaches the operator through the report instead.
 
-    The header names the source files and nothing else.  No timestamp and no
-    version, so converting the same export twice gives the same bytes.
+    The header names only the source files, with no timestamp or version, so
+    converting the same export twice produces identical bytes.
     """
     live = [task for task in tasks if task.jobs and not task.commented]
     if not live:
@@ -1555,15 +1535,12 @@ def render_yaml(tasks: list[ConvertedTask], *, sources: list[str]) -> str:
 def report_state(task: ConvertedTask) -> str:
     """The word the report puts in front of one task's notes.
 
-    Read off what the YAML actually holds, never off whether some note is
-    blocking.  A blocking note is per TRIGGER and per ACTION while
-    ``commented`` is per task, so a task carrying a logon trigger beside a
-    daily one emits a live job AND a blocking note.  Calling that "NOT
-    CONVERTED" contradicts the job sitting live in the same file, and the
-    report is the only place an operator learns which tasks are now
-    scheduled twice, once by cronstable and once by the Task Scheduler
-    registration that exporting them leaves in place.  On a real 195-task
-    export, 11 of the 24 converted tasks were labelled that way.
+    Determined from what the YAML holds: a blocking note is per trigger and
+    per action while ``commented`` is per task, so a task carrying a logon
+    trigger beside a daily one emits a live job and a blocking note.
+    Labelling that ``PARTIAL`` tells the operator that the task is scheduled
+    both by cronstable and by the Task Scheduler registration that exporting
+    leaves in place.
     """
     if not task.jobs or task.commented:
         # Nothing emitted, or emitted commented out under these same two
@@ -1640,19 +1617,11 @@ def convert_source(
                 convert_task(document, label, fallback, timezone=timezone)
             )
         except ValueError as ex:
-            # Every other thing a task can get wrong is already a Note, so
-            # one unreadable duration or timestamp should be one too.  It
-            # was the single exception, and an expensive one: the raise
-            # reached dispatch, which printed one line and wrote no YAML
-            # at all, so `P1M` in the 34th of 195 tasks cost the other
-            # 194.  A whole-machine export is exactly where such a task
-            # turns up, and hand-editing the export was the only recourse.
-            #
-            # ValueError rather than TaskXmlError, which subclasses it:
-            # lower_settings and the calendar triggers reach a bare int()
-            # on Priority, DaysInterval and WeeksInterval, and catching
-            # only the module's own error would leave those three aborting
-            # the whole export with a traceback.
+            # Record an unreadable duration, timestamp, or integer setting as
+            # a blocking Note on this task so the remaining tasks in the
+            # export still convert.  Catches ValueError (the base class of
+            # TaskXmlError) because lower_settings and the calendar triggers
+            # also call int() on Priority, DaysInterval, and WeeksInterval.
             failed = task_label(document, fallback)
             reason = (
                 str(ex)

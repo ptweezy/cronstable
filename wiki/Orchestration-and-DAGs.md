@@ -207,20 +207,17 @@ The empty fan-out is reserved for a *definitive* answer:
 
 A warning names each mapping-to-empty that indicates a problem.
 
-A version that a peer's publish removed from the scope is not store trouble
-for this read. The read lists the scope again, up to three more times, when
-a version that it listed has left the store. For that cause the task stays
-unexpanded only when versions keep leaving during every one of those reads,
-and the scheduler then logs
+If a concurrent publish by a peer removes a listed version from the scope,
+the scheduler does not immediately treat it as a store error. Instead, it
+re-lists the scope up to three times. The task stays unexpanded for this
+reason only if versions disappear during every retry, in which case the
+scheduler logs
 `dag <name>: xcom '<key>' from '<task>' could not be read (stream
 '<stream>': records kept leaving during the read); leaving the task
-unexpanded to retry`. On a mount whose client serves directory reads from a
-cache, the scope's directory read comes back with the same entries, and the
-read answers from it: the task expands from the version of the key that the
-read found, or to an empty fan-out when the read found no version of the
-key. On such a mount an empty fan-out can therefore also come from a cached
-directory read that lacks the key's current version. See
-[artifact store](Durable-State#artifact-store) for these reads.
+unexpanded to retry`. On a mount that caches directory listings, the
+directory read returns the cached entries: the task expands from the version
+found in the cache, or to an empty fan-out if the cached listing lacks the
+key. See [artifact store](Durable-State#artifact-store) for details.
 
 A fan-out is capped at **1000 items**. A larger XCom list fails the mapped task
 with an explanatory reason instead of materializing that many instances (its
@@ -307,7 +304,7 @@ the same request creates the rest. See
 
 ## Crash-resume and the fleet
 
-The durable per-task state, not memory, is the source of truth. A dag_run is
+Durable per-task state is the source of truth. A dag_run is
 advanced only by the node holding that run's **advance lease**, a
 time-to-live (TTL) lease on the shared store renewed while the run is active,
 so in a healthy fleet only one node advances a given run and a task does not
@@ -317,19 +314,19 @@ atomic compare-and-set on the run document, a correctness backstop underneath
 the lease.
 
 The owner also keeps an in-memory record of every task instance it claimed
-and was handed to launch. A store write that lands after the owner's own
-timeout stopped waiting for it (a stalled disk or network mount) leaves the
-task claimed with nothing launched. On its next pass the owner recognizes
-that claim, because the record has no entry for it, releases the task back
-to `pending` (a sensor back to its idle shape between pokes) and re-claims it
-at once. Nothing ran, so the task's attempt count is unchanged. A launch the
-owner cancels before its subprocess starts (a `state` section reload while
-the task waits behind the spawn gate) is released the same way. So is the
-launch of a task with [`resourceLimits`](Resource-Limits) that is canceled
-while its process joins its cgroup or Job Object, once cronstable has killed
-that process. Either way, a pooled task gives back its pool slot. The
-record forgets a run once the store shows it finished or collected,
-whichever node finished it.
+and queued for launch. If a store write lands after the owner's timeout
+expires (for example, on a stalled disk or network mount), the task is marked
+claimed in the store without a running process. On its next pass, the owner
+sees that the claim has no in-memory launch entry, releases the task back to
+`pending` (or returns a sensor to its idle state between pokes), and
+immediately re-claims it without incrementing the attempt count. The same
+release happens when the owner cancels a launch before the subprocess starts
+(such as during a `state` reload while the task waits at the spawn gate), or
+when a task with [`resourceLimits`](Resource-Limits) is canceled while
+joining its cgroup or Job Object after cronstable kills the process. In all
+of these cases, a pooled task returns its pool slot. The owner removes a run
+from its in-memory record once the store shows the run is finished or
+collected by any node.
 
 If a node crashes, its lease lapses and a peer adopts the run, reconciling from
 the durable state:

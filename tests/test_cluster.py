@@ -5030,6 +5030,34 @@ def test_parse_job_summaries_hostile_fields_degrade_not_poison():
     }
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "kept"),
+    [
+        (2**63 - 1, True),
+        (-(2**63), True),
+        (2**63, False),
+        (-(2**63) - 1, False),
+    ],
+)
+def test_parse_job_summaries_drops_exit_codes_outside_64_bits(exit_code, kept):
+    # a generated client reads exit_code into a 64-bit integer, so one past
+    # that range would make it discard the whole /fleet answer
+    from cronstable.cluster import _parse_job_summaries
+
+    parsed = _parse_job_summaries(
+        {
+            "j": {
+                "last": {
+                    "outcome": "failure",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "exit_code": exit_code,
+                }
+            }
+        }
+    )
+    assert parsed["j"]["last"]["exit_code"] == (exit_code if kept else None)
+
+
 @pytest.mark.parametrize("outcome", [[], {}, ["success"], 1, True, None])
 def test_parse_job_summaries_drops_nonstring_outcomes(outcome):
     from cronstable.cluster import _parse_job_summaries
@@ -5131,6 +5159,16 @@ def test_parse_node_stats_drops_nonfinite_and_bools():
         }
     )
     assert parsed == {"mem_used_bytes": 1234.0}
+
+
+@pytest.mark.parametrize("value", [1e20, 2**63, -1e20])
+def test_parse_node_stats_drops_cpu_counts_outside_64_bits(value):
+    # a finite float past the 64-bit range becomes an integer no generated
+    # client can decode, which would discard the whole /cluster answer
+    from cronstable.cluster import _parse_node_stats
+
+    parsed = _parse_node_stats({"cpu_count": value, "mem_percent": 12.5})
+    assert parsed == {"mem_percent": 12.5}
 
 
 @pytest.mark.parametrize("value", [10**400, -(10**400)])
@@ -6489,6 +6527,26 @@ async def test_observe_peer_rejects_bad_cluster_size(tmp_path):
     peer = mgr.view.peers[host]
     assert peer.status == STATUS_UNREACHABLE
     assert "cluster_size is not a positive" in peer.last_error
+
+
+async def test_observe_peer_rejects_cluster_size_outside_64_bits(tmp_path):
+    # a generated client reads cluster_size into a 64-bit integer, so one
+    # past that range would make it discard the whole /cluster answer
+    tls = _write_tls(tmp_path)
+    host = "peer-x:9000"
+    mgr = _mgr(
+        [host],
+        job_set="v1:same",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
+    )
+    body = _observe_body(cluster_size=2**63)
+    resp = _CovFakeResp(200, body, {"ETag": '"e"'})
+    await mgr._observe_peer(_CovFakeSession(resp), host, "v1:same")
+    peer = mgr.view.peers[host]
+    assert peer.status == STATUS_UNREACHABLE
+    assert "cluster_size is not a positive 64-bit integer" in peer.last_error
+    assert 2**63 not in mgr.conflicting_sizes()
 
 
 async def test_observe_peer_rejects_non_bool_elect_leader(tmp_path):

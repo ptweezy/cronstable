@@ -2919,6 +2919,140 @@ def test_webloop_tail_payload_with_cursor():
     assert len(payload["lines"]) == 3
 
 
+def _tail_lines(payload):
+    return [entry["line"] for entry in payload["lines"]]
+
+
+def _published(out, first, stop):
+    for i in range(first, stop):
+        out.publish("stdout", "line{}".format(i))
+
+
+def test_webloop_tail_payload_cursor_counts_lines_not_ring_slots():
+    # the ring keeps 5 lines; the cursor is the run's absolute line count,
+    # so a full ring does not pin it at 5.
+    out = JobOutputStream(limit=5)
+    _published(out, 0, 12)
+    payload = cronstable.cron.Cron._tail_payload(out, 3, None)
+    assert _tail_lines(payload) == ["line9", "line10", "line11"]
+    assert payload["cursor"] == 12
+    assert payload["truncated"] is True
+
+
+def test_webloop_tail_payload_cursor_polls_past_a_full_ring():
+    out = JobOutputStream(limit=5)
+    _published(out, 0, 5)
+    first = cronstable.cron.Cron._tail_payload(out, 10, None)
+    assert first["cursor"] == 5
+    # the ring is full, so these three rotate the oldest lines out.
+    _published(out, 5, 8)
+    second = cronstable.cron.Cron._tail_payload(out, 10, first["cursor"])
+    assert _tail_lines(second) == ["line5", "line6", "line7"]
+    assert second["cursor"] == 8
+    assert second["skipped"] == 0
+    assert second["reset"] is False
+    # nothing new: an empty page that keeps the cursor.
+    third = cronstable.cron.Cron._tail_payload(out, 10, second["cursor"])
+    assert third["lines"] == []
+    assert third["cursor"] == 8
+
+
+def test_webloop_tail_payload_reports_lines_the_ring_dropped():
+    out = JobOutputStream(limit=5)
+    _published(out, 0, 2)
+    # lines 2 to 4 rotate out before the next poll.
+    _published(out, 2, 10)
+    payload = cronstable.cron.Cron._tail_payload(out, 10, 2)
+    assert _tail_lines(payload) == [
+        "line5",
+        "line6",
+        "line7",
+        "line8",
+        "line9",
+    ]
+    assert payload["skipped"] == 3
+    assert payload["cursor"] == 10
+
+
+def test_webloop_tail_payload_resets_a_cursor_from_another_run():
+    # a cursor past everything this buffer has published came from an
+    # earlier run: start over at this run's oldest retained line.
+    out = JobOutputStream(limit=5)
+    _published(out, 0, 3)
+    payload = cronstable.cron.Cron._tail_payload(out, 10, 40)
+    assert _tail_lines(payload) == ["line0", "line1", "line2"]
+    assert payload["reset"] is True
+    assert payload["cursor"] == 3
+
+
+def test_webloop_job_logs_tail_payload_names_the_run():
+    from types import SimpleNamespace
+
+    cron = _cron(TWO_JOBS)
+    started = DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC)
+    out = JobOutputStream()
+    out.publish("stdout", "hello\n")
+    cron.running_jobs["alpha"] = [
+        SimpleNamespace(output=out, started_at=started)
+    ]
+    payload = cron.job_logs_tail_payload("alpha", tail=10)
+    # a client compares started_at between polls to see a new run begin.
+    assert payload["started_at"] == started.isoformat()
+    assert payload["running"] is True
+    # a job that has not run yet has no run to name.
+    assert cron.job_logs_tail_payload("beta", tail=10)["started_at"] is None
+
+
+def test_webloop_job_logs_tail_payload_falls_back_to_an_older_overlap():
+    from types import SimpleNamespace
+
+    cron = _cron(TWO_JOBS)
+    older = SimpleNamespace(
+        output=JobOutputStream(), started_at=DT(2000, 1, 1, tzinfo=UTC)
+    )
+    newer = SimpleNamespace(
+        output=JobOutputStream(), started_at=DT(2000, 1, 2, tzinfo=UTC)
+    )
+    cron.running_jobs["alpha"] = [older, newer]
+    payload = cron.job_logs_tail_payload("alpha", tail=10)
+    assert payload["started_at"] == newer.started_at.isoformat()
+    # the newer run ends first: the page switches back to the older run,
+    # which the poller sees as a different started_at.
+    cron.running_jobs["alpha"] = [older]
+    payload = cron.job_logs_tail_payload("alpha", tail=10)
+    assert payload["started_at"] == older.started_at.isoformat()
+
+
+def test_webloop_dag_task_logs_tail_payload_tracks_the_instance():
+    from types import SimpleNamespace
+
+    cron = _cron(_DAG_LOGS_YAML)
+    started = DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC)
+    out = JobOutputStream()
+    _published(out, 0, 3)
+    cron.running_jobs["lin.a"] = [
+        SimpleNamespace(
+            output=out,
+            started_at=started,
+            dag_ref=SimpleNamespace(run_key="rk", taskkey="a"),
+        )
+    ]
+    payload = cron.dag_task_logs_tail_payload("lin", "rk", "a", tail=10)
+    assert _tail_lines(payload) == ["line0", "line1", "line2"]
+    assert payload["running"] is True
+    assert payload["started_at"] == started.isoformat()
+    # the instance ends and its lines go with it: the old cursor is past
+    # everything, and running tells a finished task from another run.
+    del cron.running_jobs["lin.a"]
+    ended = cron.dag_task_logs_tail_payload(
+        "lin", "rk", "a", tail=10, cursor=payload["cursor"]
+    )
+    assert ended["lines"] == []
+    assert ended["reset"] is True
+    assert ended["running"] is False
+    assert ended["started_at"] is None
+
+
 async def test_webloop_pump_output_handles_disconnect():
     from types import SimpleNamespace
 

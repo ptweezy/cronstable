@@ -25,7 +25,7 @@ and requires no additional dependencies.
 The TUI requires an interactive terminal. If stdin or stdout is not a tty
 (for example, when piped or redirected), it prints `cronstable tui
 needs an interactive terminal (stdin/stdout are not a tty)` to stderr
-and exiting with code 2. On Windows it turns on the console's ANSI/VT
+and exits with code 2. On Windows it turns on the console's ANSI/VT
 processing itself, so a stock Command Prompt or PowerShell window works.
 It reads key events from the console, so a character outside the Basic
 Multilingual Plane, such as an emoji, and a character composed with
@@ -129,7 +129,7 @@ The TUI includes:
 - The **fuzzy command palette**, with the same global, per-job, and
   per-DAG (directed acyclic graph) actions.
 - The **verdict bar** and **incident timeline**, with the same
-  failure-correlation logic ("×4 share exit code 69 — may share a cause").
+  failure-correlation logic (`×4 share exit code 69 — may share a cause`).
   The **job actions panel** has staggered bulk start/cancel, **stop sending**,
   and a Markdown **incident writeup**, copied to the clipboard and saved
   to `~/cronstable-incident-<YYYYmmdd-HHMMSS>.md`. If the file write
@@ -266,7 +266,7 @@ footer shows.
 The panel has thirteen rows. **Theme**, **Light / dark**, **Color
 vision**, and **ASCII glyphs** are the
 [themes and accessibility](#themes-and-accessibility) settings described
-earlier. **Refresh interval** is the `--poll` cadence, 1s–10s or paused.
+earlier. **Refresh interval** is the `--poll` cadence, 1s to 10s or paused.
 **Wrap log lines** and **Log timestamps** are the **Logs** tab's `w`/`t`
 toggles. **Audible cues (bell)** is off by default. **Startup checks**
 turns the boot self-test on or off (also in the palette as "Toggle
@@ -327,19 +327,18 @@ the TUI takes every later key as pasted text, so `q`, `Esc`, and
 ends the paste and quits the TUI. A pasted `Ctrl-C` character that
 follows such a pause quits the TUI too.
 
-The Windows console marks no paste, so a pasted line break, tab, or
-escape arrives as `Enter`, `Tab`, or `Esc`. When a key takes the focus
-out of a text field and more keys reached the TUI together with it, the
-TUI drops those keys as the rest of a paste. `Enter`, `Tab` in the
-filter, and `Esc` take the focus out of a field. A key that leaves the
-field focused drops nothing: after `Tab` in the command palette, or
-`Enter` there with no match, the keys behind it are typed into the
-field. Keys that arrive on their own act as typed. When the console
-delivers a paste in more than one piece, the TUI drops only the rest of
-the piece that holds the key that left the field, and the later pieces
-act as typed keys. A paste with no text field focused acts as typed
-keys too. While the TUI is busy, a key typed right after a key that
-leaves a field can reach the TUI together with it and is then dropped.
+The Windows console does not support bracketed paste, so a pasted line
+break, tab, or escape arrives as `Enter`, `Tab`, or `Esc`. When one of
+those keys moves focus out of a text field (`Enter`, `Esc`, or `Tab` in
+the filter) and additional keys arrive in the same console read batch,
+the TUI drops the remaining keys in that batch as the rest of a paste.
+Keys that leave the field focused (such as `Tab` in the command palette,
+or `Enter` there with no match) do not drop subsequent keys. If the
+console delivers a paste across multiple batches, only the remainder of
+the batch that exited the field is dropped; later batches, or pastes when
+no text field is focused, are processed as typed keys. If a key is typed
+immediately after a field-exiting key while the TUI is busy, both can
+arrive in the same batch and the second key is dropped.
 
 ## Authentication
 
@@ -366,7 +365,7 @@ apply to a native client, so no extra configuration is needed.
 ## What it polls
 
 The endpoints and cadence model match the web page's: `GET /jobs` on
-the refresh interval (1s–10s or paused, default 3s), with `/cluster`
+the refresh interval (1s to 10s or paused, default 3s), with `/cluster`
 and `/node` riding each successful poll. `/fleet`, `/state`,
 and the heatmap's one-request `/activity` batch are polled only while
 their panels are open, with the per-job `/jobs/{name}/runs` fan-out kept

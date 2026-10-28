@@ -203,8 +203,8 @@ jobs:
     concurrencyScope: cluster
 ```
 
-`concurrencyScope: node` (the default) is the classic behavior described
-earlier: only this process's running instances are considered.
+`concurrencyScope: node` (the default) considers only this process's running
+instances, as described earlier.
 `concurrencyScope: cluster` makes `Forbid` and `Replace` also exclude
 instances of the job on other nodes sharing the `state` store. The local
 check still runs first and is unchanged, and the cluster gate is additive. It
@@ -264,7 +264,7 @@ request times out.
   launch claims in the new store.
 
 Manual starts through the [HTTP control API](HTTP-API) go through the same
-gate, consistent with the local behavior: a manual start was already subject
+gate, consistent with the local behavior: a manual start is also subject
 to a node-local `Forbid`.
 
 ### Forbid across the cluster

@@ -147,12 +147,10 @@ def _error_frame(out: Any, msg_id: Any, code: int, message: str) -> None:
 
 def _run_bridge(args: argparse.Namespace) -> int:
     try:
-        # Built once, before the read loop rather than per frame: an SSL
-        # context parses the CA and the client key off disk, which has no
-        # business on a path walked once per JSON-RPC message. Unusable
-        # material is fatal here instead of an error frame per request,
-        # because nothing about a bad path improves mid-session. The same
-        # goes for a token that no header can carry.
+        # Build once before the read loop so the SSL context parses the CA
+        # and client key from disk a single time instead of on every JSON-RPC
+        # frame. Unusable TLS material or an invalid header token fails
+        # immediately here because neither recovers mid-session.
         token = webclient.resolve_token(args)
         opener = webclient.build_opener(webclient.resolve_tls(args))
     except webclient.ClientError as ex:
@@ -333,9 +331,8 @@ def _check(args: argparse.Namespace) -> int:
     when the daemon does not answer it, then counts ``tools/list``.
     """
     try:
-        # Same one-shot build as the bridge, and the same reasoning: a --check
-        # that cannot even assemble its token or TLS material has failed, so
-        # say so once here rather than twice through the later round-trips.
+        # Build token and TLS opener once up front so invalid credentials
+        # fail immediately before sending any probe requests.
         token = webclient.resolve_token(args)
         opener = webclient.build_opener(webclient.resolve_tls(args))
     except webclient.ClientError as ex:

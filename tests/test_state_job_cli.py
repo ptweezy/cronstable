@@ -23,6 +23,7 @@ import urllib.request
 import pytest
 
 from cronstable import jobcli, webclient
+from tests._helpers import LoopbackHTTPServer
 
 
 class _FakeHTTP:
@@ -929,7 +930,7 @@ def test_3xx_that_names_no_target_from_a_real_server_is_an_error(
             pass
 
     monkeypatch.delenv(jobcli.ENV_CACERT, raising=False)
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Moved)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), _Moved)
     # a short poll, so that shutdown returns at once
     thread = threading.Thread(
         target=server.serve_forever, args=(0.01,), daemon=True

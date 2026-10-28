@@ -13,22 +13,21 @@ updated.)
 
 cronstable's source code is released under the MIT License (see
 [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md)). The MIT License grants
-broad rights over the *code*: use, modification, and redistribution. It does
-**not** grant any right to use the cronstable name or logo as a trademark.
-Copyright and trademark are separate bodies of law: you keep every freedom the
-MIT License gives you over the source while the name and logo stay protected.
+broad rights to use, modify, and redistribute the code; it does **not** grant
+any right to use the cronstable name or logo as a trademark. Copyright and
+trademark are separate bodies of law, so you keep every freedom the MIT License
+gives you over the source while the name and logo remain protected.
 
 ## The artwork is reserved separately
 
-Trademark and copyright protect different things here. Trademark protects the
-**mark**: the name and the logo as identifiers that tell you where the software
-came from. Copyright protects the **artwork**: the specific rendered image
-files. So the logo is held back twice over, and the rendered logo files are also
-excluded from the MIT grant. The exact list is in the brand assets section of
-[LICENSING.md](LICENSING.md).
+Trademark law protects the **mark** (the name and logo as identifiers of the
+software's origin), while copyright law protects the **artwork** (the rendered
+image files). Those rendered logo files are also excluded from the MIT grant;
+see [Brand assets in LICENSING.md](LICENSING.md#brand-assets) for the file
+list.
 
-The code that *draws* the logo stays MIT, like the rest of the source. The mark
-it produces is still a mark.
+The simulation code that draws the logo remains under the MIT License, while
+the mark it produces remains a trademark.
 
 ## What you may do without asking
 
@@ -48,9 +47,9 @@ it produces is still a mark.
 - Any use that suggests affiliation with, or endorsement by, the cronstable
   authors where there is none.
 
-If you distribute a modified version, please give it a distinct name and logo
-and make clear it is a derivative that the cronstable authors do not endorse.
-This mirrors how cronstable itself is a renamed derivative of
+If you distribute a modified version, give it a distinct name and logo and
+state clearly that the cronstable authors do not endorse it. This mirrors how
+cronstable itself is a renamed derivative of
 [yacron](https://github.com/gjcarneiro/yacron): a distinct name, its own
 branding, and an upfront disclosure of the lineage.
 

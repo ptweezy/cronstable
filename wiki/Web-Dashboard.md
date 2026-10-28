@@ -269,7 +269,7 @@ cell, and the drawer header repeats the live readings while the job runs.
 The Schedule tab turns the cron expression into a plain-English reading:
 
 - a **plain-English description** (for example, *"At 19:27, on Monday and Friday"*), understanding ranges, steps, lists, names, and the `@daily`/`@hourly`/`@reboot` macros;
-- a preview of the **next run times**, computed live in the browser and shown in the job's own [time zone](Schedules-and-Timezones) (UTC or an arbitrary IANA zone such as `America/Los_Angeles`; a `utc: false` job is shown in the browser's local zone, labeled "server local — approximate"), each with a relative countdown;
+- a preview of the **next run times**, computed live in the browser and shown in the job's own [time zone](Schedules-and-Timezones) (UTC or an arbitrary IANA zone such as `America/Los_Angeles`; a `utc: false` job is shown in the browser's local zone, labeled `server local — approximate`), each with a relative countdown;
 - impossible schedules (such as the 31st of February) are detected and called out rather than described as if they will fire;
 - a key/value summary of whether the job is enabled, its time zone frame, a concurrency note, and its command.
 
@@ -344,9 +344,10 @@ splits into sub-tabs built from what the store holds:
   [state inspector endpoints](HTTP-API#state-inspector-endpoints)
   (`GET /state/documents` / `GET /state/records`).
 
-The inspector shows **metadata only**, including value types and sizes. It
-does not fetch record payloads, KV values, or archived output. After the
-startup probe, it polls only while open.
+A KV entry shows its value's type and size, never the value. **inspect** on
+a cursor tab shows each stored watermark, and on a record tab it shows the
+scope's newest records in full, as JSON. The inspector never fetches
+archived output. After the startup probe, it polls only while open.
 
 ## Cluster panel
 
@@ -627,7 +628,7 @@ Both read the daemon's in-memory history, which bounds the card's horizon.
 The **`▥ schedule load`** toolbar button (or *Toggle schedule load* in the
 palette) shows upcoming scheduled runs over the next 24
 hours, fetched from [`/schedule/pressure`](HTTP-API#get-schedulepressure)
-using the server’s scheduling engine. The card shows
+using the server's scheduling engine. The card shows
 the hour-by-minute collision grid (hot cells highlighted), the minute-of-hour
 histogram, the fleet's
 [duplicate-schedule groups](Duplicate-Schedule-Detection) as clickable job
@@ -656,7 +657,7 @@ expressions. The same engine powers the dashboard's schedule advisories
 
 The daemon keeps at most the last 50 runs per job in memory. The opt-in **browser run
 history** (a Settings toggle, or *Toggle browser run history* in the palette) extends
-that horizon in your browser: while a tab is open it saves each job’s latest
+that horizon in your browser: while a tab is open it saves each job's latest
 completed run at every refresh, computes robust per-job duration baselines
 (median plus deviation over successful runs), and flags runs that are
 unusually slow with a `◱ slow` chip on the job row. Settings shows the storage
@@ -858,7 +859,7 @@ allowed to do, and draws only the controls that scope covers. With every scope,
 or against a daemon with no authentication configured, it draws the full
 interface. It asks again on the first good poll after a lost connection and
 on the first good poll a minute or more after the last read, and redraws
-only when the scopes changed. A daemon reload or restart that changes
+only when the scopes change. A daemon reload or restart that changes
 the token's scopes or the [badge settings](Status-Badges#configuration)
 therefore reaches an open page within about a minute, without a page reload.
 

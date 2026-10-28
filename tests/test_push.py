@@ -22,6 +22,7 @@ them on any cell without the wheel; never reintroduce one.
 import asyncio
 import base64
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -542,6 +543,243 @@ def test_collapse_id_salt_defeats_wordlist_precomputation():
     # install), so ids must differ salt-to-salt.
     a = push.build_payload(_FakeJobCtx(run_id=None), False, True)
     assert push.collapse_id(a, "s1") != push.collapse_id(a, "s2")
+
+
+def test_collapse_id_keeps_its_hash_layout():
+    # collapse_id hashes through the shared _keyed_id helper.  The
+    # relay's dedup rows and every in-flight id depend on the exact
+    # bytes, so this pins them without going through the helper.
+    payload = push.build_payload(_FakeJobCtx(), False, True)
+    blob = json.dumps(
+        {"kind": "failure", "name": "backup", "run_id": "run-123"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = hashlib.sha256(b"s1\x00" + blob.encode("utf-8")).hexdigest()
+    assert push.collapse_id(payload, "s1") == expected[:32]
+
+
+def _event_payload(event, name, **fields):
+    ctx = NotifyEventContext(
+        event=event,
+        success=False,
+        name=name,
+        subject="subject",
+        message="message",
+        fields=fields,
+    )
+    return push.build_payload(ctx, False, True)
+
+
+def _sla_payload(check):
+    job_config = parse_config_string(
+        'jobs:\n  - name: backup\n    command: "true"\n'
+        '    schedule: "* * * * *"\n',
+        "",
+    ).jobs[0]
+    from cronstable.job import SlaBreachContext
+
+    ctx = SlaBreachContext(
+        job_config, check=check, threshold_seconds=60.0, observed_seconds=90.0
+    )
+    return push.build_payload(ctx, False, True)
+
+
+def test_flap_id_is_stable_across_runs_of_one_job():
+    # The job API mints a fresh run_id per launch, so a job failing in a
+    # loop gets a new collapse id every run; the flap id must not move.
+    runs = [
+        push.build_payload(_FakeJobCtx(run_id=run_id), False, True)
+        for run_id in ("run-123", "run-456", None)
+    ]
+    collapses = {push.collapse_id(p, "s1") for p in runs}
+    flaps = {push.flap_id(p, "s1") for p in runs}
+    assert len(collapses) == 3
+    assert len(flaps) == 1
+
+
+def test_flap_id_keeps_failure_and_success_of_one_job_apart():
+    # A job with an onSuccess push that runs every minute must not spend
+    # the flap budget its failure pages need: success and failure take
+    # separate keys, and a failure loop still shares one (see above).
+    failed = push.build_payload(_FakeJobCtx(run_id="run-1"), False, True)
+    recovered = push.build_payload(
+        _FakeJobCtx(
+            run_id="run-2", success=True, fail_reason=None, exit_code=0
+        ),
+        True,
+        True,
+    )
+    assert failed["kind"] == "failure" and recovered["kind"] == "success"
+    assert push.flap_id(failed, "s1") != push.flap_id(recovered, "s1")
+
+
+def test_flap_id_keeps_each_host_of_a_job_apart():
+    # An EveryNode job runs on every node, and node-b failing is a
+    # separate problem from node-a failing: each host gets its own flap
+    # key.  The collapse id leaves host out, so one run reported by
+    # several nodes still coalesces.
+    on_a = push.build_payload(_FakeJobCtx(host="node-a"), False, True)
+    on_b = push.build_payload(_FakeJobCtx(host="node-b"), False, True)
+    assert push.collapse_id(on_a, "s1") == push.collapse_id(on_b, "s1")
+    assert push.flap_id(on_a, "s1") != push.flap_id(on_b, "s1")
+
+    late_a = dict(_sla_payload("lateAfter"), host="node-a")
+    late_b = dict(late_a, host="node-b")
+    assert push.collapse_id(late_a, "s1") == push.collapse_id(late_b, "s1")
+    assert push.flap_id(late_a, "s1") != push.flap_id(late_b, "s1")
+
+    # A DAG runs on whichever node leads, so its events keep one key.
+    failed_a = dict(
+        _event_payload(
+            "dag_failure", "etl", dag="etl", run_key="manual-9", run_id="r2"
+        ),
+        host="node-a",
+    )
+    failed_b = dict(failed_a, host="node-b")
+    assert push.flap_id(failed_a, "s1") == push.flap_id(failed_b, "s1")
+
+
+def test_flap_id_keys_job_runs_and_sla_breaches_on_the_cluster_node():
+    # Nodes built from one container image can all report the hostname
+    # `cronstable`, and such a cluster sets a distinct nodeName per node.
+    # The flap key follows nodeName, so each node of an EveryNode job
+    # keeps its own flap budget.
+    failed = push.build_payload(_FakeJobCtx(host="cronstable"), False, True)
+    assert push.flap_id(failed, "s1", node="a") != push.flap_id(
+        failed, "s1", node="b"
+    )
+    late = dict(_sla_payload("lateAfter"), host="cronstable")
+    assert push.flap_id(late, "s1", node="a") != push.flap_id(
+        late, "s1", node="b"
+    )
+    # The node name takes the hostname's place rather than joining it: a
+    # node keeps its key whatever hostname it reports, and the default
+    # nodeName (the hostname) keys exactly as a standalone daemon does.
+    moved = dict(failed, host="elsewhere")
+    assert push.flap_id(failed, "s1", node="a") == push.flap_id(
+        moved, "s1", node="a"
+    )
+    assert push.flap_id(failed, "s1", node="cronstable") == push.flap_id(
+        failed, "s1"
+    )
+    # Events keep one key across nodes whatever the node is called.
+    dag_failed = _event_payload(
+        "dag_failure", "etl", dag="etl", run_key="manual-9", run_id="r2"
+    )
+    assert push.flap_id(dag_failed, "s1", node="a") == push.flap_id(
+        dag_failed, "s1", node="b"
+    )
+
+
+def test_flap_id_of_a_standalone_daemon_keys_on_the_hostname():
+    # Without a cluster node name, the payload's host is the node.
+    failed = push.build_payload(_FakeJobCtx(host="node-a"), False, True)
+    on_b = dict(failed, host="node-b")
+    assert push.flap_id(failed, "s1", node=None) == push.flap_id(
+        failed, "s1"
+    )
+    assert push.flap_id(failed, "s1", node=None) != push.flap_id(
+        on_b, "s1", node=None
+    )
+
+
+def test_flap_id_differs_between_jobs():
+    a = push.build_payload(_FakeJobCtx(name="backup"), False, True)
+    b = push.build_payload(_FakeJobCtx(name="restore"), False, True)
+    assert push.flap_id(a, "s1") != push.flap_id(b, "s1")
+
+
+def test_flap_id_is_domain_separated_from_collapse_id():
+    # A quorum loss, a leadership change, and a job run with no run_id or
+    # host carry the same fields in both identities: only the domain
+    # keeps the two ids apart.
+    hostless = push.build_payload(_FakeJobCtx(run_id=None), False, True)
+    del hostless["host"]
+    payloads = [
+        hostless,
+        _event_payload("quorum_loss", "node-a", quorate=False),
+        _event_payload(
+            "leader_change", "node-a", role="leader", leader="node-a"
+        ),
+    ]
+    for payload in payloads:
+        flap = push.flap_id(payload, "s1")
+        assert flap is not None
+        assert flap != push.collapse_id(payload, "s1")
+        assert len(flap) == 32
+        assert flap == flap.lower()
+        int(flap, 16)
+
+
+def test_flap_id_depends_on_the_salt():
+    # Same wordlist argument as the collapse id: kind + name alone is
+    # low entropy.
+    a = push.build_payload(_FakeJobCtx(), False, True)
+    assert push.flap_id(a, "s1") != push.flap_id(a, "s2")
+
+
+def test_flap_id_keeps_alert_families_and_sla_checks_apart():
+    failure = push.build_payload(_FakeJobCtx(), False, True)
+    late = _sla_payload("lateAfter")
+    slow = _sla_payload("maxRuntime")
+    assert failure["name"] == late["name"] == "backup"
+    ids = {push.flap_id(p, "s1") for p in (failure, late, slow)}
+    assert len(ids) == 3
+
+
+def test_flap_id_drops_dag_run_fields():
+    # run_key and run_id name one DAG run, so a DAG failing in a loop
+    # keeps one key across runs.
+    failed = [
+        _event_payload("dag_failure", "etl", dag="etl", run_key=k, run_id=i)
+        for k, i in (("2026-10-16T00_00_00+00_00", "r1"), ("manual-9", "r2"))
+    ]
+    assert push.collapse_id(failed[0], "s1") != push.collapse_id(
+        failed[1], "s1"
+    )
+    assert push.flap_id(failed[0], "s1") == push.flap_id(failed[1], "s1")
+    other = _event_payload(
+        "dag_failure", "load", dag="load", run_key="manual-9", run_id="r3"
+    )
+    assert push.flap_id(failed[0], "s1") != push.flap_id(other, "s1")
+
+
+def test_approval_gates_have_no_flap_id():
+    # Each gate is a one-shot request for a decision that the daemon
+    # notifies once, so no gate may count toward another's suppression.
+    # The collapse id still names each run's gate.
+    def gate(run_key, run_id, taskkey):
+        return _event_payload(
+            "approval_waiting",
+            "etl",
+            dag="etl",
+            run_key=run_key,
+            run_id=run_id,
+            taskkey=taskkey,
+        )
+
+    gates = [
+        gate("2026-10-16T00_00_00+00_00", "r1", "approve"),
+        gate("manual-0a1b2c3d4e5f", "r2", "approve"),
+        gate("2026-10-16T00_00_00+00_00", "r1", "approve#1"),
+    ]
+    assert all(push.flap_id(g, "s1") is None for g in gates)
+    assert len({push.collapse_id(g, "s1") for g in gates}) == 3
+
+
+def test_flap_id_folds_both_leadership_directions():
+    acquired = _event_payload(
+        "leader_change", "node-a", role="leader", leader="node-a"
+    )
+    lost = _event_payload(
+        "leader_change", "node-a", role="follower", leader="node-b"
+    )
+    elsewhere = _event_payload(
+        "leader_change", "node-b", role="leader", leader="node-b"
+    )
+    assert push.flap_id(acquired, "s1") == push.flap_id(lost, "s1")
+    assert push.flap_id(acquired, "s1") != push.flap_id(elsewhere, "s1")
 
 
 # ----------------------------------------------------------------- crypto
@@ -1758,6 +1996,131 @@ async def test_collapse_id_comes_from_the_persistent_salt(tmp_path):
         )
 
 
+@requires_pynacl
+async def test_send_report_posts_a_flap_id_shared_across_runs(tmp_path):
+    # The relay dedups on collapseId and keys flap suppression on flapId.
+    # Two failing runs of one job post different collapse ids and one flap
+    # id, keyed with the persisted salt over the sealed payload's
+    # identity.  The job's recovery posts a flap id of its own.
+    private, public_b64 = _device_keypair()
+    async with _RelayServer() as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, public_b64)
+        for run_id in ("run-1", "run-2"):
+            await service.send_report(
+                _FakeJobCtx(run_id=run_id), False, {"enabled": True}
+            )
+        await service.send_report(
+            _FakeJobCtx(
+                run_id="run-3", success=True, fail_reason=None, exit_code=0
+            ),
+            True,
+            {"enabled": True},
+        )
+    first, second, recovered = relay.requests
+    assert first["collapseId"] != second["collapseId"]
+    assert first["flapId"] == second["flapId"]
+    assert first["flapId"] != first["collapseId"]
+    assert recovered["flapId"] != first["flapId"]
+    doc = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    opened = _open_sealed(private, first["ciphertext"])
+    assert first["flapId"] == push.flap_id(opened, doc["collapseSalt"])
+
+
+@requires_pynacl
+async def test_send_report_keys_flap_ids_on_the_node_name(tmp_path):
+    # Two nodes over one registry that report the same hostname and carry
+    # different nodeNames.  Their reports of one EveryNode job share the
+    # collapse id and the sealed display host, and carry two flap ids.  A
+    # standalone daemon keys its flap id on the hostname.
+    private, public_b64 = _device_keypair()
+    devices = str(tmp_path / "devices.json")
+
+    def node_service(node):
+        return push.PushService(
+            relay_url=relay.url,
+            relay_timeout=5.0,
+            store=push.FileDeviceStore(devices),
+            host="cronstable",
+            node=node,
+        )
+
+    async with _RelayServer() as relay:
+        on_a = node_service(lambda: "a")
+        await on_a.pair(_pair_body(public_b64), "authToken")
+        services = [
+            on_a,
+            node_service(lambda: "b"),
+            node_service(lambda: None),
+            node_service(None),
+        ]
+        for service in services:
+            await service.send_report(
+                _FakeJobCtx(host="cronstable"), False, {"enabled": True}
+            )
+    from_a, from_b, standalone, unnamed = relay.requests
+    doc = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    salt = doc["collapseSalt"]
+    opened = [_open_sealed(private, r["ciphertext"]) for r in relay.requests]
+    assert {o["host"] for o in opened} == {"cronstable"}
+    assert len({r["collapseId"] for r in relay.requests}) == 1
+    assert from_a["flapId"] == push.flap_id(opened[0], salt, node="a")
+    assert from_b["flapId"] == push.flap_id(opened[1], salt, node="b")
+    assert from_a["flapId"] != from_b["flapId"]
+    assert standalone["flapId"] == push.flap_id(opened[2], salt)
+    assert unnamed["flapId"] == standalone["flapId"]
+    assert standalone["flapId"] not in (from_a["flapId"], from_b["flapId"])
+
+
+@requires_pynacl
+async def test_send_test_carries_no_flap_id(tmp_path):
+    # A test alert's kind and name never change, so a flap key would let
+    # the relay suppress a run of test sends.  Without one, the relay
+    # keys flap state on the random collapse id, which never repeats.
+    _, public_b64 = _device_keypair()
+    async with _RelayServer() as relay:
+        service, record = await _paired_service(
+            tmp_path, relay.url, public_b64
+        )
+        await service.send_test(record)
+        await service.send_test(record)
+    assert len(relay.requests) == 2
+    assert all("flapId" not in body for body in relay.requests)
+
+
+@requires_pynacl
+async def test_send_report_posts_no_flap_id_for_an_approval_gate(tmp_path):
+    # The daemon notifies each gate once, so a gate the relay suppressed
+    # would wait unannounced.  Other events keep their flap id.
+    _, public_b64 = _device_keypair()
+
+    def event(name, **fields):
+        return NotifyEventContext(
+            event=name,
+            success=False,
+            name="etl",
+            subject="subject",
+            message="message",
+            fields=dict(dag="etl", run_id="r1", **fields),
+        )
+
+    async with _RelayServer() as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, public_b64)
+        await service.send_report(
+            event("approval_waiting", run_key="manual-1", taskkey="approve"),
+            False,
+            {"enabled": True},
+        )
+        await service.send_report(
+            event("dag_failure", run_key="manual-1"),
+            False,
+            {"enabled": True},
+        )
+    gate, failed = relay.requests
+    assert gate["event"] is True and failed["event"] is True
+    assert "flapId" not in gate
+    assert len(failed["flapId"]) == 32
+
+
 def _alert_over_the_floor() -> dict[str, Any]:
     # Sealed under x25519 this fits CIPHERTEXT_B64_MAX only after trimming,
     # and what survives is still well over CIPHERTEXT_B64_FLOOR: the shape
@@ -1798,6 +2161,7 @@ async def test_send_refits_to_a_relay_enforcing_the_floor_cap(
     assert outcomes[0]["error"] is None
     # Same alert, same id: the relay coalesces the two posts as one.
     assert first["collapseId"] == second["collapseId"]
+    assert first["flapId"] == second["flapId"]
     opened = _open_sealed(private, second["ciphertext"])
     assert opened["name"] == "etl"
     # Trimmed oldest-first like any other fit: the newest line survives.
@@ -3171,6 +3535,46 @@ async def test_start_stop_push_reload_changed_rebuilds(tmp_path):
     await cron.start_stop_push(changed)
     assert cron._push_service.relay_url == "http://127.0.0.1:1/c"
     await cron.start_stop_push(None)
+
+
+@requires_pynacl
+async def test_start_stop_push_reads_the_node_name_at_send_time(tmp_path):
+    # A config reload rebuilds the cluster manager and keeps an unchanged
+    # push service, so the service reads the node name per alert: a
+    # standalone daemon keys on the hostname, and a clustered one on
+    # whichever manager is running when the alert goes out.
+    private, public_b64 = _device_keypair()
+    devices = str(tmp_path / "devices.json")
+    cron = _cron()
+    ctx = _FakeJobCtx(host="cronstable")
+    async with _RelayServer() as relay:
+        await cron.start_stop_push(
+            {
+                "relay": {"url": relay.url, "timeout": 5.0},
+                "devicesFile": devices,
+            }
+        )
+        service = cron._push_service
+        assert service is not None
+        await service.pair(_pair_body(public_b64), "authToken")
+        try:
+            await service.send_report(ctx, False, {"enabled": True})
+            cron.cluster_manager = SimpleNamespace(node_name="a")
+            await service.send_report(ctx, False, {"enabled": True})
+            cron.cluster_manager = SimpleNamespace(node_name="b")
+            await service.send_report(ctx, False, {"enabled": True})
+        finally:
+            cron.cluster_manager = None
+            await cron.start_stop_push(None)
+    standalone, on_a, on_b = relay.requests
+    doc = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    salt = doc["collapseSalt"]
+    opened = _open_sealed(private, standalone["ciphertext"])
+    assert opened["host"] == "cronstable"
+    assert standalone["flapId"] == push.flap_id(opened, salt)
+    assert on_a["flapId"] == push.flap_id(opened, salt, node="a")
+    assert on_b["flapId"] == push.flap_id(opened, salt, node="b")
+    assert len({standalone["flapId"], on_a["flapId"], on_b["flapId"]}) == 3
 
 
 async def test_start_stop_push_absorbs_a_corrupt_registry_document(caplog):

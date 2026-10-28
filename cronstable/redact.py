@@ -7,9 +7,11 @@ to individual lines or :func:`redact_lines` to a run's output. The latter
 also tracks PEM blocks that span multiple lines.
 
 Redaction provides defense in depth, but cannot guarantee that all secrets
-are removed. It can also redact text that is not a secret. It preserves
-surrounding keys and labels to keep logs readable. Redaction is enabled by
-default; set ``redactArchivedSecrets: false`` to disable it for a job.
+are removed. It can also redact text that is not a secret. It replaces a
+line longer than :data:`LINE_SCAN_LIMIT` whole, which bounds how long each
+:func:`redact_secrets` pattern holds the GIL. It preserves surrounding keys
+and labels to keep logs readable. Redaction is enabled by default; set
+``redactArchivedSecrets: false`` to disable it for a job.
 """
 
 import re
@@ -17,6 +19,12 @@ from collections.abc import Callable, Iterable
 
 #: What a redacted span is replaced with.
 REDACTED = "***REDACTED***"
+
+#: Longest text, in characters, that :func:`redact_secrets` passes to one
+#: pattern. sre holds the GIL for a whole scan, so a longer line, or one that
+#: a replacement grows past the limit, becomes :data:`REDACTED` whole.
+#: Scanning in chunks could leak a secret that straddles a chunk edge.
+LINE_SCAN_LIMIT = 1024 * 1024
 
 _Repl = str | Callable[[re.Match], str]
 
@@ -167,10 +175,16 @@ _PATTERNS: list[tuple[re.Pattern, _Repl]] = [
     # OpenAI/Anthropic-style bare keys and Stripe live/test keys.
     (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"), REDACTED),
     (re.compile(r"\b[sr]k_(?:live|test)_[0-9A-Za-z]{16,}"), REDACTED),
-    # JWTs (three base64url segments joined by dots).
+    # JWTs (three base64url segments joined by dots). The first branch takes
+    # an "eyJ" only at the start of a base64url run, so it scans each run
+    # once. The second takes one right after a "-" ("token-eyJ..."); its
+    # header excludes "-", so its scan stops at the next "-". The leading
+    # literal lets sre jump between "eyJ" occurrences.
     (
         re.compile(
-            r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"
+            r"eyJ(?:(?<![A-Za-z0-9_-]eyJ)[A-Za-z0-9_-]{6,}"
+            r"|(?<=-eyJ)[A-Za-z0-9_]{6,})"
+            r"\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"
         ),
         REDACTED,
     ),
@@ -296,6 +310,8 @@ def redact_secrets(text: str) -> str:
     *sequence* of lines that may contain a multi-line PEM block, use
     :func:`redact_lines`, which redacts the block's body, not just its header.
     """
+    if len(text) > LINE_SCAN_LIMIT:
+        return REDACTED
     # One casefolded copy for the three case-insensitive gates, taken BEFORE
     # any substitution and reused for the whole pass.  That stays sound
     # because a replacement only ever echoes back text it just matched or
@@ -322,6 +338,9 @@ def redact_secrets(text: str) -> str:
             else:
                 continue
         text = sub(repl, text)
+        # bounds the next pattern's scan and keeps a second pass a no-op
+        if len(text) > LINE_SCAN_LIMIT:
+            return REDACTED
     return text
 
 

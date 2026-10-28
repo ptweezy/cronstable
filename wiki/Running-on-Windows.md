@@ -175,8 +175,8 @@ take over and load zero jobs. Because the path exists, the "configuration file
 not found" error would stay quiet too, so a working per-user setup would start
 normally and run nothing.
 
-Until the machine-wide directory holds a configuration file, the default stays
-the historical per-user `%APPDATA%\cronstable`. A service account's `APPDATA`
+Until the machine-wide directory holds a configuration file, the default is
+the per-user `%APPDATA%\cronstable`. A service account's `APPDATA`
 points into its own profile (LocalSystem:
 `C:\Windows\System32\config\systemprofile\...`). That is why a per-user
 configuration that works interactively is not found when the same command runs
@@ -215,13 +215,12 @@ permission for Authenticated Users.
 `cronstable init` therefore checks the directory it created. If any local
 account could write to it, `init` restricts it and reports the change: full
 control for LocalSystem and the local Administrators group, read and execute
-for everyone else, inheritance from the parent severed, and the directory
-handed to the Administrators group. The hand-over is what makes the
-restriction stick: Windows lets a directory's owner rewrite its permissions
-whatever they say, and `%ProgramData%` lets any local account create a
-directory and become its owner, so a directory that is merely restricted
-stays that account's to reopen. `init` also writes an `OWNER RIGHTS` entry that holds
-the owner to read, so the restriction holds even where the hand-over is
+for everyone else, inheritance from the parent severed, and ownership
+transferred to the Administrators group. Transferring ownership prevents a
+non-admin creator from reopening the permissions later: Windows allows a
+directory's owner to rewrite its ACL, and `%ProgramData%` lets any local
+account create a subdirectory and become its owner. `init` also writes an `OWNER RIGHTS` entry that holds
+the owner to read, so the restriction holds even where the ownership transfer is
 refused. An unelevated prompt gets that outcome, and `init` then names the
 owner it could not change together with the fix. A per-user
 `%APPDATA%\cronstable` carries no such permission to begin with, so `init`
@@ -474,8 +473,8 @@ regardless, so the drain is best-effort: when that grace expires, the OS ends
 the daemon and any jobs still running.
 
 Logging off deliberately does not stop the daemon. Windows sends its logoff
-event only to session-0 processes, which is to say services and scheduled
-tasks, and the event says nothing about which user signed out. Treating it as
+event only to session-0 processes (such as services and scheduled
+tasks), and the event says nothing about which user signed out. Treating it as
 a shutdown would stop an unattended daemon the first time anyone closed an RDP
 session on the machine.
 
@@ -825,9 +824,8 @@ anything forked afterward inherits the nice value.
 ### The default level
 
 Task Scheduler numbers run the other way (0 highest, 10 lowest), and its
-per-task default is 7, which is BELOW_NORMAL. The cronstable default is
-deliberately neither a number nor a class: `normal` emits no class flag at
-all.
+per-task default is 7, which is BELOW_NORMAL. With the default `normal`
+priority, cronstable passes no priority-class flag.
 
 Windows defaults a child to NORMAL only when its creator is not itself idle or
 below-normal, so emitting `NORMAL_PRIORITY_CLASS` would silently *promote*

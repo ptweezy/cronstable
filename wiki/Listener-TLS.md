@@ -342,8 +342,7 @@ Terminating TLS in front of the endpoint is still a valid answer.
 
 ### `ca` here is not `clientCa` there
 
-The third key means the **opposite direction** in the two blocks, so it is worth
-reading twice:
+The third key acts in the **opposite direction** in the two blocks:
 
 | Key | Direction | What it does |
 | --- | --- | --- |
@@ -509,8 +508,8 @@ message names `CRONSTABLE_STATE_CACERT`. Either `state.jobApi.tls.ca` points at
 the wrong anchor for the certificate `state.jobApi.tls.cert` serves, or the
 endpoint's certificate lacks a SAN for the host in `state.jobApi.listen`. That
 URL is the configured host verbatim, so it is the name the certificate must
-cover. A job that reports the endpoint as unreachable instead is a different
-fault. That one really is a bind, port, or network problem.
+cover. A job that reports the endpoint as unreachable instead indicates a
+bind, port, or network problem rather than a TLS failure.
 
 ## See also
 

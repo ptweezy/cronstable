@@ -220,18 +220,17 @@ def add_job_commands(sub: Any) -> None:
         )
         _add_scope_flags(p)
         if verb == "run":
-            # NOT dest "command": the root subparsers already store the
-            # command name (state/lock/...) under args.command, and a same-
-            # named REMAINDER here would clobber it and misroute the whole
-            # invocation.
+            # Use dest "run_command" because the root subparsers store the
+            # command name (state/lock/...) under args.command; a same-named
+            # REMAINDER here would clobber it and misroute the invocation.
             p.add_argument(
                 "run_command",
-                # The command after "--" is split off BEFORE argparse, in
+                # The command after "--" is split off before argparse, in
                 # __main__.main_loop (portable across Python versions; see
-                # the note there -- argparse's own "--"/trailing handling is
+                # the note there: argparse's own "--"/trailing handling is
                 # inconsistent before 3.13, and REMAINDER would swallow our
                 # own --wait/--timeout/--ttl). This positional only holds the
-                # default [] and a command given WITHOUT a "--" separator.
+                # default [] and a command given without a "--" separator.
                 nargs="*",
                 metavar="command",
                 help="the command to run while holding the lock (after --)",
@@ -473,10 +472,10 @@ SERVICE_NAME_DEFAULT = "cronstable"
 def _add_service_config_flag(parser: argparse.ArgumentParser) -> None:
     """Give a `service` action its own -c/--config.
 
-    ``SUPPRESS``, not a real default, for the reason written at
+    Use ``SUPPRESS`` for the reason described in
     ``cronstable.__main__._add_state_subcommands``: argparse applies a
-    subparser's defaults AFTER the root parse, so a concrete default here
-    would overwrite a root-level ``cronstable -c X service install``.  The
+    subparser's defaults after the root parse, so a concrete default here
+    would overwrite a root-level ``cronstable -c X service install``. The
     root parser already supplies the default.
     """
     parser.add_argument(

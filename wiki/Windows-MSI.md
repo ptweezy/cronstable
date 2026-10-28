@@ -81,9 +81,8 @@ msiexec /i cronstable-windows-amd64v3.msi /qn
 "C:\Program Files\cronstable\cronstable.exe" service start
 ```
 
-The full paths matter: the shell that ran `msiexec` predates the `PATH`
-change the installer made, so a bare `cronstable` only works in shells
-opened later.
+Use the full executable path in the shell where you ran `msiexec`, because the
+updated system `PATH` only takes effect in newly opened shells.
 
 A first install leaves the service stopped until the next boot. While the
 directory holds no configuration, the service runs with no jobs, and it loads

@@ -4,7 +4,7 @@ Schedule load shows when jobs are scheduled to run over the next 24 hours.
 Use the hour-by-minute grid to find crowded times, such as the start of
 each hour, before choosing a schedule for another job.
 
-The forecast uses the scheduler’s engine, including each job’s timezone
+The forecast uses the scheduler's engine, including each job's timezone
 and daylight saving time rules. For schedules with seconds, it counts
 every scheduled run within each minute.
 
@@ -18,7 +18,7 @@ under their schedule names, `dag:<name>`.
 GET /schedule/pressure?hours=24&tz=Europe/London
 ```
 
-Both parameters are optional: `hours` is 1 to 168 (default 24), and `tz` sets the grid’s display timezone (default UTC). Each job still follows its own configured timezone. The payload has these fields:
+Both parameters are optional: `hours` is 1 to 168 (default 24), and `tz` sets the grid's display timezone (default UTC). Each job still follows its own configured timezone. The payload has these fields:
 
 | Field | Meaning |
 |-------|---------|

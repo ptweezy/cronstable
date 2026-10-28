@@ -218,8 +218,8 @@ def _decode_output_line(raw: bytes) -> str:
     line that is not valid UTF-8 is retried through the Windows-only
     ``"oem"`` codec, keeping accented output from a non-English install
     intact rather than collapsing it to U+FFFD.  Anything still undecodable
-    falls back to UTF-8 with replacement (the old unconditional behavior),
-    so the reader task can never die on job-controlled bytes.
+    falls back to UTF-8 with replacement, so the reader task can never die
+    on job-controlled bytes.
     """
     try:
         return raw.decode("utf-8")
@@ -284,10 +284,10 @@ class _MirrorWriter:
     the queue is bounded by batch count AND retained bytes, shedding the
     OLDEST batches so memory stays flat.
 
-    The submit path NEVER logs, especially not under the lock: in the
-    shed scenario stderr IS the wedged fd, so a synchronous handler write
+    The submit path never logs, especially under the lock: in the shed
+    scenario stderr is the wedged fd, so a synchronous handler write
     would park the loop with the lock held.  Submit only flags the shed;
-    the writer thread logs it AFTER a successful write, once the consumer
+    the writer thread logs it after a successful write, once the consumer
     is provably draining again.
 
     One thread for both streams on purpose: it preserves enqueue order
@@ -431,10 +431,9 @@ class _MirrorWriter:
                 warn = self._drop_warn_pending
                 self._drop_warn_pending = False
                 # re-arm: this episode is over (the consumer is
-                # provably draining again), so the NEXT backup gets
-                # its own warning. Without the reset the latch was
-                # per-process and every later episode shed job output
-                # silently.
+                # provably draining again), so the next backup gets
+                # its own warning. Resetting per episode prevents
+                # shedding output silently on later episodes.
                 self._drop_logged = False
             if warn:
                 logger.warning(
@@ -666,8 +665,7 @@ class StreamReader:
 
         Reads in chunks and splits in C rather than awaiting ``readline``
         per line, whose per-line bookkeeping costs several times the
-        decode it surrounds.  Two things readuntil supplied for free are
-        re-implemented here:
+        decode it surrounds.  Enforces two stream invariants directly:
 
         * the ``maxLineLength`` cap: an over-cap complete line is
           dropped, and an unterminated run past the cap is dropped as it
@@ -1000,17 +998,21 @@ class MailReporter(Reporter):
         # that never sends a mail report never pays the aiosmtplib import cost.
         import aiosmtplib
 
+        # start_tls stays explicit: aiosmtplib's default (None) upgrades
+        # whenever the server offers STARTTLS.
         smtp = aiosmtplib.SMTP(
             hostname=smtp_host,
             port=smtp_port,
             use_tls=mail["tls"],
+            start_tls=bool(mail["starttls"]),
             validate_certs=mail["validate_certs"],
+            local_hostname=_smtp_local_hostname(),
         )
         # One overall bound on the whole conversation; see
         # MAIL_REPORT_TIMEOUT.
         try:
             await asyncio.wait_for(
-                self._converse(smtp, mail, username, password, message),
+                self._converse(smtp, username, password, message),
                 MAIL_REPORT_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -1024,25 +1026,35 @@ class MailReporter(Reporter):
     @staticmethod
     async def _converse(
         smtp: Any,
-        mail: dict[str, Any],
         username: str | None,
         password: str | None,
         message: EmailMessage,
     ) -> None:
-        await smtp.connect()
         # close() (sync, idempotent) guarantees the socket is released even if
-        # starttls/login/send raises (including the CancelledError a
-        # wait_for timeout injects), so a failing SMTP server can't leak a
-        # connection per report.
+        # connect (with its STARTTLS upgrade), login or send raises
+        # (including the CancelledError a wait_for timeout injects), so a
+        # failing SMTP server can't leak a connection per report.
         try:
-            if mail["starttls"]:
-                await smtp.starttls()
+            await smtp.connect()
             if username and password:
                 # aiosmtplib >=2 takes username/password as positional args.
                 await smtp.login(username, password)
             await smtp.send_message(message)
         finally:
             smtp.close()
+
+
+def _smtp_local_hostname() -> str | None:
+    """The name a mail report gives in EHLO; None leaves it to aiosmtplib.
+
+    A system hostname with a dot goes out as is. aiosmtplib's default,
+    socket.getfqdn(), looks the host's own name up on every connection,
+    inside MAIL_REPORT_TIMEOUT. On a host whose name does not resolve, such
+    as GitHub's macOS runners, each lookup can take 35 seconds or more. A
+    hostname without a dot keeps that lookup, since it can qualify the name.
+    """
+    name = gethostname()
+    return name if "." in name else None
 
 
 def _limits_env(job: Any) -> dict[str, str]:
@@ -1769,11 +1781,10 @@ class _EventLogWriter:
     A dedicated thread rather than ``run_in_executor(None, ...)``: the
     default pool is shared with the durable-state writes and the fromFile
     secret resolver, and a wedged event write would hold one of its handful
-    of slots for every report.  A dedicated ThreadPoolExecutor was rejected
-    for a sharper reason: concurrent.futures registers an atexit hook that
-    JOINS its worker threads, so one stuck ReportEventW would hang
-    interpreter exit, which is exactly the shutdown behavior this platform
-    work spent several fixes on.  A daemon thread cannot; the OS reclaims
+    of slots for every report.  A dedicated ThreadPoolExecutor is also
+    unsuitable because concurrent.futures registers an atexit hook that
+    joins its worker threads, so one stuck ReportEventW would hang
+    interpreter exit.  A daemon thread does not block exit; the OS reclaims
     it.
 
     Fire and forget, therefore: :meth:`submit` does a bounded
@@ -1881,12 +1892,12 @@ class _EventLogWriter:
             # The thread owns the handle, so it can release it here with
             # no caller waiting.  It has to be here rather than in join(),
             # because retire_event_log_writers drops a renamed writer
-            # WITHOUT joining it (a reload runs on the scheduler's own
+            # without joining it (a reload runs on the scheduler's own
             # loop iteration, and the bounded drain belongs to
-            # shutdown).  A close that lived only in join() therefore
-            # leaked one source handle per reload that renamed the source:
-            # unbounded, and invisible to EVENTLOG_MAX_WRITERS, which caps
-            # the live registry rather than what has already left it.
+            # shutdown).  Closing only in join() would leak one source
+            # handle per reload that renames the source: unbounded, and
+            # invisible to EVENTLOG_MAX_WRITERS, which caps the live
+            # registry rather than what has already left it.
             handle, self._handle = self._handle, None
             if handle is not None:
                 platform.close_event_log(handle)
@@ -2058,8 +2069,8 @@ def report_config_enabled(report_config: dict[str, Any]) -> bool:
     url = report_config["webhook"]["url"]
     if url["value"] or url["fromFile"] or url["fromEnvVar"]:
         return True
-    # .get, not [], so report dicts predating the push block (older
-    # persisted shapes, hand-built test configs) keep working.
+    # .get, not [], so report dicts that omit the push block (persisted
+    # shapes or hand-built test configs) keep working.
     if (report_config.get("push") or {}).get("enabled"):
         return True
     # eventlog last, with the platform tested before the dict: on POSIX
@@ -2451,8 +2462,8 @@ class RunningJob:
         config = self.config
         self.started_at = datetime.now(timezone.utc)
         # Isolate the job in its own process group, so cancel() can take its
-        # whole descendant tree down as a unit rather than only the process we
-        # spawned -- see cronstable.platform.new_process_group_kwargs.
+        # whole descendant tree down as a unit rather than only the spawned
+        # process (see cronstable.platform.new_process_group_kwargs).
         # The job's scheduling priority rides along on Windows, where the
         # creation flags are the only race-free place to set one; POSIX is
         # served by the renice below, once there is a group to renice.
@@ -2463,8 +2474,8 @@ class RunningJob:
         self._child_env(kwargs)
         if config.workingDirectory is not None:
             # The directory the child starts in.  Omitted rather than passed
-            # as None when unset, so a job that does not ask for one keeps
-            # inheriting the daemon's CWD byte for byte as it always has.
+            # as None when unset, so a job that does not ask for one
+            # inherits the daemon's CWD byte for byte.
             # The value was normalized at config load; whether the directory
             # exists is the OS's call, and a bad one raises OSError into the
             # start_failed net below.  Note the child chdirs BEFORE
@@ -2789,7 +2800,7 @@ class RunningJob:
     def _demote(self):
         # Runs in the child (preexec_fn) while still privileged. Order matters:
         # set/clear supplementary groups, then the primary gid, then the uid.
-        # Dropping supplementary groups BEFORE setuid is essential — otherwise
+        # Dropping supplementary groups before setuid is essential; otherwise
         # the child keeps root's supplementary group memberships (the classic
         # "forgot setgroups() before setuid()" privilege-escalation bug).
         gid = self.config.gid

@@ -463,7 +463,7 @@ node's own `len(peers) + 1`, and the [job-set fingerprint](#the-job-set-id-found
 deliberately covers job *definitions* only, **not** the peer list. So two nodes
 with divergent peer lists still see each other `agreed`, each reaches a quorum
 under its *own* `N`, and **both** elect themselves: a silent double-run. An
-ordinary cluster **resize** (say rolling 3 → 5 nodes) triggers exactly this:
+ordinary cluster **resize** (say rolling from 3 to 5 nodes) triggers this:
 mid-roll, the old nodes still carry `N = 3` (quorum 2) while the new ones carry
 `N = 5` (quorum 3), so the old `{a, b}` and new `{c, d, e}` groups are each
 quorate and each run the `Leader` jobs.
@@ -1082,7 +1082,7 @@ coordination. Each node acts on a view only as fresh as its last poll
   * Symmetrically, because bridge confirmation is only as fresh as the
     witnesses' last gossip, a confirmed candidate that has since become
     isolated can briefly draw the majority into deferring to it, a transient
-    **skip** until the stale gossip ages out (~1–2 `interval`s).
+    **skip** until the stale gossip ages out (~1 to 2 `interval`s).
 
   `spread` behaves the same per job. To *fail closed* on the double-run (skip
   rather than double-run) instead would require a lease/consensus store; see
@@ -1609,7 +1609,7 @@ its walkthrough is in
 To watch [`distribution: spread`](#distribution-one-leader-or-spread-the-load)
 fan real load across the cluster, the repository also ships
 [`example/cluster-large/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/main/example/cluster-large/docker-compose.yml):
-**ten** nodes (dashboards on ports 8080–8089) running a larger job set with
+**ten** nodes (dashboards on ports 8080 to 8089) running a larger job set with
 several CPU-heavy jobs, defaulting to `spread`. Each node's config is generated
 from environment variables by a small entrypoint, so there are no per-node files
 to maintain.

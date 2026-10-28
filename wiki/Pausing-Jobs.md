@@ -62,7 +62,7 @@ Without a [`state:` store](Durable-State), a pause is in-memory: a daemon restar
 - a pause **survives restarts**: boot rehydrates the active windows before the first fire;
 - a pause is **fleet-wide**: every node sharing the store honors it, whichever node accepted the request. The record's `host` field is audit information only. Peers pick up a pause or resume on their housekeeping pass, so cross-node propagation takes up to about a minute. The node that handled the request applies it immediately.
 
-Scheduling never reads the store. Fire-time checks are memory-only. If the store cannot be read, each node keeps its last known in-memory pause state and logs a warning, under either `onStoreUnavailable` policy. A pause is an operator convenience, not a correctness fence, so an unreadable store neither resurrects nor drops pauses, and never blocks firing.
+Scheduling never reads the store; fire-time checks use the in-memory state. If the store cannot be read, each node keeps its last known in-memory pause state, logs a warning under either `onStoreUnavailable` policy, and continues firing jobs normally.
 
 ## Where a pause shows
 

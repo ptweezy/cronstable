@@ -467,11 +467,9 @@ def parse_iso(value: Any) -> float | None:
     Mirrors the daemon's own tolerant parser: the payloads cronstable emits
     are always aware UTC, but the TUI must not crash on a foreign record.
 
-    Deliberately not memoised: a module-level stamp cache measured 7x on a
-    2,000-job board but 30% *slower* on a 100k one, where the distinct
-    stamps per frame outrun any cap and every lookup is a miss.  Callers
-    that re-parse the same payload every frame cache per payload instead
-    (see :meth:`AppOverlays._heat_runs`).
+    Callers that re-parse the same payload every frame cache per payload
+    (see :meth:`AppOverlays._heat_runs`) rather than at module scope, where
+    distinct timestamps on a large board would exceed any fixed cache size.
     """
     if not isinstance(value, str) or not value:
         return None
@@ -496,9 +494,8 @@ def utc_clock(now: float | None = None) -> str:
 # ===================================================================
 #: The one place a run outcome becomes a state key, the port of the web
 #: page's ``outcomeCls``. Every panel that paints a run reads it from
-#: here: five hand-rolled copies of this ladder used to live inline, and
-#: all five had dropped the ``skipped`` arm, so a slot a pause held back
-#: painted in the same green a real success earns.
+#: here so ``skipped`` (a slot held back by a pause) consistently maps to
+#: neutral ``off`` rather than ``ok``.
 OUTCOME_KEY = {
     "failure": "fail",
     "cancelled": "cancelled",
@@ -516,10 +513,8 @@ OUTCOME_COLOR = {
 }
 
 #: Theme color for each key :func:`health` can return, shared by the jobs
-#: table, the wallboard tiles and the job drawer header.  The
-#: :data:`OUTCOME_KEY` lesson again: three hand-rolled copies of this dict
-#: used to live inline in those panels, one drifted arm away from a job
-#: painting a different verdict per panel.
+#: table, the wallboard tiles, and the job drawer header so every panel
+#: renders the same verdict color.
 HEALTH_COLOR = {
     "ok": "ok",
     "fail": "fail",
@@ -550,10 +545,8 @@ _COL_TITLES = {
 #: green, but one real success in it outranks any number of holds.  An
 #: empty bucket paints a blank shade, so its seed never shows.  One rank
 #: per key :func:`outcome_key` can return, test-enforced
-#: (tests/test_tui.py): the heatmap paint loop subscripts this map bare,
-#: so a key it had never heard of cost a ``KeyError`` every frame, the
-#: whole dashboard rather than one mis-shaded cell.  Parsing clamps such a
-#: key to "unknown" first (:meth:`AppOverlays._heat_runs`).
+#: (tests/test_tui.py); parsing clamps any unknown key to "unknown" first
+#: (:meth:`AppOverlays._heat_runs`).
 HEAT_RANK = {
     "skipped": 0,
     "ok": 1,
@@ -565,19 +558,18 @@ HEAT_RANK = {
 
 def outcome_key(outcome: str | None) -> str:
     """State key for a run outcome: ``fail``/``cancelled``/``unknown``/
-    ``skipped``, else ``ok``. Anything painting a run goes through here
-    so a sixth copy of the ladder cannot drift again."""
+    ``skipped``, else ``ok``. Every panel that paints a run calls this
+    helper."""
     return OUTCOME_KEY.get(outcome or "", "ok")
 
 
 #: Theme color for each DAG run/task state, the port of the web page's
-#: ``dstVar``.  An explicit map over dag.py's state vocabulary (plus the
-#: run-level "scheduled"), replacing a spelling-guess ladder that handled
-#: six strings the engine never emits while ``upstream_failed`` (a failure
-#: state, fail-red on the web) fell through to neutral "dim".  The web's
-#: dedicated --unknown ink has no TUI palette twin, so "dim" stands in for
-#: it and for the web's fg-faint fallback.  Coverage of dag.py's vocabulary
-#: is test-enforced (tests/test_tui.py).
+#: ``dstVar``.  Maps dag.py's state vocabulary (plus the run-level
+#: "scheduled") to theme colors, with ``upstream_failed`` mapped to
+#: ``fail``.  The web's dedicated ``--unknown`` ink has no TUI palette
+#: twin, so ``dim`` stands in for it and for the web's ``fg-faint``
+#: fallback.  Coverage of dag.py's vocabulary is test-enforced
+#: (tests/test_tui.py).
 DAG_STATE_COLOR = {
     "verifying": "run",
     "queued": "pending",
@@ -592,8 +584,7 @@ DAG_STATE_COLOR = {
     "scheduled": "pending",  # run-level: created, awaiting its slot
     # TUI-only pseudo-state: _dag_tasks_tab substitutes it for an approval
     # gate parked on a decision, so it never reaches here from dag.py.
-    # Painted "pending" as the old ladder did: the gate is waiting, not
-    # inert, and it is the one row the operator has to act on.
+    # Painted "pending" because the gate is waiting for operator action.
     "awaiting": "pending",
     "unknown": "dim",
 }
@@ -837,13 +828,13 @@ def compute_view(
         name = job.get("name", "")
         # The web sorts (and tie-breaks) names with localeCompare, whose
         # CLDR root collation is case-insensitive at the primary level and
-        # orders lowercase BEFORE uppercase on a pure case tie ('apple' <
+        # orders lowercase before uppercase on a pure case tie ('apple' <
         # 'Backup' < 'zeta', and 'backup' < 'Backup').  A raw Python str
-        # compare is code-point order instead, which fronts EVERY
+        # compare uses code-point order instead, which fronts every
         # uppercase-initial name and inverts case ties.  casefold gives
         # the primary level, swapcase the lowercase-first tertiary tie,
         # and the raw name keeps the key total; this applies to the name
-        # column AND to the trailing tie-break of every other column, so
+        # column and to the trailing tie-break of every other column, so
         # the two frontends render one order.
         name_key = (name.casefold(), name.swapcase(), name)
         if sort_key == "status":
@@ -1511,11 +1502,9 @@ def colour_runs(cells: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Merge neighbouring cells that share a color key into ``(text,
     key)`` runs.
 
-    A ten-bar spark whose history is all green is one span, not ten: the
-    per-cell form emits a full SGR pair per bar, and those bytes are then
-    re-walked by :func:`cut_to_width` and written to the terminal on every
-    row the differ decides has changed.  Painted output is unchanged
-    because the style spans re-assert the same ink either way.
+    Coalescing adjacent same-color bars emits a single SGR span per run
+    instead of one per bar, reducing the bytes :func:`cut_to_width` walks
+    and the terminal writes while keeping painted output identical.
     """
     runs: list[tuple[str, str]] = []
     parts: list[str] = []
@@ -1671,12 +1660,10 @@ class PendulumMark:
     of brushing the web mark with the pointer, and repeated pokes
     escalate until the mark goes over and earns its recovery.
 
-    The physics is real: RK4 over the nonlinear cart/pendulum dynamics
-    at 120 Hz, a state-feedback balance law, an energy-pumping
-    swing-up.  A terminal cell is simply a very blunt renderer, so the
-    pose projects to a glyph (``l`` upright, ``/`` and ``\\`` tipping,
-    ``_`` down) plus an ink.  Every frame is plain ASCII, so --ascii
-    changes nothing here.
+    Integrates the nonlinear cart/pendulum dynamics with RK4 at 120 Hz,
+    a state-feedback balance law, and an energy-pumping swing-up, then
+    projects the pose to one ASCII glyph (``l`` upright, ``/`` and ``\\``
+    tipping, ``_`` down) and a theme color key.
 
     Deterministic under a fixed ``seed`` (the app seeds from the
     clock, the tests pin it); ``breeze=False`` stills the wind for
@@ -3083,7 +3070,7 @@ def cut_to_width(row: str, width: int) -> str:
             if match is not None:
                 idx = max(match.end(), idx + 1)
                 continue
-            end = idx + 1  # a bare ESC no pattern took: one cell, as before
+            end = idx + 1  # a bare ESC no pattern took: one cell
         else:
             end = row.find("\x1b", idx)
             if end < 0:
@@ -3106,7 +3093,7 @@ def cut_to_width(row: str, width: int) -> str:
         taken = 0
         for ch in chunk:
             if used >= width:
-                break  # a zero-width mark at the edge is cut, as before
+                break  # a zero-width mark at the edge is cut
             if " " <= ch <= "~":
                 w = 1
             else:
@@ -3666,10 +3653,10 @@ class App:
     def _trim_ansi_cache(self) -> None:
         """Drop the oldest quarter of the ANSI memo.
 
-        Clearing the whole memo also threw away the entries for the lines
-        still on screen, so an overflow cost a full re-ink of the visible
-        window (and, in wrap mode, of the whole buffer).  Dict order is
-        arrival order, so the quarter dropped is the oldest arrivals.
+        Clearing the whole memo would discard entries for lines still on
+        screen and force a full re-ink of the visible window (and, in wrap
+        mode, of the whole buffer).  Dict order is arrival order, so the
+        quarter dropped is the oldest arrivals.
         """
         cache = self._ansi_cache
         drop = max(1, len(cache) // 4)
@@ -4109,12 +4096,11 @@ class App:
             legs.append(leg("state_data", "/state"))
         await asyncio.gather(*legs)
         if self.is_open("heat") and (time.monotonic() - self.heat_loaded > 60):
-            # spawned, never awaited: this issues one batched /activity
-            # fetch (a per-job /runs fan-out against a daemon without it),
-            # and awaiting it inline froze the whole poll pipeline (jobs
-            # table, verdict, header) for the sum of the round trips
-            # whenever the overlay was open. The busy flag covers the
-            # window where a slow load outlives the 60s gate.
+            # Spawned rather than awaited: this issues a batched /activity
+            # fetch (or a per-job /runs fan-out against an older daemon),
+            # and awaiting it inline would block the poll pipeline (jobs
+            # table, verdict, header) while the overlay is open. The busy
+            # flag prevents overlapping loads past the 60s gate.
             if not self._heat_busy:
                 self._heat_busy = True
                 self._spawn(self._load_heat())
@@ -7463,7 +7449,7 @@ class AppOverlays(AppRender):
                 )
                 body.append(
                     paint.style(
-                        " Open a job’s schedule tab to preview its times.",
+                        " Open a job's schedule tab to preview its times.",
                         "dim",
                     )
                 )

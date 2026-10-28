@@ -770,6 +770,9 @@ async def test_tail_job_logs_and_not_found():
     body = result["structuredContent"]
     assert body["name"] == "hello"
     assert body["lines"] == []
+    # a job that has not run: nothing skipped, no run to name
+    assert (body["skipped"], body["reset"]) == (0, False)
+    assert (body["running"], body["started_at"]) == (False, None)
     result = await _call(h, "cron_tail_job_logs", {"name": "ghost"})
     assert result["isError"] is True
 
@@ -942,6 +945,81 @@ async def test_pause_job_unknown_and_bad_duration():
     assert result["isError"] is True
     assert "integer" in result["content"][0]["text"]
     assert "hello" not in h._cron._paused  # no rejected call took effect
+
+
+async def _input_properties(handler):
+    tools = (await _req(handler, "tools/list"))["result"]["tools"]
+    return {t["name"]: t["inputSchema"]["properties"] for t in tools}
+
+
+async def test_input_schema_counts_are_the_ones_the_handlers_apply():
+    h = _handler({"maxRows": 2})
+    props = await _input_properties(h)
+    limit = props["cron_get_status"]["limit"]
+    assert limit["default"] == limit["maximum"] == 2
+    for args in ({}, {"limit": 50}):
+        result = await _call(h, "cron_get_status", args)
+        assert result["structuredContent"]["page"]["limit"] == 2
+    count = props["cron_explain_schedule"]["count"]
+    expr = {"expression": "* * * * *"}
+    result = await _call(h, "cron_explain_schedule", expr)
+    assert len(result["structuredContent"]["fires"]) == count["default"]
+    result = await _call(
+        h, "cron_explain_schedule", {**expr, "count": count["maximum"] + 1}
+    )
+    assert len(result["structuredContent"]["fires"]) == count["maximum"]
+    hours = props["cron_schedule_pressure"]["hours"]
+    result = await _call(h, "cron_schedule_pressure")
+    assert result["structuredContent"]["hours"] == hours["default"]
+    result = await _call(
+        h, "cron_schedule_pressure", {"hours": hours["maximum"] + 1}
+    )
+    assert result["structuredContent"]["hours"] == hours["maximum"]
+
+
+async def test_input_schema_limits_are_the_ones_the_handlers_enforce():
+    # each advertised bound is accepted, and one past it is refused
+    h = _handler()
+    props = await _input_properties(h)
+    pause = props["cron_pause_job"]
+    args = {"name": "hello", "confirm": True}
+    longest = pause["durationSeconds"]["maximum"]
+    note = "n" * pause["note"]["maxLength"]
+    for extra in ({"durationSeconds": longest}, {"note": note}):
+        result = await _call(h, "cron_pause_job", {**args, **extra})
+        assert result["structuredContent"]["paused"] == "hello", extra
+    for extra in ({"durationSeconds": longest + 1}, {"note": note + "n"}):
+        result = await _call(h, "cron_pause_job", {**args, **extra})
+        assert result["isError"] is True, extra
+    by = "b" * props["cron_decide_gate"]["by"]["maxLength"]
+    gate = {
+        "dag": "d",
+        "run_key": "r",
+        "taskkey": "t",
+        "decision": "approve",
+        "confirm": True,
+    }
+    for value, refused in ((by, False), (by + "b", True)):
+        result = await _call(h, "cron_decide_gate", {**gate, "by": value})
+        text = result["content"][0]["text"]
+        assert ("by is longer than" in text) is refused
+    tasks = props["cron_preview_recovery"]["tasks"]["maxItems"]
+    recover = {"dag": "d", "run_key": "r", "mode": "from"}
+    for count, refused in ((tasks, False), (tasks + 1, True)):
+        result = await _call(
+            h, "cron_preview_recovery", {**recover, "tasks": ["t"] * count}
+        )
+        text = result["content"][0]["text"]
+        assert ("tasks must be a list" in text) is refused
+    token = props["cron_recover_dag"]["plan_token"]
+    assert token["minLength"] == token["maxLength"]
+    result = await _call(
+        h,
+        "cron_recover_dag",
+        {"dag": "d", "run_key": "r", "plan_token": "x", "confirm": True},
+    )
+    text = result["content"][0]["text"]
+    assert "{}-character".format(token["maxLength"]) in text
 
 
 async def test_resume_job_confirm_gate_clears_pause_and_noops():

@@ -128,7 +128,8 @@ defaults, so a global reporter fires per DAG **run**, not on every tick.
 
 As with jobs, in [directory mode](#directory-mode) and across
 [includes](#the-include-directive), a `defaults:` block reaches only the jobs
-**and DAGs** defined in the same file.
+**and DAGs** in its own file and in the files that include it, directly or
+through nested includes.
 
 ### Merge precedence
 
@@ -142,7 +143,11 @@ wins):
    see [running on Windows](Running-on-Windows). The
    [configuration reference](Configuration-Reference) has the full list.
 2. **Included files' defaults**: the `defaults` blocks of any files named by
-   this file's `include` directive, merged together in include order.
+   this file's `include` directive, merged together in include order. An
+   included file supplies its own `defaults` block merged over what the files
+   it includes supply, so defaults pass up through nested includes. A file
+   whose include tree has no `defaults` block, such as a classic crontab,
+   supplies nothing.
 3. **This file's `defaults` block.**
 4. **Per-job overrides**: the keys set on the individual job.
 
@@ -154,7 +159,7 @@ Each job dict is `mergedicts(defaults, config_job)`, where `defaults` is
 On Windows, user/group switching is unsupported: a job with `user` or `group`
 set raises a configuration error (`Job <name>: changing user/group is not
 supported on Windows`); see [running on Windows](Running-on-Windows). The merged
-`defaults` (steps 1–3) is also returned as the file's `job_defaults`.
+`defaults` (steps 1 to 3) is also returned as the file's `job_defaults`.
 
 ## Merge semantics (`mergedicts`)
 
