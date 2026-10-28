@@ -100,6 +100,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/ptweezy/cronstable"
 Documentation = "https://github.com/ptweezy/cronstable/wiki"
+Demo = "https://demo.cronstable.com"
 Source = "https://github.com/ptweezy/cronstable"
 Changelog = "https://github.com/ptweezy/cronstable/releases"
 Issues = "https://github.com/ptweezy/cronstable/issues"

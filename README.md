@@ -25,6 +25,17 @@ on a schedule, defined in YAML or loaded from an existing crontab, and adds
 retries, alerts, saved run history, workflows, and dashboards for the web, the
 terminal, and iOS.
 
+[Live demo](https://demo.cronstable.com) ·
+[Quick start](#quick-start) ·
+[Installation](#installation) ·
+[Documentation](https://github.com/ptweezy/cronstable/wiki) ·
+[iOS app](#ios-app)
+
+[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a workflow's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a color-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)
+
+> A tour of the web dashboard. To try it in your browser, open the
+> [live demo](https://demo.cronstable.com).
+
 ## Why cronstable?
 
 ### Scheduling
@@ -347,10 +358,6 @@ see
 
 ## Web dashboard
 
-[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a workflow's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a color-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-reel.webp)
-
-> Web UI tour.
-
 The daemon serves the built-in web dashboard at `/` on each `http://` and
 `https://` listener. It's one self-contained page, with no build step and no
 external requests, served under a strict Content Security Policy. To turn it
@@ -390,8 +397,14 @@ output, set `archiveOutput: true` on the job or under `defaults:`. For every
 panel, shortcut, and setting, see the
 [web dashboard guide](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard).
 
-To try the dashboard with a varied set of demo jobs, run this command from a
-clone of this repository, and then open <http://localhost:8080/>:
+To try the dashboard without installing anything, open the
+[live demo](https://demo.cronstable.com). It's a public board that all
+visitors share, and it needs no account or token. You can start, cancel, and
+pause its sample jobs, and approve or reject its workflow gates.
+
+For a demo board on your own machine with a varied set of jobs, run this
+command from a clone of this repository, and then open
+<http://localhost:8080/>:
 
 ```shell
 docker compose up
