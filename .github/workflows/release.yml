@@ -60,11 +60,13 @@ on:
 # only a started run, and a queued one loses its slot to the next push.
 #
 # The release test is a loose superset of `decide` (a false negative could
-# cancel a publish): any dispatch, any pushed message containing `[release`,
-# or a push of 20+ commits, where the event payload truncates.
+# cancel a publish): any dispatch, or a push to `main` that has a message
+# containing `[release` or 20+ commits, where the event payload truncates.
+# Like `decide`, it ignores pull requests and other branches, so their runs
+# stay cancellable when they carry `[release` commits from main.
 concurrency:
-  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) && 'release' || 'ci' }}
-  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) }}
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) && 'release' || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) }}
 
 # Least-privilege default for all jobs; the publish jobs opt up to the narrower
 # write scopes they actually need (see each one's own permissions:).
