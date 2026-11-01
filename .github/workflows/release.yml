@@ -3,8 +3,10 @@ name: CI
 # Every push (any branch) and pull request runs the static and package
 # checks, then the tox matrix beside the build fan-out: PyInstaller binaries,
 # Docker images (build-only), and the `perf` benchmark against the latest
-# release tag. A release gates on ALL of it except the macOS 26 rows. Outside
-# a release, only wiki/ is published (the ungated `wiki` job, on `main`).
+# release tag. A branch or pull request that changes only documentation
+# skips the fan-out (.github/scripts/build_scope.py). A release gates on ALL
+# of it except the macOS 26 rows. Outside a release this workflow publishes
+# nothing; wiki.yml publishes wiki/.
 #
 # A release happens ONLY on:
 #   - a push to `main` where a pushed commit SUBJECT starts with a marker:
@@ -101,6 +103,7 @@ jobs:
     runs-on: ubuntu-26.04
     outputs:
       release: ${{ steps.d.outputs.release }}
+      build: ${{ steps.scope.outputs.build }}
       perf: ${{ steps.d.outputs.perf }}
       perf-source: ${{ steps.d.outputs.perf_source }}
       new: ${{ steps.ver.outputs.new }}
@@ -114,6 +117,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # full history + tags: the marker scan walks BEFORE..AFTER and setuptools_scm / tag math resolve
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -189,6 +193,15 @@ jobs:
           echo "perf=$perf" >> "$GITHUB_OUTPUT"
           echo "perf_source=$perf_source" >> "$GITHUB_OUTPUT"
           echo "::notice::release=$release bump=$bump perf=$perf ($perf_source; event=$EVENT ref=$REF)"
+      # Every binary, wheel, image, perf and nix job reads `build`.
+      - name: Decide build scope
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          RELEASE: ${{ steps.d.outputs.release }}
+          HEAD_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/build_scope.py
       - name: Compute version
         id: ver
         env:
@@ -271,6 +284,8 @@ jobs:
       crypto-sha: ${{ steps.inputs.outputs.crypto-sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -341,6 +356,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # This step runs the actionlint release binary, pinned by digest.
       # Docker Hub can rate-limit a pull of the image for longer than any
       # retry lasts, and a failure here skips every test job, because they
@@ -381,7 +398,7 @@ jobs:
         run: python scripts/generate_build_files.py --check
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install tox tox-uv
-      - run: tox -p auto -e lint,mypy,bandit,openapi
+      - run: tox -p auto -e lint,mypy,bandit,openapi,zizmor
 
   # Dependency-license gate. The binaries and Docker images bundle the whole
   # dependency tree, so a copyleft (GPL/AGPL) or source-available (SSPL/BUSL)
@@ -395,6 +412,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -444,6 +463,8 @@ jobs:
     timeout-minutes: 30
     steps: &tox-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
@@ -587,6 +608,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
@@ -606,6 +629,8 @@ jobs:
       ETCD_IMAGE: gcr.io/etcd-development/etcd:v3.5.21
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -702,6 +727,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -784,6 +811,8 @@ jobs:
       UBI8_PYTHON_IMAGE: registry.access.redhat.com/ubi8/python-311:1-1779943517@sha256:06ad015cc4e4c2ec18e1119af36dd0dcae85d60b7587164338dc750d34436b58
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: ${{ env.SETUP_UV_VERSION }}
@@ -862,6 +891,8 @@ jobs:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version,
       # and the setuptools_scm file finder needs only the checked-out tree.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -913,8 +944,8 @@ jobs:
   # for tox so the Intel row does not hold a scarce macOS runner while a
   # required test is queued.
   nix:
-    needs: [preflight, tox]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
+    needs: [version, preflight, tox]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.version.outputs.build == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -924,6 +955,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
@@ -948,6 +981,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -1051,6 +1085,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # pip keeps the wheels it builds from sdists here, so QEMU compiles run
       # once per dependency bump. Keyed on the image too: a source-built wheel
       # carries a plain linux_<arch> tag whatever base built it.
@@ -1276,6 +1312,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -1366,6 +1403,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The pip wheel cache (see binaries), keyed on libc and arch: glibc and
       # musl source builds share the plain linux_<arch> tag.
       - name: Restore pip cache (QEMU-built wheels)
@@ -1544,6 +1583,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -1560,6 +1600,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Pull the build image
         run: |
@@ -1674,6 +1716,7 @@ jobs:
       - version
       - pq-wheel-armv6
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -1695,10 +1738,12 @@ jobs:
     runs-on: ubuntu-26.04
     # Generous for an emulated full-source build; a row past this is wedged.
     timeout-minutes: 360
-    # Shared with binaries-armel.
+    # Shared with binaries-armel. Shallow checkout; see the dist job. zizmor
+    # 1.31 fails on a comment between an anchor and its first item.
     steps: &legacy-arm-steps
-      # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The armv6 cryptography wheel, built in its own job because the compile
       # takes hours under emulation. Without it the row stays on x25519.
       - name: Fetch the ARMv6 post-quantum wheel
@@ -1794,6 +1839,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -1832,6 +1878,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -1863,6 +1910,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The default binfmt install includes loong64.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Pull the build image
@@ -1962,6 +2011,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -1988,9 +2038,12 @@ jobs:
             pq: soft
             pq_src: '1'
     runs-on: ${{ matrix.runner }}
+    # Shallow checkout; see the dist job. No comment goes between the anchor
+    # and the first step (see binaries-arm-legacy).
     steps: &macos-steps
-      # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
@@ -2178,7 +2231,7 @@ jobs:
       - version
       - preflight
       - tox
-    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.version.outputs.build == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -2216,6 +2269,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -2250,6 +2304,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Build binary (FreeBSD ${{ matrix.vmarch }})
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         env:
@@ -2483,6 +2539,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -2492,6 +2549,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Build binary (OpenBSD 7.9 amd64)
         uses: vmactions/openbsd-vm@f1ca8bc8ecc5b6ef7218e5b914836e067e1546d3 # v1.4.9
         env:
@@ -2583,6 +2642,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -2592,6 +2652,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Build binary (NetBSD 11.0 amd64)
         uses: vmactions/netbsd-vm@c8a0d7ddb84619a7a8cc4e652efa7950b3fd9f92 # v1.5.2
         env:
@@ -2693,6 +2755,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -2703,6 +2766,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Build binary (OmniOS r151054 amd64)
         uses: vmactions/omnios-vm@9576f0b6d15e7696548409baa533bc0a339caf42 # v1.3.7
         env:
@@ -2798,6 +2863,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: ${{ needs.version.outputs.release == 'true' }}
       matrix:
@@ -2854,6 +2920,8 @@ jobs:
     steps:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         id: py
         with:
@@ -3207,6 +3275,7 @@ jobs:
   # it) and does not block publication.
   pq-wheels:
     needs: [version, preflight]
+    if: needs.version.outputs.build == 'true'
     uses: ./.github/workflows/build-pq-wheels.yml
     with:
       matrix: ${{ needs.version.outputs.pq-glibc }}
@@ -3216,6 +3285,7 @@ jobs:
 
   pq-wheels-musl:
     needs: [version, preflight]
+    if: needs.version.outputs.build == 'true'
     uses: ./.github/workflows/build-pq-wheels.yml
     with:
       matrix: ${{ needs.version.outputs.pq-musl }}
@@ -3227,11 +3297,14 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-26.04
     continue-on-error: true
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download resolved cryptography source
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -3358,6 +3431,8 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Bound compiler cache storage
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3368,6 +3443,7 @@ jobs:
   # image before publication copies those same bytes.
   docker:
     needs: [version, preflight]
+    if: needs.version.outputs.build == 'true'
     uses: ./.github/workflows/build-docker.yml
     with:
       matrix: ${{ needs.version.outputs.docker-none }}
@@ -3377,6 +3453,7 @@ jobs:
 
   docker-glibc:
     needs: [version, preflight, pq-wheels]
+    if: needs.version.outputs.build == 'true'
     uses: ./.github/workflows/build-docker.yml
     with:
       matrix: ${{ needs.version.outputs.docker-glibc }}
@@ -3386,6 +3463,7 @@ jobs:
 
   docker-musl:
     needs: [version, preflight, pq-wheels-musl]
+    if: needs.version.outputs.build == 'true'
     uses: ./.github/workflows/build-docker.yml
     with:
       matrix: ${{ needs.version.outputs.docker-musl }}
@@ -3395,6 +3473,7 @@ jobs:
 
   docker-assemble:
     needs: [version, docker, docker-glibc, docker-musl]
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
@@ -3404,6 +3483,8 @@ jobs:
         include: ${{ fromJSON(needs.version.outputs.docker-matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -3440,6 +3521,7 @@ jobs:
     needs:
       - version
       - preflight
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-26.04
     # perf=ignore: a perf job that fails for any reason (crashed bench,
     # timeout, pairing refusal) does not hold the release.
@@ -3451,6 +3533,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # full history + tags: the baseline is the latest release tag
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -3603,6 +3686,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # the full PR commit range must be walkable
+          persist-credentials: false
       - name: Verify Signed-off-by on every PR commit
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -3650,6 +3734,8 @@ jobs:
     steps:
       # For packaging/msi/cronstable.wxs.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -3953,6 +4039,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: cronstable-linux-*
@@ -4003,6 +4091,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # Publish the exact wheel and sdist that `dist` built and checked.
       - name: Download distributions
@@ -4212,6 +4301,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          # Without RELEASE_TOKEN, the tag push goes through this credential.
+          persist-credentials: true
 
       # release-prepare assembled and hashed the wheel, sdist and binaries:
       # publish those exact bytes rather than rebuilding.
@@ -4465,6 +4556,8 @@ jobs:
     steps:
       # For the formula template + render script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download validated Homebrew formula
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -4523,6 +4616,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
@@ -4576,75 +4671,3 @@ jobs:
           ./wingetcreate.exe submit winget-manifests \
             --no-open --token "$WINGET_TOKEN" \
             --prtitle "New version: ptweezy.cronstable version ${VERSION}"
-
-  # ---------------------------------------------------------------------------
-  # Docs. Gated on neither a release nor the build and test matrix, so a
-  # flaky emulated arch never holds up a wiki fix.
-  # ---------------------------------------------------------------------------
-
-  # Publish wiki/ (the source of truth) to the GitHub wiki, a separate
-  # <repo>.wiki.git repository where its bare [Page](Page) links resolve.
-  # Only a push to main publishes, because the pages link to /blob/main/.
-  # GITHUB_TOKEN can push the wiki of its own repository, so no PAT is needed.
-  wiki:
-    # A fork has no wiki repository until someone creates a page, so the
-    # wiki checkout would fail on every fork main push.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable'
-    runs-on: ubuntu-26.04
-    permissions:
-      # Allows the wiki push (undocumented under `contents`). Nothing in this
-      # repository is written.
-      contents: write
-    steps:
-      # For the wiki/ page sources.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The wiki is its own repo; its default branch is always master.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.repository }}.wiki
-          path: .wiki
-
-      - name: Publish wiki/ to the GitHub wiki
-        env:
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          # Mirror, so pages deleted from wiki/ leave the wiki too. This also
-          # removes pages created in the wiki web UI; edit wiki/ instead.
-          mirror() {
-            find .wiki -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-            cp -R wiki/. .wiki/
-          }
-
-          git -C .wiki config user.name  "github-actions[bot]"
-          git -C .wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Web UI edits or a concurrent run can win the push race; the commit
-          # is a snapshot of wiki/, so re-mirror onto the new tip and retry.
-          for attempt in 1 2 3; do
-            git -C .wiki fetch -q origin master
-            git -C .wiki reset -q --hard origin/master
-            mirror
-
-            # Stage first, then compare the index; see the homebrew job.
-            git -C .wiki add -A
-            if git -C .wiki diff --cached --quiet; then
-              echo "Wiki already current for ${SHA:0:7}."
-              exit 0
-            fi
-
-            # Print the change set: a mirror deletes, and a deletion must never
-            # be silent in the log.
-            git -C .wiki diff --cached --name-status
-
-            git -C .wiki commit -q -m "Sync wiki from ${SHA:0:7}"
-            if git -C .wiki push -q origin HEAD:master; then
-              echo "::notice::Wiki published from ${SHA:0:7}."
-              exit 0
-            fi
-            echo "::warning::Wiki push rejected (attempt ${attempt}/3); re-mirroring onto the new tip."
-          done
-
-          echo "::error::Could not push the wiki after 3 attempts; the wiki repo is being written concurrently. Re-run this job." >&2
-          exit 1

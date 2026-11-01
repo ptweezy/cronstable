@@ -86,11 +86,12 @@ jobs:
           # The probe below installs the project, and the python images carry
           # no git, so the version comes from here.
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
+          CRYPTOGRAPHY_VERSION: ${{ inputs.cryptography }}
         run: |
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
             -e PIP_RETRIES -e PIP_TIMEOUT -e PQ_TOOLS -e RUST_SETUP_CMD \
-            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION -e CRYPTOGRAPHY_VERSION \
             -v "$PWD:/src" -w /src \
             ${{ matrix.image }} sh -euc '
               . /src/.github/scripts/retry.sh
@@ -138,7 +139,7 @@ jobs:
               $PY -m pip install --upgrade pip
               rm -rf /src/wheelhouse
               # The preflight resolves this source from pyproject and checks its hash.
-              $PY -m pip wheel --no-deps --wheel-dir /src/wheelhouse /src/release-inputs/cryptography-${{ inputs.cryptography }}.tar.gz
+              $PY -m pip wheel --no-deps --wheel-dir /src/wheelhouse "/src/release-inputs/cryptography-${CRYPTOGRAPHY_VERSION}.tar.gz"
               # Prove the wheel seals X-Wing through the daemon (the probe the
               # binary lanes run) before an image build uses it.
               $PY -m pip install /src/wheelhouse/cryptography-*.whl

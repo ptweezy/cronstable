@@ -2,7 +2,9 @@
 # The `daily` interval runs Monday through Friday. SECURITY updates are enabled
 # in the repo settings (Code security: "Dependabot alerts" and "Dependabot
 # security updates") and reuse the ecosystems below, so keep this list in step
-# with what the pipeline uses.
+# with what the pipeline uses. A version update waits 7 days after its release
+# (`cooldown`), which gives a compromised release time to be pulled. Security
+# updates and Docker digests, which carry base-image OS patches, don't wait.
 version: 2
 updates:
   # Actions are pinned to commit SHAs with a trailing version comment
@@ -14,6 +16,8 @@ updates:
       - "/.github/actions/*"
     schedule:
       interval: daily
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     groups:
       github-actions:
@@ -40,6 +44,8 @@ updates:
       - "pyinstaller/requirements/**"
     schedule:
       interval: daily
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     groups:
       python:
@@ -51,7 +57,7 @@ updates:
   # .clusterfuzzlite/Dockerfile pins the OSS-Fuzz builder's moving v1 tag by
   # digest, so its updates are digest bumps.
   # Review, do not automerge: a new base image can change the default Python.
-  - package-ecosystem: docker
+  - package-ecosystem: docker # zizmor: ignore[dependabot-cooldown]
     directories:
       - "/"
       - "/docker"
@@ -69,6 +75,8 @@ updates:
     directory: "/"
     schedule:
       interval: daily
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     groups:
       nix:

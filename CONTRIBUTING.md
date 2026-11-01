@@ -128,14 +128,15 @@ describes:
 
 Edit [`wiki/`](wiki) in this repo, not the wiki in the browser. The
 [GitHub wiki](https://github.com/ptweezy/cronstable/wiki) is a published copy:
-every push to `main` runs the pipeline's `wiki` job, which mirrors
-`wiki/*.md` onto it (one file per page, named as the page's URL, so
-`Web-Dashboard.md` maps to `/wiki/Web-Dashboard`).
+every push to `main` that changes `wiki/` runs the `Wiki` workflow
+(`.github/workflows/wiki.yml`), which mirrors `wiki/*.md` onto it (one file
+per page, named as the page's URL, so `Web-Dashboard.md` maps to
+`/wiki/Web-Dashboard`).
 
-The `wiki/` directory is the source of truth. On the next push to `main`, the
-`wiki` job overwrites an edit made in the wiki's web UI and **deletes** a page
-created there. The job prints every page it adds, changes, or deletes to the
-run log.
+The `wiki/` directory is the source of truth. The next publish overwrites an
+edit made in the wiki's web UI and **deletes** a page created there. The
+maintainer can also publish by running the `Wiki` workflow manually on `main`.
+The workflow prints every page it adds, changes, or deletes to the run log.
 
 Pages link to each other with bare wiki links, such as
 `[Installation](Installation)`, which resolve only on the published wiki.
@@ -271,7 +272,7 @@ request, run the static checks and the test suite on your current
 interpreter, with the same commands that CI uses:
 
 ```sh
-tox -e lint,mypy,bandit,openapi
+tox -e lint,mypy,bandit,openapi,zizmor
 tox -e py-windows,py-posix
 ```
 
@@ -285,10 +286,11 @@ To run all environments or a single check:
 
 ```sh
 tox                # all envs: py311-py315 (each with a windows and a posix
-                   # profile), lint, mypy, bandit, openapi
+                   # profile), lint, mypy, bandit, openapi, zizmor
 tox -e lint        # ruff check + ruff format --check
 tox -e mypy        # mypy
 tox -e bandit      # bandit security lint (medium+ severity)
+tox -e zizmor      # zizmor audit of the GitHub Actions workflows
 tox -e py          # pytest on the current interpreter, POSIX coverage profile
 tox -e py-windows  # Windows hosts: the Windows coverage profile explicitly
 tox -e py-posix    # POSIX hosts: the POSIX coverage profile explicitly
@@ -560,11 +562,13 @@ effect on users.
 After you open the pull request:
 
 1. The `CI` workflow runs the full build and test pipeline on your branch,
-   with the signing and publishing jobs skipped. Until you've had a pull
-   request merged, each run waits for the maintainer to approve it. A new push
-   cancels the previous run, whether that run is active or queued. To fully
-   test a particular commit, wait for its checks to finish before pushing
-   again.
+   with the signing and publishing jobs skipped. When every file the branch
+   changes is documentation (`wiki/`, `docs/`, or a Markdown file other than
+   `HISTORY.md`), the binary, image, benchmark, and Nix jobs skip too, and
+   only the tests and checks run. Until you've had a pull request merged, each run
+   waits for the maintainer to approve it. A new push cancels the previous
+   run, whether that run is active or queued. To fully test a particular
+   commit, wait for its checks to finish before pushing again.
 2. GitHub Copilot reviews each push to a pull request that isn't a draft.
    CodeQL code scanning and GitHub code quality analysis also run. A new alert
    at warning level or above, or a security alert of medium severity or

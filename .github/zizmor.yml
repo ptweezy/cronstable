@@ -1,0 +1,6 @@
+# zizmor settings for `tox -e zizmor`.
+rules:
+  # actionlint 1.7.12 rejects the `$/` form of `uses:` that this audit
+  # suggests.
+  self-repository:
+    disable: true
