@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 
 import pytest
 
@@ -262,7 +263,6 @@ def test_dockerignore_excludes_the_heavy_untouched_trees():
 
 def _extract_deps_module():
     """docker/extract_deps.py imported by path (it ships no package)."""
-    pytest.importorskip("tomllib")  # 3.11+, as the script itself needs
     path = os.path.join(ROOT, "docker", "extract_deps.py")
     spec = importlib.util.spec_from_file_location("_extract_deps", path)
     module = importlib.util.module_from_spec(spec)
@@ -273,7 +273,6 @@ def _extract_deps_module():
 @pytest.fixture
 def linux_cryptography_requirement():
     """The complete Linux push constraint, without its platform marker."""
-    tomllib = pytest.importorskip("tomllib")
     from packaging.requirements import Requirement
 
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
@@ -299,9 +298,7 @@ def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):
     # The push+discovery extras pair lives in exactly one place, so pin
     # what the script writes against a straight read of pyproject.toml, and
     # that everything it writes is echoed to stdout (the build-log
-    # visibility the old `cat` provided). tomllib is 3.11+; every image venv
-    # has it, only the 3.10 tox rows skip here.
-    tomllib = pytest.importorskip("tomllib")
+    # visibility the old `cat` provided).
     module = _extract_deps_module()
     shutil.copy(
         os.path.join(ROOT, "pyproject.toml"), tmp_path / "pyproject.toml"
@@ -409,7 +406,6 @@ def test_extract_deps_writes_the_file_the_target_can_install(
 
 def _speedups_line(name):
     """pyproject's speedups requirement for ``name``, marker included."""
-    tomllib = pytest.importorskip("tomllib")
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
         speedups = tomllib.load(fobj)["project"]["optional-dependencies"][
             "speedups"

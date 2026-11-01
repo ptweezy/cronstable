@@ -295,8 +295,10 @@ class Boundary(NamedTuple):
 def parse_boundary(text: str, where: str) -> Boundary:
     """Parse a ``StartBoundary``.
 
-    Uses a explicit regex instead of ``datetime.fromisoformat``, which does
-    not accept a trailing ``Z`` on Python 3.10.
+    Uses the ``_BOUNDARY`` regex, which :func:`_timezone_keys` shares,
+    instead of ``datetime.fromisoformat``: the converter keeps the
+    wall-clock time naive and the zone text as written (``Z``, an offset,
+    or none).
     """
     match = _BOUNDARY.match((text or "").strip())
     if match is None:

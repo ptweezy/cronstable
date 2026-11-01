@@ -880,7 +880,7 @@ async def capture_boot(prefs_file):
     keys.send("q")
     try:
         await asyncio.wait_for(task, 10)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         task.cancel()
 
 
@@ -1128,7 +1128,7 @@ async def capture_all():  # noqa: C901 - one linear staging walk
     keys.send("q")
     try:
         await asyncio.wait_for(task, 10)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         task.cancel()
 
 

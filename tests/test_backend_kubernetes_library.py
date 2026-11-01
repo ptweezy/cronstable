@@ -314,7 +314,7 @@ async def test_observe_turns_the_model_into_the_wire_dict(monkeypatch):
     assert seen["spec"]["renewTime"] == "2026-01-01T12:00:00.250000+00:00"
     state = parse_lease(seen)
     assert state.renew_time == datetime.datetime(
-        2026, 1, 1, 12, 0, 0, 250000, tzinfo=datetime.timezone.utc
+        2026, 1, 1, 12, 0, 0, 250000, tzinfo=datetime.UTC
     )
     assert state.acquire_time is None
     assert state.resource_version == "1001"

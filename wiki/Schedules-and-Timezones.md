@@ -169,7 +169,7 @@ A past `year` means the job never fires again. To run the schedule every year, o
 Resolution order (`timezone` wins):
 
 1. If `timezone` is set, the job uses `ZoneInfo(timezone)`. An unknown name raises `ConfigError("unknown timezone: ...")`. The `utc` value is ignored in this case.
-2. Else if `utc` is `true` (the default), the job uses `datetime.timezone.utc`.
+2. Else if `utc` is `true` (the default), the job uses `datetime.UTC`.
 3. Else (`utc: false`, no `timezone`) the resolved tzinfo is `None`: the job runs on the **host's local clock**. The scheduler and every schedule view frame that clock as `LOCAL_ZONE` (`cronstable/cronexpr.py`), a tzinfo that reads each offset from the C library. The job therefore follows the host's DST rules exactly as a job with an explicit `timezone` follows its zone's: a wall time the clocks skip fires once at the shifted time, and a wall time they repeat fires on its first occurrence only.
 
 The resolved value is a `datetime.tzinfo` (or `None`) stored on the job and passed to `get_now(job.timezone)` when the schedule is tested. Because `utc` is `true` by default, **schedules are interpreted in UTC unless you opt out.**

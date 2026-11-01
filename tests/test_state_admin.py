@@ -27,7 +27,7 @@ from cronstable.platform import IS_WINDOWS
 from cronstable.state import RECORDS_DIR, _TokenBucket
 from tests._helpers import _backend, _write_raw_record
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 
 # --- self-observability stats ---------------------------------------------

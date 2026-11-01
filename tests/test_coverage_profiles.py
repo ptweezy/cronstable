@@ -45,12 +45,11 @@ import ast
 import configparser
 import os
 import re
+import tomllib
 
 import coverage.config
 import pytest
 from strictyaml.ruamel import YAML
-
-tomllib = pytest.importorskip("tomllib")  # py3.11+; the other cells enforce
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = os.path.join(ROOT, "cronstable")

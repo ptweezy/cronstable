@@ -189,9 +189,9 @@ def _job_frame(
 
             return str(tz_name), ZoneInfo(str(tz_name))
         except Exception:  # noqa: BLE001 - unknown zone: fall back
-            return str(tz_name), datetime.timezone.utc
+            return str(tz_name), datetime.UTC
     if job.get("utc", True):
-        return "UTC", datetime.timezone.utc
+        return "UTC", datetime.UTC
     return "local", None
 
 
@@ -215,7 +215,7 @@ def fmt_til(iso: str | None) -> str:
     t = parse_iso(iso)
     if t is None:
         return "til ?"
-    stamp = datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
+    stamp = datetime.datetime.fromtimestamp(t, tz=datetime.UTC)
     return "til %s" % stamp.strftime("%H:%M")
 
 
@@ -246,7 +246,7 @@ def fmt_ago_any(value: Any, now: float | None = None) -> str:
         return "—"
     if isinstance(value, (int, float)):
         stamp = datetime.datetime.fromtimestamp(
-            float(value), tz=datetime.timezone.utc
+            float(value), tz=datetime.UTC
         ).isoformat()
         return fmt_ago(stamp, now)
     return fmt_ago(value, now)
@@ -474,17 +474,17 @@ def parse_iso(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(value)
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        parsed = parsed.replace(tzinfo=datetime.UTC)
     return parsed.timestamp()
 
 
 def utc_clock(now: float | None = None) -> str:
     t = datetime.datetime.fromtimestamp(
-        now if now is not None else time.time(), tz=datetime.timezone.utc
+        now if now is not None else time.time(), tz=datetime.UTC
     )
     return t.strftime("%H:%M:%S UTC")
 
@@ -3974,7 +3974,7 @@ class App:
                 await asyncio.wait_for(
                     self._poll_wakeup.wait(), poll_ms / 1000
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             self._poll_wakeup.clear()
             if self.quit:
@@ -4427,7 +4427,7 @@ class App:
                 tab = CronTab(text)
             except (ValueError, KeyError):
                 continue  # e.g. an H form; /dags has no resolved spelling
-            entries.append(ScheduleEntry(name, tab, datetime.timezone.utc))
+            entries.append(ScheduleEntry(name, tab, datetime.UTC))
         return entries
 
     async def _recompute_pressure_bg(self) -> None:
@@ -4453,7 +4453,7 @@ class App:
         """
         try:
             entries = self._pressure_entries()
-            start = datetime.datetime.now(datetime.timezone.utc)
+            start = datetime.datetime.now(datetime.UTC)
             pressure = schedule_pressure(entries, start=start)
             # both suggestions score the pressure walk's own grid, so the
             # panel pays for ONE fire enumeration instead of three
@@ -4494,7 +4494,7 @@ class App:
         """
         try:
             entries = self._pressure_entries()
-            now = datetime.datetime.now(datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.UTC)
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             end = start + datetime.timedelta(days=7)
             grid = [[0] * 24 for _ in range(7)]
@@ -4512,7 +4512,7 @@ class App:
                 fires: list[datetime.datetime] = []
                 capped = False
                 for when in _walk_fires(entry.tab, zone, probe, end):
-                    utc = when.astimezone(datetime.timezone.utc)
+                    utc = when.astimezone(datetime.UTC)
                     if len(fires) >= WEEK_PER_JOB_CAP:
                         capped = True
                         break
@@ -4719,7 +4719,7 @@ class AppActions(App):
             self.open("token")
             self.focus = "token"
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.toast("fail", "start %s: no answer from the daemon" % name)
             return
         except Exception as exc:  # noqa: BLE001 - toast + carry on
@@ -7465,9 +7465,7 @@ class AppOverlays(AppRender):
                 # advisory lint (never-fires, AND day semantics, uneven
                 # steps, skipped months), same rules the daemon logs at
                 # config load; the UTC frame matches the preview above.
-                findings = lint_schedule(
-                    expr.strip(), timezone=datetime.timezone.utc
-                )
+                findings = lint_schedule(expr.strip(), timezone=datetime.UTC)
                 if findings:
                     body.append(paint.style("", "fg"))
                 body.extend(finding_rows(findings, paint, width, 4))
@@ -8178,7 +8176,7 @@ class AppOverlays(AppRender):
         # display, so one build serves every frame of a minute.  The cache
         # holds the compared payload reference (a recycled object id can
         # never validate a stale entry) and retheme clears it.
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         minute = now.replace(second=0, microsecond=0)
         cached = self._week_body
         if (

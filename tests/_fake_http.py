@@ -176,7 +176,7 @@ class FakeHttpServer:
                     await asyncio.wait_for(
                         self._release_hangs.wait(), _HANG_CAP_SECONDS
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 return web.Response(status=503)
             return web.Response(

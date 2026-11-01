@@ -50,13 +50,13 @@ respect.
 
 ## Development setup
 
-The project targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13, 3.14, and 3.15
+The project targets **Python 3.11 or later** (3.11, 3.12, 3.13, 3.14, and 3.15
 are tested) and runs on **Linux, macOS, and Windows**. The test suite runs on
 all three in CI, including Windows ARM64.
 
 cronstable uses [uv](https://docs.astral.sh/uv/) for local development.
 The `tox-uv` plugin also lets tox use uv to create environments and install
-dependencies. uv can install the Python 3.10 to 3.15 interpreters used by the
+dependencies. uv can install the Python 3.11 to 3.15 interpreters used by the
 test matrix.
 
 Install uv and fork
@@ -204,8 +204,8 @@ files to the generator:
   settings, and `.github/docker-matrix.json` lists the supported image paths
   and platforms.
 
-After changing an input, regenerate with Python 3.11 or newer. The second
-command verifies that every generated file is current:
+After changing an input, regenerate the files. The second command verifies
+that every generated file is current:
 
 ```sh
 python scripts/generate_build_files.py
@@ -213,8 +213,8 @@ python scripts/generate_build_files.py --check
 ```
 
 Commit the generated files with their inputs. CI runs the same verification
-before its static checks. Builds use the checked-in files directly, including
-on Python 3.10, and never run the generator.
+before its static checks. Builds use the checked-in files directly and never
+run the generator.
 
 `requirements/min.txt` pins the minimum runtime and test dependency versions
 for `tox -e mindeps`. Each file in `pyinstaller/requirements/` holds one
@@ -245,8 +245,8 @@ these reasons:
   dependency.
 - A bug fix, an API, or (for `tzdata`) zone data that cronstable needs.
 - A release that PyPI withdrew or that can't be imported.
-- The first release with Python 3.10 wheels, or with a wheel for every target
-  that the requirement's marker lists.
+- The first release with wheels for the oldest supported Python (3.11), or
+  with a wheel for every target that the requirement's marker lists.
 
 Write the reason in a comment beside the requirement, and give the `dev`
 extra's copy of the requirement the same floor. A new release on its own
@@ -257,7 +257,7 @@ alert with an explanation of why the advisory doesn't affect cronstable. Never
 lower a floor that a security fix set.
 
 After you change a floor, regenerate the build files and run
-`tox -e mindeps` with Python 3.10. It installs the pins in
+`tox -e mindeps` with Python 3.11. It installs the pins in
 `requirements/min.txt` and runs the test suite on them. Because the `dev`
 extra doesn't install `kubernetes` or `uvloop`, `requirements/min.txt` omits
 both; test changes to their floors manually. For `kubernetes`, run
@@ -284,7 +284,7 @@ every OS.
 To run all environments or a single check:
 
 ```sh
-tox                # all envs: py310-py315 (each with a windows and a posix
+tox                # all envs: py311-py315 (each with a windows and a posix
                    # profile), lint, mypy, bandit, openapi
 tox -e lint        # ruff check + ruff format --check
 tox -e mypy        # mypy
@@ -452,8 +452,7 @@ profiles, and fails when only one side of a branch is annotated.
 
 Release pipeline tests are in `.github/tests`, and the full test suite
 includes them. To run only these tests, for example after you change a
-workflow, use Python 3.11 or newer and run these commands from the repository
-root:
+workflow, run these commands from the repository root:
 
 ```sh
 python -m pip install packaging pytest strictyaml

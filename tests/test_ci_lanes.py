@@ -11,6 +11,7 @@ import itertools
 import os
 import re
 import sys
+import tomllib
 import types
 import xml.etree.ElementTree as ET
 
@@ -33,7 +34,6 @@ def _tox():
 
 
 def _pyproject():
-    tomllib = pytest.importorskip("tomllib")  # Python 3.11+
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fobj:
         return tomllib.load(fobj)
 
@@ -255,6 +255,100 @@ def test_the_memory_pids_lane_skips_only_the_tests_that_need_cpu(
         (passed, ("test_scope", "skipped", "no user scope: no bus")),
         (passed, ("test_hog", "failures", "the hog lived")),
         (passed, ("test_hog", "errors", "no fixture")),
+    ):
+        with pytest.raises(AssertionError):
+            check(*hollow)
+
+
+def _tls_lane_step():
+    """The ``run`` script of the OpenSSL 1.1.1 TLS lane."""
+    job = _load_workflow("release.yml")["jobs"]["tls-openssl1"]
+    assert job["runs-on"].startswith("ubuntu-")
+    # a rebuilt image under the same tag could link another OpenSSL
+    image = job["env"]["UBI8_PYTHON_IMAGE"]
+    assert re.search(r"@sha256:[0-9a-f]{64}$", image), image
+    return next(
+        step["run"]
+        for step in job["steps"]
+        if step.get("name") == "Run the TLS tests under OpenSSL 1.1.1"
+    )
+
+
+#: The TLS test files the OpenSSL 1.1.1 lane runs. Dropping one is a
+#: deliberate edit here too.
+_TLS_LANE_FILES = {
+    "tests/test_web_tls.py",
+    "tests/test_state_job_cli.py",
+    "tests/test_cluster.py",
+    "tests/test_webclient.py",
+    "tests/test_backend_etcd_transport.py",
+    "tests/test_backend_kubernetes_transport.py",
+    "tests/test_paircli.py",
+    "tests/test_tui_pair.py",
+    "tests/test_mcpcli.py",
+}
+
+
+def _openssl_readers():
+    """Every test file whose result depends on the linked OpenSSL."""
+    tests = os.path.join(ROOT, "tests")
+    myself = os.path.basename(__file__)  # this file names both markers
+    readers = []
+    for name in sorted(os.listdir(tests)):
+        if not name.endswith(".py") or name == myself:
+            continue
+        with open(os.path.join(tests, name), encoding="utf-8") as fobj:
+            source = fobj.read()
+        if "ssl.OPENSSL_VERSION" in source or "VERIFY_X509_STRICT" in source:
+            readers.append("tests/" + name)
+    assert len(readers) >= 2, "the OpenSSL detector went stale"
+    return readers
+
+
+def test_the_openssl_1_1_1_lane_cannot_pass_hollow(tmp_path, monkeypatch):
+    run = _tls_lane_step()
+    command = " ".join(run.split("\\\n"))
+    # without a 1.1.1 interpreter the lane tests OpenSSL 3 again, so an
+    # uncommented line must exit on the version
+    assert re.search(
+        r"^\s*/tmp/venv/bin/python -c \"[^\"#]*"
+        r"sys\.exit\(ssl\.OPENSSL_VERSION_INFO\[:3\] != \(1, 1, 1\)\)\"$",
+        run,
+        re.M,
+    )
+    files = set(re.findall(r"\btests/test_\w+\.py\b", command))
+    assert files == _TLS_LANE_FILES
+    for path in files:
+        assert os.path.exists(os.path.join(ROOT, path)), path
+    # every test file that depends on the OpenSSL version runs in the lane
+    for path in _openssl_readers():
+        assert path in files, path
+    # a selection flag would run a subset of those files
+    pytest_args = command.split(" -m pytest ", 1)[1]
+    assert not re.search(r"\s(-k|-m|--deselect)\s", pytest_args)
+    # the one skip the check allows is the reason the test file gives
+    expected = re.search(r'expected = "([^"]+)"', run).group(1)
+    with open(os.path.join(ROOT, "tests", "test_web_tls.py")) as fobj:
+        assert 'reason="{}"'.format(expected) in fobj.read()
+    checker = compile(
+        run.split("<<'EOF'\n", 1)[1].split("\nEOF", 1)[0], "check", "exec"
+    )
+    junit = str(tmp_path / "tls-openssl1.xml")
+    monkeypatch.setattr(sys, "argv", ["check", junit])
+    aki = ("test_no_aki", "skipped", expected)
+    passed = ("test_handshake", "passed", None)
+
+    def check(*cases):
+        _junit(junit, cases)
+        exec(checker, {})
+
+    check(passed, aki)
+    check(passed)
+    for hollow in (
+        (),
+        (passed, ("test_pair", "skipped", "cryptography is not installed")),
+        (passed, ("test_mtls", "failures", "the handshake failed")),
+        (passed, ("test_mtls", "errors", "no fixture")),
     ):
         with pytest.raises(AssertionError):
             check(*hollow)

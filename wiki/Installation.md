@@ -8,7 +8,7 @@ method. For Windows-specific behavior, see [running on Windows](Running-on-Windo
 
 | Requirement | Value |
 | --- | --- |
-| Python (pip/pipx) | `>= 3.10` (`requires-python = ">=3.10"`). Versions 3.10, 3.11, 3.12, 3.13, 3.14, and 3.15 are supported and tested. For an older Python, use the standalone binary instead. |
+| Python (pip/pipx) | `>= 3.11` (`requires-python = ">=3.11"`). Versions 3.11, 3.12, 3.13, 3.14, and 3.15 are supported and tested. For an older Python, use the standalone binary instead. |
 | Operating system | Linux, macOS, and Windows. `cronstable/platform.py` isolates OS-specific behavior. `grp` and `pwd` are imported only on POSIX. A few features differ on Windows; see [running on Windows](Running-on-Windows). |
 | CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), for both the container image and the prebuilt binaries. The prebuilt binaries also cover `armv6` and `riscv64` and `loong64` (LoongArch) in both libcs, plus `mips64le` and `armel` (glibc). macOS: `amd64` and `arm64`. Windows: `amd64` (x64), `arm64` (ARM64) and `i686`. Also FreeBSD (`amd64`, `arm64`), OpenBSD, NetBSD and illumos (`amd64`). Every amd64 release binary/package and Docker distro has an `amd64v3` counterpart, recommended for compatible CPUs; `amd64` is the compatibility build; see [CPU requirements](#amd64v3-cpu-requirements). |
 
@@ -29,7 +29,7 @@ Installing the `cronstable` distribution pulls in the following, taken from
 | `aiosmtplib` | `>=5.1.3,<6` |
 | `jinja2` | `>=3.1.6,<4` |
 | `tzdata` | `>=2024.1` |
-| `psutil` | `>=5.9.0` |
+| `psutil` | `>=5.9.4` |
 
 Each minimum is the oldest release that cronstable supports, so you can
 install cronstable next to packages that need an older release of a shared
@@ -140,7 +140,7 @@ docker run --rm \
   ghcr.io/ptweezy/cronstable:1.2.60-alpine
 ```
 
-Because cronstable is a pure-Python app that supports any Python >= 3.10,
+Because cronstable is a pure-Python app that supports Python 3.11 or later,
 behavior is identical across variants. Pick the base, not the interpreter
 version.
 
@@ -191,7 +191,7 @@ images, run `docker compose pull` followed by `docker compose up -d`.
 
 ## Install using pip
 
-Python >= 3.10 is required. Install cronstable in a virtual environment:
+cronstable requires Python 3.11 or later. Install it in a virtual environment:
 
 ```shell
 python3 -m venv cronstableenv
@@ -229,8 +229,7 @@ the program into it:
 pipx install cronstable
 ```
 
-pipx still requires a supported Python (3.10 or newer) available to build the
-isolated environment.
+pipx still requires Python 3.11 or later to build the isolated environment.
 
 ## Install using Homebrew
 

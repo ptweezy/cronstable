@@ -52,7 +52,6 @@ import platform
 import re
 import struct
 import sys
-
 import tomllib
 
 EXTRAS = ("push", "discovery")

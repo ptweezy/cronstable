@@ -424,13 +424,13 @@ jobs:
         # macOS runs the POSIX profile: its process, signal, fsync, and pipe
         # behavior differs from Linux, and releases ship macOS binaries.
         os: [ubuntu-26.04, windows-latest, macos-latest]
-        python: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
+        python: ['3.11', '3.12', '3.13', '3.14', '3.15']
         include:
           # Linux ARM64 on the oldest and newest Python, and on 3.14, which
           # the release binaries bundle: releases ship ARM64 artifacts, and
           # cryptography and orjson use different wheels there.
           - os: ubuntu-26.04-arm
-            python: '3.10'
+            python: '3.11'
           - os: ubuntu-26.04-arm
             python: '3.14'
           - os: ubuntu-26.04-arm
@@ -589,7 +589,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.10'
+          python-version: '3.11'
       - run: pip install tox tox-uv
       - run: tox -e mindeps
     needs:
@@ -769,6 +769,83 @@ jobs:
               for skipped in case.iter("skipped"):
                   message = skipped.get("message")
                   assert message in cpu, (case.get("name"), message)
+          EOF
+    needs:
+      - version
+      - tox-static
+
+  # Runs the TLS tests with RHEL 8's python3.11, which links OpenSSL 1.1.1k.
+  # OpenSSL 1.1.1 makes fewer certificate checks than OpenSSL 3
+  # (wiki/Listener-TLS.md), and the other test jobs all link OpenSSL 3.
+  tls-openssl1:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      UBI8_PYTHON_IMAGE: registry.access.redhat.com/ubi8/python-311:1-1779943517@sha256:06ad015cc4e4c2ec18e1119af36dd0dcae85d60b7587164338dc750d34436b58
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.SETUP_UV_VERSION }}
+      # Its own step, so a registry blip is retried before the tests start.
+      - name: Pull the RHEL 8 Python image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          retry 5 docker pull "$UBI8_PYTHON_IMAGE"
+      - name: Run the TLS tests under OpenSSL 1.1.1
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tls-openssl1"
+          mkdir -p "$out"
+          # The container runs as the image user, not the runner user.
+          chmod 777 "$out"
+          docker run --rm \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e UV_HTTP_TIMEOUT -e UV_PYTHON_DOWNLOADS \
+            -v "$PWD:/src:ro" -v "$out:/out" \
+            -v "$(command -v uv):/usr/local/bin/uv:ro" \
+            "$UBI8_PYTHON_IMAGE" bash -euc '
+              # NO APOSTROPHES: this whole script is single-quoted (bash -euc).
+              # The install and the tests write into the tree, so they run
+              # on a copy of the read-only checkout.
+              cp -r /src /tmp/src
+              cd /tmp/src
+              uv venv /tmp/venv --python python3.11
+              /tmp/venv/bin/python -c "import ssl, sys; print(ssl.OPENSSL_VERSION); sys.exit(ssl.OPENSSL_VERSION_INFO[:3] != (1, 1, 1))"
+              uv pip install --python /tmp/venv/bin/python -e ".[dev]"
+              /tmp/venv/bin/python -m pytest --no-cov -p no:cacheprovider \
+                -v -rs --junitxml=/out/tls-openssl1.xml \
+                tests/test_web_tls.py \
+                tests/test_state_job_cli.py \
+                tests/test_cluster.py \
+                tests/test_webclient.py \
+                tests/test_backend_etcd_transport.py \
+                tests/test_backend_kubernetes_transport.py \
+                tests/test_paircli.py \
+                tests/test_tui_pair.py \
+                tests/test_mcpcli.py
+            '
+          python3 - "$out/tls-openssl1.xml" <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for suite in root.iter("testsuite"):
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          print("TLS tests on OpenSSL 1.1.1:", totals)
+          assert totals["tests"] >= 1, "no TLS test was collected"
+          assert totals["failures"] == 0 and totals["errors"] == 0
+          # The only skip is the one OpenSSL 1.1.1 case.
+          expected = "OpenSSL 1.1.1 does not check the AKI"
+          for case in root.iter("testcase"):
+              for skipped in case.iter("skipped"):
+                  message = skipped.get("message")
+                  assert message == expected, (case.get("name"), message)
           EOF
     needs:
       - version
@@ -4121,6 +4198,7 @@ jobs:
       - tox-mindeps
       - backends-live
       - cgroups-live
+      - tls-openssl1
       - tox-static
       - licenses
       - release-prepare

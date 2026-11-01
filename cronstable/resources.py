@@ -408,7 +408,7 @@ class _SharedSampleTicker:
                     self._wake.clear()
                     try:
                         await asyncio.wait_for(self._wake.wait(), delay)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
         except Exception:  # noqa: BLE001 - a sampler bug must not crash it
             logger.warning(

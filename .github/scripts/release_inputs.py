@@ -5,11 +5,11 @@ import json
 import os
 import shutil
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-import tomllib
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version

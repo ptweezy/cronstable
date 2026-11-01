@@ -44,7 +44,7 @@ from cronstable.cron import (
 from cronstable.job import JobOutputStream
 from tests.conftest import Req, _cron
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 _SVG = "{http://www.w3.org/2000/svg}"
 
 _JOBS = """
@@ -813,11 +813,10 @@ async def test_the_deeper_read_yields_to_what_happens_meanwhile(meanwhile):
 @pytest.mark.parametrize(
     "error, timed_out",
     [
-        (asyncio.TimeoutError(), True),
         (TimeoutError(), True),
         (OSError("store unavailable"), False),
     ],
-    ids=["asyncio-timeout", "builtin-timeout", "store-error"],
+    ids=["timeout", "store-error"],
 )
 async def test_a_deeper_read_failure_leaves_the_badge_pending(
     error, timed_out, caplog
@@ -1624,7 +1623,7 @@ async def test_tui_first_load_lands_while_whoami_stalls(tmp_path):
         if path == "/whoami":
             reads.append(path)
             await release.wait()
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
         return await stub(path, **k)
 
     app.api.get_json = get_json
@@ -1651,7 +1650,7 @@ async def test_tui_polls_land_while_whoami_stalls(tmp_path):
         if path == "/whoami":
             reads.append(path)
             await release.wait()
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
         return {"from": path}
 
     app.api.get_json = get_json

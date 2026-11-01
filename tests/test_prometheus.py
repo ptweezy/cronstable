@@ -592,7 +592,7 @@ def _closed_output():
 
 async def test_web_metrics_handler_reports_job_state():
     cron = _cron(_TWO_JOBS)
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cron._record_run(
         "alpha",
         JobRunInfo(
@@ -669,7 +669,7 @@ async def test_next_run_reads_seeded_next_fire_index():
     # regression that recomputed via the fallback would render a different
     # value and fail here rather than silently matching.
     cron = Cron(None, config_yaml=_NEXT_RUN_GATE)
-    when = datetime.datetime(2099, 1, 1, 0, 2, 3, tzinfo=datetime.timezone.utc)
+    when = datetime.datetime(2099, 1, 1, 0, 2, 3, tzinfo=datetime.UTC)
     cron._next_fire["cron-on"] = when
     text = cron.metrics.render(cron)
     assert _next_run_ts(text, job_name="cron-on") == when.timestamp()
@@ -689,7 +689,7 @@ async def test_next_run_skips_known_dead_schedules(monkeypatch, schedule):
     schedule: "{schedule}"
 """,
     )
-    now = datetime.datetime(2026, 9, 9, tzinfo=datetime.timezone.utc)
+    now = datetime.datetime(2026, 9, 9, tzinfo=datetime.UTC)
     cron._ensure_seeded(now)
     assert "dead" in cron._dead_schedules
     assert "dead" not in cron._next_fire
@@ -1539,7 +1539,7 @@ async def test_job_families_emit_last_run_cpu_and_rss():
 
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.web_config = {}
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cron._record_run(
         "alpha",
         JobRunInfo(
@@ -1562,7 +1562,7 @@ async def test_job_families_omit_last_run_cpu_when_unmonitored():
     # the negative side: a run without resource_usage exports neither gauge.
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.web_config = {}
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cron._record_run(
         "alpha",
         JobRunInfo(
@@ -1636,7 +1636,7 @@ def _limits_record(**over):
 
 
 def _capped_run(limits=None):
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     return JobRunInfo(
         outcome="failure" if limits is not None else "success",
         exit_code=0,
@@ -1748,7 +1748,7 @@ def _pinned_cron():
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.web_config = {}
     cron._next_fire["alpha"] = datetime.datetime(
-        2026, 7, 25, 12, 0, tzinfo=datetime.timezone.utc
+        2026, 7, 25, 12, 0, tzinfo=datetime.UTC
     )
     return cron
 

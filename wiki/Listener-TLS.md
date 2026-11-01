@@ -227,11 +227,11 @@ and the other CLI clients, and the cluster's peer certificates. With OpenSSL
 - A certificate that a CA issued carries an Authority Key Identifier that
   names the CA's key.
 
-A Python linked to OpenSSL 1.1.1, such as the python.org builds of Python
-3.10 for Windows and macOS, makes fewer of these checks. It accepts a
-certificate without an Authority Key Identifier, and a CA certificate
-without a key usage extension, a Subject Key Identifier, or a critical
-`basicConstraints`. To see which OpenSSL a Python links, run
+A Python linked to OpenSSL 1.1.1, such as the python3.11 package on RHEL 8 or
+the python.org builds of Python 3.11.4 and earlier for Windows and macOS,
+makes fewer of these checks. It accepts a certificate without an Authority
+Key Identifier, and a CA certificate without a key usage extension, a
+Subject Key Identifier, or a critical `basicConstraints`. To see which OpenSSL a Python links, run
 `python -c "import ssl; print(ssl.OPENSSL_VERSION)"` with the Python that
 runs cronstable.
 

@@ -174,7 +174,7 @@ Notes on behavior:
   TLS connections (`tls` or `starttls`) to servers with self-signed or otherwise
   untrusted certificates fail.
 - The reporter sets an `RFC 5322` `Date` header
-  (`email.utils.format_datetime(datetime.now(timezone.utc))`), for example
+  (`email.utils.format_datetime(datetime.now(UTC))`), for example
   `Wed, 18 Jun 2026 12:34:56 +0000`, not ISO-8601.
 - **Empty-body success emails are skipped.** On a success report, if the
   rendered body is empty after stripping whitespace, no email is sent. (Failure

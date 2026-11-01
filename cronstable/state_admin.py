@@ -417,7 +417,7 @@ async def _gc_async(
                 name, limit=MANIFEST_STREAM_KEEP, newest_first=True
             )
         )
-    now = get_now(datetime.timezone.utc)
+    now = get_now(datetime.UTC)
     # same young-history deferral as the daemon's automatic pass: unless
     # the manifest history spans one full grace window, absence cannot be
     # proven and nothing may be deleted.

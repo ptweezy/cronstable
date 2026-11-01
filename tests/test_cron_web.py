@@ -2288,7 +2288,7 @@ async def test_web_500_and_504_carry_the_json_envelope(
         raise RuntimeError("secret detail: /var/lib/cronstable/state")
 
     def slow():
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     with caplog.at_level(logging.ERROR, logger="cronstable"):
         async with aiohttp.ClientSession() as session:
