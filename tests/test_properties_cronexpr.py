@@ -27,7 +27,7 @@ from tests._strategies import (
     zone,
 )
 
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 MINUTE = datetime.timedelta(minutes=1)
 SECOND = datetime.timedelta(seconds=1)
 #: how far the brute-force scans look; wide enough that most generated

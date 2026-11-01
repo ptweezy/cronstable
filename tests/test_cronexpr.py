@@ -30,7 +30,7 @@ from cronstable import cronexpr
 from cronstable.cronexpr import CronTab
 from tests._helpers import _pin_host_zone
 
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 # next() deltas are compared to a nanosecond: the legacy library computed
 # its float seconds along a different arithmetic path, so a microsecond
@@ -260,9 +260,7 @@ def test_prev_aware_past_horizon_is_bounded_and_correct():
     ago = ct.prev(now=datetime.datetime(9999, 1, 1, tzinfo=ny))
     assert _time.perf_counter() - started < 2.0
     # the answer is the real fire set's last member: 2099-12-31 23:59 local
-    now_utc = datetime.datetime(9999, 1, 1, tzinfo=ny).astimezone(
-        datetime.timezone.utc
-    )
+    now_utc = datetime.datetime(9999, 1, 1, tzinfo=ny).astimezone(datetime.UTC)
     last = (now_utc - datetime.timedelta(seconds=ago)).astimezone(ny)
     assert last.replace(tzinfo=None) == datetime.datetime(2099, 12, 31, 23, 59)
 
@@ -294,7 +292,7 @@ def _accumulate(ct, start, count):
         if delay is None:
             break
         current = (
-            current.astimezone(datetime.timezone.utc)
+            current.astimezone(datetime.UTC)
             + datetime.timedelta(seconds=delay)
         ).astimezone(current.tzinfo)
         fires.append(current)
@@ -325,12 +323,12 @@ def test_occurrences_spring_forward_fires_once_at_shifted_label():
     first, second = next(it), next(it)
     # 02:30 does not exist on 2026-03-08; the fire lands at 07:30Z, whose
     # wall label is 03:30 EDT, and the day yields exactly one fire
-    assert first.astimezone(datetime.timezone.utc) == datetime.datetime(
-        2026, 3, 8, 7, 30, tzinfo=datetime.timezone.utc
+    assert first.astimezone(datetime.UTC) == datetime.datetime(
+        2026, 3, 8, 7, 30, tzinfo=datetime.UTC
     )
     assert (first.hour, first.minute) == (3, 30)
-    assert second.astimezone(datetime.timezone.utc) == datetime.datetime(
-        2026, 3, 9, 6, 30, tzinfo=datetime.timezone.utc
+    assert second.astimezone(datetime.UTC) == datetime.datetime(
+        2026, 3, 9, 6, 30, tzinfo=datetime.UTC
     )
 
 
@@ -340,7 +338,7 @@ def test_occurrences_fall_back_first_occurrence_only():
     start = datetime.datetime(2026, 10, 31, 12, 0, tzinfo=ny)
     it = ct.occurrences(start)
     first, second = next(it), next(it)
-    utc = datetime.timezone.utc
+    utc = datetime.UTC
     # 01:30 EDT (05:30Z), and NOT again at 01:30 EST (06:30Z); the next
     # fire is the following day, 25 real hours later
     assert first.astimezone(utc) == datetime.datetime(
@@ -899,7 +897,7 @@ def test_occurrences_honours_start_fold_no_past_fires_replayed():
     # 07:00Z: the dashboard preview showed a "next" fire that had already
     # happened, and missed-run detection reported a run the scheduler never
     # performed.
-    utc = datetime.timezone.utc
+    utc = datetime.UTC
     ny = ZoneInfo("America/New_York")
     ct = CronTab("*/15 * * * *")
     start = datetime.datetime(2026, 11, 1, 1, 30, tzinfo=ny, fold=1)
@@ -929,7 +927,7 @@ def test_next_finds_gap_shifted_fire_after_spring_forward():
     # was 59 minutes in the future -- while prev() afterwards reported it
     # as having happened.  Any daemon start or reload inside the window
     # [gap end, shifted label) lost that day's run.
-    utc = datetime.timezone.utc
+    utc = datetime.UTC
     ny = ZoneInfo("America/New_York")
     ct = CronTab("59 2 * * *")
     fire_utc = datetime.datetime(2015, 3, 8, 7, 59, tzinfo=utc)
@@ -965,7 +963,7 @@ def test_next_first_occurrence_prev_agree_across_dst_edges(expr, fold):
     # days and both folds: next(now) == the first occurrences(now) yield,
     # every yield is strictly future, and prev() one second after a fire
     # finds it.
-    utc = datetime.timezone.utc
+    utc = datetime.UTC
     ny = ZoneInfo("America/New_York")
     ct = CronTab(expr)
     for base in (

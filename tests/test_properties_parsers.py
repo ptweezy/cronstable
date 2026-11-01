@@ -579,7 +579,7 @@ def test_a_rendered_calendar_is_well_formed_for_any_job_names(jobs, days):
         ical.CalendarEntry._make(_entry_fields(name, CronTab(expr)))
         for name, expr in jobs
     ]
-    start = datetime.datetime(2026, 3, 7, tzinfo=datetime.timezone.utc)
+    start = datetime.datetime(2026, 3, 7, tzinfo=datetime.UTC)
     text = ical.render_calendar(
         entries, start, days, per_job_cap=20, now=start
     )
@@ -598,8 +598,8 @@ def _entry_fields(name, tab):
         "tab": tab,
         "crontab": tab,
         "schedule": str(tab),
-        "timezone": datetime.timezone.utc,
-        "tz": datetime.timezone.utc,
+        "timezone": datetime.UTC,
+        "tz": datetime.UTC,
         "avg_duration": None,
         "enabled": True,
         "paused": False,

@@ -139,7 +139,7 @@ class LeaseStore:
             )
         meta["uid"] = str(uuid.uuid4())
         meta["creationTimestamp"] = datetime.datetime.now(
-            datetime.timezone.utc
+            datetime.UTC
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         obj.setdefault("apiVersion", API_VERSION)
         obj.setdefault("kind", "Lease")

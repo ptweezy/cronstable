@@ -122,7 +122,7 @@ _ONE_SECOND = datetime.timedelta(seconds=1)
 
 #: The UTC singleton; the aware loops in next(), prev() and occurrences()
 #: convert through it once per candidate.
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 
 #: Days per month, indexed 1-12 (February's non-leap length); index 0 unused.

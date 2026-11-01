@@ -14,7 +14,7 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.message import EmailMessage
 from email.utils import format_datetime
 from functools import lru_cache
@@ -987,7 +987,7 @@ class MailReporter(Reporter):
         message["To"] = mail["to"].strip()
         message["Subject"] = subject.strip()
         # RFC 5322 date, e.g. "Wed, 18 Jun 2026 12:34:56 +0000" (not ISO-8601).
-        message["Date"] = format_datetime(datetime.now(timezone.utc))
+        message["Date"] = format_datetime(datetime.now(UTC))
         if mail["html"]:
             # set_content handles charset + transfer-encoding so non-ASCII
             # HTML bodies are sent correctly (set_payload would not).
@@ -1015,7 +1015,7 @@ class MailReporter(Reporter):
                 self._converse(smtp, username, password, message),
                 MAIL_REPORT_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "mail: report for job %s did not complete within %.0f "
                 "seconds; giving up on it",
@@ -1224,7 +1224,7 @@ class ShellReporter(Reporter):
         timeout = shell_config.get("timeout") or 60
         try:
             retcode = await asyncio.wait_for(proc.wait(), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "Shell reporter of job %s did not finish within %.1f "
                 "seconds; killing it",
@@ -1243,7 +1243,7 @@ class ShellReporter(Reporter):
             # extra bound guarantees the reaper can never be wedged here.
             try:
                 await asyncio.wait_for(proc.wait(), 10)
-            except asyncio.TimeoutError:  # pragma: no cover - defensive
+            except TimeoutError:  # pragma: no cover - defensive
                 logger.error(
                     "Shell reporter of job %s could not be reaped after "
                     "being killed",
@@ -1469,11 +1469,7 @@ class WebhookReporter(Reporter):
                             job.config.name,
                             resp.status,
                         )
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                UnicodeError,
-            ) as exc:
+            except (TimeoutError, aiohttp.ClientError, UnicodeError) as exc:
                 # Caught HERE rather than left to _report_common's
                 # catch-all: the URL is the credential, and a spelling
                 # yarl rejects raises InvalidUrlClientError, whose str()
@@ -2404,7 +2400,7 @@ class RunningJob:
             return
         self._stopped = True
         if self.ended_at is None:
-            self.ended_at = datetime.now(timezone.utc)
+            self.ended_at = datetime.now(UTC)
         # Finalize resource accounting before statsd reports it. _on_stop
         # is the single idempotent choke point every completion path
         # funnels through, so usage is captured exactly once.
@@ -2430,7 +2426,7 @@ class RunningJob:
             # one; see STATSD_START_FLUSH_TIMEOUT.
             try:
                 await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # the documented "host that misses this window" case: the
                 # open is still in flight and stays pooled, nothing to say
                 pass
@@ -2460,7 +2456,7 @@ class RunningJob:
         if self.proc is not None:
             raise RuntimeError("process already running")
         config = self.config
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = datetime.now(UTC)
         # Isolate the job in its own process group, so cancel() can take its
         # whole descendant tree down as a unit rather than only the spawned
         # process (see cronstable.platform.new_process_group_kwargs).
@@ -2853,10 +2849,10 @@ class RunningJob:
                         self.proc.wait(), timeout
                     )
                 else:
-                    raise asyncio.TimeoutError
+                    raise TimeoutError
                 if await self._output_open_at_deadline():
-                    raise asyncio.TimeoutError
-            except asyncio.TimeoutError:
+                    raise TimeoutError
+            except TimeoutError:
                 logger.info(
                     "Job %s exceeded its executionTimeout of "
                     "%.1f seconds, cancelling it...",
@@ -2948,7 +2944,7 @@ class RunningJob:
             if self.on_verifying is not None:
                 try:
                     await self.on_verifying()
-                except (OSError, asyncio.TimeoutError):
+                except (TimeoutError, OSError):
                     logger.warning("Could not publish verification status")
             if self._terminated:
                 await check.cancel()
@@ -2958,7 +2954,7 @@ class RunningJob:
         try:
             try:
                 await asyncio.wait_for(verify(), spec["timeout"])
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 check.retcode = -100
                 await check.cancel()
                 if self._terminated:
@@ -2974,7 +2970,7 @@ class RunningJob:
             raise
         finally:
             self._verifier = None
-        finished = datetime.now(timezone.utc)
+        finished = datetime.now(UTC)
         self.verification = {
             "outcome": "failure" if check.failed else "success",
             "exit_code": check.retcode,
@@ -3120,7 +3116,7 @@ class RunningJob:
         """End this run: its canceled verification check has no process."""
         self._verifier_cancelled = True
         if self.ended_at is None:
-            self.ended_at = datetime.now(timezone.utc)
+            self.ended_at = datetime.now(UTC)
 
     async def cancel(self) -> None:
         """Terminate this run and everything it spawned.

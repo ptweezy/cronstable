@@ -274,7 +274,7 @@ class BonjourAdvertiser:
                 loop.run_in_executor(None, netutil.lan_address),
                 timeout=_ADDR_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     async def _unregister(self) -> None:

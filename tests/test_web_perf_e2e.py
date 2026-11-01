@@ -267,9 +267,7 @@ def test_a_revalidated_poll_keeps_the_countdown_anchor(browser, tmp_path):
 
 def _daily_job():
     """A job whose next fire is about twelve hours away."""
-    fire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        hours=12
-    )
+    fire = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=12)
     return e2e.job("daily", schedule="%d %d * * *" % (fire.minute, fire.hour))
 
 

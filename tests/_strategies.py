@@ -196,7 +196,7 @@ def transitions(name, year):
     """UTC instants (hour resolution, refined to the second) at which the
     zone's offset changes during ``year``."""
     tz = zone(name)
-    utc = datetime.timezone.utc
+    utc = datetime.UTC
     found = []
     cursor = datetime.datetime(year, 1, 1, tzinfo=utc)
     end = datetime.datetime(year + 1, 1, 1, tzinfo=utc)
@@ -244,7 +244,7 @@ def aware_datetimes(draw, near_transition=None):
         instant = edge + datetime.timedelta(seconds=skew)
     else:
         instant = draw(naive_datetimes(1995, 2037)).replace(
-            tzinfo=datetime.timezone.utc
+            tzinfo=datetime.UTC
         )
     return instant.astimezone(tz)
 

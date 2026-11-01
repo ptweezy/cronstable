@@ -55,7 +55,7 @@ _RETRYCLAIM_RETRY_JOB_DEADLINE = job_yaml(
 def _retryclaim_foreign(cron, job, host="node-a", secs_stale=120):
     from cronstable.fingerprint import job_digest
 
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     stale = now - datetime.timedelta(seconds=secs_stale)
     return {
         "kind": "pending",
@@ -147,7 +147,7 @@ async def test_retryclaim_refresh_pauses_from_store_skip_removed_and_replace(
     stateful_cron,
 ):
     cron = await stateful_cron(TWO_JOBS)
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     until1 = now + datetime.timedelta(hours=1)
     until2 = now + datetime.timedelta(hours=2)
     # a stream for a job not in the config: the sweep skips it entirely
@@ -196,7 +196,7 @@ async def test_retryclaim_refresh_pauses_from_store_skip_removed_and_replace(
 
 def test_retryclaim_sla_bank_pause_clamps_ended_at_to_until():
     cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     cron._sla_last_success["s"] = now  # pin the staleness reference at `now`
     was = cronstable.cron.PauseInfo(
         since=now,
@@ -214,7 +214,7 @@ def test_retryclaim_sla_bank_pause_clamps_ended_at_to_until():
 
 def test_retryclaim_sla_observations_skips_runjob_without_started_at():
     cron = cronstable.cron.Cron(None, config_yaml=_SLA_RUNTIME_JOB)
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
 
     class _R:
         started_at = None
@@ -284,7 +284,8 @@ async def test_retry_waits_out_an_early_timer_wakeup(monkeypatch):
     async def early_sleep(delay):
         nonlocal elapsed
         sleeps.append(delay)
-        # Windows 3.10's event-loop clock can wake a timer one tick early.
+        # Before Python 3.13, the Windows event-loop clock can wake a timer
+        # one tick early.
         elapsed += max(0, delay - 0.01) if len(sleeps) == 1 else delay
 
     monkeypatch.setattr(
@@ -310,7 +311,7 @@ async def test_retry_waits_out_an_early_timer_wakeup(monkeypatch):
 
 async def test_retryclaim_schedule_retry_paused_returns_when_state_gone():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     cron._paused["alpha"] = cronstable.cron.PauseInfo(
         since=now,
         until=now + datetime.timedelta(hours=1),
@@ -557,7 +558,7 @@ async def test_retryclaim_consume_decision_read_timeout_fail_closed_defers(
         return None
 
     async def _read_timeout(name):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     cron.state_backend = types.SimpleNamespace(
         acquire_lease=_acq_none, read_lease=_read_timeout
@@ -850,7 +851,7 @@ async def test_retryclaim_maybe_claim_retry_claims_and_arms(
 
 async def test_retryclaim_claim_under_lease_no_backend_false():
     cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     ok = await cron._claim_retry_under_lease(
         "j", cron.cron_jobs["j"], {}, 1, now
     )
@@ -865,7 +866,7 @@ async def test_retryclaim_claim_under_lease_recheck_mismatch_false(
     job = cron.cron_jobs["j"]
     foreign = _retryclaim_foreign(cron, job, host="node-a")
     await cron.state_backend.append_record("retries/j", foreign)
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     # the record we "saw" differs from what is now newest -> declined
     stale_view = dict(foreign, attempt=2)
     ok = await cron._claim_retry_under_lease("j", job, stale_view, 2, now)
@@ -875,7 +876,7 @@ async def test_retryclaim_claim_under_lease_recheck_mismatch_false(
 async def test_retryclaim_claim_under_lease_list_error_false(stateful_cron):
     cron = await stateful_cron(_RETRYCLAIM_RETRY_JOB)
     job = cron.cron_jobs["j"]
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
 
     async def _boom(*a, **k):
         raise OSError("read fail")
@@ -912,7 +913,7 @@ async def test_retryclaim_claim_under_lease_superseded_by_run(
     job = cron.cron_jobs["j"]
     foreign = _retryclaim_foreign(cron, job, host="node-a")
     await cron.state_backend.append_record("retries/j", foreign)
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     later = (now + datetime.timedelta(minutes=1)).isoformat()
 
     async def _durable(name):
@@ -944,7 +945,7 @@ def test_retryclaim_retry_record_claimable_variants():
     cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
     job = cron.cron_jobs["j"]
     f = cron._retry_record_claimable
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     stale = (now - datetime.timedelta(seconds=120)).isoformat()
     dig = job_digest(job)
     # not a pending/handoff record
@@ -1022,7 +1023,7 @@ def test_retryclaim_retry_record_claimable_deadline_exceeded():
 
     cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB_DEADLINE)
     job = cron.cron_jobs["j"]
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     # notBefore is older than startingDeadlineSeconds (60): past its deadline
     old = (now - datetime.timedelta(seconds=600)).isoformat()
     rec = {

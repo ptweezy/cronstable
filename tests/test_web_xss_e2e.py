@@ -445,7 +445,7 @@ class _FakeLimitsManager:
 
 
 async def _record_hostile_limits(cron):
-    start = datetime.datetime.now(datetime.timezone.utc)
+    start = datetime.datetime.now(datetime.UTC)
     t0 = start.timestamp()
     series = [[t0 + k, 50.0, (k + 1) * 2**20] for k in range(5)]
     for name, usage in (

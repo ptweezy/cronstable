@@ -19,7 +19,7 @@ with atheris.instrument_imports(include=["cronstable"]):
     from cronstable.croninfo import describe_cron, lint_schedule
 
 HASH_KEY = "fuzz-job"
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 # A leap day, and both ends of the engine's 1970 to 2099 search window.
 NAIVE_NOWS = (
     datetime.datetime(2024, 2, 29, 12, 0, 30),

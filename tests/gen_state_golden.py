@@ -64,12 +64,12 @@ EPOCH = 1767225600.0
 
 #: The retry deadline sits far in the future so a test that rehydrates the
 #: tree re-arms the ladder without it ever coming due.
-RETRY_NOT_BEFORE = datetime.datetime(2099, 1, 1, tzinfo=datetime.timezone.utc)
+RETRY_NOT_BEFORE = datetime.datetime(2099, 1, 1, tzinfo=datetime.UTC)
 #: A pause is capped at 30 days, so the standing one cannot outlive the
 #: real calendar; a test that wants it live reads the store at REHYDRATE_AT,
 #: inside its window.
 PAUSE_SECONDS = 7 * 86400
-REHYDRATE_AT = datetime.datetime(2026, 1, 4, tzinfo=datetime.timezone.utc)
+REHYDRATE_AT = datetime.datetime(2026, 1, 4, tzinfo=datetime.UTC)
 
 CONFIG = """
 pools:
@@ -156,9 +156,7 @@ class Clock:
         return datetime.datetime.fromtimestamp(self.now, timezone)
 
     def at(self, offset=0.0):
-        return datetime.datetime.fromtimestamp(
-            self.now + offset, datetime.timezone.utc
-        )
+        return datetime.datetime.fromtimestamp(self.now + offset, datetime.UTC)
 
 
 class _Counter:

@@ -75,8 +75,8 @@ a machine-wide install and needs administrator approval. See
 ### pip / pipx
 
 `pip install cronstable` works on Windows as it does on POSIX, installing the
-`cronstable` console script into your environment. A supported Python (3.10 or
-newer) must be present. See [installation](Installation) for the Python and
+`cronstable` console script into your environment. Python 3.11 or later
+must be present. See [installation](Installation) for the Python and
 dependency requirements that apply on every platform.
 
 ```shell

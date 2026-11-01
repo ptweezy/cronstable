@@ -623,7 +623,7 @@ class DagScheduler:
         (re)seeds a new dag or one whose schedule changed, running its one-time
         missed-run catch-up.
         """
-        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        now_dt = datetime.datetime.now(datetime.UTC)
         live = self._dags()
         for name in list(self._seeded):
             dagcfg = live.get(name)
@@ -694,7 +694,7 @@ class DagScheduler:
                 logger.exception("dag %s: catch-up seed failed", dagcfg.name)
 
     async def _fire_scheduled(self, now: float) -> None:
-        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        now_dt = datetime.datetime.now(datetime.UTC)
         for name, dagcfg in list(self._dags().items()):
             sched = dagcfg.schedule_job
             if sched is None or not dagcfg.enabled:
@@ -782,7 +782,7 @@ class DagScheduler:
                 # record as aware-UTC like every other run key; schedule_slot
                 # renders now into the job's own frame (its zone, or the host
                 # clock as LOCAL_ZONE) and astimezone maps it back.
-                fired_now = now_slot.astimezone(datetime.timezone.utc)
+                fired_now = now_slot.astimezone(datetime.UTC)
         # Create then resync, like the replay loop above: a create that
         # raises (into _fire_scheduled's per-dag isolation) leaves the stale
         # index in place, so the next pass re-enters this branch and retries;
@@ -933,7 +933,7 @@ class DagScheduler:
                     await asyncio.wait_for(
                         self._cron._stop_event.wait(), timeout=offset
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass  # normal: the jitter elapsed without a shutdown
             if self._cron._stop_event.is_set():
                 return
@@ -1038,7 +1038,7 @@ class DagScheduler:
         record = {
             "kind": kind,
             "watermark": watermark,
-            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
         try:
             await asyncio.wait_for(
@@ -1070,9 +1070,9 @@ class DagScheduler:
         # read as UTC (matching the scheduled path), never shifted by local
         # time.
         if logical_dt.tzinfo is None:
-            logical_dt = logical_dt.replace(tzinfo=datetime.timezone.utc)
+            logical_dt = logical_dt.replace(tzinfo=datetime.UTC)
         else:
-            logical_dt = logical_dt.astimezone(datetime.timezone.utc)
+            logical_dt = logical_dt.astimezone(datetime.UTC)
         run_key = dag.run_key_for_logical(logical_dt.isoformat())
         created = await self._create_doc(
             dagcfg, run_key, logical_dt.isoformat(), kind
@@ -1157,7 +1157,7 @@ class DagScheduler:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
         if lease is None:
             return False
@@ -1187,7 +1187,7 @@ class DagScheduler:
                     backend.renew_lease(lease, DAG_LEASE_TTL),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue  # unknown: retry next period
             except Exception:  # noqa: BLE001 - renewal is best-effort
                 continue
@@ -1250,7 +1250,7 @@ class DagScheduler:
                     backend.list_document_keys(self._ns(name)),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return
             if keys is not None:
                 # Keys-only pass: one directory listing, plus a body read for
@@ -1268,7 +1268,7 @@ class DagScheduler:
                             backend.read_document(self._ns(name), key),
                             timeout=STATE_OP_TIMEOUT,
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         return
                     if body is None:
                         continue  # deleted (or unreadable) since the listing
@@ -1285,7 +1285,7 @@ class DagScheduler:
                 backend.list_documents(self._ns(name)),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         terminal: set[str] = set()
         for body in docs:
@@ -1746,7 +1746,7 @@ class DagScheduler:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None  # transient: retry next pass
         except jobstate.JobStateError as ex:
             if getattr(ex, "status", None) == 413:
@@ -2547,7 +2547,7 @@ class DagScheduler:
                     backend.list_documents(self._ns(name)),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "dag %s: boot reconciliation timed out reading runs", name
                 )
@@ -2812,11 +2812,7 @@ class DagScheduler:
 
             try:
                 _, created = await self._mutate(name, key, create)
-            except (
-                TimeoutError,
-                asyncio.TimeoutError,
-                asyncio.CancelledError,
-            ):
+            except (TimeoutError, asyncio.CancelledError):
                 # the abandoned create can still land
                 lease = None
                 raise
@@ -3028,11 +3024,7 @@ class DagScheduler:
                     ),
                     STATE_OP_TIMEOUT,
                 )
-            except (
-                TimeoutError,
-                asyncio.TimeoutError,
-                asyncio.CancelledError,
-            ):
+            except (TimeoutError, asyncio.CancelledError):
                 # the abandoned write can still land
                 leases.clear()
                 raise
@@ -3200,7 +3192,7 @@ class DagScheduler:
         while nxt is not None and nxt <= end and created < DAG_MAX_CATCHUP:
             try:
                 ref = await self._create_run(dagcfg, nxt, "backfill")
-            except (OSError, asyncio.TimeoutError, _DocumentUnreadable) as ex:
+            except (TimeoutError, OSError, _DocumentUnreadable) as ex:
                 # a timeout carries no message
                 logger.warning(
                     "dag %s: backfill is unavailable at the run for %s: %s",
@@ -3729,11 +3721,7 @@ class DagScheduler:
                         await self._delete_run_locked(
                             backend, name, run_key, run_id, created_at
                         )
-                    except (
-                        TimeoutError,
-                        asyncio.TimeoutError,
-                        asyncio.CancelledError,
-                    ):
+                    except (TimeoutError, asyncio.CancelledError):
                         # the abandoned delete can still land
                         held.remove(entry)
                         raise
@@ -4014,7 +4002,7 @@ def _parse_iso(value: str | None) -> datetime.datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt = dt.replace(tzinfo=datetime.UTC)
     return dt
 
 

@@ -720,7 +720,7 @@ class KubernetesBackend(StoreLeaseBackend):
                 )
             try:
                 await asyncio.wait_for(self._stop.wait(), self.retry_period)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def _renew_once(self) -> None:
@@ -1380,6 +1380,7 @@ class _K8sHttpTransport(_K8sTransport):
 
     async def observe(self) -> dict[str, Any] | None:
         assert self._session is not None
+        assert self._ssl is not None
         async with self._session.get(
             self._lease_url(),
             ssl=self._ssl,
@@ -1398,6 +1399,7 @@ class _K8sHttpTransport(_K8sTransport):
     async def write(self, body: dict[str, Any], *, create: bool) -> bool:
         """POST (create) or PUT (replace) the Lease; ``False`` on 409 race."""
         assert self._session is not None
+        assert self._ssl is not None
         if create:
             url, method = self._lease_url(collection=True), self._session.post
         else:

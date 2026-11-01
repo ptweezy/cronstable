@@ -604,7 +604,7 @@ _STRICT = ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
 
 def _lax_default_contexts(monkeypatch):
     """Make ssl.create_default_context leave out the verify flags that
-    Python 3.13 and later set, as 3.10 to 3.12 do."""
+    Python 3.13 and later set, as 3.11 and 3.12 do."""
     real = ssl.create_default_context
 
     def lax(*args, **kwargs):

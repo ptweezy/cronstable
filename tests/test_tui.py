@@ -86,9 +86,9 @@ def _job(
 ) -> dict[str, Any]:
     last_run = None
     if outcome is not None:
-        finished = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(seconds=finished_ago)
+        finished = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+            seconds=finished_ago
+        )
         last_run = {
             "outcome": outcome,
             "exit_code": exit_code,
@@ -103,7 +103,7 @@ def _job(
     # paused=True synthesizes a fresh one-hour record; a dict is used
     # verbatim (the daemon's shape: since/until/note/by/channel)
     if paused is True:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         paused = {
             "since": now.isoformat(),
             "until": (now + datetime.timedelta(hours=1)).isoformat(),
@@ -134,9 +134,7 @@ def _job(
             "breaches": [
                 {
                     "check": "lateAfter",
-                    "since": datetime.datetime.now(
-                        datetime.timezone.utc
-                    ).isoformat(),
+                    "since": datetime.datetime.now(datetime.UTC).isoformat(),
                     "observed_seconds": 120.0,
                     "threshold_seconds": 60,
                 }
@@ -349,9 +347,7 @@ def test_describe_cron_common_shapes():
 
 
 def test_next_fires_agrees_with_the_engine():
-    start = datetime.datetime(
-        2026, 7, 17, 11, 59, 30, tzinfo=datetime.timezone.utc
-    )
+    start = datetime.datetime(2026, 7, 17, 11, 59, 30, tzinfo=datetime.UTC)
     fires = next_fires("0 12 * * *", 2, start=start)
     assert [f.strftime("%H:%M") for f in fires] == ["12:00", "12:00"]
     assert fires[0].date().isoformat() == "2026-07-17"
@@ -402,7 +398,7 @@ def test_format_helpers():
     assert fmt_bytes(2048) == "2.0KiB"
     now = time.time()
     iso = datetime.datetime.fromtimestamp(
-        now - 90, tz=datetime.timezone.utc
+        now - 90, tz=datetime.UTC
     ).isoformat()
     assert fmt_ago(iso, now) == "1m ago"
     assert fmt_ago(None) == "—"
@@ -1364,7 +1360,7 @@ class FakeDaemon:
         if verb == "pause":
             # the daemon's pause is an idempotent overwrite: re-pausing
             # a paused job answers 200 with the fresh record, never 409
-            now = datetime.datetime.now(datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.UTC)
             job["paused"] = {
                 "since": now.isoformat(),
                 "until": (now + datetime.timedelta(hours=1)).isoformat(),
@@ -1425,7 +1421,7 @@ class Harness:
             self.keys.send("q")  # unblock the input loop
             try:
                 await asyncio.wait_for(self._task, 5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._task.cancel()
         await self.daemon.stop()
 
@@ -2658,7 +2654,7 @@ async def test_tui_panels_paint_a_pause_held_slot_as_skipped(tmp_path):
     # but one real success in that same hour still outranks the holds
     now = time.time()
     stamp = (
-        datetime.datetime.fromtimestamp(now - 60, tz=datetime.timezone.utc)
+        datetime.datetime.fromtimestamp(now - 60, tz=datetime.UTC)
     ).isoformat()
     app.heat_data = {
         "held": [{"outcome": "skipped", "finished_at": stamp}],
@@ -2872,7 +2868,7 @@ def test_dispatch_reports_a_token_no_header_can_carry(monkeypatch, capsys):
 # ===================================================================
 def _iso_ago(seconds: float) -> str:
     return datetime.datetime.fromtimestamp(
-        time.time() - seconds, tz=datetime.timezone.utc
+        time.time() - seconds, tz=datetime.UTC
     ).isoformat()
 
 
@@ -2891,22 +2887,22 @@ def test_more_format_helpers_branches():
     assert fmt_in(200000) == "in 2d"
     # a future stamp clamps to zero rather than going negative
     future = datetime.datetime.fromtimestamp(
-        now + 100, tz=datetime.timezone.utc
+        now + 100, tz=datetime.UTC
     ).isoformat()
     assert fmt_ago(future, now) == "0s ago"
     two_h = datetime.datetime.fromtimestamp(
-        now - 7200, tz=datetime.timezone.utc
+        now - 7200, tz=datetime.UTC
     ).isoformat()
     assert fmt_ago(two_h, now) == "2h ago"
     two_d = datetime.datetime.fromtimestamp(
-        now - 200000, tz=datetime.timezone.utc
+        now - 200000, tz=datetime.UTC
     ).isoformat()
     assert fmt_ago(two_d, now) == "2d ago"
     assert ago_short(None) == "?"
     assert (
         ago_short(
             datetime.datetime.fromtimestamp(
-                now - 30, tz=datetime.timezone.utc
+                now - 30, tz=datetime.UTC
             ).isoformat(),
             now,
         )
@@ -3451,7 +3447,7 @@ async def test_job_action_error_and_status_paths(tmp_path):
 
     # a request that times out has an empty message of its own
     async def _time_out(*a, **k):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     app.api.post = _time_out
     await app.run_job("j")
@@ -4191,7 +4187,7 @@ def test_render_week_variants(tmp_path):
     app = _bare_app(tmp_path)
     paint = _paint(app)
     assert "enumerating the week" in _txt(app.render_week(paint, 110, 30))
-    start = datetime.datetime.now(datetime.timezone.utc).replace(
+    start = datetime.datetime.now(datetime.UTC).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
     app.week = {
@@ -4202,7 +4198,7 @@ def test_render_week_variants(tmp_path):
         "grid": [[0] * 24 for _ in range(7)],
     }
     assert "no runs scheduled" in _txt(app.render_week(paint, 110, 30))
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     app.week = {
         "items": [
             (now + datetime.timedelta(hours=2), "future-job"),
@@ -7363,7 +7359,7 @@ async def main():
     try:
         for _ in range(6):
             keys.append(await asyncio.wait_for(reader.get(), 10))
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
     while (key := reader.get_nowait()) is not None:
         keys.append(key)

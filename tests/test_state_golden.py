@@ -35,7 +35,7 @@ from tests import gen_state_golden as gen
 from tests._helpers import _backend, start_state
 
 GOLDEN = gen.OUT
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 
 @pytest.fixture(params=["/bin/sh", ""], ids=["posix-shell", "windows-shell"])

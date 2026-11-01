@@ -27,7 +27,7 @@ from tests._helpers import _wait_until
 from tests.conftest import Req, _cron
 
 MIB = 1024 * 1024
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 _CAPPED = """
 jobs:

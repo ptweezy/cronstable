@@ -660,7 +660,7 @@ async def test_wedged_renew_does_not_re_extend_fence_from_read(
     deadline = a._lease_deadline_mono
 
     async def _timeout(*_args, **_kw):
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     monkeypatch.setattr(a._store, "renew_lease", _timeout)
     # transient: still inside the last good renew's window -> leader
@@ -721,7 +721,7 @@ def test_utcnow_is_tz_aware_utc():
     now = _utcnow()
     assert isinstance(now, datetime.datetime)
     # deadlines/display must be an aware UTC stamp, never naive local time.
-    assert now.tzinfo is datetime.timezone.utc
+    assert now.tzinfo is datetime.UTC
 
 
 def test_is_quorate_false_before_any_round(tmp_path):
@@ -740,7 +740,7 @@ def test_apply_round_without_expiry_clears_display_deadline(tmp_path):
     # the held lease and the monotonic fence; the holder falls back to the
     # unknown-holder sentinel, never None.
     a = _backend(tmp_path)
-    a._lease_deadline = datetime.datetime.now(datetime.timezone.utc)
+    a._lease_deadline = datetime.datetime.now(datetime.UTC)
     a._apply_round(None, False, None, None)
     assert a._lease_deadline is None
     assert a._lease_deadline_mono is None
@@ -872,7 +872,7 @@ async def test_renew_timeout_leaves_state_to_its_deadlines(
     deadline = a._lease_deadline_mono
 
     async def _timeout(*_args, **_kw):
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     monkeypatch.setattr(a._store, "renew_lease", _timeout)
     clock.advance(a.renew_period)
@@ -889,7 +889,7 @@ async def test_observe_read_timeout_changes_nothing(monkeypatch, fsb_factory):
     a = await fsb_factory("node-a")
 
     async def _timeout(*_args, **_kw):
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     monkeypatch.setattr(a._store, "read_lease", _timeout)
     await a._renew_once()
@@ -905,7 +905,7 @@ async def test_acquire_timeout_changes_nothing(monkeypatch, fsb_factory):
     a = await fsb_factory("node-a")
 
     async def _timeout(*_args, **_kw):
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     monkeypatch.setattr(a._store, "acquire_lease", _timeout)
     await a._renew_once()  # observe absent -> campaign -> acquire times out
@@ -984,7 +984,7 @@ async def test_confirm_read_timeout_changes_nothing(monkeypatch, fsb_factory):
         reads["n"] += 1
         if reads["n"] == 1:
             return None  # observe: absent -> campaign
-        raise asyncio.TimeoutError  # confirm times out
+        raise TimeoutError  # confirm times out
 
     monkeypatch.setattr(a._store, "read_lease", _read)
     await a._renew_once()

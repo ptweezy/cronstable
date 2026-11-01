@@ -55,7 +55,7 @@ _SPEC = YAML(typ="safe").load(
     )
 )
 _SCHEMAS = _SPEC["components"]["schemas"]
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 _PY = sys.executable
 
 

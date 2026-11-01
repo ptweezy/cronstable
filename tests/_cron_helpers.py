@@ -109,7 +109,7 @@ class _FakeMesh:
 
 
 DT = datetime.datetime
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 
 
 def _reboot_job(name="boot", policy="Leader", enabled=True):
@@ -201,7 +201,7 @@ def _seed_due(cron, *names):
     Mirrors what a real pass does once the loop has been running -- the loop's
     start-up seeding is strictly-future, which deliberately skips the current
     slot."""
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     for name in names:
         cron._set_next_fire(name, now)
 

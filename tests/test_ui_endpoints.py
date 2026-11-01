@@ -36,7 +36,7 @@ from tests._helpers import (
 )
 from tests.conftest import Req, _cron
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 
 def _run(outcome, *, dur=1.0, exit_code=0):
@@ -783,6 +783,15 @@ async def test_schedule_why_resolves_dag_schedule_jobs():
     assert body["job"] == "dag:pipe"
     assert body["expression"] == "0 4 * * *"
     assert body["matches"] is True
+
+
+@pytest.mark.parametrize(
+    "at", ["2026-07-17T09:00:00Z", "2026-07-17T09:00:00z"]
+)
+def test_schedule_why_reads_a_trailing_z_as_utc(at):
+    assert Cron._parse_probe_timestamp(at) == datetime.datetime(
+        2026, 7, 17, 9, tzinfo=datetime.UTC
+    )
 
 
 async def test_schedule_why_bad_requests():

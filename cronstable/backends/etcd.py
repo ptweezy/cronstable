@@ -543,7 +543,7 @@ class EtcdBackend(StoreLeaseBackend):
                 await asyncio.wait_for(self._renew_once(), self.round_deadline)
             except (
                 aiohttp.ClientError,
-                asyncio.TimeoutError,
+                TimeoutError,
                 OSError,
                 # ValueError covers the binascii.Error a malformed election-
                 # key value raises in _campaign, OUTSIDE _post's catch. The
@@ -682,7 +682,8 @@ class EtcdBackend(StoreLeaseBackend):
                 async with self._session.post(
                     url,
                     json=body,
-                    ssl=self._ssl,
+                    # aiohttp treats ssl=None as True (default verification)
+                    ssl=self._ssl if self._ssl is not None else True,
                     headers=headers,
                     timeout=timeout,
                     # never follow a redirect to an attacker-chosen target
@@ -725,8 +726,8 @@ class EtcdBackend(StoreLeaseBackend):
             # tuple (the eager reboot-ran persist runs outside the run-loop
             # guard).
             except (
+                TimeoutError,
                 aiohttp.ClientError,
-                asyncio.TimeoutError,
                 OSError,
                 ValueError,
             ) as ex:
@@ -812,7 +813,7 @@ class EtcdBackend(StoreLeaseBackend):
                 # inside the lease window, so a slow-but-quorate endpoint
                 # cannot make the holder self-demote every cycle.
                 await asyncio.wait_for(self._renew_once(), self.round_deadline)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+            except (TimeoutError, aiohttp.ClientError, OSError) as ex:
                 # could not reach etcd this round: leave the monotonic contact
                 # deadline alone so is_quorate goes stale (Leader closed,
                 # PreferLeader runs).
@@ -821,7 +822,7 @@ class EtcdBackend(StoreLeaseBackend):
                 logger.exception("cluster: unexpected etcd error")
             try:
                 await asyncio.wait_for(self._stop.wait(), self.renew_period)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def _renew_once(self) -> None:
@@ -947,7 +948,7 @@ class EtcdBackend(StoreLeaseBackend):
             await self._cas_write_reboot_ran()
         except (
             aiohttp.ClientError,
-            asyncio.TimeoutError,
+            TimeoutError,
             OSError,
             ValueError,
             # a wrong-shape gateway body that slips past _post's dict guard
@@ -1063,7 +1064,7 @@ class EtcdBackend(StoreLeaseBackend):
             await self._cas_write_reboot_ran()
         except (
             aiohttp.ClientError,
-            asyncio.TimeoutError,
+            TimeoutError,
             OSError,
             ValueError,
             # see _sync_reboot_ran: a wrong-shape gateway body can raise
@@ -1121,7 +1122,7 @@ class EtcdBackend(StoreLeaseBackend):
                     self._post("/v3/lease/revoke", {"ID": self._lease_id}),
                     self.connect_timeout,
                 )
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+            except (TimeoutError, aiohttp.ClientError, OSError) as ex:
                 logger.debug("cluster: etcd lease revoke failed: %s", ex)
             self._lease_id = None
         if self._session is not None:

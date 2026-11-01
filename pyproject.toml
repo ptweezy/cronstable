@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "cronstable"
 description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE", "TRADEMARKS.md", "LICENSING.md"]
 authors = [{ name = "Parker Loflin", email = "parker@cronstable.dev" }]
@@ -71,8 +71,8 @@ dependencies = [
     # Per-run CPU/memory accounting (opt-in `monitorResources`; see
     # cronstable.resources). The feature is off by default, but the import is
     # unconditional so `cronstable --help` and mypy resolve it everywhere.
-    # 5.9.0 is the first release with Python 3.10 wheels.
-    "psutil>=5.9.0",
+    # 5.9.4 is the first release with Python 3.11 wheels.
+    "psutil>=5.9.4",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -80,7 +80,6 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "Natural Language :: English",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -234,7 +233,7 @@ packages = ["cronstable", "cronstable.web", "cronstable.backends"]
 version_file = "cronstable/version.py"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 79
 
 [tool.ruff.lint]
@@ -253,11 +252,14 @@ select = [
     "F",
     # Pycodestyle warnings
     "W",
-    # pyupgrade, typing-modernization codes only (builtin generics, PEP 604
-    # unions and optionals, deprecated typing imports)
+    # pyupgrade: typing modernization (builtin generics, PEP 604 unions and
+    # optionals, deprecated typing imports) and the Python 3.11 spellings
+    # datetime.UTC and builtin TimeoutError
     "UP006",
     "UP007",
+    "UP017",
     "UP035",
+    "UP041",
     "UP045",
     "I",  # <= import sorting
 ]
@@ -266,7 +268,7 @@ select = [
 max-complexity = 20
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 # Check the POSIX API surface (grp, pwd, os.setuid) on every OS, as Linux CI
 # does; Windows branches are runtime-guarded and the Windows test rows cover
 # them. No `--platform win32` pass: cronstable.platform.apply_priority

@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 import pytest
@@ -311,7 +310,7 @@ def _unreadable():
     "error",
     [
         lambda: OSError("store offline"),
-        asyncio.TimeoutError,
+        TimeoutError,
         _unreadable,
         recovery.RecoveryUnavailable,
     ],
@@ -490,7 +489,7 @@ async def test_backfill_answers_503_until_the_store_starts(tmp_path):
     "fault, cause",
     [
         (lambda: OSError("store offline"), "store offline"),
-        (asyncio.TimeoutError, "TimeoutError"),
+        (TimeoutError, "TimeoutError"),
         (_unreadable, "document 'd': not a document"),
     ],
     ids=["store-error", "timeout", "unreadable-document"],

@@ -49,7 +49,7 @@ from cronstable.leadership import LeadershipBackend
 
 logger = logging.getLogger("cronstable.cluster")
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 # Per-peer status, as reported in the /cluster view.
 STATUS_UNKNOWN = "unknown"  # not yet contacted
@@ -1580,7 +1580,7 @@ class ClusterManager(LeadershipBackend):
                 _read_capped(request, MAX_PEER_RESPONSE_BYTES),
                 self.config["connectTimeout"],
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # a slow/stalled body read from a hung peer: bound by the same
             # per-request timeout the client side uses (_read_capped bounds
             # bytes, not time).
@@ -1734,7 +1734,7 @@ class ClusterManager(LeadershipBackend):
                 await asyncio.wait_for(
                     self._stop.wait(), self.config["interval"]
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     def _reconcile_job_set_id(self, my_id: str) -> None:
@@ -1950,11 +1950,7 @@ class ClusterManager(LeadershipBackend):
             # not provably) a cluster member.
             self.view.record_failure(host, str(ex), untrusted=True)
             return
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            OSError,
-        ) as ex:
+        except (TimeoutError, aiohttp.ClientError, OSError) as ex:
             self.view.record_failure(host, str(ex), untrusted=False)
             return
         # Timestamp at receipt, not before the request: the peer computed
@@ -2281,7 +2277,7 @@ class ClusterManager(LeadershipBackend):
                 allow_redirects=False,
             ) as resp:
                 resp.raise_for_status()
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        except (TimeoutError, aiohttp.ClientError, OSError):
             # best-effort: a delivery failure is fine, the periodic pull-poll
             # carries the same set; don't let it disturb the run loop.
             pass

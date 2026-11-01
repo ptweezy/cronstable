@@ -163,7 +163,7 @@ from cronstable.state import (
 _RECOVERY_UNAVAILABLE = (
     RecoveryUnavailable,
     OSError,
-    asyncio.TimeoutError,
+    TimeoutError,
     _DocumentUnreadable,
 )
 
@@ -171,7 +171,7 @@ _RECOVERY_UNAVAILABLE = (
 _BACKFILL_UNAVAILABLE = (
     BackfillUnavailable,
     OSError,
-    asyncio.TimeoutError,
+    TimeoutError,
     _DocumentUnreadable,
 )
 
@@ -710,7 +710,7 @@ async def _bounded(
         cap = left if cap is None else min(cap, left)
     try:
         return await (op if cap is None else asyncio.wait_for(op, cap))
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return None
 
 
@@ -872,7 +872,7 @@ async def _error_envelope_middleware(request, handler):
             headers=headers,
             content_type="application/json",
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # a store call that outran its budget: aiohttp would answer 500,
         # but the accurate status is a gateway timeout, and either way the
         # body must be the envelope like every other error.
@@ -1085,7 +1085,7 @@ class PauseInfo:
 
 #: What a row with no finish instant sorts as: OLDEST.  Shared by
 #: :func:`_run_finish_key` and the copy of it inlined into :func:`_run_stats`.
-_OLDEST_INSTANT = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+_OLDEST_INSTANT = datetime.datetime.min.replace(tzinfo=datetime.UTC)
 
 
 def _run_finish_key(info: "JobRunInfo") -> datetime.datetime:
@@ -1306,7 +1306,7 @@ def _parse_iso_utc(value: Any) -> datetime.datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        parsed = parsed.replace(tzinfo=datetime.UTC)
     return parsed
 
 
@@ -2006,7 +2006,7 @@ def next_sleep_interval(
     omitted the function reads the clock itself.
     """
     if now is None:
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
     if subminute:
         target = now.replace(microsecond=0) + datetime.timedelta(seconds=1)
     else:
@@ -2472,7 +2472,7 @@ class Cron:
         # In-memory only, so a restart re-fires a still-breached check once.
         self._sla_state: dict[tuple[str, str], datetime.datetime] = {}
         # the maxTimeSinceSuccess fallback baseline (see _sla_last_success).
-        self._process_start = get_now(datetime.timezone.utc)
+        self._process_start = get_now(datetime.UTC)
         # name -> when the job first entered cron_jobs: the staleness
         # reference for a reload-added job, which must age from when it
         # appeared, not a process start it predates.
@@ -2813,9 +2813,7 @@ class Cron:
             # a sub-minute schedule ticks faster. In pure minute-tick mode
             # `not _wakes_subminute()` forces it every iteration, so a
             # frozen-clock test still reloads every loop.
-            now_minute = get_now(datetime.timezone.utc).replace(
-                second=0, microsecond=0
-            )
+            now_minute = get_now(datetime.UTC).replace(second=0, microsecond=0)
             # None when housekeeping is skipped or the reload failed; on
             # failure we keep running the previously loaded jobs.
             config: CronstableConfig | None = None
@@ -3051,7 +3049,7 @@ class Cron:
         """
         try:
             await asyncio.wait_for(self._wake_event.wait(), sleep_interval)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         # Cleared here, not in reload_config: the event only wakes this
         # sleep; the voided _config_sig carries the force-reparse into
@@ -3464,7 +3462,7 @@ class Cron:
         # first-seen is the one tracker this pass also SEEDS: a just-added
         # job ages into maxTimeSinceSuccess from now, not process start.
         self._sla_first_seen = _kept(self._sla_first_seen, keep)
-        seen_at = get_now(datetime.timezone.utc)
+        seen_at = get_now(datetime.UTC)
         for name in self.cron_jobs:
             self._sla_first_seen.setdefault(name, seen_at)
         # a removed job's last_run/run_history is unreachable (payload
@@ -3475,7 +3473,7 @@ class Cron:
         # Re-sync the next-fire index: drop removed jobs, reseed changed
         # schedules, KEEP unchanged ones (a reseed computes a strictly-
         # future fire and could skip one on this reload's minute boundary).
-        self._refresh_schedule(get_now(datetime.timezone.utc), old_jobs)
+        self._refresh_schedule(get_now(datetime.UTC), old_jobs)
         return config
 
     async def _converge_limits(self) -> None:
@@ -3868,7 +3866,7 @@ class Cron:
         # explicit annotation: the rows are mixed-shape.
         out: list[dict[str, Any]] = []
         # one clock read for the whole pass; see _scheduled_in's `now`
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         for name, job in self.cron_jobs.items():
             running = self.running_jobs.get(name, None)
             if running:
@@ -3952,7 +3950,7 @@ class Cron:
         in one call, derived from the same live scheduler state /jobs and
         /status read, so the surfaces cannot disagree.
         """
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         total = enabled = running = paused = failing = never_fires = 0
         soonest_name: str | None = None
         soonest_in: float | None = None
@@ -4364,7 +4362,7 @@ class Cron:
         into a 400.
         """
         if not tz_name:
-            return datetime.timezone.utc
+            return datetime.UTC
         try:
             return ZoneInfo(tz_name)
         except (ZoneInfoNotFoundError, ValueError, KeyError, OSError):
@@ -4425,14 +4423,14 @@ class Cron:
         """An ``at=`` timestamp as a datetime (aware when it has an offset).
 
         Accepts ISO 8601 as :func:`datetime.datetime.fromisoformat` does,
-        plus the ubiquitous trailing ``Z`` (which the py310 parser still
-        rejects).  Raises ValueError, with the accepted forms in the
-        message, for anything else; the handlers turn that into a 400.
+        plus a lowercase trailing ``z``, which that parser rejects.  Raises
+        ValueError, with the accepted forms in the message, for anything
+        else; the handlers turn that into a 400.
         """
         raw = (text or "").strip()
         iso = raw
-        if iso.endswith(("Z", "z")):
-            iso = iso[:-1] + "+00:00"
+        if iso.endswith("z"):
+            iso = iso[:-1] + "Z"
         try:
             return datetime.datetime.fromisoformat(iso)
         except ValueError:
@@ -4646,9 +4644,9 @@ class Cron:
         prev_delta = tab.prev(now=aware)
         previous_fire = None
         if prev_delta is not None:
-            fire_utc = aware.astimezone(
-                datetime.timezone.utc
-            ) - datetime.timedelta(seconds=prev_delta)
+            fire_utc = aware.astimezone(datetime.UTC) - datetime.timedelta(
+                seconds=prev_delta
+            )
             # fires are whole seconds; round away float/microsecond residue
             # from the elapsed-seconds reconstruction.
             if fire_utc.microsecond >= 500000:
@@ -4969,7 +4967,7 @@ class Cron:
             "cronstable" if name is None else "cronstable: {}".format(name)
         )
         if start is None:
-            start = get_now(datetime.timezone.utc)
+            start = get_now(datetime.UTC)
         return render_calendar(
             entries,
             start=start,
@@ -5117,9 +5115,7 @@ class Cron:
             raise _api_error(
                 web.HTTPNotFound, "job {!r} not found".format(name)
             )
-        verdict = self._badge_verdict(
-            name, job, get_now(datetime.timezone.utc)
-        )
+        verdict = self._badge_verdict(name, job, get_now(datetime.UTC))
         return self._badge_response(
             request, name, verdict, VERDICT_COLORS[verdict]
         )
@@ -5135,7 +5131,7 @@ class Cron:
 
     async def _build_fleet_badge_verdict(self) -> tuple[str, str]:
         # one instant for the whole pass, as jobs_payload reads it
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         return fleet_message(
             self._badge_verdict(name, job, now)
             for name, job in self.cron_jobs.items()
@@ -5286,7 +5282,7 @@ class Cron:
         """
         if name not in self.cron_jobs:
             raise ApiActionError("job {!r} not found".format(name), status=404)
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         if duration is not None and until is not None:
             raise ApiActionError(
                 "give durationSeconds or until, not both", status=400
@@ -5303,7 +5299,7 @@ class Cron:
             until = now + datetime.timedelta(seconds=seconds)
         else:
             if until.tzinfo is None:
-                until = until.replace(tzinfo=datetime.timezone.utc)
+                until = until.replace(tzinfo=datetime.UTC)
             if until <= now:
                 raise ApiActionError("until is in the past", status=400)
             if (until - now).total_seconds() > PAUSE_MAX_SECONDS:
@@ -5367,7 +5363,7 @@ class Cron:
         self.metrics.job_pause_state(name, False)
         self._persist_resume(name, by, channel)
         if was is not None:
-            self._sla_bank_pause(name, was, get_now(datetime.timezone.utc))
+            self._sla_bank_pause(name, was, get_now(datetime.UTC))
             logger.info("Job %s resumed by %s (%s)", name, by, channel)
 
     def _pause_active(
@@ -5387,7 +5383,7 @@ class Cron:
         if info is None:
             return None
         if now is None:
-            now = get_now(datetime.timezone.utc)
+            now = get_now(datetime.UTC)
         if info.until <= now:
             return None
         return info
@@ -5422,7 +5418,7 @@ class Cron:
         is installed synchronously, so the same pass's refresh sees the
         write in flight and leaves the job's memory alone.
         """
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         for name, info in list(self._paused.items()):
             if info.until <= now:
                 self._clear_pause(name)
@@ -5472,7 +5468,7 @@ class Cron:
                 ex,
             )
             return
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         for stream in streams:
             name = stream[len(PAUSE_STREAM_PREFIX) :]
             if name not in self.cron_jobs:
@@ -5584,7 +5580,7 @@ class Cron:
             # below would be a no-op, so skip it. The reload that adds an
             # sla block clears _sla_jobs_cache, so the next pass walks.
             return
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         if self._sla_state:
             # A latch of a job with no sla block (or one a reload blanked)
             # must not stay stuck at breached; the walk below visits SLA
@@ -6157,13 +6153,13 @@ class Cron:
             # clamped at zero: a job due this very instant reads as
             # marginally past until the pass advances it beyond its slot
             if now is None:
-                now = get_now(datetime.timezone.utc)
+                now = get_now(datetime.UTC)
             return max(0.0, (when - now).total_seconds())
         if name in self._dead_schedules:
             # no future occurrence; the engine's answer would be None too,
             # found only after walking the remaining horizon
             return None
-        seconds: float | None = job.next_delay(get_now(datetime.timezone.utc))
+        seconds: float | None = job.next_delay(get_now(datetime.UTC))
         return seconds
 
     def _schedule_never_fires(self, name: str, job: JobConfig) -> bool:
@@ -6181,7 +6177,7 @@ class Cron:
             return False
         if name in self._dead_schedules:
             return True
-        return job.next_delay(get_now(datetime.timezone.utc)) is None
+        return job.next_delay(get_now(datetime.UTC)) is None
 
     def fleet_job_summaries(self) -> dict[str, Any]:
         """Compact per-job snapshot gossiped to peers for the fleet view.
@@ -6192,7 +6188,7 @@ class Cron:
         """
         out: dict[str, Any] = {}
         # one clock read for the whole pass; see _scheduled_in's `now`
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         for name, job in self.cron_jobs.items():
             running = bool(self.running_jobs.get(name))
             last = self.last_run.get(name)
@@ -6232,7 +6228,7 @@ class Cron:
         # or a fresh read): scheduled_in, pause expiry and SLA observations
         # agree about the time.
         if now is None:
-            now = get_now(datetime.timezone.utc)
+            now = get_now(datetime.UTC)
         running = self._row_instances(name)
         # next scheduled run, in seconds; None when not applicable (disabled,
         # currently running, or a one-off @reboot schedule).
@@ -6286,7 +6282,7 @@ class Cron:
                 str(job.timezone) if job.timezone is not None else None
             ),
             "running": bool(running),
-            # guarded: most jobs are idle, and on 3.10/3.11 even an empty
+            # guarded: most jobs are idle, and on 3.11 even an empty
             # comprehension is a function call
             "pids": (
                 [
@@ -6463,7 +6459,7 @@ class Cron:
     def jobs_payload(self) -> list[dict[str, Any]]:
         """Full per-job dicts for ``GET /jobs``."""
         # one clock read for the whole pass; see _scheduled_in's `now`
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         return [
             self._job_to_dict(name, job, now)
             for name, job in self.cron_jobs.items()
@@ -6477,7 +6473,7 @@ class Cron:
         configured job.
         """
         # one clock read for the whole pass; see _scheduled_in's `now`
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         jobs = self.cron_jobs
         return [self._job_to_dict(name, jobs[name], now) for name in names]
 
@@ -7508,7 +7504,7 @@ class Cron:
         else:
             source = "memory"
             infos = fallback or []
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         # One pass instead of one filter pass per window: each info's age is
         # computed once and the info appended to every window it fits, which
         # reproduces the per-window filters exactly (same members, same
@@ -7663,7 +7659,7 @@ class Cron:
             while not ended:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=15)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # SSE comment as keep-alive (also detects disconnects)
                     await resp.write(b": ping\n\n")
                     continue
@@ -8340,7 +8336,7 @@ class Cron:
 
         The one swallow list for start_stop_cluster and
         start_stop_observability, so the two cannot drift.
-        ``aiohttp.ClientError`` / ``asyncio.TimeoutError`` cover a lease
+        ``aiohttp.ClientError`` / ``TimeoutError`` cover a lease
         backend that cannot reach or authenticate to its store at start(),
         an operational misconfiguration to log, not the generic "report a
         bug" path (a ClientResponseError on a rejected token is not
@@ -8354,7 +8350,7 @@ class Cron:
             ValueError,
             ConfigError,
             aiohttp.ClientError,
-            asyncio.TimeoutError,
+            TimeoutError,
         )
 
     async def start_stop_cluster(
@@ -8750,7 +8746,7 @@ class Cron:
                 await asyncio.wait_for(
                     backend.start(), timeout=STATE_OP_TIMEOUT
                 )
-            except (OSError, ConfigError, asyncio.TimeoutError) as ex:
+            except (TimeoutError, OSError, ConfigError) as ex:
                 # an operational misconfiguration (unwritable path, bad mount)
                 # to log and keep running through, not the run loop's generic
                 # "report a bug" path.
@@ -8838,7 +8834,7 @@ class Cron:
         )
         try:
             await asyncio.wait_for(api.start(), timeout=STATE_OP_TIMEOUT)
-        except (OSError, asyncio.TimeoutError) as ex:
+        except (TimeoutError, OSError) as ex:
             logger.error(
                 "state: job API failed to start (jobs will run without the "
                 "loopback state endpoint): %s",
@@ -8856,7 +8852,7 @@ class Cron:
         self._job_api_tls_signature = None
         try:
             await asyncio.wait_for(api.stop(), timeout=STATE_OP_TIMEOUT)
-        except (OSError, asyncio.TimeoutError) as ex:
+        except (TimeoutError, OSError) as ex:
             logger.warning("state: job API did not stop cleanly: %s", ex)
 
     def _job_api_tls_files_changed(self, tls: dict[str, Any] | None) -> bool:
@@ -9038,7 +9034,7 @@ class Cron:
             # (see _collect_state_garbage).
             "scopes": sorted(self._artifact_scope_names()),
             "dags": sorted(self.cron_dags),
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         stream = self._manifest_stream()
         try:
@@ -9158,7 +9154,7 @@ class Cron:
                 ex,
             )
             return
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         # Prove absence before deleting: unless manifest history spans a
         # full grace window, a job could be missing simply because nobody
         # recorded manifests yet; defer rather than collect.
@@ -9908,7 +9904,7 @@ class Cron:
         """
         # one clock read serves the housekeeping snap and the soonest-fire
         # delta below
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         housekeeping = next_sleep_interval(False, now)
         # Wake sooner when a DAG poke/retry/run is due, floored at
         # MIN_TICK_SLEEP (an already-due hint stays due until its pass
@@ -9972,7 +9968,7 @@ class Cron:
             crontab = job.schedule
             assert isinstance(crontab, CronTab)
             now_slot = schedule_slot(job, now)
-            current_slot = now_slot.astimezone(datetime.timezone.utc)
+            current_slot = now_slot.astimezone(datetime.UTC)
             pause = self._pause_active(job.name, now)
             # An active pause excuses its portion of the gap immediately.
             # Keep only pre-pause backlog, so a later manual resume cannot
@@ -10015,7 +10011,7 @@ class Cron:
             # branch. schedule_slot renders now into the job's OWN frame
             # (what crontab.test matches); astimezone(utc) maps it back.
             fires = (
-                [now_slot.astimezone(datetime.timezone.utc)]
+                [now_slot.astimezone(datetime.UTC)]
                 if crontab.test(now_slot)
                 else []
             )
@@ -10120,7 +10116,7 @@ class Cron:
         record = {
             "kind": kind,
             "watermark": watermark or "",
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         stream = self._catchup_stream(name)
         try:
@@ -10569,7 +10565,7 @@ class Cron:
                     await asyncio.wait_for(
                         self._stop_event.wait(), timeout=offset
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass  # normal: the jitter elapsed without a shutdown
             if self._stop_event.is_set():
                 return
@@ -10719,7 +10715,7 @@ class Cron:
                 return not self._stop_event.is_set()
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=0.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 waited += 0.5
                 continue
             return False
@@ -10775,7 +10771,7 @@ class Cron:
         reload pushed past is still serviced. The start-up pass seeds
         the next-fire index strictly-future and runs catch-up.
         """
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         if startup:
             self._ensure_seeded(now)
         await self.spawn_jobs(startup, now)
@@ -10807,7 +10803,7 @@ class Cron:
         caller for a fresh read.
         """
         if now is None:
-            now = get_now(datetime.timezone.utc)
+            now = get_now(datetime.UTC)
         self._log_cluster_role()
         if startup:
             await self._spawn_reboot_jobs()
@@ -11136,7 +11132,7 @@ class Cron:
         try:
             covered = await self._reboot_marker_covers(job)
         except Exception as ex:  # noqa: BLE001 - policy decides below
-            if isinstance(ex, asyncio.TimeoutError):
+            if isinstance(ex, TimeoutError):
                 self._reboot_gate_sick = True
             if fail_closed:
                 logger.warning(
@@ -11165,7 +11161,7 @@ class Cron:
             "bootId": platform.os_boot_id(),
             "bootTime": platform.os_boot_time(),
             "jobDigest": job_digest_cached(job),
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         stream = self._reboot_stream(job.name)
         try:
@@ -11180,7 +11176,7 @@ class Cron:
             )
         except Exception as ex:  # noqa: BLE001 - policy decides below
             self.metrics.state_write_dropped("reboot-marker")
-            if isinstance(ex, asyncio.TimeoutError):
+            if isinstance(ex, TimeoutError):
                 self._reboot_gate_sick = True
                 if fail_closed:
                     # A timed-out append is NOT a failed append: the
@@ -11660,7 +11656,7 @@ class Cron:
                     outcome="skipped",
                     exit_code=None,
                     started_at=None,
-                    finished_at=get_now(datetime.timezone.utc),
+                    finished_at=get_now(datetime.UTC),
                     fail_reason=None,
                     output=output,
                     skip_reason="paused",
@@ -11944,7 +11940,7 @@ class Cron:
         self._add_running_instance(running_job)
         # every actual launch (scheduled, manual, catch-up, retry) clears
         # the lateAfter breach condition (see _sla_periodic).
-        self._sla_last_start[job.name] = get_now(datetime.timezone.utc)
+        self._sla_last_start[job.name] = get_now(datetime.UTC)
         if self.state_backend is not None and first_instance:
             # record the run as in-flight (0 -> 1 live instances) so a crash
             # leaves an "open" record for reconciliation; _settle_inflight
@@ -12070,7 +12066,7 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         except Exception:  # noqa: BLE001 - a raised store error is as
             # ambiguous as a timeout; fail closed via the read-back path
@@ -12171,7 +12167,7 @@ class Cron:
                         deadline,
                     )
                     answered = observed is not None
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 except Exception:  # noqa: BLE001 - a raised store error here
                     # is as ambiguous as a timeout: leave answered=False so the
@@ -12184,8 +12180,7 @@ class Cron:
                         # abandoned (the documented UNKNOWN case): adopt it.
                         got = observed
                     elif (
-                        get_now(datetime.timezone.utc).timestamp()
-                        > observed.expires_at
+                        get_now(datetime.UTC).timestamp() > observed.expires_at
                     ):
                         # expired but unreclaimed: treat as unanswered and
                         # let the policy decide (the next attempt acquires).
@@ -12277,7 +12272,7 @@ class Cron:
             "kind": "cancel",
             "fence": observed.fence,
             "by": self._state_host,
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         stream = self._slot_name(name)
         try:
@@ -12310,7 +12305,7 @@ class Cron:
                 )
             except Exception:  # noqa: BLE001 - keep waiting
                 pass
-            now = get_now(datetime.timezone.utc).timestamp()
+            now = get_now(datetime.UTC).timestamp()
             if (
                 current is None
                 or now > current.expires_at
@@ -12382,7 +12377,7 @@ class Cron:
                     backend.renew_lease(lease, self._slot_ttl),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue  # unknown; retry next period
             except Exception:  # noqa: BLE001 - a RAISED store error is as
                 # ambiguous as a timeout and must NOT kill the renewer: a
@@ -12627,7 +12622,7 @@ class Cron:
         proc = getattr(running_job, "proc", None)
         pid = proc.pid if proc is not None else None
         if started_at is None:
-            started_at = get_now(datetime.timezone.utc)
+            started_at = get_now(datetime.UTC)
         record = {
             "kind": "open",
             "host": self._state_host,
@@ -12666,7 +12661,7 @@ class Cron:
             "host": self._state_host,
             "proc": self._proc_token,
             "reason": reason,
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         try:
             await asyncio.wait_for(
@@ -12814,7 +12809,7 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return "timeout"
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
@@ -12959,7 +12954,7 @@ class Cron:
         """
         started_iso = rec.get("startedAt")
         if not isinstance(started_iso, str):
-            started_iso = get_now(datetime.timezone.utc).isoformat()
+            started_iso = get_now(datetime.UTC).isoformat()
         fail_reason = (
             "run interrupted: no completion was recorded for the run started "
             "at {} on {}. The server may have stopped or lost access to saved "
@@ -12980,9 +12975,7 @@ class Cron:
             data["ranAt"] = started_iso
         else:
             data["interruptedAt"] = started_iso
-        finished = _parse_iso_utc(started_iso) or get_now(
-            datetime.timezone.utc
-        )
+        finished = _parse_iso_utc(started_iso) or get_now(datetime.UTC)
         # a run on record can have ended after this one started
         prune = not self._recorded_late(self.last_run.get(name), finished)
         self._queue_inflight_write(
@@ -13596,7 +13589,7 @@ class Cron:
                 return
             self._counter_snapshot_next = now + COUNTER_SNAPSHOT_INTERVAL
         record = self.metrics.counters_snapshot()
-        record["at"] = get_now(datetime.timezone.utc).isoformat()
+        record["at"] = get_now(datetime.UTC).isoformat()
         stream = self._counters_stream()
         try:
             await asyncio.wait_for(
@@ -13754,7 +13747,7 @@ class Cron:
                 name,
                 str(ex) or type(ex).__name__,
             )
-            return not isinstance(ex, (asyncio.TimeoutError, TimeoutError))
+            return not isinstance(ex, TimeoutError)
         reals = [
             info
             for info in (_job_run_info_from_dict(r) for r in recs)
@@ -13880,7 +13873,7 @@ class Cron:
                     ),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # abandoning the warm-up costs little: the dashboard
                 # fills in as jobs run.
                 return "timeout"
@@ -14072,7 +14065,7 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return "timeout"
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
@@ -14133,7 +14126,7 @@ class Cron:
         for _ in range(attempt):
             state.next_delay()
         self._pools.restore_retry(state, rec)
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         remaining = max(0.0, (not_before - now).total_seconds())
         self.retry_state[name] = state
         state.task = asyncio.create_task(
@@ -14192,7 +14185,7 @@ class Cron:
         if maximum != -1 and attempt > maximum:
             self._persist_retry_settled(name, "exhausted", attempt)
             return None
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         deadline = job.startingDeadlineSeconds
         if deadline and (now - not_before).total_seconds() > deadline:
             # same bound catch-up honors: a retry stale beyond the job's
@@ -14411,7 +14404,7 @@ class Cron:
         can already be on record; the cap covers a wall clock stepped back
         since the run ended.
         """
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         ended: datetime.datetime | None = getattr(job, "ended_at", None)
         return ended if ended is not None and ended < now else now
 
@@ -14667,7 +14660,7 @@ class Cron:
         # writes are ordered after it (_queue_retry_write).
         pending_job = self.cron_jobs.get(job_name)
         if pending_job is not None:
-            now_arm = get_now(datetime.timezone.utc)
+            now_arm = get_now(datetime.UTC)
             not_before = now_arm + datetime.timedelta(seconds=delay)
             self._persist_retry_pending(pending_job, retry_num, not_before)
             # record the absolute fire time (GET /jobs countdown) and the
@@ -14679,7 +14672,8 @@ class Cron:
                 armed_state.scheduled_delay = delay
                 armed_state.armed_at = now_arm
         # Event-loop timers may wake one clock tick early (notably on
-        # Windows 3.10). Preserve the minimum delay using a high-resolution
+        # Windows before Python 3.13, where the loop clock ticks every
+        # 15.6 ms). Preserve the minimum delay using a high-resolution
         # monotonic clock, including when restoring a persisted deadline.
         deadline = time.perf_counter() + delay
         remaining = delay
@@ -14822,7 +14816,7 @@ class Cron:
             # the arming node: on a shared store another node's boot must
             # neither re-arm this ladder (its owner is alive) nor settle it.
             "host": self._state_host,
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         state = self.retry_state.get(job.name)
         if state is not None and state.pool_retry is not None:
@@ -14845,7 +14839,7 @@ class Cron:
             "kind": "settled",
             "reason": reason,
             "host": self._state_host,
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         if attempt is not None:
             record["attempt"] = attempt
@@ -14911,7 +14905,7 @@ class Cron:
         backend the record holds in memory; with a configured store it
         is held for replay (_defer_pause_write).
         """
-        record["at"] = get_now(datetime.timezone.utc).isoformat()
+        record["at"] = get_now(datetime.UTC).isoformat()
         record["host"] = self._state_host
         if self.state_backend is None:
             self._defer_pause_write(name, record)
@@ -15082,14 +15076,14 @@ class Cron:
                 await asyncio.wait_for(
                     asyncio.shield(prev), timeout=STATE_OP_TIMEOUT
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         record = {
             "kind": "settled",
             "reason": "launched",
             "attempt": retry_num,
             "host": self._state_host,
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
         }
         stream = self._retry_stream(job_name)
         try:
@@ -15187,7 +15181,7 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         except Exception as ex:  # noqa: BLE001 - flock ENOLCK/EIO/ESTALE on
             # a sick shared mount is as ambiguous as a timeout; the policy
@@ -15238,7 +15232,7 @@ class Cron:
                     backend.read_lease(self._retry_claim_lease(job.name)),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             except Exception:  # noqa: BLE001 - as ambiguous as a timeout;
                 # observed stays None so the policy fork below decides.
@@ -15388,7 +15382,7 @@ class Cron:
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             lease = None
         if lease is None:
             return  # a rival claimer or a sick store: next scan retries
@@ -15432,7 +15426,7 @@ class Cron:
         for _ in range(attempt):
             state.next_delay()
         self._pools.restore_retry(state, rec)
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         remaining = max(0.0, (not_before - now).total_seconds())
         self.retry_state[name] = state
         state.task = asyncio.create_task(
@@ -15496,7 +15490,7 @@ class Cron:
             "notBefore": not_before.isoformat(),
             "jobDigest": job_digest_cached(job),
             "host": self._state_host,
-            "at": get_now(datetime.timezone.utc).isoformat(),
+            "at": get_now(datetime.UTC).isoformat(),
             "claimedFrom": rec.get("host") or rec.get("fromHost"),
         }
         if "poolRetry" in rec:
@@ -15509,7 +15503,7 @@ class Cron:
             await asyncio.wait_for(
                 asyncio.shield(write), timeout=STATE_OP_TIMEOUT
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Abandoning the claim: without this cancel the shielded
             # write could land LATER as an own-host pending that nothing
             # re-arms while a live original owner aborts its ladder (an
@@ -15546,7 +15540,7 @@ class Cron:
         maximum = retry["maximumRetries"]
         if maximum != -1 and attempt > maximum:
             return None
-        now = get_now(datetime.timezone.utc)
+        now = get_now(datetime.UTC)
         deadline = job.startingDeadlineSeconds
         if deadline and (now - not_before).total_seconds() > deadline:
             return None
@@ -15625,7 +15619,7 @@ class Cron:
             state.cancelled = True
         self.retry_state.pop(job_name, None)
         if self._retry_cross_node_eligible(job):
-            now = get_now(datetime.timezone.utc)
+            now = get_now(datetime.UTC)
             # Anchor the new owner's superseded-by-run guard on when the
             # attempt was ARMED, not the hand-off instant: a peer may
             # have already claimed and RUN it, and a now-stamped anchor
@@ -15687,7 +15681,7 @@ class Cron:
                 outcome="cancelled",
                 exit_code=None,
                 started_at=None,
-                finished_at=get_now(datetime.timezone.utc),
+                finished_at=get_now(datetime.UTC),
                 fail_reason="retry abandoned: cluster ownership moved to "
                 "another node",
                 output=output,
