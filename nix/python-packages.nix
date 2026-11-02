@@ -165,6 +165,11 @@ pkgs.python3Packages
 
           substituteInPlace Makefile \
             --replace-fail "cythonize: .install-cython" "cythonize:"
+
+          # Cython 3.3 crashes on a Final annotation for a name that
+          # reader_c.pxd declares with cdef. Drop it as aiohttp main does.
+          substituteInPlace aiohttp/_websocket/reader_py.py \
+            --replace-fail "MSG_SIZE_OVERHEAD: Final[int] = 128" "MSG_SIZE_OVERHEAD = 128"
         '';
         doCheck = false;
         meta = old.meta // {
