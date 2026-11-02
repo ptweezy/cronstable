@@ -153,6 +153,9 @@ pkgs.python3Packages
           tag = "v${version}";
           hash = "sha256-gSxqab8AYJ6PsMP1PYWUxQ8TJ9KtEehoekLD8ziBt+g=";
         };
+        # This release already includes the Cython 3.3 fix that nixpkgs
+        # patches in.
+        patches = [ ];
         # The nixpkgs postPatch edits pytest settings in setup.cfg, which
         # this release keeps in pytest.ini. Keep its build steps only.
         postPatch = ''
