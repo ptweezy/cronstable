@@ -1177,6 +1177,9 @@ def test_every_required_build_and_preparation_gates_publication():
     assert "pq-wheels" not in ancestors(jobs, "docker-musl")
 
 
+BUILD = "needs.version.outputs.build == 'true'"
+
+
 def test_builds_overlap_tests_but_advisory_jobs_wait_for_required_rows():
     jobs = workflow()["jobs"]
     checks = {
@@ -1199,14 +1202,110 @@ def test_builds_overlap_tests_but_advisory_jobs_wait_for_required_rows():
             parents = ancestors(jobs, name)
             assert {"tox-static", "dist"} <= parents, name
             assert not (checks - {"dist"}) & parents, name
+    advisory = "!cancelled() && needs.preflight.result == 'success'"
     for name in ("nix", "tox-experimental", "binaries-macos-experimental"):
         assert {"preflight", "tox"} <= ancestors(jobs, name), name
+    assert jobs["tox-experimental"]["if"] == "${{ " + advisory + " }}"
+    for name in ("nix", "binaries-macos-experimental"):
         assert jobs[name]["if"] == (
-            "${{ !cancelled() && needs.preflight.result == 'success' }}"
+            "${{ " + advisory + " && " + BUILD + " }}"
         ), name
     assert checks <= ancestors(jobs, "release")
     # The license check must scan the resolved version used in the bundles.
     assert "preflight" in ancestors(jobs, "licenses")
+
+
+def test_only_the_build_fan_out_skips_a_docs_only_change():
+    jobs = workflow()["jobs"]
+    outputs = jobs["version"]["outputs"]
+    assert outputs["build"] == "${{ steps.scope.outputs.build }}"
+    fan_out = {
+        name
+        for name in jobs
+        if name.startswith(("binaries", "docker", "pq-wheel"))
+        and name != "docker-push"
+    } | {"perf", "nix"}
+    for name, job in jobs.items():
+        gated = BUILD in str(job.get("if", ""))
+        assert gated == (name in fan_out), name
+        if gated:
+            assert "version" in job["needs"], name
+
+
+@pytest.mark.parametrize(
+    "paths,build",
+    [
+        (["wiki/Home.md", "README.md", "docs/img/logo.png"], False),
+        (["example/basic/README.md"], False),
+        (["wiki/Home.md", "cronstable/cron.py"], True),
+        (["HISTORY.md"], True),
+        ([], False),
+        (None, True),
+    ],
+)
+def test_docs_only_changes_skip_the_build_fan_out(paths, build):
+    scope = load("build_scope")
+    for event, ref in (
+        ("pull_request", "refs/pull/7/merge"),
+        ("push", "refs/heads/topic"),
+    ):
+        assert scope.needs_build(event, ref, False, paths) is build
+
+
+@pytest.mark.parametrize(
+    "event,ref,release",
+    [
+        ("push", "refs/heads/main", False),
+        ("workflow_dispatch", "refs/heads/topic", False),
+        ("push", "refs/heads/main", True),
+    ],
+)
+def test_main_dispatches_and_releases_always_build(event, ref, release):
+    scope = load("build_scope")
+    assert scope.needs_build(event, ref, release, ["wiki/Home.md"])
+
+
+def test_build_scope_sees_every_change_since_main(tmp_path, monkeypatch):
+    if shutil.which("git") is None:
+        pytest.skip("git required")
+    for name, value in {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "ci",
+        "GIT_AUTHOR_EMAIL": "ci@example.invalid",
+        "GIT_COMMITTER_NAME": "ci",
+        "GIT_COMMITTER_EMAIL": "ci@example.invalid",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(tmp_path)
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (tmp_path / "tool.py").write_text("x = 1\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "-qb", "topic")
+    (tmp_path / "wiki").mkdir()
+    git("mv", "tool.py", "wiki/tool.py")
+    git("commit", "-qm", "move code under wiki/")
+    (tmp_path / "wiki" / "Home.md").write_text("docs\n")
+    git("add", "-A")
+    git("commit", "-qm", "docs")
+    scope = load("build_scope")
+    expected = ["tool.py", "wiki/Home.md", "wiki/tool.py"]
+    # The last push holds only the docs commit, and the rename shows the
+    # deleted code path as well as its new name.
+    assert scope.changed_paths("push", git("rev-parse", "HEAD")) == expected
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--no-ff", "-m", "merge", "topic")
+    merge = git("rev-parse", "HEAD")
+    assert scope.changed_paths("pull_request", merge) == expected
+    assert scope.changed_paths("push", "0" * 40) is None
 
 
 def test_publication_consumes_only_prepared_artifacts():

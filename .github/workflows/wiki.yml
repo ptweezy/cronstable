@@ -1,0 +1,92 @@
+name: Wiki
+
+# Publish wiki/ (the source of truth) to the GitHub wiki, a separate
+# <repo>.wiki.git repository where its bare [Page](Page) links resolve.
+# Only main publishes, because the pages link to /blob/main/. A dispatch
+# republishes without a wiki/ change, such as after an edit in the web UI.
+# GITHUB_TOKEN can push the wiki of its own repository, so no PAT is needed.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wiki/**"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch:
+
+# Each run mirrors the whole of wiki/, so the newest run supersedes the rest.
+concurrency:
+  group: wiki
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  wiki:
+    # A fork has no wiki repository until someone creates a page, so the
+    # wiki checkout would fail on every fork main push.
+    if: github.ref == 'refs/heads/main' && github.repository == 'ptweezy/cronstable'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      # Allows the wiki push (undocumented under `contents`). Nothing in this
+      # repository is written.
+      contents: write
+    steps:
+      # For the wiki/ page sources.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The wiki is its own repo; its default branch is always master. The
+      # push below uses the credential this checkout keeps.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: .wiki
+          persist-credentials: true
+
+      - name: Publish wiki/ to the GitHub wiki
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Mirror, so pages deleted from wiki/ leave the wiki too. This also
+          # removes pages created in the wiki web UI; edit wiki/ instead.
+          mirror() {
+            find .wiki -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            cp -R wiki/. .wiki/
+          }
+
+          git -C .wiki config user.name  "github-actions[bot]"
+          git -C .wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # A web UI edit can win the push race; the commit is a snapshot of
+          # wiki/, so re-mirror onto the new tip and retry.
+          for attempt in 1 2 3; do
+            git -C .wiki fetch -q origin master
+            git -C .wiki reset -q --hard origin/master
+            mirror
+
+            # Stage first, then compare the index: a plain `git diff`
+            # ignores untracked files, so a new page would look unchanged.
+            git -C .wiki add -A
+            if git -C .wiki diff --cached --quiet; then
+              echo "Wiki already current for ${SHA:0:7}."
+              exit 0
+            fi
+
+            # Print the change set: a mirror deletes, and a deletion must never
+            # be silent in the log.
+            git -C .wiki diff --cached --name-status
+
+            git -C .wiki commit -q -m "Sync wiki from ${SHA:0:7}"
+            if git -C .wiki push -q origin HEAD:master; then
+              echo "::notice::Wiki published from ${SHA:0:7}."
+              exit 0
+            fi
+            echo "::warning::Wiki push rejected (attempt ${attempt}/3); re-mirroring onto the new tip."
+          done
+
+          echo "::error::Could not push the wiki after 3 attempts; the wiki repo is being written concurrently. Re-run this job." >&2
+          exit 1

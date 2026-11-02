@@ -498,3 +498,19 @@ def test_the_unit_matrix_covers_every_shipped_desktop_os():
     )
     included = {row["os"] for row in matrix["include"]}
     assert {"windows-11-arm", "ubuntu-26.04-arm"} <= included
+
+
+def test_the_static_gate_audits_workflows_with_a_pinned_zizmor():
+    # A new zizmor release can add audits. Unpinned, it could fail the
+    # static gate, and with it every test job, on an unrelated commit.
+    steps = _load_workflow("release.yml")["jobs"]["tox-static"]["steps"]
+    (run,) = [s["run"] for s in steps if s.get("run", "").startswith("tox ")]
+    assert "zizmor" in run.split()[-1].split(",")
+    env = _tox()["testenv:zizmor"]
+    assert env["deps"].split() == ["-rrequirements/zizmor.txt"]
+    with open(os.path.join(ROOT, "requirements", "zizmor.txt")) as fobj:
+        pins = [
+            line for line in fobj.read().splitlines() if line[:1] not in "#"
+        ]
+    assert len(pins) == 1 and re.fullmatch(r"zizmor==[\d.]+", pins[0])
+    assert "--offline" in env["commands"]

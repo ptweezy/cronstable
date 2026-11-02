@@ -53,8 +53,10 @@ runs:
     - name: Back off before retrying ${{ inputs.label }}
       if: steps.sign1.outcome == 'failure'
       shell: bash
+      env:
+        LABEL: ${{ inputs.label }}
       run: |
-        echo "::warning::signing ${{ inputs.label }}: attempt 1 of 3 failed; retrying in 20s"
+        echo "::warning::signing ${LABEL}: attempt 1 of 3 failed; retrying in 20s"
         sleep 20
 
     - name: Sign ${{ inputs.label }} (retry)
@@ -77,8 +79,10 @@ runs:
     - name: Back off before the last attempt at ${{ inputs.label }}
       if: steps.sign2.outcome == 'failure'
       shell: bash
+      env:
+        LABEL: ${{ inputs.label }}
       run: |
-        echo "::warning::signing ${{ inputs.label }}: attempt 2 of 3 failed; retrying in 60s"
+        echo "::warning::signing ${LABEL}: attempt 2 of 3 failed; retrying in 60s"
         sleep 60
 
     # No continue-on-error, so an exhausted ladder fails the release
@@ -102,5 +106,7 @@ runs:
     - name: Report the recovered ${{ inputs.label }} signature
       if: steps.sign1.outcome == 'failure'
       shell: bash
+      env:
+        LABEL: ${{ inputs.label }}
       run: |
-        echo "::notice::signing ${{ inputs.label }}: recovered after a retry"
+        echo "::notice::signing ${LABEL}: recovered after a retry"
