@@ -226,11 +226,9 @@ which does not support free-threaded Python. With Python 3.14t or 3.15t
 installed, run `tox -e py314t-posix` or `tox -e py315t-posix` to test the
 standard-library JSON fallback with the same test suite and coverage floor.
 
-On Python 3.15, the `dev` extra skips `isal`, which has no wheel for that
-version, so the `isal` half of `tests/test_gzip.py` doesn't run there. The
-`orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39 or later.
-On an older glibc, installing the `dev` extra builds `orjson` from source,
-which requires a Rust toolchain.
+The `orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39 or
+later. On an older glibc, installing the `dev` extra builds `orjson` from
+source, which requires a Rust toolchain.
 
 ### Dependency floors
 

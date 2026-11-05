@@ -214,11 +214,9 @@ On a 32-bit userland with a 64-bit kernel, install the push extra as
 the 32-bit machine, so pip skips `cryptography`, which has no 32-bit wheel,
 rather than failing to build it from source.
 
-On Python 3.15, the `speedups` extra skips `isal`, which has no wheel for
-that version, so the daemon compresses responses with the standard library's
-`zlib`. The `orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39
-or later, which Debian 13 and Ubuntu 24.04 provide. On an older glibc, pip
-builds `orjson` from source, which requires a Rust toolchain.
+For Python 3.15 on glibc Linux, the `orjson` wheels in the `speedups` extra
+require glibc 2.39 or later, which Debian 13 and Ubuntu 24.04 provide. On an
+older glibc, pip builds `orjson` from source, which requires a Rust toolchain.
 
 ## Install using pipx
 
