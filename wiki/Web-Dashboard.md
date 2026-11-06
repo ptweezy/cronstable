@@ -3,7 +3,9 @@
 The **web dashboard** lets you monitor jobs, tail live output, review run
 history, and preview schedules from a browser. It supports keyboard shortcuts
 and is served by the optional [HTTP control API](HTTP-API), with no external
-assets or build step.
+assets or build step. To try it without installing anything, open the
+[live demo](https://demo.cronstable.com), a public board that all visitors
+share.
 
 [![The cronstable web dashboard, a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/main/docs/img/dashboard-overview.png)
 
