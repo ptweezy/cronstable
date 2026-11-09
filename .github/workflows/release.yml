@@ -659,7 +659,7 @@ jobs:
           docker logs etcd-plain
           exit 1
       - name: Start a kind cluster
-        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
       - name: Run the live backend tests
         env:
           CRONSTABLE_LIVE_REQUIRED: '1'
@@ -2704,7 +2704,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (OmniOS r151054 amd64)
-        uses: vmactions/omnios-vm@9576f0b6d15e7696548409baa533bc0a339caf42 # v1.3.7
+        uses: vmactions/omnios-vm@aeee92416495d9685b2997d954f6b063ae5b832d # v1.3.8
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
