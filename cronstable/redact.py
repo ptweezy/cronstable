@@ -92,9 +92,10 @@ _PATTERNS: list[tuple[re.Pattern, _Repl]] = [
     # shell metacharacter follows it. The shell joins "part1"part2 into one
     # word, so any other character after the quote sends the value to the
     # bare forms below, which redact the rest of it. A value that is
-    # already REDACTED, followed by the same kind of boundary, matches
-    # alongside the quoted forms and is replaced by itself, so a second pass
-    # over redacted output changes nothing.
+    # already REDACTED matches when the same kind of boundary or an "@"
+    # follows it, and is replaced by itself, so a second pass over redacted
+    # output changes nothing. The URL pattern below leaves the "@" form when
+    # the URL's user name ends in a keyword (scheme://token:REDACTED@host).
     # Bare values: a value ending at a JSON/`key=value`-list delimiter
     # (comma, closing brace/bracket) is redacted only up to it, preserving
     # the surrounding structure; anything else redacts to end of line (a
@@ -104,9 +105,8 @@ _PATTERNS: list[tuple[re.Pattern, _Repl]] = [
             r"(?i)(?=[pstacr])("
             + "|".join(_KEY_KEYWORDS)
             + r")(s?)([\"']?\s*[=:]\s*)"
-            r"((?:\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|"
-            + re.escape(REDACTED)
-            + r")(?=[\s,;|&)<>}\]]|$)"
+            r"((?:\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')(?=[\s,;|&)<>}\]]|$)"
+            r"|" + re.escape(REDACTED) + r"(?=[\s,;|&)<>}\]@]|$)"
             r"|[^\s,}\]]+(?=\s*[,}\]])|[^\r\n]+)"
         ),
         lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}",

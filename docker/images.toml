@@ -69,14 +69,14 @@ toolchain = '''
     rm -rf /var/lib/apt/lists/*
 '''
 python = "python3.13"
-runtime = "gcr.io/distroless/python3-debian13:latest@sha256:0db804f397ca31a1498c9d94c3c1df53fe49ac8007e5942b1cb547c1c3355c09"
+runtime = "gcr.io/distroless/python3-debian13:latest@sha256:9a1ed29d41d7695245ff86bc2e08684d3dd253a3f9c8ca45677427f9f4fe3598"
 entrypoint = "[\"/opt/venv/bin/cronstable\"]"
 description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (distroless)."
 
 # System libsodium avoids PyNaCl's bundled autotools tests under QEMU.
 # The runtime must carry libsodium to match the builder link.
 [fedora]
-builder = "fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80"
+builder = "fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c"
 toolchain = '''
     retry dnf --setopt=retries=10 install -y python3 python3-pip python3-devel gcc make libffi-devel libsodium-devel git; \
     dnf clean all
@@ -125,12 +125,12 @@ description = "A job scheduler with retries, alerts, saved run history, workflow
 
 # UBI builder and ubi-minimal runtime share their Python 3.12 layout.
 [rhel]
-builder = "registry.access.redhat.com/ubi10/ubi:latest@sha256:7495bfa53ae7a81a58aeface0bb4858d12741832c542c29dc690d67b183b73b0"
+builder = "registry.access.redhat.com/ubi10/ubi:latest@sha256:0e8ccad7d35f5fd756f4f2202f018b8d3c3e8bb9af8e627d874239381a00ab41"
 toolchain = '''
     retry dnf --setopt=retries=10 install -y python3 python3-pip python3-devel gcc make libffi-devel git; \
     dnf clean all
 '''
-runtime = "registry.access.redhat.com/ubi10/ubi-minimal:latest@sha256:ab67cd02caf8706e34a695a1432ebe965934f6128ec352a6c3f4048b43a4fb5e"
+runtime = "registry.access.redhat.com/ubi10/ubi-minimal:latest@sha256:c3fe95ec9f53a3888c47314eb4d08bde09ebde646a428137b445091afe1daf89"
 runtime_install = '''
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
@@ -145,7 +145,7 @@ rust_cleanup = '''
 description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (RHEL/UBI 10)."
 
 [ubuntu]
-builder = "ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944"
+builder = "ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c"
 builder_env = "ENV DEBIAN_FRONTEND=noninteractive"
 toolchain = '''
     retry apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update; \

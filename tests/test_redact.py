@@ -513,6 +513,30 @@ def test_a_second_pass_leaves_redacted_lines_unchanged():
     )
 
 
+def test_a_second_pass_leaves_a_redacted_url_password_unchanged():
+    # The URL's user name ends in a keyword, so the key=value pattern reads
+    # the password as its value, and a "," "}" or "]" ends that value early.
+    # The URL pattern then redacts through to the "@". The first line is the
+    # fuzzer's.
+    for line in [
+        "lis://password:on\ufffd}passwo@d@Z\x1elo",
+        "https://x-access-token:abc,def@github.com/owner/repo",
+        "redis://mypassword:a]b@cache:6379",
+        "x://pwds:_@}@",
+    ]:
+        once = redact_secrets(line)
+        assert redact_secrets(once) == once, (line, once)
+    url = "https://x-access-token:abc,def@github.com/owner/repo"
+    assert redact_secrets(url) == (
+        "https://x-access-token:" + REDACTED + "@github.com/owner/repo"
+    )
+    # a marker before an "@" is an already redacted URL password
+    marked = "amqp://token:" + REDACTED + "@broker:5672"
+    assert redact_secrets(marked) == marked
+    # a quoted value before an "@" runs on as one shell word
+    assert redact_secrets('password="x"@tail') == "password=" + REDACTED
+
+
 # ---------------------------------------------------------------------------
 # LINE_SCAN_LIMIT: sre holds the GIL for a whole scan
 # ---------------------------------------------------------------------------
