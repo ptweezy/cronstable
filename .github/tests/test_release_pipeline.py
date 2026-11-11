@@ -15,8 +15,6 @@ import pytest
 from packaging.requirements import Requirement
 from strictyaml.ruamel import YAML
 
-pytest.importorskip("tomllib")  # CI helpers execute on Python 3.14.
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -1150,6 +1148,7 @@ def test_every_required_build_and_preparation_gates_publication():
         "tox-mindeps",
         "backends-live",
         "cgroups-live",
+        "tls-openssl1",
         "tox-static",
         "licenses",
         "preflight",
@@ -1180,7 +1179,14 @@ def test_every_required_build_and_preparation_gates_publication():
 
 def test_builds_overlap_tests_but_advisory_jobs_wait_for_required_rows():
     jobs = workflow()["jobs"]
-    checks = {"tox", "tox-mindeps", "backends-live", "cgroups-live", "dist"}
+    checks = {
+        "tox",
+        "tox-mindeps",
+        "backends-live",
+        "cgroups-live",
+        "tls-openssl1",
+        "dist",
+    }
     for name in checks:
         assert "tox-static" in ancestors(jobs, name)
         assert "preflight" not in ancestors(jobs, name)
@@ -1506,6 +1512,7 @@ def test_input_resolution_ignores_yanked_prerelease_and_incompatible_sources():
 )
 def test_source_constraints_come_from_pyproject(name, extra):
     import tomllib
+
     from packaging.requirements import Requirement
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())

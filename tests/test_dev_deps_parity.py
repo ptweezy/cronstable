@@ -68,8 +68,6 @@ def _has_cryptography_wheel():
 
 def _has_isal_wheel():
     # mirrors the marker on the isal lines of the speedups and dev extras
-    if sys.version_info >= (3, 15):
-        return False
     machine = platform.machine()
     if sys.platform == "linux":
         return machine in ("x86_64", "aarch64")

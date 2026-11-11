@@ -271,7 +271,7 @@ class DemoGateway:
                 {"error": "Not available in the public demo."},
                 status=ex.status,
             )
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (TimeoutError, aiohttp.ClientError):
             raise error(
                 web.HTTPBadGateway, "The demo daemon is unavailable."
             ) from None
@@ -359,7 +359,7 @@ class DemoGateway:
         async with self.lock:
             try:
                 raw = await asyncio.wait_for(request.read(), timeout=5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 raise error(
                     web.HTTPRequestTimeout, "Demo request timed out."
                 ) from None
@@ -477,11 +477,7 @@ class DemoGateway:
                 async for chunk in upstream.content.iter_any():
                     await response.write(chunk)
                 await response.write_eof()
-            except (
-                ConnectionError,
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-            ):
+            except (TimeoutError, ConnectionError, aiohttp.ClientError):
                 response.force_close()
             return response
 

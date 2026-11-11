@@ -40,7 +40,7 @@ from tests.test_state_dag_run import (
 )
 
 _PY = sys.executable
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 _YAML = """
 jobs:

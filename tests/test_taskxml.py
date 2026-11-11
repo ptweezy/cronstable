@@ -182,8 +182,7 @@ def test_duration_refuses_what_has_no_fixed_length(text):
     ],
 )
 def test_parse_boundary(text, zone):
-    # fromisoformat is not used: it does not take a trailing Z on the oldest
-    # interpreter this project supports, which is a live matrix row.
+    # The zone comes back as written, so "Z" and an offset stay distinct.
     assert parse_boundary(text, "w").zone == zone
     assert parse_boundary(text, "w").when.hour == 3
 

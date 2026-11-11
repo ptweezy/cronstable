@@ -106,7 +106,7 @@ def _fold(line: str) -> str:
 
 def _stamp(dt: datetime.datetime) -> str:
     """An aware instant as the RFC 5545 UTC form (``YYYYMMDDTHHMMSSZ``)."""
-    return dt.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return dt.astimezone(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _block_seconds(avg_duration: float | None) -> int:
@@ -159,7 +159,7 @@ def render_calendar(
     if start.tzinfo is None:
         raise ValueError("render_calendar needs an aware start")
 
-    utc = datetime.timezone.utc
+    utc = datetime.UTC
     if now is None:
         now = datetime.datetime.now(utc)
     end_utc = (start + datetime.timedelta(days=days)).astimezone(utc)

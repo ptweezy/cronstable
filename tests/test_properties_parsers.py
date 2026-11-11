@@ -409,6 +409,7 @@ _KEY = st.sampled_from(
 @given(st.one_of(junk_text, st.text(max_size=300)))
 @example('password: "abc" and more text')
 @example('AWS_SECRET_ACCESS_KEY="not-"-real-secret-123"')
+@example("lis://password:on�}passwo@d@Z\x1elo")
 def test_redaction_is_total_and_stable(text):
     once = redact_secrets(text)
     assert isinstance(once, str)
@@ -579,7 +580,7 @@ def test_a_rendered_calendar_is_well_formed_for_any_job_names(jobs, days):
         ical.CalendarEntry._make(_entry_fields(name, CronTab(expr)))
         for name, expr in jobs
     ]
-    start = datetime.datetime(2026, 3, 7, tzinfo=datetime.timezone.utc)
+    start = datetime.datetime(2026, 3, 7, tzinfo=datetime.UTC)
     text = ical.render_calendar(
         entries, start, days, per_job_cap=20, now=start
     )
@@ -598,8 +599,8 @@ def _entry_fields(name, tab):
         "tab": tab,
         "crontab": tab,
         "schedule": str(tab),
-        "timezone": datetime.timezone.utc,
-        "tz": datetime.timezone.utc,
+        "timezone": datetime.UTC,
+        "tz": datetime.UTC,
         "avg_duration": None,
         "enabled": True,
         "paused": False,

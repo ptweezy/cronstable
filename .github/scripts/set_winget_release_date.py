@@ -1,17 +1,17 @@
 """Set the WinGet release date from GitHub's publication timestamp."""
 
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from strictyaml.ruamel import YAML
 
 
 def set_release_date(version, published_at, manifest_path):
-    published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    published = datetime.fromisoformat(published_at)
     if published.tzinfo is None:
         raise ValueError("Publication timestamp must include a timezone")
-    release_date = published.astimezone(timezone.utc).date()
+    release_date = published.astimezone(UTC).date()
     path = Path(manifest_path)
     yaml = YAML()
     manifest = yaml.load(path.read_text("utf-8"))

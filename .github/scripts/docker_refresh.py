@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import quote
 
 ATTEMPTS = 4
@@ -171,7 +171,7 @@ def main():
                 revision,
                 os.environ["GITHUB_RUN_ID"],
                 os.environ["GITHUB_RUN_ATTEMPT"],
-                datetime.now(timezone.utc).strftime("%Y%m%d"),
+                datetime.now(UTC).strftime("%Y%m%d"),
             )
         )
     else:

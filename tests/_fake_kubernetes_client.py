@@ -93,7 +93,7 @@ _DATETIME_ATTRS = {"creation_timestamp", "acquire_time", "renew_time"}
 def _parse_time(value: Any) -> Any:
     if not isinstance(value, str):
         return value
-    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.datetime.fromisoformat(value)
 
 
 def _to_model(cls: type[_Model], wire: Optional[dict[str, Any]]) -> Any:

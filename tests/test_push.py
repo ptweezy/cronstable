@@ -1619,7 +1619,7 @@ async def test_file_store_abandoned_op_cannot_interleave(tmp_path):
 
     store._write = slow_write  # type: ignore[method-assign]
 
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(TimeoutError):
         await asyncio.wait_for(store.upsert({"id": "d1"}), timeout=0.3)
     assert entered.is_set()  # the abandoned worker really is mid-write
     second = asyncio.create_task(store.upsert({"id": "d2"}))

@@ -33,7 +33,7 @@ from cronstable.backends.etcd import (
 from cronstable.config import parse_config_string
 from tests._helpers import _utc_now_plus, _write_tls
 
-NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
 
 
 def _backend(extra="", endpoint="http://127.0.0.1:2379"):

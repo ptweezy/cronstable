@@ -103,20 +103,6 @@ def pytest_configure(config):
     # fd this reads, and conftest hooks run before builtin plugins' by
     # default
     global _DUMP_TASKS_AFTER, _DUMP_FD
-    if sys.version_info[:2] == (3, 10):
-        # CPython #90476: the old SSL protocol leaves its wrapper marked open
-        # after connection_lost has disposed of the underlying transport.
-        # Reproduced with _ssl_protocol._transport is None, including rejected
-        # mTLS handshakes. Fixed by the SSL rewrite in 3.11. Limit this to the
-        # wrapper on 3.10; socket/session and all other warnings remain errors.
-        # Remove with Python 3.10 support.
-        # https://github.com/python/cpython/issues/90476
-        config.addinivalue_line(
-            "filterwarnings",
-            r"ignore:unclosed transport <asyncio\.sslproto\."
-            r"_SSLProtocolTransport object at .*"
-            r":ResourceWarning:asyncio\.sslproto",
-        )
     timeout = float(config.getini("faulthandler_timeout") or 0)
     if timeout:
         _DUMP_TASKS_AFTER = timeout * 0.8

@@ -343,7 +343,7 @@ class FilesystemBackend(ElectionReadsBase):
             self._lease = None
         if expires_at is not None and expires_at > 0.0:
             self._lease_deadline = datetime.datetime.fromtimestamp(
-                expires_at, datetime.timezone.utc
+                expires_at, datetime.UTC
             )
         else:
             self._lease_deadline = None
@@ -397,7 +397,7 @@ class FilesystemBackend(ElectionReadsBase):
                 await asyncio.wait_for(
                     self._renew_once(), timeout=self.round_deadline
                 )
-            except (OSError, asyncio.TimeoutError) as ex:
+            except (TimeoutError, OSError) as ex:
                 logger.warning(
                     "cluster: filesystem election: first round did not "
                     "complete (%s); starting unquorate",
@@ -463,7 +463,7 @@ class FilesystemBackend(ElectionReadsBase):
                 await asyncio.wait_for(
                     self._renew_once(), timeout=self.round_deadline
                 )
-            except (OSError, asyncio.TimeoutError) as ex:
+            except (TimeoutError, OSError) as ex:
                 # transient store trouble: nothing to change -- the fixed
                 # quorum deadline simply lapses (Leader closes, PreferLeader
                 # runs), and the next round retries.
@@ -478,7 +478,7 @@ class FilesystemBackend(ElectionReadsBase):
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=self.renew_period
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def _bounded(self, coro: Any) -> Any:
@@ -499,7 +499,7 @@ class FilesystemBackend(ElectionReadsBase):
                 renewed = await self._bounded(
                     self._store.renew_lease(self._lease, self.ttl)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # UNKNOWN: the abandoned (locked) worker may still land the
                 # renew. Change NOTHING and return -- do not fall through to
                 # the unlocked read below, which would re-extend the
@@ -552,7 +552,7 @@ class FilesystemBackend(ElectionReadsBase):
             observed = await self._bounded(
                 self._store.read_lease(self.election_name)
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         if observed is not None and observed.holder == self._holder_token:
             # our own lease -- read UNLOCKED (read_lease takes no flock),
@@ -605,7 +605,7 @@ class FilesystemBackend(ElectionReadsBase):
                     self.election_name, self._holder_token, self.ttl
                 )
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # UNKNOWN, not denied: the write may still land. The
             # own-holder adoption branch above self-heals next round.
             return
@@ -644,7 +644,7 @@ class FilesystemBackend(ElectionReadsBase):
             confirm = await self._bounded(
                 self._store.read_lease(self.election_name)
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         if confirm is not None:
             # confirm is an UNLOCKED read: never assert leadership from it
@@ -695,7 +695,7 @@ class FilesystemBackend(ElectionReadsBase):
         ) or _monotonic() >= self._reboot_refresh_next:
             try:
                 await self._refresh_reboot_ran()
-            except (OSError, asyncio.TimeoutError) as ex:
+            except (TimeoutError, OSError) as ex:
                 if self._reboot_ran_synced:
                     logger.debug(
                         "cluster: could not refresh the @reboot-ran set: %s",
@@ -732,7 +732,7 @@ class FilesystemBackend(ElectionReadsBase):
                         "(still deferring pending @reboot one-shots)",
                         ex,
                     )
-        with contextlib.suppress(OSError, asyncio.TimeoutError):
+        with contextlib.suppress(OSError, TimeoutError):
             await self._persist_reboot_ran()
 
     async def _refresh_reboot_ran(self) -> None:
@@ -795,7 +795,7 @@ class FilesystemBackend(ElectionReadsBase):
                 )
             )
             self._reboot_persisted.add(job)
-        with contextlib.suppress(OSError, asyncio.TimeoutError):
+        with contextlib.suppress(OSError, TimeoutError):
             await self._bounded(
                 self._store.prune_records(
                     _REBOOT_RAN_STREAM, keep=_REBOOT_RAN_KEEP
@@ -834,5 +834,5 @@ class FilesystemBackend(ElectionReadsBase):
         # eager, bounded, best-effort: the caller launches right after, so
         # a store that cannot answer must not stall the launch -- the
         # maintenance pass retries the append.
-        with contextlib.suppress(OSError, asyncio.TimeoutError):
+        with contextlib.suppress(OSError, TimeoutError):
             await self._persist_reboot_ran()

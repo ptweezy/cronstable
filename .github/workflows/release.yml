@@ -60,11 +60,13 @@ on:
 # only a started run, and a queued one loses its slot to the next push.
 #
 # The release test is a loose superset of `decide` (a false negative could
-# cancel a publish): any dispatch, any pushed message containing `[release`,
-# or a push of 20+ commits, where the event payload truncates.
+# cancel a publish): any dispatch, or a push to `main` that has a message
+# containing `[release` or 20+ commits, where the event payload truncates.
+# Like `decide`, it ignores pull requests and other branches, so their runs
+# stay cancellable when they carry `[release` commits from main.
 concurrency:
-  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) && 'release' || 'ci' }}
-  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null) }}
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) && 'release' || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) }}
 
 # Least-privilege default for all jobs; the publish jobs opt up to the narrower
 # write scopes they actually need (see each one's own permissions:).
@@ -115,7 +117,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Decide release
@@ -303,7 +305,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Check optional Docker Hub login
         if: needs.version.outputs.release == 'true' && env.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -396,7 +398,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Install runtime + distributable extras
@@ -422,13 +424,13 @@ jobs:
         # macOS runs the POSIX profile: its process, signal, fsync, and pipe
         # behavior differs from Linux, and releases ship macOS binaries.
         os: [ubuntu-26.04, windows-latest, macos-latest]
-        python: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
+        python: ['3.11', '3.12', '3.13', '3.14', '3.15']
         include:
           # Linux ARM64 on the oldest and newest Python, and on 3.14, which
           # the release binaries bundle: releases ship ARM64 artifacts, and
           # cryptography and orjson use different wheels there.
           - os: ubuntu-26.04-arm
-            python: '3.10'
+            python: '3.11'
           - os: ubuntu-26.04-arm
             python: '3.14'
           - os: ubuntu-26.04-arm
@@ -587,7 +589,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.10'
+          python-version: '3.11'
       - run: pip install tox tox-uv
       - run: tox -e mindeps
     needs:
@@ -657,7 +659,7 @@ jobs:
           docker logs etcd-plain
           exit 1
       - name: Start a kind cluster
-        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
       - name: Run the live backend tests
         env:
           CRONSTABLE_LIVE_REQUIRED: '1'
@@ -772,6 +774,83 @@ jobs:
       - version
       - tox-static
 
+  # Runs the TLS tests with RHEL 8's python3.11, which links OpenSSL 1.1.1k.
+  # OpenSSL 1.1.1 makes fewer certificate checks than OpenSSL 3
+  # (wiki/Listener-TLS.md), and the other test jobs all link OpenSSL 3.
+  tls-openssl1:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      UBI8_PYTHON_IMAGE: registry.access.redhat.com/ubi8/python-311:1-1779943517@sha256:06ad015cc4e4c2ec18e1119af36dd0dcae85d60b7587164338dc750d34436b58
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.SETUP_UV_VERSION }}
+      # Its own step, so a registry blip is retried before the tests start.
+      - name: Pull the RHEL 8 Python image
+        run: |
+          set -euo pipefail
+          . .github/scripts/retry.sh
+          retry 5 docker pull "$UBI8_PYTHON_IMAGE"
+      - name: Run the TLS tests under OpenSSL 1.1.1
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tls-openssl1"
+          mkdir -p "$out"
+          # The container runs as the image user, not the runner user.
+          chmod 777 "$out"
+          docker run --rm \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e UV_HTTP_TIMEOUT -e UV_PYTHON_DOWNLOADS \
+            -v "$PWD:/src:ro" -v "$out:/out" \
+            -v "$(command -v uv):/usr/local/bin/uv:ro" \
+            "$UBI8_PYTHON_IMAGE" bash -euc '
+              # NO APOSTROPHES: this whole script is single-quoted (bash -euc).
+              # The install and the tests write into the tree, so they run
+              # on a copy of the read-only checkout.
+              cp -r /src /tmp/src
+              cd /tmp/src
+              uv venv /tmp/venv --python python3.11
+              /tmp/venv/bin/python -c "import ssl, sys; print(ssl.OPENSSL_VERSION); sys.exit(ssl.OPENSSL_VERSION_INFO[:3] != (1, 1, 1))"
+              uv pip install --python /tmp/venv/bin/python -e ".[dev]"
+              /tmp/venv/bin/python -m pytest --no-cov -p no:cacheprovider \
+                -v -rs --junitxml=/out/tls-openssl1.xml \
+                tests/test_web_tls.py \
+                tests/test_state_job_cli.py \
+                tests/test_cluster.py \
+                tests/test_webclient.py \
+                tests/test_backend_etcd_transport.py \
+                tests/test_backend_kubernetes_transport.py \
+                tests/test_paircli.py \
+                tests/test_tui_pair.py \
+                tests/test_mcpcli.py
+            '
+          python3 - "$out/tls-openssl1.xml" <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for suite in root.iter("testsuite"):
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          print("TLS tests on OpenSSL 1.1.1:", totals)
+          assert totals["tests"] >= 1, "no TLS test was collected"
+          assert totals["failures"] == 0 and totals["errors"] == 0
+          # The only skip is the one OpenSSL 1.1.1 case.
+          expected = "OpenSSL 1.1.1 does not check the AKI"
+          for case in root.iter("testcase"):
+              for skipped in case.iter("skipped"):
+                  message = skipped.get("message")
+                  assert message == expected, (case.get("name"), message)
+          EOF
+    needs:
+      - version
+      - tox-static
+
   # The `release` job publishes this artifact verbatim, so the bytes checked
   # here are the bytes that ship.
   dist:
@@ -786,7 +865,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Build distributions
@@ -1915,7 +1994,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Prepare macOS signing credentials
@@ -2514,7 +2593,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (NetBSD 11.0 amd64)
-        uses: vmactions/netbsd-vm@c8a0d7ddb84619a7a8cc4e652efa7950b3fd9f92 # v1.5.2
+        uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2625,7 +2704,7 @@ jobs:
       # Shallow checkout; see the dist job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build binary (OmniOS r151054 amd64)
-        uses: vmactions/omnios-vm@9576f0b6d15e7696548409baa533bc0a339caf42 # v1.3.7
+        uses: vmactions/omnios-vm@aeee92416495d9685b2997d954f6b063ae5b832d # v1.3.8
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         with:
@@ -2780,7 +2859,7 @@ jobs:
         with:
           python-version: '3.14'
           architecture: ${{ matrix.pyarch }}
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Build amd64v3 Python
@@ -3375,7 +3454,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - name: Install current and baseline environments
@@ -4119,6 +4198,7 @@ jobs:
       - tox-mindeps
       - backends-live
       - cgroups-live
+      - tls-openssl1
       - tox-static
       - licenses
       - release-prepare
@@ -4182,7 +4262,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ needs.version.outputs.new }}
           name: ${{ needs.version.outputs.new }}
@@ -4345,7 +4425,7 @@ jobs:
             type=raw,value=latest-debian,enable=${{ startsWith(matrix.distro, 'debian') }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -4353,7 +4433,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: steps.registries.outputs.dockerhub == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

@@ -153,6 +153,9 @@ pkgs.python3Packages
           tag = "v${version}";
           hash = "sha256-gSxqab8AYJ6PsMP1PYWUxQ8TJ9KtEehoekLD8ziBt+g=";
         };
+        # This release already includes the Cython 3.3 fix that nixpkgs
+        # patches in.
+        patches = [ ];
         # The nixpkgs postPatch edits pytest settings in setup.cfg, which
         # this release keeps in pytest.ini. Keep its build steps only.
         postPatch = ''
@@ -162,6 +165,11 @@ pkgs.python3Packages
 
           substituteInPlace Makefile \
             --replace-fail "cythonize: .install-cython" "cythonize:"
+
+          # Cython 3.3 crashes on a Final annotation for a name that
+          # reader_c.pxd declares with cdef. Drop it as aiohttp main does.
+          substituteInPlace aiohttp/_websocket/reader_py.py \
+            --replace-fail "MSG_SIZE_OVERHEAD: Final[int] = 128" "MSG_SIZE_OVERHEAD = 128"
         '';
         doCheck = false;
         meta = old.meta // {

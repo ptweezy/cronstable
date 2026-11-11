@@ -603,10 +603,10 @@ or differs from the running one, and (re)started (with `make_backend` inside a
 `try`) when present and none is running.
 
 A start failure is caught as `OSError`, `ssl.SSLError`, `ValueError`,
-`ConfigError`, `aiohttp.ClientError`, or `asyncio.TimeoutError`, logged, and the
+`ConfigError`, `aiohttp.ClientError`, or `TimeoutError`, logged, and the
 reload continues (jobs keep running). `OSError`/`ssl.SSLError`/`ValueError`
 cover the gossip case (bad cert files, a bad listen address, a port already in
-use). `ConfigError`, `aiohttp.ClientError`, and `asyncio.TimeoutError`
+use). `ConfigError`, `aiohttp.ClientError`, and `TimeoutError`
 additionally cover a lease backend that cannot reach or authenticate to its
 store at `start()` (a `ClientResponseError` on a rejected token is an
 `aiohttp.ClientError`, not an `OSError`), so these operational

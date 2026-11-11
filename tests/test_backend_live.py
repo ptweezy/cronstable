@@ -153,7 +153,7 @@ async def _etcd_nodes(test, *, count=2, ttl=15, auth=False, dead_first=False):
             await node.stop()
         janitor = _etcd_backend(endpoints, election, extra=extra)
         # a cleanup that cannot reach etcd must not mask the test's own error
-        with contextlib.suppress(aiohttp.ClientError, asyncio.TimeoutError):
+        with contextlib.suppress(aiohttp.ClientError, TimeoutError):
             await janitor.start()
             try:
                 key = _b64(janitor.reboot_ran_key)

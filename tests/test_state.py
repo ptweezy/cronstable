@@ -559,7 +559,7 @@ async def test_lease_lane_isolated_from_saturated_bulk_pool(fs_backend):
         )
         assert got == "ok"
         # ...while a further BULK op is blocked (the bulk lane is exhausted).
-        with pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(TimeoutError):
             await asyncio.wait_for(
                 backend._call("bulk-extra", lambda: "nope"), timeout=0.3
             )
@@ -7791,7 +7791,7 @@ async def test_call_survives_abandoned_await(fs_backend):
     previous = loop.get_exception_handler()
     loop.set_exception_handler(lambda lp, ctx: captured.append(ctx))
     try:
-        with pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(TimeoutError):
             await asyncio.wait_for(
                 backend.append_record("s", {"i": 1}), timeout=0.1
             )

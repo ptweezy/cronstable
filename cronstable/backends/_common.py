@@ -36,7 +36,7 @@ _UNKNOWN_HOLDER = "<unknown holder>"
 
 
 def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
+    return datetime.datetime.now(datetime.UTC)
 
 
 def _monotonic() -> float:
@@ -86,25 +86,12 @@ def _parse_microtime(value: object) -> datetime.datetime | None:
     """
     if not isinstance(value, str) or not value:
         return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    if "." in text:
-        date_part, _, frac_and_tz = text.partition(".")
-        frac, tzsep = frac_and_tz, ""
-        for sep in ("+", "-"):
-            idx = frac_and_tz.find(sep)
-            if idx != -1:
-                frac, tzsep = frac_and_tz[:idx], frac_and_tz[idx:]
-                break
-        frac = (frac + "000000")[:6]
-        text = "{}.{}{}".format(date_part, frac, tzsep)
     try:
-        parsed = datetime.datetime.fromisoformat(text)
+        parsed = datetime.datetime.fromisoformat(value.strip())
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        parsed = parsed.replace(tzinfo=datetime.UTC)
     return parsed
 
 
@@ -114,9 +101,7 @@ def _format_microtime(when: datetime.datetime) -> str:
     Also the expiry format in every backend's ``lease_detail``, so the
     dashboard parses one shape.
     """
-    return when.astimezone(datetime.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%S.%fZ"
-    )
+    return when.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class ElectionReadsBase(LeaseBackend):

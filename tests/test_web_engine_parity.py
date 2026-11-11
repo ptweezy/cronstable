@@ -48,9 +48,7 @@ INDEX = os.path.join(
 
 #: fixed naive instant, read as UTC on both sides
 _FROM = datetime.datetime(2026, 1, 7, 12, 0, 30)
-_FROM_MS = int(
-    _FROM.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000
-)
+_FROM_MS = int(_FROM.replace(tzinfo=datetime.UTC).timestamp() * 1000)
 _COUNT = 8
 
 
@@ -78,9 +76,7 @@ def _python_side(exprs):
             out[expr] = {"valid": False}
             continue
         fires = [
-            int(
-                dt.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000
-            )
+            int(dt.replace(tzinfo=datetime.UTC).timestamp() * 1000)
             for dt in itertools.islice(tab.occurrences(_FROM), _COUNT)
         ]
         out[expr] = {
@@ -219,7 +215,7 @@ def _zone_seeds(zone):
     """Instants six hours before each 2026 offset change in ``zone`` (found
     by an hourly scan), or one fixed instant for a zone without any."""
     tz = zoneinfo.ZoneInfo(zone)
-    utc = datetime.timezone.utc
+    utc = datetime.UTC
     t = datetime.datetime(2026, 1, 1, tzinfo=utc)
     end = datetime.datetime(2027, 1, 1, tzinfo=utc)
     step = datetime.timedelta(hours=1)
@@ -286,6 +282,6 @@ def test_client_engine_matches_daemon_engine_across_zone_transitions():
             case["zone"],
             case["expr"],
             datetime.datetime.fromtimestamp(
-                case["fromMs"] / 1000, datetime.timezone.utc
+                case["fromMs"] / 1000, datetime.UTC
             ).isoformat(),
         )

@@ -2728,8 +2728,8 @@ _EXPLAIN_COUNT_DEFAULT = 5
 
 # Input properties that several tools share.
 _ISO_UTC = (
-    "Use ISO 8601, such as 2026-10-01T00:00+00:00 (write UTC as +00:00, "
-    "not Z). A value without an offset is read as UTC."
+    "Use ISO 8601, such as 2026-10-01T00:00Z or 2026-10-01T00:00+00:00. A "
+    "value without an offset is read as UTC."
 )
 _JOB_ARG = _arg(
     _STR,

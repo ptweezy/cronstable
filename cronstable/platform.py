@@ -620,7 +620,7 @@ async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover (windows)
         return False
     try:
         retcode = await asyncio.wait_for(proc.wait(), TASKKILL_TIMEOUT)
-    except (asyncio.TimeoutError, asyncio.CancelledError) as ex:
+    except (TimeoutError, asyncio.CancelledError) as ex:
         # A lease renewer can be cancelled while its taskkill is running.
         # Always reap our helper before propagating cancellation or returning
         # a timeout; otherwise its transport outlives the owning event loop.

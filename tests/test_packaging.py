@@ -35,10 +35,7 @@ import fnmatch
 import os
 import posixpath
 import re
-
-import pytest
-
-tomllib = pytest.importorskip("tomllib")  # py3.11+; the other cells enforce
+import tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG_ROOT = os.path.join(ROOT, "cronstable")

@@ -22,7 +22,7 @@ from cronstable.croninfo import (
 )
 from tests._helpers import _pin_host_zone
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 _NY = ZoneInfo("America/New_York")
 #: a fixed reference instant: July 2026, between the US transitions
 _NOW = datetime.datetime(2026, 7, 18, 12, 0, tzinfo=_UTC)

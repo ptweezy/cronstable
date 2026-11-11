@@ -649,7 +649,7 @@ async def test_kill_process_group_windows_reaches_the_grandchild(tmp_path):
         assert await platform.kill_process_group(proc.pid, force=False)
         try:
             await asyncio.wait_for(proc.wait(), 5)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         # forced step: the taskkill /F /T tree kill (reports False when the
         # break already took the whole tree down, like taskkill's 128)

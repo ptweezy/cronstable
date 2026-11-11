@@ -86,8 +86,8 @@ async def test_close_survives_a_lost_waiter_cancellation(monkeypatch):
         try:
             return await wait_for(awaitable, timeout)
         except asyncio.CancelledError:
-            # Python 3.10's wait_for can lose cancellation when its inner
-            # waiter completes at the same time (CPython issue #86296).
+            # Before Python 3.12, wait_for can lose cancellation when its
+            # inner waiter completes at the same time (CPython issue #86296).
             if swallowed.is_set():
                 raise
             swallowed.set()
@@ -119,9 +119,7 @@ async def test_full_queue_does_not_interrupt_due_slots(dag_cron, monkeypatch):
     )
     for _ in range(4):
         await cron.maybe_launch_job(cron.cron_jobs["one"])
-    now = datetime.datetime.now(datetime.timezone.utc).replace(
-        second=0, microsecond=0
-    )
+    now = datetime.datetime.now(datetime.UTC).replace(second=0, microsecond=0)
     for name in cron.cron_jobs:
         cron._set_next_fire(name, now)
     await cron._service_slots(False)
@@ -131,7 +129,7 @@ async def test_full_queue_does_not_interrupt_due_slots(dag_cron, monkeypatch):
 
 @pytest.mark.parametrize(
     "error",
-    [PoolError("draining"), OSError("offline"), asyncio.TimeoutError()],
+    [PoolError("draining"), OSError("offline"), TimeoutError()],
 )
 async def test_scheduled_admission_failure_is_contained(
     dag_cron, monkeypatch, error
@@ -153,7 +151,7 @@ async def test_catchup_waits_for_each_receipt_before_closing(
     job = cron.cron_jobs["one"]
     job.onMissed = "run-all"
     job.concurrencyPolicy = "Allow"
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     watermark = (now - datetime.timedelta(minutes=3)).isoformat()
     monkeypatch.setattr(
         cron,
@@ -187,7 +185,7 @@ async def test_catchup_shutdown_preserves_one_receipt(dag_cron, monkeypatch):
     )
     job = cron.cron_jobs["one"]
     job.onMissed = "run-all"
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     watermark = (now - datetime.timedelta(minutes=3)).isoformat()
     monkeypatch.setattr(
         cron,
@@ -221,7 +219,7 @@ async def test_resume_run_once_coalesces_while_waiting_in_pool(
     cron = await make(dag_cron, monkeypatch)
     job = cron.cron_jobs["one"]
     job.onMissed = "run-once"
-    after = datetime.datetime.now(datetime.timezone.utc)
+    after = datetime.datetime.now(datetime.UTC)
     await cron._pools.enqueue_job(job, with_retries=False, catchup_after=after)
     await wait_queued(cron)
     cron._sla_last_start[job.name] = after + datetime.timedelta(seconds=1)
@@ -507,7 +505,7 @@ async def test_late_settlement_does_not_cancel_a_new_generation(
     async def timeout_after_write(pool, action, **kwargs):
         await original(pool, action, **kwargs)
         callbacks.append((pool, action))
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     with monkeypatch.context() as patch:
         patch.setattr(cron._pools, "_change", timeout_after_write)

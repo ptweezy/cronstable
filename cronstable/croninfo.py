@@ -517,7 +517,7 @@ def next_fires(
             tab = CronTab(text, hash_key=hash_key)
         except (ValueError, KeyError):
             return []
-    zone = tz or datetime.timezone.utc
+    zone = tz or datetime.UTC
     current = start if start is not None else datetime.datetime.now(zone)
     return list(itertools.islice(tab.occurrences(current), count))
 
@@ -609,7 +609,7 @@ def lint_schedule(
         # str(tab) the re-parsing branch would have produced from it
         text = str(tab)
     if now is None:
-        now = datetime.datetime.now(timezone or datetime.timezone.utc)
+        now = datetime.datetime.now(timezone or datetime.UTC)
     findings: list[Finding] = []
     # resolved_differs compares against the canonical str(tab), NOT `text`:
     # on the re-parsing branch above, `text` is the caller's RAW expression,
@@ -907,15 +907,13 @@ class _HostZoneKey:
     __slots__ = ("name", "offset", "samples")
 
     def __init__(self) -> None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         civil = _local_civil(now)
         self.name = civil.tzname()
         self.offset = civil.utcoffset()
         self.samples = tuple(
             _local_civil(
-                datetime.datetime(
-                    now.year, month, 1, tzinfo=datetime.timezone.utc
-                )
+                datetime.datetime(now.year, month, 1, tzinfo=datetime.UTC)
             ).utcoffset()
             for month in range(1, 13)
         )
@@ -1093,7 +1091,7 @@ def _classify(
     if off0 == off1:
         return None
     aware = civil.replace(tzinfo=timezone)
-    roundtrip = aware.astimezone(datetime.timezone.utc).astimezone(timezone)
+    roundtrip = aware.astimezone(datetime.UTC).astimezone(timezone)
     if roundtrip.replace(tzinfo=None, fold=0) == civil:
         return "fold"
     return "gap"
@@ -1316,7 +1314,7 @@ def why_no_run(
         if kind == "gap":
             shifted = (
                 civil.replace(tzinfo=timezone)
-                .astimezone(datetime.timezone.utc)
+                .astimezone(datetime.UTC)
                 .astimezone(timezone)
             )
             notes.append(
@@ -1619,9 +1617,9 @@ def schedule_pressure(
     weigh sub-minute schedules by their fires per matched minute; the
     per-minute JOB counts stay distinct job names.
     """
-    zone = tz or datetime.timezone.utc
+    zone = tz or datetime.UTC
     if start is None:
-        start = datetime.datetime.now(datetime.timezone.utc)
+        start = datetime.datetime.now(datetime.UTC)
     hours = max(1, min(int(hours), PRESSURE_MAX_HOURS))
     grid, cell_jobs, minute_jobs = _fire_cells(entries, start, hours, zone)
     # zip(*grid) walks the 24x60 grid once, one column tuple per minute
@@ -1772,9 +1770,9 @@ def suggest_slot(
         raise ValueError(
             "period must be 'hourly' or 'daily', got {!r}".format(period)
         )
-    zone = tz or datetime.timezone.utc
+    zone = tz or datetime.UTC
     if start is None:
-        start = datetime.datetime.now(datetime.timezone.utc)
+        start = datetime.datetime.now(datetime.UTC)
     if grid is None:
         # only the grid is scored below, so the walk skips the per-cell
         # and per-minute name bookkeeping entirely

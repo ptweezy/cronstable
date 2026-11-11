@@ -2221,7 +2221,7 @@ class JobConfig:
                     "unknown timezone: {}".format(timezone)
                 ) from err
         if self.utc:
-            return datetime.timezone.utc
+            return datetime.UTC
         return None
 
     @property

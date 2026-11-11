@@ -240,7 +240,7 @@ Kubernetes or Docker setup, see
 
 ### Install using pip
 
-cronstable requires Python 3.10 or later. Install it in a virtual environment:
+cronstable requires Python 3.11 or later. Install it in a virtual environment:
 
 ```shell
 pip install cronstable

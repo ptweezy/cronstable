@@ -31,7 +31,7 @@ def test_basic_line_gets_standard_defaults():
     assert job.concurrencyPolicy == "Allow"
     assert job.enabled is True
     assert job.environment == []
-    assert job.timezone == datetime.timezone.utc
+    assert job.timezone == datetime.UTC
     assert job.failsWhen["nonzeroReturn"] is True
     assert job.failsWhen["producesStderr"] is True
 
@@ -141,7 +141,7 @@ def test_cron_tz_sets_schedule_timezone():
         "t.crontab",
     )
     utc_job, berlin_job = conf.jobs
-    assert utc_job.timezone == datetime.timezone.utc
+    assert utc_job.timezone == datetime.UTC
     assert str(berlin_job.timezone) == "Europe/Berlin"
 
 

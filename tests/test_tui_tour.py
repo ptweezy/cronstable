@@ -43,7 +43,7 @@ from tests.test_tui import (
 
 
 def _iso(seconds_ago: float) -> str:
-    stamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+    stamp = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         seconds=seconds_ago
     )
     return stamp.isoformat()

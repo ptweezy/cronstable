@@ -276,8 +276,8 @@ def test_failed_runtime_verification_exposes_no_interpreter(
 def source_runtime(monkeypatch, tmp_path):
     runtime = load("docker/python_runtime.py")
 
-    # Python 3.10.11 lacks tar extraction filters. Stub extraction so these
-    # tests reach the build and install commands on every test interpreter.
+    # Stub extraction so these tests reach the build and install commands
+    # without a real source archive.
     def extractall(path, *, filter):
         assert filter == "data"
         source = Path(path) / f"Python-{runtime.VERSION}"

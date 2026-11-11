@@ -156,6 +156,21 @@ def test_release_runs_are_never_cancelled():
     assert "'release'" in group and "'ci'" in group, group
 
 
+def test_only_dispatches_and_main_pushes_reach_the_release_group():
+    # `decide` releases only on a dispatch or a push to main, so the
+    # message and commit-count probes apply only to a push to main. Without
+    # that gate, a branch push carrying `[release` commits merged from main,
+    # or a Dependabot body with a "[Release notes]" link, lands in the
+    # uncancellable group and runs in full beside its PR.
+    con = _workflow()["concurrency"]
+    gated = (
+        "(github.event_name == 'push' && github.ref == 'refs/heads/main' "
+        "&& (contains("
+    )
+    for key in ("group", "cancel-in-progress"):
+        assert gated in str(con[key]), "{} lost the main-push gate".format(key)
+
+
 def test_perf_gate_override_is_resolved_once_and_honoured_everywhere():
     # The override is resolved in ONE place (the decide step) and read in
     # three that must agree: the perf job's continue-on-error, its compare

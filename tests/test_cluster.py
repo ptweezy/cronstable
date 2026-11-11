@@ -42,7 +42,7 @@ from cronstable.fingerprint import SCHEME_VERSION
 from tests._helpers import _free_port, _wait_until
 from tests._helpers import _write_tls as _mint_tls
 
-NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
 
 
 # --------------------------------------------------------------------------
@@ -2383,7 +2383,7 @@ def test_view_counts_failed_rounds_until_a_poll_succeeds(no_tls):
     mgr.view.end_round()
     assert mgr.view.peers["c:1"].failed_rounds == 2
     assert mgr.view.peers["b:1"].failed_rounds == 0
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     mgr.view.record_success(
         "c:1", "node-c", "v1:mine", SCHEME_VERSION, "v1:mine", now, "node-a"
     )
@@ -5346,7 +5346,7 @@ def test_view_dict_carries_peer_node_stats_and_local_readout(no_tls):
     peer.node_stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
     # record_success stamps this alongside the stats; a reading with no stamp
     # (or one past the staleness window) renders None -- see the expiry test.
-    peer.node_stats_at = datetime.datetime.now(datetime.timezone.utc)
+    peer.node_stats_at = datetime.datetime.now(datetime.UTC)
     view = mgr.view_dict()
     by_host = {p["host"]: p for p in view["peers"]}
     assert by_host["b:1"]["node_stats"] == {
@@ -5416,7 +5416,7 @@ def test_view_expires_node_stats_without_fresh_reading(no_tls):
 
     mgr = _mgr(["b:1"])
     window = NODE_STATS_STALE_ROUNDS * mgr.config["interval"]
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
 
     def poll(at, with_stats):
@@ -5579,7 +5579,7 @@ def test_fleet_view_includes_node_stats(no_tls):
     peer_b.last_seen = NOW
     peer_b.node_stats = {"cpu_percent": 88.0, "mem_percent": 50.0}
     # freshly stamped, as record_success would; expiry is covered separately
-    peer_b.node_stats_at = datetime.datetime.now(datetime.timezone.utc)
+    peer_b.node_stats_at = datetime.datetime.now(datetime.UTC)
     fleet = mgr.fleet_view()
     # self carries its own freshly-sampled load
     assert fleet["nodes"][0]["node_stats"] == {
@@ -6106,7 +6106,7 @@ def test_fleet_view_ages_peer_countdowns(no_tls):
     peer.status = STATUS_AGREED
     peer.node_name = "node-b"
     peer.instance_id = "ib"
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     peer.last_seen = now
     peer.job_summaries = {
         "soon": {

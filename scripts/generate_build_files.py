@@ -1,16 +1,15 @@
 """Generate build inputs from pyproject.toml and the Docker image definitions.
 
-Run with Python 3.11+: python scripts/generate_build_files.py [--check].
-Generated files stay checked in, so builds and Python 3.10 contributors do
-not need a generation step. This script uses only the standard library.
+Run: python scripts/generate_build_files.py [--check].
+Generated files stay checked in, so builds do not need a generation step.
+This script uses only the standard library.
 """
 
 import argparse
 import json
 import re
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATED = (
