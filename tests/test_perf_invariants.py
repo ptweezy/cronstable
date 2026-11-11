@@ -2877,6 +2877,32 @@ def test_state_get_dispatch_loads_only_the_client_modules():
     )
 
 
+def test_importing_jobcli_loads_no_ca_store():
+    # The client's shared opener carries an HTTPS handler, and on Python
+    # 3.12 and later a stock HTTPSHandler loads the system CA store when it
+    # is constructed, about 30ms before a plain-HTTP loopback request can
+    # start.  The opener's handler loads the store on its first HTTPS
+    # request, so importing the client loads it zero times.
+    code = textwrap.dedent(
+        """
+        import ssl
+
+        loads = []
+        real = ssl.SSLContext.load_default_certs
+
+        def counting(self, *args, **kwargs):
+            loads.append(1)
+            return real(self, *args, **kwargs)
+
+        ssl.SSLContext.load_default_certs = counting
+        import cronstable.jobcli
+
+        print(len(loads))
+        """
+    )
+    assert _configcli_child(code) == "0"
+
+
 def test_importing_taskxml_loads_the_standard_library_only():
     # `cronstable import-taskscheduler` converts an estate on any machine,
     # so the converter depends on nothing a bare interpreter lacks.
@@ -3146,6 +3172,43 @@ async def test_denied_semaphore_acquire_probes_each_permit_once(fs_backend):
         assert len(attempts) == freed["slot"] + 1
     finally:
         await api.stop()
+
+
+# --- an MCP response pays no portability walk ------------------------------
+#
+# An MCP payload is a transient response, so it encodes trusted, as a REST
+# response does.  The portability walk visits every node of a payload in
+# Python, and a tool call encodes its result twice: into the text block,
+# then inside the envelope, which carries structuredContent as well.  The
+# invariant is that COUNT: zero walks per encode.
+
+
+def test_mcp_response_encodes_without_a_portability_walk(monkeypatch):
+    from cronstable import _json, mcp
+
+    walks = []
+
+    def counting(name):
+        real = getattr(_json, name)
+
+        def walk(*args, **kwargs):
+            walks.append(name)
+            return real(*args, **kwargs)
+
+        return walk
+
+    # the orjson flavour pre-walks with _ensure_finite, the stdlib flavour
+    # with ensure_portable
+    for name in ("ensure_portable", "_ensure_finite"):
+        monkeypatch.setattr(_json, name, counting(name))
+    payload = {
+        "rows": [
+            {"name": "job%d" % i, "history": [{"ok": True, "secs": 1.5}]}
+            for i in range(20)
+        ]
+    }
+    assert _json.loads(mcp._dumps(payload)) == payload
+    assert walks == []
 
 
 async def test_mcp_list_jobs_builds_one_row_per_returned_job(monkeypatch):
