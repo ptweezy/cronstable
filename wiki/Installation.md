@@ -128,7 +128,7 @@ also available explicitly as `-debian`:
 | `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
 | `-ubuntu` | `ubuntu:26.04` | 3.14 | Ubuntu LTS userland. |
 | `-rhel` | UBI 10 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
-| `-fedora` | `fedora:44` | 3.14 | Leading-edge RPM userland. |
+| `-fedora` | `fedora:45` | 3.15 | Leading-edge RPM userland. |
 | `-opensuse` | `opensuse/leap:16.0` | 3.13 | SUSE / SLES family. |
 | `-amazonlinux` | `amazonlinux:2023` | 3.11 | AWS-centric deployments. |
 | `-distroless` | `gcr.io/distroless/python3-debian13` | 3.13 | No shell or package manager; minimal attack surface. |

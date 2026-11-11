@@ -1,5 +1,9 @@
 # History
 
+## 1.2.76
+
+- The `-fedora` image is built on Fedora 45 and runs Python 3.15.
+
 ## 1.2.75
 
 - On Python 3.15, the `speedups` extra installs `isal`, so the daemon
