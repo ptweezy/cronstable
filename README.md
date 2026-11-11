@@ -399,8 +399,9 @@ panel, shortcut, and setting, see the
 
 To try the dashboard without installing anything, open the
 [live demo](https://demo.cronstable.com). It's a public board that all
-visitors share, and it needs no account or token. You can start, cancel, and
-pause its sample jobs, and approve or reject its workflow gates.
+visitors share, and it needs no account or token. You can start, cancel,
+pause, and resume its sample jobs, trigger its workflows, and approve or
+reject their gates.
 
 For a demo board on your own machine with a varied set of jobs, run this
 command from a clone of this repository, and then open
