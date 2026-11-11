@@ -29,7 +29,7 @@ from cronstable import cronexpr
 from cronstable.config import parse_config_string
 from cronstable.state import FilesystemStateBackend
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 # Cert validity anchor. Both source files (tests/test_cluster.py and
 # tests/test_web_tls.py) pin the same NOW = 2026-01-01 UTC for cert
@@ -336,7 +336,7 @@ async def _seed_orphan_open(
 def _utc_now_plus(seconds):
     # canonical: identical copies in tests/test_backend_etcd.py and
     # tests/test_backend_kubernetes.py
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+    return datetime.datetime.now(datetime.UTC) + datetime.timedelta(
         seconds=seconds
     )
 

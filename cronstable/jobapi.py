@@ -349,7 +349,7 @@ class JobLockManager:
                         backend.acquire_lease(lease_name, holder, ttl),
                         timeout=STATE_OP_TIMEOUT,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # unknown, not denied: skip this slot for now (a later
                     # pass, or the TTL, sorts out an acquire that did land).
                     lease = None
@@ -434,7 +434,7 @@ class JobLockManager:
                     backend.renew_lease(hold.lease, hold.ttl),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue  # unknown: try again next period
             except Exception:  # noqa: BLE001 - renewal is best-effort
                 continue
@@ -703,11 +703,7 @@ class JobStateAPI:
                 # without it would otherwise let a non-portable value surface
                 # as a 500.  It is the caller's bad input -> a clean 400.
                 return _json_response({"error": ex.message}, status=400)
-            except (
-                asyncio.TimeoutError,
-                OSError,
-                _DocumentUnreadable,
-            ) as ex:
+            except (TimeoutError, OSError, _DocumentUnreadable) as ex:
                 # The exception text stays OUT of the body.  An OSError
                 # reads "[Errno 13] Permission denied: <absolute document
                 # path>", and _DocumentUnreadable is built from exactly
@@ -718,9 +714,7 @@ class JobStateAPI:
                 # and may already be demoted to another uid.  Same move as
                 # Cron._push_store_unavailable (cron.py): the detail goes
                 # to the log an operator reads, the caller gets a fixed
-                # sentence.  asyncio.TimeoutError stays in the tuple; it
-                # is only redundant with OSError from 3.11 on, and the
-                # supported floor is 3.10.
+                # sentence.
                 logger.warning(
                     "state job API: backend error serving %s: %s",
                     request.rel_url.path,

@@ -48,7 +48,7 @@ import tempfile
 import threading
 import time
 import tracemalloc
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 SCHEMA = 1
 
@@ -248,7 +248,7 @@ def bench(
 # inside timed regions beyond the measured work itself).
 # ---------------------------------------------------------------------------
 
-_NOW = datetime(2026, 3, 15, 12, 30, 45, tzinfo=timezone.utc)
+_NOW = datetime(2026, 3, 15, 12, 30, 45, tzinfo=UTC)
 _NAIVE = datetime(2026, 7, 18, 12, 30)
 
 _SIMPLE_EXPRS = [
@@ -869,7 +869,7 @@ def _dst_window_exprs(n):
 def bench_next_dst():
     """The ZoneInfo branch of the aware next() search.
 
-    Every other datetime in the suite is timezone.utc, and the fixed-offset
+    Every other datetime in the suite is datetime.UTC, and the fixed-offset
     fast path (``type(tzinfo) is datetime.timezone``) provably skips the
     spring-forward gap probe, so the code a production DST fleet runs on
     every fire had zero coverage.  Three fixed aware instants per tab:
@@ -1858,7 +1858,7 @@ def bench_schedule_lint_zoned():
 #: A pass instant a week clear of the 2026 US transitions, so the host-clock
 #: seed below takes the fixed-offset path on any host zone; also the
 #: due-pass base further down.
-_DUE_BASE = datetime(2026, 3, 15, 12, 31, 0, tzinfo=timezone.utc)
+_DUE_BASE = datetime(2026, 3, 15, 12, 31, 0, tzinfo=UTC)
 
 
 @bench(
@@ -3136,9 +3136,7 @@ def _dagstate_wide_spec(dag, name, tasks):
 def _dagstate_finished_body(dag, spec, name, index):
     """One finished run document of ``spec``, sized like a real run."""
     stamp = 1700000000.0 + index
-    logical = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(
-        minutes=index
-    )
+    logical = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=index)
     body = dag.new_run_body(
         dag=name,
         run_key="r%05d" % index,
@@ -5597,13 +5595,11 @@ def bench_ical():
                 expr = "%d * * * *" % (i % 60)
             else:
                 expr = "%d %d * * *" % (i % 60, (i * 7) % 24)
-            entries.append(
-                CalendarEntry("job%05d" % i, CronTab(expr), timezone.utc)
-            )
+            entries.append(CalendarEntry("job%05d" % i, CronTab(expr), UTC))
         return entries
 
     entries = fixture("ical_entries", build)
-    start = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    start = datetime(2026, 1, 5, tzinfo=UTC)
     t0 = time.perf_counter()
     render_calendar(entries, start=start, days=7, per_job_cap=50)
     return time.perf_counter() - t0
@@ -8343,7 +8339,7 @@ def bench_loop_idle_wake():
             # out its real minute and this would hang the suite rather than
             # record a drifted seam.
             await asyncio.wait_for(cron.run(), timeout=120.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise Skip(
                 "the idle loop did not reach %d passes in 120s; the "
                 "next_sleep_interval seam no longer drives it" % passes
@@ -8572,7 +8568,7 @@ def bench_loop_stall_completions():
         cron._jobs_running.set()
         try:
             await asyncio.wait_for(reaper, timeout=5.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except (TimeoutError, asyncio.CancelledError):
             reaper.cancel()
         await _teardown_cron(cron)
         if len(handled) != n:
@@ -12255,7 +12251,7 @@ async def _herd_stop(cron, reaper):
     cron._jobs_running.set()
     try:
         await asyncio.wait_for(reaper, timeout=5.0)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except (TimeoutError, asyncio.CancelledError):
         reaper.cancel()
     await _teardown_cron(cron)
 
@@ -13629,7 +13625,7 @@ def _gc_manifest_store(records, names):
         )
         state_config = parse_config_string(text, "").state_config
         jobs = ["job%05d" % i for i in range(names)]
-        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        base = datetime(2026, 1, 1, tzinfo=UTC)
 
         async def seed():
             cron = Cron(None, config_yaml=text)

@@ -129,9 +129,7 @@ def _record(**over):
     return LimitsRecord(**fields)
 
 
-_START = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-    hours=1
-)
+_START = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
 
 
 def _run(minute, *, outcome="success", exit_code=0, fail_reason=None, **kw):
@@ -878,7 +876,7 @@ def test_resources_tab_leaves_unsampled_runs_out_of_the_charts(
 
 def _with_live(body):
     """The daemon's /resources answer plus one live instance."""
-    t0 = datetime.datetime.now(datetime.timezone.utc).timestamp() - 20
+    t0 = datetime.datetime.now(datetime.UTC).timestamp() - 20
     body["live"] = [
         {
             "started_at": "2026-01-01T00:00:00+00:00",

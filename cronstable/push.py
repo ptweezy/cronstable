@@ -571,9 +571,7 @@ def _xwing_probe() -> bool:
 
 def _utcnow_iso() -> str:
     return (
-        datetime.datetime.now(datetime.timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
+        datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()
     )
 
 
@@ -1225,7 +1223,7 @@ class FileDeviceStore:
                 _call_on_daemon_thread(_guarded, "cronstable-push"),
                 timeout=STORE_OP_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise PushError(
                 "timed out {} push devices file {}".format(doing, self.path)
             ) from None
@@ -1447,7 +1445,7 @@ class StateDeviceStore:
         """
         try:
             return await asyncio.wait_for(awaitable, timeout=STORE_OP_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise PushError(
                 "timed out {} in the state store".format(operation)
             ) from None
@@ -2091,7 +2089,7 @@ class PushService:
                     outcome["error"] = "relay HTTP {}: {}".format(
                         resp.status, (await resp.text())[:512]
                     )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             outcome["error"] = _redact_userinfo_in(
                 "relay unreachable: {}".format(exc), self.relay_url
             )

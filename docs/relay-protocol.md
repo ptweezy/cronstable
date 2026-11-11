@@ -9,10 +9,10 @@ implementation (the source of the hosted relay at
 Anything that implements this contract can serve as the relay a daemon's
 `push.relay.url` points at.
 
-The design goal is that the relay is not a trusted party. Every alert is
-sealed end to end (by default a libsodium sealed box: X25519 +
-XSalsa20-Poly1305, see [Suites](#suites)) to each paired device's public key
-before it leaves the daemon. The relay
+The relay operates as an untrusted forwarder. The daemon seals every alert end
+to end (by default with a libsodium sealed box using X25519 and
+XSalsa20-Poly1305; see [Suites](#suites)) to each paired device's public key
+before sending it. The relay
 handles ciphertext and routing metadata only. The paired device's app
 decrypts the payload on the phone, inside its Notification Service
 Extension.
@@ -23,9 +23,8 @@ protocol can evolve independently.
 
 ## Pairing links
 
-Separate from the alert path, the dashboard's "Pair a device" QR encodes a
-pairing link rather than the bare pairing JSON, so a phone's system camera
-deep-links straight into the mobile app:
+The dashboard's **Pair a device** QR code encodes a pairing URL so that a
+phone's system camera opens the mobile app directly:
 
 ```text
 https://relay.cronstable.com/pair#<base64url({"v":1,"name":…,"url":…,"token":…})>
@@ -33,18 +32,18 @@ https://relay.cronstable.com/pair#<base64url({"v":1,"name":…,"url":…,"token"
 
 The payload (the same `{v, name, url, token}` JSON the panel shows as a
 copyable string) rides in the URL fragment, base64url-encoded with padding
-stripped. The link's base is the origin of the daemon's `push.relay.url`
-plus `/pair`, embedded credentials dropped. The dashboard reads that base
-from `GET /whoami` as `pairLinkBase`, and the hosted relay's landing is
-the fallback while no `push:` section is applied.
+stripped. The link's base URL is the origin of the daemon's `push.relay.url`
+(with any embedded credentials removed) plus `/pair`. The dashboard reads that
+base from `GET /whoami` as `pairLinkBase`, and falls back to the hosted
+relay's landing page when no `push:` section is configured.
 
-Fragments are never sent with an HTTP request, so the payload never
-reaches the landing host's server or its logs. The page that host serves
-is another matter. When it loads at all (a scan with the app installed
-opens the app directly), its script reads the fragment to build the
-fallback link described later, so the app-absent camera flow trusts the
-landing host's content. The in-app scanner and the copyable raw JSON
-involve no third party.
+Browsers never send URL fragments in HTTP requests, so the payload never
+reaches the landing host's server or logs. If the app is already installed,
+scanning the code opens the app directly without loading the web page. If the
+app is not installed, the browser loads the landing page, whose script reads
+the fragment to build the `cronstable://` fallback link. That browser flow
+therefore trusts the landing host's script, whereas the in-app scanner and the
+copyable raw JSON never contact the landing host.
 
 The hosted relay serves that landing page at `GET /pair`: install pointers
 plus a `cronstable://pair#<fragment>` fallback link carrying the identical
@@ -64,8 +63,8 @@ deployments pair through the in-app scanner or the copyable JSON instead.
 The daemon sends one HTTP POST per (alert, device) to `push.relay.url`, with
 a JSON body. It issues the POSTs for one alert concurrently, so a relay sees
 a burst of up to one request per paired device (at most 100 connections per
-alert, the client's connector limit). Size admission control for that shape
-rather than for a serial stream.
+alert, the client's connector limit). Size admission control for concurrent
+bursts.
 
 ```json
 {
@@ -85,9 +84,9 @@ rather than for a serial stream.
 | `v` | int | Protocol version. Always `1`. |
 | `device` | string | The platform push token (APNs device token), exactly as the device registered it at pairing time. Opaque to the daemon. The relay uses it to address the notification. |
 | `ciphertext` | string | The sealed alert, base64, sealed to the target device's public key under `suite`. At most 3800 characters (see [Size budget](#size-budget)). |
-| `suite` | string | The sealing suite the ciphertext was produced under, so neither relay nor app has to infer the algorithm from a length. Optional: an absent value means `x25519`. See [Suites](#suites). |
+| `suite` | string | The sealing suite used to produce the ciphertext, so neither the relay nor the app infers the algorithm from the payload length. Optional; defaults to `x25519`. See [Suites](#suites). |
 | `collapseId` | string | An opaque coalescing key: 32 lowercase hex characters (a truncated SHA-256 over the alert's identity fields, keyed with a per-installation secret salt the relay never sees). The same alert, reported again or by any node sharing the installation's device registry, produces the same id. Without the salt the id is not invertible even for guessable job names. Test alerts are the exception: each carries a fresh random id so a coalescing relay never drops one. |
-| `flapId` | string | Optional. The flap-suppression key: 32 lowercase hex characters, a keyed hash of the alert's flap identity. Every run of one alert shares it, where `collapseId` names a single run. Test alerts and `approval_waiting` events carry none. See [Flap identity](#flap-identity). |
+| `flapId` | string | Optional. The flap-suppression key: 32 lowercase hex characters, a keyed hash of the alert's flap identity. Every run of the same alert shares `flapId`, whereas `collapseId` identifies a single run. Omitted on test alerts and `approval_waiting` events. See [Flap identity](#flap-identity). |
 | `priority` | string | `time-sensitive` or `passive`. The relay maps it to the APNs interruption level: `time-sensitive` breaks through scheduled summaries, `passive` does not. |
 | `event` | bool | `true` when the alert is a daemon event (the `notify:` fan-out: DAG failures, approval gates, leadership and quorum changes), `false` for job, SLA, and test alerts. Routing metadata only. The event's content is inside the ciphertext. |
 
@@ -97,11 +96,11 @@ limits keyed on `device`).
 
 ### Flap identity
 
-`collapseId` names one run wherever the alert has one, so a job that fails
-every minute reaches the relay under a fresh `collapseId` each time.
-`flapId` names the source that keeps alerting instead. The daemon hashes
-these fields with the same per-installation salt as `collapseId`, under a
-separate domain, so the two ids differ even where the fields match:
+`collapseId` includes the run identifier when an alert has one, so a job that
+fails every minute produces a new `collapseId` on each run. `flapId`
+identifies the underlying alert source across runs. The daemon hashes the flap
+identity fields with the same per-installation salt as `collapseId` under a
+separate hash domain, so the two IDs differ even when their input fields match:
 
 | Alert | Flap identity |
 | --- | --- |
@@ -110,23 +109,20 @@ separate domain, so the two ids differ even where the fields match:
 | `approval_waiting` event | None: the envelope carries no `flapId` |
 | Other events | `event`, `name`, and `dag` |
 
-The per-run fields (`run_id` and `run_key`) stay out, so every run of a
-job that fails in a loop shares one `flapId`. Each remaining choice in the
-table has a reason:
+`flapId` omits the per-run fields (`run_id` and `run_key`), so repeated
+failures of the same job share one `flapId`:
 
 - `kind` keeps a job's successes and failures apart. A job that pushes on
   every success spends its own flap budget and leaves its failures' budget
   untouched.
 - The node keeps the nodes of an `EveryNode` job apart, because each node
   runs its own instance and fails for its own reasons. A clustered daemon
-  names its node by the cluster `nodeName`, and a standalone daemon by the
-  payload's `host`. Nodes built from one container image can share a
-  hostname, and such a cluster sets a distinct `nodeName` on each node, so
-  the hostname alone can't tell them apart. The sealed payload's `host`
-  carries the hostname either way. A `Leader` job that moves between nodes
-  takes one budget per node, which the cluster size bounds. Events leave
-  the node out: a DAG runs on whichever node leads, and the leadership and
-  quorum events name their node in `name`.
+  uses its cluster `nodeName` (since containers built from the same image can
+  share a hostname), and a standalone daemon uses the payload's `host`. The
+  sealed payload's `host` field always carries the hostname. A `Leader` job
+  that moves between nodes takes one budget per node, which the cluster size
+  bounds. Events leave the node out: a DAG runs on whichever node leads, and
+  the leadership and quorum events name their node in `name`.
 - An approval gate is a one-shot request for a decision. The daemon
   notifies each gate only once, so a gate the relay suppressed would wait
   unannounced. Without a `flapId`, a relay keys a gate's flap state on its
@@ -144,22 +140,20 @@ ignores it, so its flap suppression stays per run. Test alerts carry no
 ## Suites
 
 `suite` names the public-key algorithm a device's registered key belongs
-to. It rides on the pairing record, this envelope, and the APNs payload
-the relay builds, so the algorithm is always stated rather than inferred
-from a key or ciphertext length.
+to. It appears in the pairing record, the relay request envelope, and the APNs
+payload, so the algorithm is always explicit.
 
 | Suite | Algorithm | Public key | Sealing overhead |
 | --- | --- | ---: | ---: |
 | `x25519` | libsodium sealed box (X25519 + XSalsa20-Poly1305) | 32 B | 48 B |
 | `xwing` | X-Wing (ML-KEM-768 + X25519) | 1216 B | 1136 B |
 
-`x25519` is the default suite; `xwing` is the post-quantum hybrid. A
-daemon seals each alert under the suite the target device registered at
-pairing, and a daemon that cannot seal to a suite (its install lacks the
-suite's library) refuses the pairing rather than storing a record whose
-every alert would fail. `GET /whoami` lists the suites a daemon can seal
-to as `sealableSuites`, and the companion app pairs under `xwing` when
-that list advertises it.
+`x25519` is the default suite, and `xwing` is the post-quantum hybrid. The
+daemon seals each alert using the suite that the target device registered at
+pairing. If the daemon's environment lacks the library for a requested suite,
+it rejects the pairing request so it never stores an unusable device record.
+`GET /whoami` lists the suites a daemon can seal to as `sealableSuites`, and
+the companion app pairs under `xwing` when that list advertises it.
 
 Relays MUST treat `suite` as opaque routing metadata: the ciphertext is
 sealed to the device either way, and a relay that does not recognize a
@@ -223,37 +217,34 @@ frame is divided as:
 | `ciphertext`, base64 | ≤ 3800 |
 | Reserve for future protocol fields | 107 |
 
-The 189 is measured, not estimated: the relay's `tests/apns-size.spec.ts`
-serializes the real envelope at a max-length ciphertext and asserts the
-total stays under the cap. The daemon derives its own cap from the same
-three numbers.
+The 189-byte envelope size is verified by the relay's `tests/apns-size.spec.ts`,
+which serializes a real envelope with a maximum-length ciphertext and asserts
+that the total stays within 4096 bytes. The daemon derives its cap from the
+same three numbers.
 
-What that leaves for plaintext, after each suite's sealing overhead:
+After subtracting each suite's sealing overhead and base64 expansion, the
+plaintext budgets are:
 
 | Suite | Plaintext budget |
 | --- | ---: |
 | `x25519` | 2802 B |
 | `xwing` | 1714 B |
 
-A daemon fits each device's payload to **that device's** suite budget, so
-a device paired under a wider-ciphertext suite is trimmed harder without
-costing the devices beside it any log lines.
+The daemon fits each device's payload to **that device's** suite budget, so
+a device using `xwing` receives a shorter log tail without reducing the log
+lines sent to `x25519` devices.
 
 ### Relay and daemon versions
 
-A relay enforces the cap it was built with, and a daemon fits alerts to the
-cap it was built with. Deploy the relay before you upgrade the daemons that
-post to it. A daemon that fits to 3800 in front of a relay that enforces a
-smaller cap gets a 400 for its largest alerts, which are the ones that carry
-a full log tail.
+Upgrade the relay before upgrading the daemons that post to it. If a daemon
+built for the 3800-character cap posts a large alert to an older relay with a
+smaller cap, the relay returns 400.
 
-The daemon recovers from that 400 instead of dropping the page. **3000
-characters is the floor**: the smallest cap a conforming relay enforces. A
-relay MUST accept every ciphertext up to the floor. When a daemon's
-ciphertext exceeds the floor and the relay answers 400 with an error that
-names `ciphertext`, the daemon re-fits that device's payload to the floor,
-posts the envelope again, and logs once per process that the relay is
-behind. The alert reaches the phone with fewer log lines.
+**3000 characters is the minimum cap** that a conforming relay MUST accept.
+When a ciphertext exceeds 3000 characters and the relay returns 400 with an
+error naming `ciphertext`, the daemon trims that device's payload to 3000
+characters, resends the request, and logs once per process that the relay is
+outdated. The alert still reaches the phone with fewer log lines.
 
 ## Responses
 
@@ -269,11 +260,10 @@ The daemon never retries a relay POST: delivery semantics past acceptance
 A failed POST is logged and never propagates into the daemon's reporting
 path.
 
-Because the daemon never sends a refused alert again, a relay SHOULD
-answer an envelope that exceeds a per-device rate limit with a 2xx
-`digested` and fold it into a [digest](#digests), rather than answer 429.
-The hosted relay does, and it answers 429 only from its edge limiter and
-when APNs throttles the device. The edge limiter admits 6000 POSTs per
+Because the daemon never resends a rejected alert, a relay SHOULD fold
+envelopes that exceed a per-device rate limit into a [digest](#digests) and
+return a 2xx `digested` response instead of 429. The hosted relay does this,
+returning 429 only from its edge limiter or when APNs throttles the device. The edge limiter admits 6000 POSTs per
 minute from one IPv4 address or IPv6 /64, far above any honest daemon's
 burst. Daemons that share an egress address share that budget, and it
 counts daemon events (`event: true`) like any other envelope.
@@ -503,15 +493,15 @@ transaction once per push token, so the relay clears the device.
   lines, and event details exist only inside the sealed payload, which only
   the target device's private key (generated on the phone and never leaving
   it) can open.
-- `collapseId` and `flapId` are truncated hashes of identity fields, not
-  the fields themselves. Both hashes are keyed with a per-installation salt
-  stored beside the device registry and never sent to the relay. Identity
-  fields are low entropy (a `flapId` leaves out the run, and on a stateless
-  install a `collapseId`'s fields reduce to alert kind plus job name), so
-  an unkeyed hash would let a relay recover job names from a precomputed
-  wordlist. The salt closes that. A shared `flapId` tells the relay that
-  two alerts come from the same source, which flap suppression needs, but
-  not what that source is.
+- `collapseId` and `flapId` are truncated, keyed SHA-256 hashes of the alert's
+  identity fields, using a per-installation salt stored beside the device
+  registry and never sent to the relay. Identity fields are low entropy (a
+  `flapId` leaves out the run, and on a stateless install a `collapseId`'s
+  fields reduce to alert kind plus job name), so an unkeyed hash would let a
+  relay recover job names from a precomputed wordlist. The salt prevents that
+  lookup. A shared `flapId` tells the relay that two alerts come from the same
+  source, which flap suppression requires, without revealing what that source
+  is.
 - Sealing is anonymous-sender under every suite: a fresh ephemeral sender
   key per message under `x25519`, a fresh encapsulation per message under
   `xwing`, so the daemon holds no long-lived sending secret worth stealing.

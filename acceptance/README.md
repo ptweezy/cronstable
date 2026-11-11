@@ -2,9 +2,9 @@
 
 These tests launch a packaged executable and observe its public CLI, HTTP
 API, and job outputs. They never import cronstable. The driver needs Python
-3.10+, pytest, and psutil; the workloads need only the executable and the
-platform's native shell and utilities. Nothing uses a real account or sends
-external notifications.
+3.11 or later, pytest, and psutil; the workloads need only the executable
+and the platform's native shell and utilities. Nothing uses a real account
+or sends external notifications.
 
 ## Run locally
 

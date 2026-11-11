@@ -56,8 +56,7 @@ A one-file build unpacks itself to a temporary directory and runs the
 program in a **child** process. The SCM starts and watches the parent
 bootloader, which never registers with the service dispatcher. The start
 therefore fails on the SCM's timeout while the real program's own
-registration is refused with error 1063. Nothing in cronstable can change
-that, because it is the bootloader that forks.
+registration is refused with error 1063.
 
 To run as a service, download the one-directory zip for your architecture
 (`cronstable-windows-amd64v3.zip`, `-amd64.zip`, `-arm64.zip`, or
@@ -67,10 +66,9 @@ install with pip or pipx. The [MSI](Windows-MSI) registers the service
 during the install with the same settings `service install` writes, so none
 of the preceding commands are needed there.
 
-The [`schtasks` recipe](Running-on-Windows#running-unattended) remains the
-answer for the one-file executable, and it does start at boot and survive
-logoff. What it does not give you is the Services console, recovery actions,
-and a real stop control.
+For the one-file executable, use the [`schtasks` recipe](Running-on-Windows#running-unattended)
+to start at boot and survive logoff, though Task Scheduler does not provide
+`services.msc` integration, service recovery actions, or a graceful stop control.
 
 ## Commands
 
@@ -160,11 +158,9 @@ up on the housekeeping pass. The reload verb belongs to the service.
 
 Unless you pass `--no-restart`, `install` configures Windows' own recovery:
 restart after `--restart-delay` seconds for the first two failures, then
-stop trying, with the failure count resetting daily. It also sets the flag
-that makes recovery apply to a clean exit with a nonzero code, not only to a
-crash. Without that flag the recovery actions would be decorative here,
-because this host reports its own failures as an orderly stop carrying an
-exit code rather than by crashing.
+stop trying, with the failure count resetting daily. It also enables recovery
+on clean exits with a nonzero code, because the service reports startup and
+runtime failures by exiting with a nonzero code rather than crashing.
 
 `cronstable service status` decodes the last failure:
 
@@ -181,9 +177,8 @@ The service stays stopped rather than being restarted.
 
 ## Where a service logs
 
-A service has no console. Its `sys.stdout` and `sys.stderr` are not
-redirected somewhere unhelpful. They are `None`, so the default logging
-setup writes into nothing and cannot even report that it failed.
+Because a Windows service has no console, `sys.stdout` and `sys.stderr` are
+`None`, so the default logging setup has nowhere to write.
 
 `service run` therefore opens a rotating bootstrap log before it does
 anything else, by default at `<config directory>\logs\cronstable-service.log`
@@ -240,16 +235,15 @@ a cancel from the API.
 off by default, because a console changes what a job inherits:
 
 - The job is genuinely attached to that console. It can open `CONIN$` and
-  `CONOUT$`, `GetConsoleWindow` no longer returns NULL, and a `pause` or
+  `CONOUT$`, `GetConsoleWindow` returns a window handle instead of `NULL`, and a `pause` or
   `set /p` in a `.cmd` can still block.
-- Straight after allocating, cronstable points the service's own standard
-  handles at nothing, so an uncaptured job does not inherit a console
-  `stdin` that blocks instead of reaching end of file. That closes the
-  handle half. It does not undo console membership, which is inherited
-  separately and is the entire reason for allocating one.
+- Immediately after allocating the console, cronstable redirects the service's
+  standard handles to `NUL`, so an uncaptured job does not inherit a console
+  `stdin` that blocks instead of reaching end of file. This closes the
+  standard handles while preserving console group membership for signal delivery.
 - A console costs one extra `conhost.exe` per service.
 
-Turn it on when `killTimeout` has to mean something. Leave it off otherwise.
+Enable `--console` only when jobs require `killTimeout` grace periods.
 
 ## Removing
 

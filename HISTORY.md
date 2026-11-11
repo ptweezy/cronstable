@@ -1,5 +1,17 @@
 # History
 
+## 1.2.75
+
+- On Python 3.15, the `speedups` extra installs `isal`, so the daemon
+  gzips web and cluster responses with SIMD deflate. The extra requires
+  `isal` 1.9.0 or newer, the first release with Python 3.15 wheels.
+
+## 1.2.74
+
+- cronstable requires Python 3.11 or later, and `psutil` 5.9.4 or later
+  (its first release with Python 3.11 wheels). On Python 3.10, pip
+  installs the last release that supports it.
+
 ## 1.2.73
 
 - The MCP log-tail tools, `cron_tail_job_logs` and `cron_tail_dag_task_logs`,

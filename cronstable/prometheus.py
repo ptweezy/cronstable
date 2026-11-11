@@ -1395,11 +1395,11 @@ class PrometheusMetrics:
             ):
                 # Before the scheduler seeds the index, compute the next fire
                 # directly so enabled cron jobs can expose a timestamp.
-                seconds = job_config.next_delay(get_now(datetime.timezone.utc))
+                seconds = job_config.next_delay(get_now(datetime.UTC))
                 if seconds is not None:
                     next_run.add(
                         labels,
-                        get_now(datetime.timezone.utc).timestamp() + seconds,
+                        get_now(datetime.UTC).timestamp() + seconds,
                     )
             last = cron.last_run.get(name)
             if last is not None:

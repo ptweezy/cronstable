@@ -10,9 +10,6 @@ configured, they also report the cluster and fleet views. This page documents
 the configuration schema, every endpoint, bearer-token authentication,
 Unix-socket permissions, and lifecycle behavior.
 
-The `/version`, `/status`, and `/jobs/{name}/start` interface comes from
-upstream yacron; the rest is cronstable's.
-
 > **Looking for the browser UI?** The same HTTP interface also serves the
 > built-in **[web dashboard](Web-Dashboard)** at `/` on every listener
 > (enabled by default; disable it with `ui: false`). This page documents the REST
@@ -101,7 +98,7 @@ section. `listen` is required; the rest are optional (strictyaml `Opt(...)`).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port`, `https://host:port`, or `unix:///path`. An empty list disables the server. |
-| `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response except `POST /mcp` (all routes, including `/cluster` and `/job-set-id`) and to the `409` conflict body, but not the `404` or `401`. |
+| `headers` | map of string to string | (none) | Extra HTTP headers added to every `200` success response except `POST /mcp` (all routes, including `/cluster` and `/job-set-id`) and to the `409` conflict body, but not the `404` or `401`. |
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [cross-site request defense](#cross-site-request-defense)). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes as an all-scopes token (see [authentication](#authentication)). |
 | `authTokens` | sequence of maps (`value`/`fromFile`/`fromEnvVar` + `scopes` + optional `label`) | `[]` | Additional per-device scoped bearer tokens (`view`/`control`/`approve`/`params`). To revoke one, drop its entry and reload (see [scoped tokens](#scoped-tokens-webauthtokens)). |
@@ -280,7 +277,7 @@ Query parameters:
 | --- | --- |
 | `expr` | **Required.** The expression to decode (URL-encoded). `400` when missing or blank. |
 | `tz` | Optional IANA zone for the preview frame and the DST lint checks (default `UTC`). `400` for an unknown name. |
-| `limit` | Optional number of upcoming fires to return, clamped to 1–60 (default 12). `count` is its legacy alias, read when `limit` is absent (every capped listing on this API takes `limit`). |
+| `limit` | Optional number of upcoming fires to return, clamped to `1` to `60` (default 12). `count` is an alias read when `limit` is absent (every capped listing on this API takes `limit`). |
 | `seed` | Optional hash key (a job name, real or prospective) that resolves [`H` items](Hashed-Schedules). Without it, an `H` expression comes back `valid: false` with the engine's own error. With it, the response echoes `seed` and adds `resolved`, the expression with every `H` replaced by its hashed values. |
 
 For an expression the engine accepts, the response carries `valid: true`,
@@ -389,8 +386,8 @@ the scheduler's own engine in each job's resolved time zone and emitted as
 UTC instants with stable UIDs, so subscribed calendar apps update in place.
 
 Query parameters `days` (window, default 14, clamped 1 to 60) and `limit`
-(event cap per job, default 100, clamped 1 to 1000; `per_job` is its legacy
-alias, read when `limit` is absent) are clamped rather than erroring.
+(event cap per job, default 100, clamped 1 to 1000; `per_job` is an
+alias read when `limit` is absent) are clamped rather than erroring.
 Disabled and `@reboot` jobs carry no events. An unknown job name on the
 per-job route is a `404`.
 
@@ -503,9 +500,9 @@ For `kubernetes` and `etcd` the `expiry` is populated only while **this** node
 holds the lease: a follower reports `expiry: null` (for `kubernetes` it is the
 local lease deadline while this node leads; for `etcd` the current lease
 deadline). For `filesystem` it is the written expiry of the last lease this node
-observed, follower included. `quorate` is whether the node has a fresh
-successful read of the lease store (stale → `Leader` fails closed; the
-never-skip `PreferLeader` default then runs the job anyway).
+observed, follower included. `quorate` indicates whether the node has a fresh
+successful read of the lease store (when stale, `Leader` fails closed and the
+never-skip `PreferLeader` default runs the job anyway).
 
 ```shell
 $ http get http://127.0.0.1:8080/cluster Accept:application/json
@@ -581,8 +578,8 @@ Per node: `jobs` maps each job name to
 `{running, enabled, scheduled_in, last}`, where `last` is
 `{outcome, finished_at, duration, exit_code}` or `null` for a job that has not
 run since that node started. `jobs: null` (as opposed to `{}`) means no
-snapshot is held for that node at all: it was never reached, or it runs an
-older build that does not gossip summaries.
+snapshot is held for that node at all (for example, it has not been reached
+yet).
 
 Each node also carries `node_stats`, its whole-node CPU/memory (the same shape
 as [`GET /node`](#get-node)'s `resources`), when the cluster shares node load
@@ -623,8 +620,7 @@ quota.
 
 Memory and CPU switch over independently: a container with only a memory limit
 still reports host-wide CPU. Unlimited cgroups, cgroup v1 hosts, and non-Linux
-platforms report whole-host numbers as before, and the response shape never
-changes.
+platforms report whole-host numbers, and the response shape is always the same.
 
 **Resource limits.** `limits` says whether this host can enforce
 [`resourceLimits`](Resource-Limits), and is always present:
@@ -1044,7 +1040,7 @@ finished runs that were **monitored or capped** (oldest first, other runs are
 omitted; the ordering note on
 [`GET /jobs/{name}/runs`](#get-jobsnameruns) applies to this array too),
 capped by the `limit` query parameter (default 20, clamped to the retained
-history; `runs` is its legacy alias, read when `limit` is absent).
+history; `runs` is an alias read when `limit` is absent).
 
 `limits` is the job's [`resourceLimits`](Resource-Limits) caps, the same
 object as `limits` on [`GET /jobs`](#get-jobs), or `null` when the job sets
@@ -1664,11 +1660,10 @@ full tool catalog see [MCP](MCP); for configuration see
 
 ## Response headers
 
-The `web.headers` map (merged upstream but never released in yacron 0.19) is a
-string→string map applied to every `200` success response except `POST /mcp`
-(`/version`, `/status`, `/cluster`, `/job-set-id`, the job routes, and the
-`200` of `/jobs/{name}/start`) and to the `409` conflict bodies of
-`/jobs/{name}/start` and `/jobs/{name}/cancel`.
+The `web.headers` map is a string-to-string map applied to every `200` success
+response except `POST /mcp` (`/version`, `/status`, `/cluster`, `/job-set-id`,
+the job routes, and the `200` of `/jobs/{name}/start`) and to the `409`
+conflict bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`.
 
 It is not applied to the `404` (unknown job) or `401` (authentication failure)
 responses, which are raised without the configured headers. One key is exempt
@@ -1782,7 +1777,7 @@ carrying a `scopes` list and an optional `label`:
 web:
   listen:
     - http://0.0.0.0:8080
-  authToken:                     # optional: the legacy all-scopes token
+  authToken:                     # optional: the all-scopes token
     fromEnvVar: CRONSTABLE_WEB_TOKEN
   authTokens:
     - label: parker-iphone
@@ -1841,7 +1836,7 @@ web:
 ```
 
 The required scope for a route is the safe-method default
-(`GET`/`HEAD`/`OPTIONS` → `view`, everything else → `control`) with two
+(`GET`, `HEAD`, and `OPTIONS` require `view`; everything else requires `control`) with two
 overrides: the approval decision needs `approve`, and `/mcp` needs only
 `view`. A newly added `POST` route therefore requires `control`
 automatically rather than slipping through unguarded. Each MCP tool then
@@ -2214,7 +2209,7 @@ All routes are under `/v1/` and registered in `JobStateAPI._routes`:
 
 | Method | Path | Body / query | Success response |
 | --- | --- | --- | --- |
-| `GET` | `/v1/run` | -- | `{runId, job, attempt, scheduledAt, host, defaultScope}` |
+| `GET` | `/v1/run` | none | `{runId, job, attempt, scheduledAt, host, defaultScope}` |
 | `GET` | `/v1/kv/get` | `?scope=&key=` | `{value, updatedAt}`, or `404` |
 | `POST` | `/v1/kv/set` | `{scope?, key, value}` | `{ok, updatedAt}` |
 | `POST` | `/v1/kv/delete` | `{scope?, key}` | `{existed}` |
@@ -2229,9 +2224,9 @@ All routes are under `/v1/` and registered in `JobStateAPI._routes`:
 | `POST` | `/v1/lock/acquire` | `{scope?, name, permits?, ttl?, wait?, blockSeconds?}` | `{acquired, token?, slot?, fence?, ttl?}` |
 | `POST` | `/v1/lock/release` | `{token}` | `{released}` |
 | `GET` | `/v1/secret/get` | `?name=` | `{value}`, or `404` |
-| `GET` | `/v1/secret/list` | -- | `{names: [...]}` |
+| `GET` | `/v1/secret/list` | none | `{names: [...]}` |
 | `GET` | `/v1/param/get` | `?name=` | `{value}` in the declared JSON type, or `404` |
-| `GET` | `/v1/param/list` | -- | `{params: {...}}`, the [run parameters](Orchestration-and-DAGs#run-parameters) of the calling run, empty for a run without parameters |
+| `GET` | `/v1/param/list` | none | `{params: {...}}`, the [run parameters](Orchestration-and-DAGs#run-parameters) of the calling run, empty for a run without parameters |
 
 `cursor/advance` is monotonic by default: the stored value only ever moves to
 `max(current, value)`, so a replayed or out-of-order batch cannot walk a

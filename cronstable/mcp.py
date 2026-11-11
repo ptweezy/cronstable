@@ -1,26 +1,24 @@
-"""A hand-rolled Model Context Protocol (MCP) server for cronstable.
+"""Model Context Protocol (MCP) server for cronstable.
 
-MCP (https://modelcontextprotocol.io) lets an AI agent -- Claude Desktop /
-Code, Cursor, VS Code Copilot, and other MCP clients -- drive cronstable the
-way an operator drives the dashboard: list and inspect jobs, DAGs, the
-cluster/fleet and the durable state store (observe), and, when the operator
-opts in, run/cancel a job or trigger/backfill/approve a DAG (act).
+MCP (https://modelcontextprotocol.io) lets an AI agent (such as Claude
+Desktop, Claude Code, Cursor, or VS Code Copilot) inspect and operate
+cronstable: list and inspect jobs, DAGs, the cluster/fleet, and the durable
+state store (observe), and, when enabled, run/cancel a job or
+trigger/backfill/approve a DAG (act).
 
-The protocol is JSON-RPC 2.0 over the "Streamable HTTP" transport
-(https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) --
-a single ``POST /mcp`` endpoint.  cronstable already owns every building block
-(a JSON dispatcher, aiohttp, a bearer-token middleware, the ``_json`` fast
-path), so this server is a few hundred lines of pure Python with NO new
-dependencies -- deliberately, rather than vendoring the official ``mcp`` SDK
-and its Rust-compiled transitive tree (pydantic-core / cryptography / rpds-py),
-which would break cronstable's multi-architecture, distroless packaging story.
+The protocol is JSON-RPC 2.0 over the Streamable HTTP transport
+(https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+at ``POST /mcp``.  cronstable reuses its existing JSON dispatcher, aiohttp
+server, bearer-token middleware, and ``_json`` serializer so the server runs
+in pure Python without the external ``mcp`` SDK or its compiled transitive
+dependencies (pydantic-core, cryptography, rpds-py).
 
-The endpoint is served on the existing ``web.listen`` addresses and rides the
-same bearer/mTLS/unix-socket auth (see :meth:`cronstable.cron.Cron.\
-start_stop_web_app`).  The tools call the same in-process payload builders the
-``_web_*`` REST handlers use, so there is one source of truth.  Local desktop
-clients reach the server through the featherweight ``cronstable mcp`` stdio
-bridge (:mod:`cronstable.mcpcli`), which forwards frames here over urllib.
+The endpoint is served on the ``web.listen`` addresses and shares the
+bearer/mTLS/unix-socket auth (see
+:meth:`cronstable.cron.Cron.start_stop_web_app`).  The tools call the same
+in-process payload builders as the ``_web_*`` REST handlers.  Local desktop
+clients connect through the ``cronstable mcp`` stdio bridge
+(:mod:`cronstable.mcpcli`), which forwards frames here over urllib.
 
 The server offers tools, resources, prompts and argument completion, and
 keeps no sessions (no ``Mcp-Session-Id``, no GET SSE stream). It serves both
@@ -381,11 +379,11 @@ class MCPHandler:
     # -- capabilities / visibility ----------------------------------------
 
     def _capabilities(self) -> dict[str, Any]:
-        """Advertise ONLY what the current caller can use.
+        """Advertise only what the current caller can use.
 
-        A server MUST NOT advertise a capability it does not implement (a
+        A server must not advertise a capability it does not implement (a
         conformant client would then call the method and get -32601). Tools
-        are always present; resources/prompts appear only when enabled AND
+        are always present; resources/prompts appear only when enabled and
         something is visible, and completions whenever either appears.
         """
         caps: dict[str, Any] = {"tools": {"listChanged": False}}
@@ -1669,23 +1667,14 @@ class MCPHandler:
             raise _ToolInputError("`match` must be a string")
         limit = self._clamp_limit(args.get("limit"))
         cron = self._cron
-        # Split in two phases exactly the way GET /metrics splits a scrape
-        # (see Cron._web_metrics and Metrics.families), and offload at the
-        # same job count, for the same reason.  A metrics query is asked for
-        # a handful of samples but has to visit the WHOLE metric universe to
-        # know which ones match, and the visit is the expensive half: it
-        # assembles a label block and formats a value for every sample of
-        # every family.  Doing that inline stalled job dispatch and every
-        # other handler for the duration, and at fleet scale that is a
-        # measurable freeze on a tool an agent may poll.
-        #
-        # The universe walk (the expensive half: it assembles a label
-        # block and formats a value per sample) is shared across the
-        # callers that arrive within a second and offloaded past the same
-        # job-count gate GET /metrics uses, so an agent polling this tool
-        # neither stalls dispatch nor rebuilds what a concurrent caller is
-        # already building. The filter stays per call: it is substring
-        # matching over prebuilt strings, far cheaper than the walk.
+        # Share the metric universe walk across callers arriving within one
+        # second and offload it past the same job-count threshold GET /metrics
+        # uses (see Cron._web_metrics and Metrics.families). A metrics query
+        # visits every metric family to format label blocks and sample values
+        # before filtering, so sharing and offloading the walk prevents an
+        # agent polling this tool from stalling job dispatch or duplicating
+        # a concurrent caller's work. The substring filter runs per call over
+        # the prebuilt strings.
         samples = await cron.metric_samples_snapshot()
         rows, total = _filter_metric_samples(iter(samples), match, limit)
         return _result(
@@ -2166,12 +2155,11 @@ class MCPHandler:
             )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
-        # dry_run defaults TRUE, tested by IDENTITY like _require_confirm:
-        # only the literal boolean false may take the destructive branch.
-        # ``args.get("dry_run", True)`` applied the default only when the
-        # key was ABSENT, so a present-but-falsy value -- null (exactly how
-        # an MCP client or LLM encodes "unspecified"), [], {}, "", 0 --
-        # fell through the preview gate into a real backfill.
+        # dry_run defaults to True and is checked by identity (`is not False`),
+        # matching _require_confirm: only the literal boolean False runs the
+        # backfill. Checking `args.get("dry_run", True)` would apply the
+        # default only when the key is absent, letting a present-but-falsy
+        # value such as null, [], {}, "", or 0 bypass the preview gate.
         if args.get("dry_run") is not False:
             return _result(
                 {
@@ -2862,8 +2850,8 @@ _EXPLAIN_COUNT_DEFAULT = 5
 
 # Input properties that several tools share.
 _ISO_UTC = (
-    "Use ISO 8601, such as 2026-10-01T00:00+00:00 (write UTC as +00:00, "
-    "not Z). A value without an offset is read as UTC."
+    "Use ISO 8601, such as 2026-10-01T00:00Z or 2026-10-01T00:00+00:00. A "
+    "value without an offset is read as UTC."
 )
 _JOB_ARG = _arg(
     _STR,

@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "cronstable"
 description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE", "TRADEMARKS.md", "LICENSING.md"]
 authors = [{ name = "Parker Loflin", email = "parker@cronstable.dev" }]
@@ -71,8 +71,8 @@ dependencies = [
     # Per-run CPU/memory accounting (opt-in `monitorResources`; see
     # cronstable.resources). The feature is off by default, but the import is
     # unconditional so `cronstable --help` and mypy resolve it everywhere.
-    # 5.9.0 is the first release with Python 3.10 wheels.
-    "psutil>=5.9.0",
+    # 5.9.4 is the first release with Python 3.11 wheels.
+    "psutil>=5.9.4",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -80,7 +80,6 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "Natural Language :: English",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -132,16 +131,11 @@ speedups = [
     # isal (ISA-L) gzips web and cluster responses with SIMD deflate
     # (cronstable._gzip falls back to stdlib zlib). The marker lists only
     # targets with a wheel, so pip never tries the sdist, which builds ISA-L
-    # and needs nasm on x86. There is no cp315 wheel yet. Linux stops at
-    # x86_64 and aarch64, with the same 32-bit userland caveat as the push
-    # extra's cryptography line. 1.7.0 is the first release with a wheel
-    # for every target the marker lists.
-    # TODO: https://github.com/pycompression/python-isal/issues/247 - When
-    # isal publishes cp315 wheels, drop `python_version < '3.15'` from this
-    # marker and the dev extra's, and regenerate the build files. Then
-    # remove the 3.15 gate in tests/test_dev_deps_parity.py and the isal
-    # notes for Python 3.15 in CONTRIBUTING.md and wiki/Installation.md.
-    "isal>=1.7.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
+    # and needs nasm on x86. Linux stops at x86_64 and aarch64, with the
+    # same 32-bit userland caveat as the push extra's cryptography line.
+    # 1.9.0 is the first release with a wheel for every target the marker
+    # lists, including Python 3.15.
+    "isal>=1.9.0; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64')",
 ]
 # End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
 # PyNaCl seals `x25519` and fails closed: a config with a `push:` section
@@ -185,7 +179,7 @@ dev = [
     "orjson>=3.11.6; platform_machine != 'ARM64' or sys_platform != 'win32'",
     # isal reuses the speedups marker; tests/test_gzip.py covers both
     # backends wherever it installs.
-    "isal>=1.7.0; python_version < '3.15' and ((sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
+    "isal>=1.9.0; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     "pynacl>=1.6.2",
     "zeroconf>=0.149.16",
     # Browser-backed tests require a separate `playwright install chromium`
@@ -234,7 +228,7 @@ packages = ["cronstable", "cronstable.web", "cronstable.backends"]
 version_file = "cronstable/version.py"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 79
 
 [tool.ruff.lint]
@@ -253,11 +247,14 @@ select = [
     "F",
     # Pycodestyle warnings
     "W",
-    # pyupgrade, typing-modernization codes only (builtin generics, PEP 604
-    # unions and optionals, deprecated typing imports)
+    # pyupgrade: typing modernization (builtin generics, PEP 604 unions and
+    # optionals, deprecated typing imports) and the Python 3.11 spellings
+    # datetime.UTC and builtin TimeoutError
     "UP006",
     "UP007",
+    "UP017",
     "UP035",
+    "UP041",
     "UP045",
     "I",  # <= import sorting
 ]
@@ -266,7 +263,7 @@ select = [
 max-complexity = 20
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 # Check the POSIX API surface (grp, pwd, os.setuid) on every OS, as Linux CI
 # does; Windows branches are runtime-guarded and the Windows test rows cover
 # them. No `--platform win32` pass: cronstable.platform.apply_priority
@@ -311,6 +308,9 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Every async fixture is function-scoped. Leaving this unset raises a
+# pytest-asyncio deprecation warning, which the "error" filter makes fatal.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests", ".github/tests"]
 # A wedged await dumps every thread's stack and fails the run before the
 # 30-minute CI job timeout cancels it. Armed per test; none comes near 300s.

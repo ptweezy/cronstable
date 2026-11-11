@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def generator():
-    pytest.importorskip("tomllib")  # generation/CI use Python 3.11+
     spec = importlib.util.spec_from_file_location(
         "generate_build_files", ROOT / "scripts/generate_build_files.py"
     )

@@ -14,7 +14,7 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.message import EmailMessage
 from email.utils import format_datetime
 from functools import lru_cache
@@ -234,8 +234,8 @@ def _decode_output_line(raw: bytes) -> str:
     line that is not valid UTF-8 is retried through the Windows-only
     ``"oem"`` codec, keeping accented output from a non-English install
     intact rather than collapsing it to U+FFFD.  Anything still undecodable
-    falls back to UTF-8 with replacement (the old unconditional behavior),
-    so the reader task can never die on job-controlled bytes.
+    falls back to UTF-8 with replacement, so the reader task can never die
+    on job-controlled bytes.
     """
     try:
         return raw.decode("utf-8")
@@ -300,10 +300,10 @@ class _MirrorWriter:
     the queue is bounded by batch count AND retained bytes, shedding the
     OLDEST batches so memory stays flat.
 
-    The submit path NEVER logs, especially not under the lock: in the
-    shed scenario stderr IS the wedged fd, so a synchronous handler write
+    The submit path never logs, especially under the lock: in the shed
+    scenario stderr is the wedged fd, so a synchronous handler write
     would park the loop with the lock held.  Submit only flags the shed;
-    the writer thread logs it AFTER a successful write, once the consumer
+    the writer thread logs it after a successful write, once the consumer
     is provably draining again.
 
     One thread for both streams on purpose: it preserves enqueue order
@@ -447,10 +447,9 @@ class _MirrorWriter:
                 warn = self._drop_warn_pending
                 self._drop_warn_pending = False
                 # re-arm: this episode is over (the consumer is
-                # provably draining again), so the NEXT backup gets
-                # its own warning. Without the reset the latch was
-                # per-process and every later episode shed job output
-                # silently.
+                # provably draining again), so the next backup gets
+                # its own warning. Resetting per episode prevents
+                # shedding output silently on later episodes.
                 self._drop_logged = False
             if warn:
                 logger.warning(
@@ -682,8 +681,7 @@ class StreamReader:
 
         Reads in chunks and splits in C rather than awaiting ``readline``
         per line, whose per-line bookkeeping costs several times the
-        decode it surrounds.  Two things readuntil supplied for free are
-        re-implemented here:
+        decode it surrounds.  Enforces two stream invariants directly:
 
         * the ``maxLineLength`` cap: an over-cap complete line is
           dropped, and an unterminated run past the cap is dropped as it
@@ -1005,7 +1003,7 @@ class MailReporter(Reporter):
         message["To"] = mail["to"].strip()
         message["Subject"] = subject.strip()
         # RFC 5322 date, e.g. "Wed, 18 Jun 2026 12:34:56 +0000" (not ISO-8601).
-        message["Date"] = format_datetime(datetime.now(timezone.utc))
+        message["Date"] = format_datetime(datetime.now(UTC))
         if mail["html"]:
             # set_content handles charset + transfer-encoding so non-ASCII
             # HTML bodies are sent correctly (set_payload would not).
@@ -1033,7 +1031,7 @@ class MailReporter(Reporter):
                 self._converse(smtp, username, password, message),
                 MAIL_REPORT_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "mail: report for job %s did not complete within %.0f "
                 "seconds; giving up on it",
@@ -1242,7 +1240,7 @@ class ShellReporter(Reporter):
         timeout = shell_config.get("timeout") or 60
         try:
             retcode = await asyncio.wait_for(proc.wait(), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "Shell reporter of job %s did not finish within %.1f "
                 "seconds; killing it",
@@ -1261,7 +1259,7 @@ class ShellReporter(Reporter):
             # extra bound guarantees the reaper can never be wedged here.
             try:
                 await asyncio.wait_for(proc.wait(), 10)
-            except asyncio.TimeoutError:  # pragma: no cover - defensive
+            except TimeoutError:  # pragma: no cover - defensive
                 logger.error(
                     "Shell reporter of job %s could not be reaped after "
                     "being killed",
@@ -1487,11 +1485,7 @@ class WebhookReporter(Reporter):
                             job.config.name,
                             resp.status,
                         )
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                UnicodeError,
-            ) as exc:
+            except (TimeoutError, aiohttp.ClientError, UnicodeError) as exc:
                 # Caught HERE rather than left to _report_common's
                 # catch-all: the URL is the credential, and a spelling
                 # yarl rejects raises InvalidUrlClientError, whose str()
@@ -1799,11 +1793,10 @@ class _EventLogWriter:
     A dedicated thread rather than ``run_in_executor(None, ...)``: the
     default pool is shared with the durable-state writes and the fromFile
     secret resolver, and a wedged event write would hold one of its handful
-    of slots for every report.  A dedicated ThreadPoolExecutor was rejected
-    for a sharper reason: concurrent.futures registers an atexit hook that
-    JOINS its worker threads, so one stuck ReportEventW would hang
-    interpreter exit, which is exactly the shutdown behavior this platform
-    work spent several fixes on.  A daemon thread cannot; the OS reclaims
+    of slots for every report.  A dedicated ThreadPoolExecutor is also
+    unsuitable because concurrent.futures registers an atexit hook that
+    joins its worker threads, so one stuck ReportEventW would hang
+    interpreter exit.  A daemon thread does not block exit; the OS reclaims
     it.
 
     Fire and forget, therefore: :meth:`submit` does a bounded
@@ -1911,12 +1904,12 @@ class _EventLogWriter:
             # The thread owns the handle, so it can release it here with
             # no caller waiting.  It has to be here rather than in join(),
             # because retire_event_log_writers drops a renamed writer
-            # WITHOUT joining it (a reload runs on the scheduler's own
+            # without joining it (a reload runs on the scheduler's own
             # loop iteration, and the bounded drain belongs to
-            # shutdown).  A close that lived only in join() therefore
-            # leaked one source handle per reload that renamed the source:
-            # unbounded, and invisible to EVENTLOG_MAX_WRITERS, which caps
-            # the live registry rather than what has already left it.
+            # shutdown).  Closing only in join() would leak one source
+            # handle per reload that renames the source: unbounded, and
+            # invisible to EVENTLOG_MAX_WRITERS, which caps the live
+            # registry rather than what has already left it.
             handle, self._handle = self._handle, None
             if handle is not None:
                 platform.close_event_log(handle)
@@ -2088,8 +2081,8 @@ def report_config_enabled(report_config: dict[str, Any]) -> bool:
     url = report_config["webhook"]["url"]
     if url["value"] or url["fromFile"] or url["fromEnvVar"]:
         return True
-    # .get, not [], so report dicts predating the push block (older
-    # persisted shapes, hand-built test configs) keep working.
+    # .get, not [], so report dicts that omit the push block (persisted
+    # shapes or hand-built test configs) keep working.
     if (report_config.get("push") or {}).get("enabled"):
         return True
     # eventlog last, with the platform tested before the dict: on POSIX
@@ -2440,7 +2433,7 @@ class RunningJob:
             return
         self._stopped = True
         if self.ended_at is None:
-            self.ended_at = datetime.now(timezone.utc)
+            self.ended_at = datetime.now(UTC)
         # Finalize resource accounting before statsd reports it. _on_stop
         # is the single idempotent choke point every completion path
         # funnels through, so usage is captured exactly once.
@@ -2466,7 +2459,7 @@ class RunningJob:
             # one; see STATSD_START_FLUSH_TIMEOUT.
             try:
                 await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # the documented "host that misses this window" case: the
                 # open is still in flight and stays pooled, nothing to say
                 pass
@@ -2496,10 +2489,10 @@ class RunningJob:
         if self.proc is not None:
             raise RuntimeError("process already running")
         config = self.config
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = datetime.now(UTC)
         # Isolate the job in its own process group, so cancel() can take its
-        # whole descendant tree down as a unit rather than only the process we
-        # spawned -- see cronstable.platform.new_process_group_kwargs.
+        # whole descendant tree down as a unit rather than only the spawned
+        # process (see cronstable.platform.new_process_group_kwargs).
         # The job's scheduling priority rides along on Windows, where the
         # creation flags are the only race-free place to set one; POSIX is
         # served by the renice below, once there is a group to renice.
@@ -2510,8 +2503,8 @@ class RunningJob:
         self._child_env(kwargs)
         if config.workingDirectory is not None:
             # The directory the child starts in.  Omitted rather than passed
-            # as None when unset, so a job that does not ask for one keeps
-            # inheriting the daemon's CWD byte for byte as it always has.
+            # as None when unset, so a job that does not ask for one
+            # inherits the daemon's CWD byte for byte.
             # The value was normalized at config load; whether the directory
             # exists is the OS's call, and a bad one raises OSError into the
             # start_failed net below.  Note the child chdirs BEFORE
@@ -2837,7 +2830,7 @@ class RunningJob:
     def _demote(self):
         # Runs in the child (preexec_fn) while still privileged. Order matters:
         # set/clear supplementary groups, then the primary gid, then the uid.
-        # Dropping supplementary groups BEFORE setuid is essential — otherwise
+        # Dropping supplementary groups before setuid is essential; otherwise
         # the child keeps root's supplementary group memberships (the classic
         # "forgot setgroups() before setuid()" privilege-escalation bug).
         gid = self.config.gid
@@ -2890,10 +2883,10 @@ class RunningJob:
                         self.proc.wait(), timeout
                     )
                 else:
-                    raise asyncio.TimeoutError
+                    raise TimeoutError
                 if await self._output_open_at_deadline():
-                    raise asyncio.TimeoutError
-            except asyncio.TimeoutError:
+                    raise TimeoutError
+            except TimeoutError:
                 logger.info(
                     "Job %s exceeded its executionTimeout of "
                     "%.1f seconds, cancelling it...",
@@ -2993,7 +2986,7 @@ class RunningJob:
             if self.on_verifying is not None:
                 try:
                     await self.on_verifying()
-                except (OSError, asyncio.TimeoutError):
+                except (TimeoutError, OSError):
                     logger.warning("Could not publish verification status")
             if self._terminated:
                 await check.cancel()
@@ -3003,7 +2996,7 @@ class RunningJob:
         try:
             try:
                 await asyncio.wait_for(verify(), spec["timeout"])
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 check.retcode = -100
                 await check.cancel()
                 if self._terminated:
@@ -3019,7 +3012,7 @@ class RunningJob:
             raise
         finally:
             self._verifier = None
-        finished = datetime.now(timezone.utc)
+        finished = datetime.now(UTC)
         self.verification = {
             "outcome": "failure" if check.failed else "success",
             "exit_code": check.retcode,
@@ -3185,7 +3178,7 @@ class RunningJob:
         """End this run: its canceled verification check has no process."""
         self._verifier_cancelled = True
         if self.ended_at is None:
-            self.ended_at = datetime.now(timezone.utc)
+            self.ended_at = datetime.now(UTC)
 
     async def cancel(self) -> None:
         """Terminate this run and everything it spawned.

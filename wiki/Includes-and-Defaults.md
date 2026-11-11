@@ -160,7 +160,7 @@ Each job dict is `mergedicts(defaults, config_job)`, where `defaults` is
 On Windows, user/group switching is unsupported: a job with `user` or `group`
 set raises a configuration error (`Job <name>: changing user/group is not
 supported on Windows`); see [running on Windows](Running-on-Windows). The merged
-`defaults` (steps 1–3) is also returned as the file's `job_defaults`.
+`defaults` (steps 1 to 3) is also returned as the file's `job_defaults`.
 
 ## Merge semantics (`mergedicts`)
 

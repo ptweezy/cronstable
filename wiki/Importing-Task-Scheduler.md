@@ -72,8 +72,7 @@ a partial conversion is the normal outcome.
 
 ## Expect most of a whole-machine export not to convert
 
-This is the part worth knowing before the first run. Measured on a stock
-Windows 11 machine, of 195 registered tasks:
+Measured on a stock Windows 11 machine, of 195 registered tasks:
 
 - **111** act through a COM handler rather than a command line.
 - **97** use `WnfStateChangeTrigger`, an internal Windows notification.
@@ -82,11 +81,11 @@ Windows 11 machine, of 195 registered tasks:
 - **30** fire on logon, **12** on an event-log event, **11** on a session
   change.
 
-24 converted. That is not the tool failing; almost all of those tasks are
-Windows' own internal plumbing, which does not belong in a cron scheduler.
-On a folder of tasks somebody wrote by hand, the ratio is very different.
-Every task that does not convert gets a line in the report saying which
-element stopped it and, where one exists, what to do instead.
+24 converted. Almost all of the remaining tasks are internal Windows plumbing
+that does not belong in a cron scheduler. On a folder of user-authored tasks,
+the conversion rate is much higher. Every task that does not convert gets a
+line in the report naming the element that stopped it and, where one exists,
+what to use instead.
 
 ## What converts
 
@@ -112,8 +111,8 @@ A task with more than one trigger becomes one job per trigger, suffixed
 
 ## What does not, and why
 
-Nothing is dropped silently. Everything that follows is a line in the report,
-naming the element responsible.
+Every unsupported element produces a line in the report naming the element
+responsible; nothing is dropped silently.
 
 Six trigger types have no cron equivalent at all: logon, idle, event-log,
 session change, registration, and the internal notification trigger.
@@ -145,16 +144,16 @@ or `group:`. Those keys are a config-load error on Windows, so emitting them
 would produce a file that cannot load on the platform it was converted for.
 Every job runs as the account the daemon runs as.
 
-What is left is settings with no counterpart. Because cronstable schedules on
+Other task settings have no counterpart. Because cronstable schedules on
 time and does not test machine state, run only if idle, only on AC power, only
 when a network is available, and wake to run are all reported.
-`RestartOnFailure` is the one of those with a near equivalent worth naming,
+`RestartOnFailure` maps closely to
 [`onFailure.retry`](Failure-Detection-and-Retries).
 
-`RandomDelay` has no near equivalent worth naming.
-[Hashed schedules](Hashed-Schedules) spread jobs deterministically, which is
-usually what the delay was for, but it is not the same thing. Nor does
-`EndBoundary`, because a cronstable schedule has no end date.
+`RandomDelay` has no direct equivalent.
+[Hashed schedules](Hashed-Schedules) spread jobs deterministically, which
+usually serves the same purpose, though the mechanism differs. `EndBoundary`
+also has no counterpart, because a cronstable schedule has no end date.
 
 ## Details worth knowing
 
@@ -185,9 +184,9 @@ only propagates a lowered priority class to children.
 
 Three labels appear in the report. `NOT CONVERTED` means no job was emitted
 for that task, or that its jobs were written commented out. `PARTIAL` means
-the converter emitted jobs and they are live in the file, but something else
-about the task did not carry across, usually one trigger of several. `note`
-means the jobs are complete and something is worth reading anyway.
+the converter emitted live jobs in the file, but part of the task (usually one
+trigger of several) did not carry across. `note` means the jobs converted
+completely, with an informational note attached.
 
 One task that cannot be converted does not stop the others. A duration or
 timestamp the converter cannot read becomes a blocking note for that task, so
@@ -224,10 +223,10 @@ spaces become `-`, so `\Contoso\Nightly Backup` becomes
 `<folder>.<task>` name looks exactly like a DAG task name, so if you later
 add a DAG named after a Task Scheduler folder, the pair fails to load.
 
-A directory scan skips what it does not recognize. `.xml` is a name half the
-tooling on a Windows machine writes, so a stray file in a scanned directory
-is a report line and a skip. A file you name on the command line is not: that
-is a mistake worth stopping for.
+A directory scan skips unrecognized `.xml` files with a report line, because
+many Windows tools write unrelated `.xml` files. A file named explicitly on
+the command line must be a valid Task Scheduler export, or the command exits
+with an error.
 
 ## Related pages
 

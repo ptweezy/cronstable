@@ -86,16 +86,16 @@ Deliberately **not** part of the identity:
   itself. The peer list, `distribution`, and the rest of the coordination
   config never move the id.
 
-Fields added after the `v1` scheme shipped enter the identity only when they
-are set away from their default (`concurrencyScope`, listed earlier, is one),
-so upgrading cronstable never changes the id of an existing configuration.
+Optional fields such as `concurrencyScope`, `priority`, `verify`, `pool`, and
+`resourceLimits` enter the identity only when set away from their default, so
+configurations that leave them unset keep the same id.
 
 Because the id is taken over effective config, it also reflects
 [environment-variable interpolation](Environment-Variable-Interpolation): a
 `${VAR}` in a fingerprinted string field is expanded before the fingerprint is
 computed, so a config that interpolates per-environment values yields a
-**different id per environment** by design. That is correct: the deployments
-really are running different job sets. If you need one id to compare across
+**different id per environment** by design, reflecting that the deployments
+run different job sets. If you need one id to compare across
 environments, keep interpolated variables out of fingerprinted job fields.
 
 ## No secret material

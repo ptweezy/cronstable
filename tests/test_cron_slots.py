@@ -346,7 +346,7 @@ async def test_slotlease_slot_fidelity_reason_latches_and_logs(caplog):
 
 async def test_slotlease_acquire_slot_lease_maps_failures_to_none():
     cron = cronstable.cron.Cron(None)
-    timed_out = _SlotleaseBackend(acquire_exc=asyncio.TimeoutError())
+    timed_out = _SlotleaseBackend(acquire_exc=TimeoutError())
     errored = _SlotleaseBackend(acquire_exc=RuntimeError("flock ENOLCK"))
     assert await cron._acquire_slot_lease(timed_out, "slots/s") is None
     assert await cron._acquire_slot_lease(errored, "slots/s") is None
@@ -625,7 +625,7 @@ async def test_slotlease_claim_expired_unreclaimed_falls_to_policy(
 async def test_slotlease_claim_read_timeout_is_unanswered(monkeypatch):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend(
-        acquire=None, read_exc=asyncio.TimeoutError()
+        acquire=None, read_exc=TimeoutError()
     )
     cron._state_on_unavailable = "fail-closed"
     assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is None
@@ -903,7 +903,7 @@ async def test_slotlease_slot_renewer_renew_timeout_then_error_then_taken_over(
         list_script=[[], [], []],
         # cycle 1: renew times out -> continue; cycle 2: renew errors ->
         # warn+continue; cycle 3: renew denied -> read shows takeover -> return.
-        renew_script=[asyncio.TimeoutError(), RuntimeError("EIO"), None],
+        renew_script=[TimeoutError(), RuntimeError("EIO"), None],
         read_script=[None, None, _slotlease_lease(holder="peer#3", fence=7)],
     )
     cron.state_backend = backend

@@ -73,11 +73,9 @@ history.
 - Argument completion (§4.3): the server adds `completion/complete`, which
   completes prompt arguments and resource template variables from job
   names, workflow names, and recent run keys.
-- TLS is served by the daemon, not only by a reverse proxy (§6): where the
-  design text says to terminate TLS/mTLS in a reverse proxy and cites the
-  [HTTP control API](HTTP-API) page for it, `web.listen` accepts
-  `https://` addresses served from a `web.tls` block, and
-  `web.tls.clientCa` makes those listeners require a client certificate.
-  That mTLS listener satisfies the fail-closed token gate on its own,
-  exactly as a proxy-terminated one does. Plain `https://` does not. See
-  [listener TLS](Listener-TLS).
+- Daemon-terminated TLS (§6): the original design delegates TLS and mTLS
+  termination to a reverse proxy, but `web.listen` also accepts `https://`
+  addresses served from a `web.tls` block, and `web.tls.clientCa` requires a
+  client certificate on those listeners. An mTLS listener satisfies the
+  fail-closed token gate on its own, just like a proxy-terminated listener.
+  Plain `https://` does not. See [listener TLS](Listener-TLS).

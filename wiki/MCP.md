@@ -16,9 +16,8 @@ It is served two ways from the same code:
 - **`cronstable mcp`**, a small **stdio bridge** that desktop clients launch as
   a subprocess. It forwards frames to a running daemon's `/mcp`.
 
-It is hand-written in pure Python with **no new dependencies** (the same
-minimal-dependency stance as the rest of cronstable), and exposes **tools**,
-**resources**, **prompts**, and argument **completion**.
+The implementation is pure Python with **no extra dependencies**, and exposes
+**tools**, **resources**, **prompts**, and argument **completion**.
 
 ## Protocol revisions
 
@@ -121,11 +120,10 @@ running. Each result also has these fields:
   cursor came from another run, or the run's lines are gone: a workflow task
   that ended, or a run from before a daemon restart. The page then starts at
   the oldest line the buffer holds.
-- `started_at`: when the job run, or the running workflow task instance,
-  started. A value that differs from the previous call's means the lines come
-  from another run, newer or older, so start over without a cursor. For
-  example, an older run that is still going takes over after a newer
-  overlapping run ends.
+- `started_at`: when the job run or running workflow task instance started. If
+  this value differs from the previous call, the lines come from a different
+  run (for example, when an older overlapping run continues after a newer run
+  finishes), so restart polling without a cursor.
 - `running`: for a job, whether any instance is running; for a workflow task,
   whether the instance is still running. A workflow task's lines are gone
   after it ends.
@@ -179,18 +177,17 @@ observe tools report the resulting `paused` and `sla` state on every job
 payload. Semantics: [pausing jobs](Pausing-Jobs) and
 [late-run detection](Late-Run-Detection).
 
-`cron_get_job_resources` returns the object that
-[`GET /jobs/{name}/resources`](HTTP-API#get-jobsnameresources) serves. For a
-job with [resource limits](Resource-Limits), that object includes the
-configured caps under `limits`, and each capped run's `limits` record, which
-says whether the caps applied and whether the run hit its memory cap.
-`cron_list_jobs` and `cron_get_job` carry a capped job's `limits` as
-[`GET /jobs`](HTTP-API#get-jobs) does. `cron_list_runs` and the
-`cronstable://jobs/{name}/runs` resource carry each capped run's `limits`
-record, as [`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns) does, and
-`cron_get_node` carries the host's `limits` capability, as
-[`GET /node`](HTTP-API#get-node) does, so an agent can tell whether this host
-enforces caps at all.
+`cron_get_job_resources` returns the same payload as
+[`GET /jobs/{name}/resources`](HTTP-API#get-jobsnameresources). For a job with
+[resource limits](Resource-Limits), this includes the configured caps under
+`limits` and each capped run's `limits` record (whether caps applied and
+whether the run hit its memory cap). Similarly, `cron_list_jobs` and
+`cron_get_job` include a capped job's `limits` (like
+[`GET /jobs`](HTTP-API#get-jobs)), `cron_list_runs` and
+`cronstable://jobs/{name}/runs` include each capped run's `limits` record (like
+[`GET /jobs/{name}/runs`](HTTP-API#get-jobsnameruns)), and `cron_get_node`
+reports the host's `limits` capability (like
+[`GET /node`](HTTP-API#get-node)).
 
 `cron_list_pools` inspects shared capacity and waiting work.
 `cron_cancel_queued` cancels a waiting entry using its `pool` and `id`.
@@ -211,10 +208,10 @@ not started, a store operation fails or times out, or a run document cannot
 be read. For a store operation that fails or times out and for a run
 document that cannot be read, the daemon logs the warning that
 [`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill) describes.
-The dry run, the refusal that asks for `confirm=true`, and
-`dag not found: '<name>'` need no store. A workflow absent from the
-configuration therefore gets `dag not found` from the tool where the REST
-route answers `503` while the store has not started.
+Dry runs, `confirm=true` checks, and `dag not found: '<name>'` checks do not
+require the store. As a result, an unconfigured workflow returns
+`dag not found` from the tool even when the store has not started and the REST
+route would return `503`.
 `cron_list_pools`, `cron_cancel_queued`, and `cron_run_job` for a
 pooled job return the tool error `pool state is unavailable` when pool state
 cannot be read or written. A refusal by a pool that answers comes back as a
@@ -230,8 +227,8 @@ section, the recovery tools return `workflow run not found` for a run and
 cases behind each answer. See [resource pools](Resource-Pools) and
 [workflow recovery](Workflow-Recovery) for behavior and limits.
 
-The three schedule-authoring tools make an agent a competent schedule
-**author**, not only a reader, with the daemon's own engine as the authority:
+Three schedule-authoring tools let an agent validate, explain, and debug
+schedules using the daemon's own engine:
 
 - `cron_validate_schedule` parses and lints any expression before it becomes a
   job: the engine's exact error with its dialect hints,
@@ -255,8 +252,8 @@ can attach as context, scoped by the same toolsets:
 Template values are percent-encoded, as RFC 6570 expands them: a job named
 `nightly backup` is `cronstable://jobs/nightly%20backup`.
 
-Every critical read is *also* a tool, because client support for resources is
-uneven. Resources are an optimization, never the only path.
+Every critical read is also exposed as a tool for clients that do not support
+resources.
 
 ### Prompts (canned triage playbooks)
 
@@ -332,8 +329,7 @@ earlier.
 
 `cronstable mcp` reads newline-delimited JSON-RPC on stdin and forwards each
 frame to `<url>/mcp`, writing the reply to stdout (only frames go to stdout;
-logs go to stderr). It needs a **reachable running daemon**, the right design
-for an operations tool.
+logs go to stderr). It requires a **reachable running daemon**.
 
 For a frame whose `_meta` names a protocol version, the bridge copies that
 version, the method, and the tool, prompt, or resource name into the

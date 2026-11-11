@@ -270,9 +270,9 @@ paths:
         - name: sort
           in: query
           description: >-
-            The order a `jobs` cap selects in. `name` keeps the first
-            `jobs` job names in ascending code point order. It has no
-            effect without a `jobs` cap.
+            Sort order applied before the `jobs` cap. `name` selects the
+            first `jobs` job names in ascending code point order. Ignored
+            when `jobs` is not set.
           schema: { type: string, enum: [name] }
       responses:
         "200":
@@ -1216,10 +1216,10 @@ paths:
       operationId: getFleetBadge
       description: >-
         An SVG badge for the whole job set, such as `cronstable | 2 failing`.
-        The message counts the jobs whose own badges show the most urgent of
-        `failing`, `overdue`, and `passing`, in that order. It reads
-        `no status` when no job shows one of the three, and `no jobs` when
-        none is configured. The count reads the jobs as the serving node
+        The message counts the jobs in the most urgent state among
+        `failing`, `overdue`, and `passing`, in that order. It shows
+        `no status` when no job is in those three states, and `no jobs` when
+        no jobs are configured. The count reads the jobs as the serving node
         sees them, not the cluster-wide `/fleet` view. Registered unless
         `web.badges: false`. With `web.badges.public: true`, exempt from
         the bearer token and loadable by pages on any origin. Supports
@@ -1272,10 +1272,10 @@ paths:
         `failing`, `overdue` (an SLA check is in breach), `paused`,
         `disabled`, `cancelled`, `unknown`, `running` (a run is in progress
         and the daemon has no earlier run of the job on record), or
-        `pending` (the daemon has no record of a run of the job). When a
-        run is on record, a run in progress or a slot that a pause held
-        back leaves the last run's verdict in place. The verdict reads the
-        runs that the serving node has on record. Registered unless
+        `pending` (the daemon has no record of a run of the job). Once the
+        job has a recorded run, an in-progress run or a run skipped by a
+        pause keeps the previous run's verdict. The verdict reads the runs
+        that the serving node has on record. Registered unless
         `web.badges: false`. With `web.badges.public: true`, exempt from
         the bearer token and loadable by pages on any origin. Supports
         `ETag` / `If-None-Match` (304).
@@ -1594,10 +1594,9 @@ paths:
         "502":
           description: >-
             `{device, status, error}`: sealing failed or the relay refused
-            or was unreachable. The one error body that carries more than
-            the envelope, so a `test` caller can see which device and which
-            relay status produced the reason; it is still readable as the
-            envelope.
+            or was unreachable. Includes `device` and `status` alongside the
+            standard `error` field so a `test` caller can see which device
+            and relay status caused the failure.
           content:
             application/json:
               schema:
@@ -1625,15 +1624,15 @@ paths:
       operationId: shutdownDaemon
       x-required-scope: control
       description: >-
-        The same drain Ctrl-C / SIGTERM trigger: stop scheduling new runs,
-        wait for the running jobs to finish, stop the web app, exit. The
-        graceful stop for deployments with no console to press Ctrl-C in
-        (service wrappers, supervisors, headless Windows boxes, where no
-        SIGTERM exists). Always refused unless the request is bearer-token
-        authenticated, even on a deployment that leaves every other route
-        open: an unauthenticated listener must not hand every process that
-        can reach it a stop switch. In a cluster this stops only the node
-        addressed.
+        Starts the same graceful drain as Ctrl-C or SIGTERM: stops
+        scheduling new runs, waits for running jobs to finish, stops the web
+        server, and exits. Useful for deployments without an interactive
+        console or SIGTERM support, such as service wrappers, supervisors,
+        and headless Windows hosts. Always refused unless the request is
+        bearer-token authenticated, even on a deployment that leaves every
+        other route open: an unauthenticated listener must not hand every
+        process that can reach it a stop switch. In a cluster this stops
+        only the node addressed.
       responses:
         "200":
           description: "`{shuttingDown: true}`: the drain has begun."
@@ -2013,7 +2012,7 @@ components:
         (choosing run parameter values on a DAG trigger or backfill, or
         reusing chosen values in a DAG recovery, each of which also needs
         `control`); `control`, `approve` and `params` each imply
-        `view`. A recognised token
+        `view`. A recognized token
         that lacks the scope an operation requires is 403, not 401. The
         required scope defaults to `view` for GET/HEAD and `control` for other
         methods; operations that need another carry an `x-required-scope`
@@ -2133,16 +2132,15 @@ components:
   responses:
     Unauthorized:
       description: >-
-        Missing or unrecognised bearer token (when `web.authToken` or any
+        Missing or unrecognized bearer token (when `web.authToken` or any
         `web.authTokens` entry is configured). The body is the same JSON
         error envelope every other error response carries, but its `error`
         is the generic `401: Unauthorized`, byte-identical for a missing
-        header, a wrong scheme and an unknown token: a reason that told
-        those apart would answer, for an unauthenticated caller, which half
-        of a guess was right. On a daemon configuring `web.anonymousScopes`
-        this narrows to "credentials were presented and are invalid": a
-        request carrying nothing at all is served, or refused with a
-        reasoned 403 naming the scope it lacked.
+        header, a wrong scheme, and an unknown token so that the response
+        does not leak which part of the header failed. On a daemon
+        configuring `web.anonymousScopes` this narrows to "credentials were
+        presented and are invalid": a request carrying nothing at all is
+        served, or refused with a reasoned 403 naming the scope it lacked.
       headers:
         Cronstable-Instance:
           $ref: "#/components/headers/CronstableInstance"
@@ -2178,7 +2176,7 @@ components:
         parse failures one way across every endpoint. The one exception is
         /mcp's 2026-07-28 path, whose protocol errors are `McpError`. A request that fails
         before it reaches the application (a malformed request line, an
-        unparseable method token, oversized request headers, an unrecognised
+        unparseable method token, oversized request headers, an unrecognized
         `Expect:`) is answered by the HTTP server itself as text/plain and is
         not described by this specification. Neither is the cluster peer
         transport, a separate mTLS listener this specification does not
@@ -2320,15 +2318,12 @@ components:
         sealableHere:
           type: boolean
           description: >-
-            Whether the daemon answering this request can seal `suite`.
-            The device registry is shared by every node on one state
-            store while the sealing libraries are per node, so a record
-            that paired against a node with cryptography reads as false on
-            a node without it, and alerts raised there never reach that
-            device.
-            False is a per-node fact and says nothing about the others.
-            The field stays outside `required`: a daemon that omits it
-            seals every suite it stores.
+            Whether this node can seal alerts for `suite`. Nodes sharing a
+            state store share the device registry, but each node has its own
+            installed libraries; a device paired with `xwing` on a node with
+            `cryptography` installed reports `false` on a node without it,
+            and alerts from that node cannot reach the device. Optional; when
+            omitted, the daemon can seal every stored suite.
         fingerprint:
           type: string
           nullable: true

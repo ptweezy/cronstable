@@ -3199,7 +3199,7 @@ async def test_catchup_reboot_gate_read_timeout_marks_sick_then_runs(tmp_path):
     cron = await _catchup_reboot_cron(tmp_path)
 
     async def boom(job):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     cron._reboot_marker_covers = boom  # type: ignore[method-assign]
     # default degrade policy: a read timeout latches sick and runs the job.
@@ -3234,7 +3234,7 @@ async def test_catchup_reboot_gate_write_timeout_fail_closed_recheck_visible(
         return seen["n"] > 1  # absent at the gate, visible on the re-check
 
     async def boom(*a, **k):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     cron._reboot_marker_covers = marker  # type: ignore[method-assign]
     cron.state_backend.append_record = boom  # type: ignore[method-assign]
@@ -3259,7 +3259,7 @@ async def test_catchup_reboot_gate_write_timeout_fail_closed_recheck_absent(
         raise RuntimeError("still unknown")  # re-check cannot decide
 
     async def boom(*a, **k):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     cron._reboot_marker_covers = marker  # type: ignore[method-assign]
     cron.state_backend.append_record = boom  # type: ignore[method-assign]
@@ -3384,7 +3384,7 @@ async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
         raise asyncio.CancelledError()  # cancelled during the re-check
 
     async def boom(*a, **k):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     cron._reboot_marker_covers = marker  # type: ignore[method-assign]
     cron.state_backend.append_record = boom  # type: ignore[method-assign]
@@ -3474,14 +3474,14 @@ def test_job_frame_and_next_delay_follow_the_timezone(monkeypatch):
         config_yaml="jobs:\n  - name: u\n    command: x\n"
         "    schedule: '0 9 * * *'\n",
     ).cron_jobs["u"]
-    assert utc_job.frame is datetime.timezone.utc
-    after = datetime.datetime(2027, 6, 1, 12, 0, tzinfo=datetime.timezone.utc)
+    assert utc_job.frame is datetime.UTC
+    after = datetime.datetime(2027, 6, 1, 12, 0, tzinfo=datetime.UTC)
     assert local.next_delay(after) == twin.next_delay(after)
     assert local.next_delay(after) == local.schedule.next(
         now=after.astimezone(LOCAL_ZONE)
     )
     assert utc_job.next_delay(after) == utc_job.schedule.next(
-        now=after.astimezone(datetime.timezone.utc)
+        now=after.astimezone(datetime.UTC)
     )
 
 
@@ -3503,13 +3503,13 @@ def test_compute_next_fire_takes_the_fixed_path_away_from_transitions(
 
     monkeypatch.setattr(CronTab, "next", recording)
     job = cron.cron_jobs["local0"]
-    june = datetime.datetime(2027, 6, 1, 12, 0, tzinfo=datetime.timezone.utc)
+    june = datetime.datetime(2027, 6, 1, 12, 0, tzinfo=datetime.UTC)
     assert cron._compute_next_fire(job, june) == june.replace(
         hour=13, minute=0
     )
     assert frames == [datetime.timezone]
     del frames[:]
-    soon = datetime.datetime(2027, 3, 14, 12, 0, tzinfo=datetime.timezone.utc)
+    soon = datetime.datetime(2027, 3, 14, 12, 0, tzinfo=datetime.UTC)
     cron._compute_next_fire(job, soon)
     assert frames == [LocalZone]
 

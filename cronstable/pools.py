@@ -49,7 +49,7 @@ class PoolUnavailable(PoolError):
 POOL_UNAVAILABLE = (
     PoolUnavailable,
     OSError,
-    asyncio.TimeoutError,
+    TimeoutError,
     _DocumentUnreadable,
 )
 
@@ -226,7 +226,7 @@ class PoolScheduler:
                 return
             try:
                 await asyncio.wait_for(self._wake.wait(), 1.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def _change(self, pool, action, *, backend=None, strict=False):
@@ -878,7 +878,7 @@ class PoolScheduler:
                 return entry is not None and entry["state"] == "finished"
             try:
                 await asyncio.wait_for(self.cron._stop_event.wait(), 0.25)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         return False
 

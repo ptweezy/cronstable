@@ -16,7 +16,7 @@ from tests._helpers import (
     _wait_until,
 )
 
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 BOOT = datetime.datetime(2026, 7, 1, 10, 0, 30, tzinfo=UTC)
 RESUME = BOOT + datetime.timedelta(minutes=9)
 

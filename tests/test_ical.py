@@ -20,7 +20,7 @@ from cronstable.ical import (
     render_calendar,
 )
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 _START = datetime.datetime(2026, 7, 1, tzinfo=_UTC)
 _NOW = datetime.datetime(2026, 7, 18, 12, 0, tzinfo=_UTC)
 

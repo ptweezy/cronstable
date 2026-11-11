@@ -4,7 +4,7 @@ Enable `monitorResources` to record a job's **total CPU time** (user + system), 
 
 The run record carries the numbers to every surface that already reports a run: the [web dashboard](Web-Dashboard), the [terminal dashboard](Terminal-Dashboard), the [HTTP API](HTTP-API), [Prometheus](Metrics-with-Prometheus), [statsd](Metrics-with-Statsd), failure [reports](Reporting), and the durable [run ledger](Durable-State).
 
-It is observability only. Monitoring never changes a run's success/failure verdict, never delays or crashes a job, and is off by default. A per-run sampling task is spawned only when it is on. To cap a run's CPU, memory, or process count, see [resource limits](Resource-Limits).
+Monitoring is read-only: it never changes a run's success or failure verdict, never delays or crashes a job, and is off by default. A per-run sampling task spawns only when monitoring is enabled. To cap a run's CPU, memory, or process count, see [resource limits](Resource-Limits).
 
 psutil is a core dependency. If it is unavailable, monitoring reports no data and the job continues.
 

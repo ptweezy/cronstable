@@ -39,7 +39,7 @@ from tests.test_state import (
     _state_cfg,
 )
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 
 def _now_utc() -> datetime.datetime:

@@ -326,9 +326,9 @@ DEFAULT_FILESYSTEM: dict[str, Any] = {
     # namespace prefix inside the store; None -> "default". Use the SAME
     # value as state.deploymentId when sharing a mount with the state store.
     "deploymentId": None,
-    # auto (probe the mount) | single-node | shared -- same semantics as
-    # state.topology. Windows/macOS cannot probe; assert `shared` explicitly
-    # there.
+    # auto (probe the mount) | single-node | shared, with the same semantics
+    # as state.topology. Windows/macOS cannot probe; assert `shared`
+    # explicitly there.
     "topology": "auto",
 }
 
@@ -476,7 +476,7 @@ DEFAULT_SUBJECT_TEMPLATE = (
 )
 
 # Same text as the default sentry body (subject + body), JSON-encoded into a
-# {"text": ...} payload -- the shape Slack, Mattermost and Teams incoming
+# {"text": ...} payload, the shape Slack, Mattermost and Teams incoming
 # webhooks accept out of the box. Override `body` for other services (e.g.
 # Discord wants {"content": ...}, ntfy takes a plain-text body).
 DEFAULT_WEBHOOK_BODY_TEMPLATE = (
@@ -540,22 +540,21 @@ DEFAULT_NOTIFY_WEBHOOK_BODY_TEMPLATE = (
 
 # Named (not inlined below) because cronstable.fingerprint compares against it
 # to keep the reporter timeout out of a job's identity while it holds the
-# default -- see canonical_job's omit-when-default rule.
+# default (see canonical_job's omit-when-default rule).
 DEFAULT_REPORT_SHELL_TIMEOUT = 60
 
-# Named for the same fingerprint reason: the push block post-dates the v1
-# identity scheme, so cronstable.fingerprint omits it from a job's canonical
-# form while it still equals these defaults (an all-default block must not
-# repoint every existing job's digest on upgrade).
+# Named for the same fingerprint reason: cronstable.fingerprint omits the push
+# block from a job's canonical form while it equals these defaults, so an
+# all-default block leaves the job's digest unchanged.
 DEFAULT_PUSH_REPORT = {
     "enabled": False,
     "priority": "time-sensitive",
     "includeLogTail": True,
 }
 
-# Named for the same fingerprint reason as DEFAULT_PUSH_REPORT above: the
-# eventlog block post-dates the v1 identity scheme, so cronstable.fingerprint
-# omits it from a job's canonical form while it still equals these defaults.
+# Named for the same fingerprint reason as DEFAULT_PUSH_REPORT above:
+# cronstable.fingerprint omits the eventlog block from a job's canonical form
+# while it equals these defaults.
 DEFAULT_EVENTLOG_REPORT = {
     "enabled": False,
     # The Event Log source name, which is also the registry key name a
@@ -630,8 +629,8 @@ class JobScalarField(NamedTuple):
     """A scalar option's default, YAML validator and v1 identity policy.
 
     Complex values keep their explicit normalization and redaction paths.
-    New behavior-affecting options use ``nondefault`` so old job identities
-    (and the retries/reboot markers they protect) survive an upgrade.
+    Options with ``nondefault`` identity enter the digest only when set away
+    from their default, keeping the default digest stable.
     """
 
     default: Any
@@ -762,8 +761,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "stateAllowedScopes": [],
     "env_file": None,
     # directory the job's process starts in ("Start in" on a Task Scheduler
-    # action).  None, the default, inherits the daemon's own CWD, which is
-    # what every job got before this key existed.
+    # action).  None, the default, inherits the daemon's own CWD.
     "workingDirectory": None,
     "statsd": None,
     "verify": None,
@@ -809,10 +807,9 @@ def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
     onLate that would really fire demands an ``sla`` block to fire about.
 
     Every reporter has to be named here, and a new one is easy to forget:
-    a reporter this function does not know about makes an onLate that WOULD
+    a reporter this function does not know about makes an onLate that would
     really fire skip the "onLate requires sla" check below, so the hook
-    loads clean and is then dead for the life of the config.  That is the
-    exact failure push had until it was added.
+    loads clean and is then dead for the life of the config.
     """
     report = on_late.get("report") or {}
     sentry_dsn = (report.get("sentry") or {}).get("dsn") or {}
@@ -840,7 +837,7 @@ def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
 #: JobConfig._validate_numeric_ranges settle the "onLate requires sla" check
 #: with one identity test instead of walking four nested report chains for
 #: every job in the fleet.  The shortcut is only sound while the stock block
-#: names no destination, so that is checked here rather than assumed -- a
+#: names no destination, so that is checked here rather than assumed: a
 #: plain `if`, not an `assert`, because the release binary runs under -OO.
 _DEFAULT_ONLATE = DEFAULT_CONFIG["onLate"]
 if _onlate_names_a_destination(  # pragma: no cover - dev invariant
@@ -1758,7 +1755,7 @@ def _merge_lists(key: str, base: list, override: list) -> list:
       secrets under one name (mirrors ``environment``).
     - sentry ``fingerprint`` is replace-not-append: a job (or defaults
       block) that supplies its own fingerprint must override the default
-      entirely -- concatenation would silently prepend the three default
+      entirely; concatenation would silently prepend the three default
       entries, making custom Sentry issue grouping impossible.
     """
     if key == "environment":
@@ -1855,9 +1852,9 @@ def _schedule_field(
 
     ``default`` when the key is absent (or set to null); otherwise the
     value rendered to a string, required to be a single non-empty token
-    with no whitespace of any kind -- see
+    with no whitespace of any kind (see
     :func:`schedule_object_to_crontab` for why anything looser corrupts
-    neighbouring columns.
+    neighbouring columns).
     """
     value = spec.get(key)
     if value is None:
@@ -2013,9 +2010,9 @@ class JobConfig:
         self.has_seconds: bool = schedule_has_seconds(self.schedule_unparsed)
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
-        # cluster scope reaches across nodes, so it IS fingerprinted (like
-        # clusterPolicy) -- but only when set, so pre-existing configs keep
-        # their digests (see cronstable.fingerprint.canonical_job).
+        # cluster scope reaches across nodes, so it is fingerprinted (like
+        # clusterPolicy), but only when set away from the default (see
+        # cronstable.fingerprint.canonical_job).
         self.concurrencyScope = config.pop("concurrencyScope")
         self.clusterPolicy = config.pop("clusterPolicy")
         # Catch-up config is deliberately NOT part of the job-set fingerprint
@@ -2286,7 +2283,7 @@ class JobConfig:
                     "unknown timezone: {}".format(timezone)
                 ) from err
         if self.utc:
-            return datetime.timezone.utc
+            return datetime.UTC
         return None
 
     @property
@@ -3379,7 +3376,7 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
         return True
     # A literal loopback of the same family as the wildcard bind, on our own
     # port: unambiguously this node (see the docstring). The family must
-    # match -- a "::"-only bind does not necessarily accept v4, so 127.0.0.1
+    # match: a "::"-only bind does not necessarily accept v4, so 127.0.0.1
     # there could in principle be a different colocated process.
     return _loopback_ip_version(peer_h) in versions
 
@@ -3387,8 +3384,8 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
 def _likely_self_fqdn(peer_host: str, listen: str, node_name: str) -> bool:
     """Whether a peer entry *looks like* this node listed by its FQDN.
 
-    A heuristic for diagnostics only (never used to drop a peer -- that fuzzy
-    match is exactly the dangerous over-match :func:`_is_self_listed` refuses).
+    A heuristic for diagnostics only (never used to drop a peer, since that
+    fuzzy match is the dangerous over-match :func:`_is_self_listed` refuses).
     True when, under a wildcard ``listen``, a peer on our port has a host
     whose first DNS label equals our ``nodeName`` but is not an exact match
     (which :func:`_is_self_listed` would already have dropped). Used to warn
@@ -3451,8 +3448,8 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
     was chosen and attached to the returned config as two derived keys the
     scheduler reads (the backends themselves ignore them):
 
-    * ``shareNodeStats`` -- gossip this node's CPU/memory for the fleet view.
-    * ``observabilityMesh`` -- a resolved, election-inert gossip ClusterConfig
+    * ``shareNodeStats``: gossip this node's CPU/memory for the fleet view.
+    * ``observabilityMesh``: a resolved, election-inert gossip ClusterConfig
       to stand up as a *second* manager (lease backends only); ``None`` under
       ``backend: gossip``, where the election mesh already carries the data.
     """
@@ -3484,7 +3481,8 @@ def _attach_observability(
     if obs is None:
         return
     # explicit opt-out is allowed (configure the overlay mesh for fleet job
-    # summaries but not CPU/memory); defaults on -- sharing load is the point.
+    # summaries but not CPU/memory); defaults on because sharing load is the
+    # point.
     cfg["shareNodeStats"] = obs.get("shareNodeStats", True)
     transport_keys = ("listen", "tls", "peers")
     has_transport = any(obs.get(k) is not None for k in transport_keys)
@@ -3511,8 +3509,8 @@ def _attach_observability(
                     "election mesh, so set cluster.{} instead".format(key, key)
                 )
         return
-    # a lease backend has no node-to-node channel, so the overlay must stand up
-    # its own gossip mesh -- which needs the full gossip transport, and runs
+    # a lease backend has no node-to-node channel, so the overlay stands up
+    # its own gossip mesh, which needs the full gossip transport and runs
     # election-inert (electLeader forced false: it never gates jobs).
     for key in transport_keys:
         if obs.get(key) is None:
@@ -3754,7 +3752,7 @@ def _build_gossip_cluster_config(
     # its mesh through here too.
     cfg = _cluster_base(raw)
     _reject_foreign_store_blocks(cfg, "gossip")
-    # listen/tls/peers are schema-optional now (so a lease backend need not
+    # listen/tls/peers are schema-optional (so a lease backend need not
     # carry them), but the gossip transport requires all three.
     for key in ("listen", "tls", "peers"):
         if cfg.get(key) is None:
@@ -3797,7 +3795,7 @@ def _build_gossip_cluster_config(
         # A bare (unbracketed) IPv6 literal has more colons left in ``host``;
         # rpartition would silently mis-split it (``2001:db8::1`` ->
         # host=``2001:db8:``, port=``1``), passing validation and then failing
-        # opaquely at connect/bind time -- and for a peer, silently dropping it
+        # opaquely at connect/bind time, and for a peer, silently dropping it
         # from quorum with no error. Require the bracketed form instead.
         if ":" in host:
             raise ConfigError(
@@ -3915,9 +3913,8 @@ _GOSSIP_ONLY_CLUSTER_KEYS = (
 def _lease_advisories(raw: dict, backend: str) -> list[str]:
     """Non-fatal advisories for a lease (kubernetes/etcd) cluster block.
 
-    Surfaced (once, via :func:`cluster_config_warnings`) rather than raised so
-    an upgrade does not fail a previously-accepted config; promote to a hard
-    ConfigError behind a deprecation window if stricter validation is wanted.
+    Surfaced once via :func:`cluster_config_warnings` rather than raised as a
+    hard :class:`ConfigError`.
     """
     advisories: list[str] = []
     present = [k for k in _GOSSIP_ONLY_CLUSTER_KEYS if raw.get(k) is not None]
@@ -4047,7 +4044,7 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
             "ServiceAccount bearer token is not sent in cleartext; got "
             # redact any embedded userinfo: a non-https apiServer carrying
             # credentials (http://tok:secret@host) is echoed into this
-            # ConfigError, which the reload loop logs -- never leak the secret.
+            # ConfigError, which the reload loop logs; never leak the secret.
             "{!r}".format(_redact_userinfo(str(api_server)))
         )
     duration = k8s["leaseDurationSeconds"]
@@ -4105,7 +4102,7 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
 
 
 # An RFC 3986 scheme (ALPHA *(ALPHA / DIGIT / "+" / "-" / ".")) followed by
-# ":" -- recognized as a scheme only when "//" (an authority) follows, so a
+# ":", recognized as a scheme only when "//" (an authority) follows, so a
 # scheme-less "user:pass@host" is NOT mistaken for scheme "user".
 _URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:(?=//)")
 
@@ -4614,8 +4611,9 @@ def _is_local_listener(addr: str) -> bool:
     """True if a web ``listen`` address is loopback-only or a unix socket.
 
     These are the addresses on which an unauthenticated ``/mcp`` is
-    acceptable -- nothing off-host can reach them; every other address is
-    routable and must carry authentication (see :func:`_validate_mcp_config`).
+    acceptable because nothing off-host can reach them; every other address
+    is routable and must carry authentication (see
+    :func:`_validate_mcp_config`).
     """
     text = addr if "://" in addr else "http://" + addr
     parsed = _safe_urlparse(text, "web.listen")
@@ -4665,7 +4663,7 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for the MCP server that also need the web section.
 
     Runs at the top-level parse (from :func:`_validate_cross_sections`), where
-    the web and mcp sections are both fully merged -- an ``mcp`` block and the
+    the web and mcp sections are both fully merged; an ``mcp`` block and the
     ``web`` listeners it rides on may legitimately live in different
     config-directory files.
     """
@@ -4743,15 +4741,14 @@ def _push_report_users(config: "CronstableConfig") -> list[str]:
 
 
 def _eventlog_report_users(config: "CronstableConfig") -> list[str]:
-    """Every place the assembled config ENABLES the eventlog reporter.
+    """Every place the assembled config enables the eventlog reporter.
 
     Deliberately a near-copy of :func:`_push_report_users` rather than the
     two sharing one walker.  That function's inner ``_uses`` returns on the
     first matching hook, so it yields at most one name per job, and it feeds
-    a fail-closed refusal whose exact wording operators have been reading
-    since push shipped.  Folding both through one traversal would either
-    change that wording or constrain this one; nine duplicated lines is the
-    cheaper of the two.
+    a fail-closed refusal with its own established wording.  Folding both
+    through one traversal would either change that wording or constrain this
+    one; nine duplicated lines is the cheaper of the two.
     """
 
     def _uses(holder: Any) -> bool:
@@ -5556,7 +5553,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     """Validate constraints spanning jobs and the optional sections.
 
     Runs only at the top-level parse entry point (:func:`parse_config`),
-    on the fully-assembled config -- never inside :func:`_config_from_doc`,
+    on the fully-assembled config, never inside :func:`_config_from_doc`,
     where an included or config-dir sibling file is parsed standalone and
     the section a job depends on may legitimately live in another file.
     """

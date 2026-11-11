@@ -1350,9 +1350,7 @@ async def _schedcore_catchup_calls(tmp_path, policy):
     assert cron.state_backend is not None
     try:
         backend = cron.state_backend
-        now = datetime.datetime(
-            2026, 3, 15, 12, 30, 5, tzinfo=datetime.timezone.utc
-        )
+        now = datetime.datetime(2026, 3, 15, 12, 30, 5, tzinfo=datetime.UTC)
         last = (now - datetime.timedelta(hours=48)).isoformat()
         for name in cron.cron_jobs:
             await backend.append_record(

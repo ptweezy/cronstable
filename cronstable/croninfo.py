@@ -252,8 +252,8 @@ def _engine_accepts(expr: str, hash_key: str | None) -> bool:
     :func:`cronstable.cronexpr.expand_field`) deliberately accept a
     superset of the engine (wrap-around ranges like ``fri-mon``, steps
     whose first stride escapes the field, the classic-crontab-only
-    ``@midnight``), which used to keep the prose affirmative for text
-    the daemon then refuses to load.  The confident phrasing is gated
+    ``@midnight``).  Without this gate, the prose would stay affirmative
+    for text the daemon refuses to load.  The confident phrasing is gated
     on the engine's own verdict instead, per the module contract: what
     the engine rejects reads as a Custom line.  The web page's
     ``describeCron`` gates on the same rules (``cronRejected``); the two
@@ -296,9 +296,9 @@ def describe_cron(
     that already parsed ``expr`` passes the result, and the engine gate
     reuses it instead of parsing a second time.  Every hot caller (the
     schedule preview, the job payload, the calendar feed) holds one
-    already, so the default path is now one parse per request rather than
-    two.  The tab MUST be the parse of ``expr`` under ``hash_key``; a
-    mismatched one would describe a schedule the daemon does not run.
+    already, so the default path parses once per request.  The tab MUST
+    be the parse of ``expr`` under ``hash_key``; a mismatched one would
+    describe a schedule the daemon does not run.
     """
     low = (expr or "").strip().lower()
     if low == "@reboot":
@@ -517,7 +517,7 @@ def next_fires(
             tab = CronTab(text, hash_key=hash_key)
         except (ValueError, KeyError):
             return []
-    zone = tz or datetime.timezone.utc
+    zone = tz or datetime.UTC
     current = start if start is not None else datetime.datetime.now(zone)
     return list(itertools.islice(tab.occurrences(current), count))
 
@@ -609,7 +609,7 @@ def lint_schedule(
         # str(tab) the re-parsing branch would have produced from it
         text = str(tab)
     if now is None:
-        now = datetime.datetime.now(timezone or datetime.timezone.utc)
+        now = datetime.datetime.now(timezone or datetime.UTC)
     findings: list[Finding] = []
     # resolved_differs compares against the canonical str(tab), NOT `text`:
     # on the re-parsing branch above, `text` is the caller's RAW expression,
@@ -907,15 +907,13 @@ class _HostZoneKey:
     __slots__ = ("name", "offset", "samples")
 
     def __init__(self) -> None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         civil = _local_civil(now)
         self.name = civil.tzname()
         self.offset = civil.utcoffset()
         self.samples = tuple(
             _local_civil(
-                datetime.datetime(
-                    now.year, month, 1, tzinfo=datetime.timezone.utc
-                )
+                datetime.datetime(now.year, month, 1, tzinfo=datetime.UTC)
             ).utcoffset()
             for month in range(1, 13)
         )
@@ -963,13 +961,13 @@ def _zone_transition_ordinals(key: _MemoZone, year: int) -> tuple[int, ...]:
     UTC offset differs from the previous day's, for the zone ``key``
     stands for (:func:`_memo_key`).
 
-    This is exactly the step-function boundary detection :func:`_lint_dst`
-    used to walk inline (``offset(d) != offset(d - 1 day)``), but computed
-    once per (zone, year) and cached.  A calendar year has at most a
-    handful of transitions, so the returned tuple is tiny; the cache is
-    bounded and keyed on the ``ZoneInfo`` (hashable, and interned by the
-    ``zoneinfo`` module, so equal zones share an entry) or on the host's
-    current zone for :data:`LOCAL_ZONE`.
+    This is the step-function boundary detection :func:`_lint_dst` relies
+    on (``offset(d) != offset(d - 1 day)``), computed once per (zone,
+    year) and cached.  A calendar year has at most a handful of
+    transitions, so the returned tuple is tiny; the cache is bounded and
+    keyed on the ``ZoneInfo`` (hashable, and interned by the ``zoneinfo``
+    module, so equal zones share an entry) or on the host's current zone
+    for :data:`LOCAL_ZONE`.
     """
     timezone = _memo_zone(key)
     one = datetime.timedelta(days=1)
@@ -992,10 +990,9 @@ def _zone_transitions_in_range(
     """Ascending transition ordinals ``d`` with ``lo < d <= hi``.
 
     Gathers the memoized per-year scans for every calendar year the
-    (lo, hi] window can touch, reproducing :func:`_lint_dst`'s original
-    forward walk over ``day0 + 1 .. day0 + 366`` day-for-day.  Falls back
-    to an uncached scan for the (vanishingly rare) unhashable ``tzinfo``
-    that cannot key the cache.
+    (lo, hi] window can touch, matching a day-for-day forward walk over
+    ``day0 + 1 .. day0 + 366``.  Falls back to an uncached scan for the
+    (vanishingly rare) unhashable ``tzinfo`` that cannot key the cache.
     """
     first_year = datetime.date.fromordinal(lo + 1).year
     last_year = datetime.date.fromordinal(hi).year
@@ -1094,7 +1091,7 @@ def _classify(
     if off0 == off1:
         return None
     aware = civil.replace(tzinfo=timezone)
-    roundtrip = aware.astimezone(datetime.timezone.utc).astimezone(timezone)
+    roundtrip = aware.astimezone(datetime.UTC).astimezone(timezone)
     if roundtrip.replace(tzinfo=None, fold=0) == civil:
         return "fold"
     return "gap"
@@ -1317,7 +1314,7 @@ def why_no_run(
         if kind == "gap":
             shifted = (
                 civil.replace(tzinfo=timezone)
-                .astimezone(datetime.timezone.utc)
+                .astimezone(datetime.UTC)
                 .astimezone(timezone)
             )
             notes.append(
@@ -1502,14 +1499,14 @@ def _fire_cells(
     cap = hours * 60 + 2  # backstop; a minute-granular walk cannot exceed it
     # A fleet duplicates schedules heavily (the whole reason this heatmap
     # exists), and the occurrence walk depends only on the schedule and the
-    # zone -- never the job name.  So walk each distinct (resolved_source,
-    # zone) ONCE into a list of civil (hour, minute) labels, and then GROUP
+    # zone, never the job name.  So walk each distinct (resolved_source,
+    # zone) once into a list of civil (hour, minute) labels, and group
     # the replay too: every entry sharing a walk contributes the same fire
     # to the same cell, so one pass adding `weight * members` per fire is
-    # exact, order-independent and O(distinct schedules x fires) where the
-    # per-entry replay was O(jobs x fires).  ``unwalkable`` marks a schedule
-    # that failed :func:`_minute_tab`, so its entries are skipped without
-    # re-raising.  Everything here is per call: no cross-request state.
+    # exact, order-independent and O(distinct schedules x fires) rather
+    # than O(jobs x fires).  ``unwalkable`` marks a schedule that failed
+    # :func:`_minute_tab`, so its entries are skipped without re-raising.
+    # Everything here is per call: no cross-request state.
     walk_cache: dict[_WalkKey, tuple[list[tuple[int, int]], int]] = {}
     unwalkable: set[_WalkKey] = set()
     members: dict[_WalkKey, list[str]] = {}
@@ -1620,9 +1617,9 @@ def schedule_pressure(
     weigh sub-minute schedules by their fires per matched minute; the
     per-minute JOB counts stay distinct job names.
     """
-    zone = tz or datetime.timezone.utc
+    zone = tz or datetime.UTC
     if start is None:
-        start = datetime.datetime.now(datetime.timezone.utc)
+        start = datetime.datetime.now(datetime.UTC)
     hours = max(1, min(int(hours), PRESSURE_MAX_HOURS))
     grid, cell_jobs, minute_jobs = _fire_cells(entries, start, hours, zone)
     # zip(*grid) walks the 24x60 grid once, one column tuple per minute
@@ -1773,9 +1770,9 @@ def suggest_slot(
         raise ValueError(
             "period must be 'hourly' or 'daily', got {!r}".format(period)
         )
-    zone = tz or datetime.timezone.utc
+    zone = tz or datetime.UTC
     if start is None:
-        start = datetime.datetime.now(datetime.timezone.utc)
+        start = datetime.datetime.now(datetime.UTC)
     if grid is None:
         # only the grid is scored below, so the walk skips the per-cell
         # and per-minute name bookkeeping entirely

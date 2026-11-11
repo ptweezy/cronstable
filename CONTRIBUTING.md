@@ -50,13 +50,13 @@ respect.
 
 ## Development setup
 
-The project targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13, 3.14, and 3.15
+The project targets **Python 3.11 or later** (3.11, 3.12, 3.13, 3.14, and 3.15
 are tested) and runs on **Linux, macOS, and Windows**. The test suite runs on
 all three in CI, including Windows ARM64.
 
 cronstable uses [uv](https://docs.astral.sh/uv/) for local development.
 The `tox-uv` plugin also lets tox use uv to create environments and install
-dependencies. uv can install the Python 3.10–3.15 interpreters used by the
+dependencies. uv can install the Python 3.11 to 3.15 interpreters used by the
 test matrix.
 
 Install uv and fork
@@ -129,8 +129,8 @@ describes:
 Edit [`wiki/`](wiki) in this repo, not the wiki in the browser. The
 [GitHub wiki](https://github.com/ptweezy/cronstable/wiki) is a published copy:
 every push to `main` runs the pipeline's `wiki` job, which mirrors
-`wiki/*.md` onto it (one file per page, named as the page's URL:
-`Web-Dashboard.md` → `/wiki/Web-Dashboard`).
+`wiki/*.md` onto it (one file per page, named as the page's URL, so
+`Web-Dashboard.md` maps to `/wiki/Web-Dashboard`).
 
 The `wiki/` directory is the source of truth. On the next push to `main`, the
 `wiki` job overwrites an edit made in the wiki's web UI and **deletes** a page
@@ -170,8 +170,8 @@ default, its YAML validator, and its identity policy.
 The identity policy controls whether the option's value goes into the job's
 digest, a hash of the job's effective configuration. cronstable stores a job's
 pending retries and its `@reboot` markers with that digest, and drops a pending
-retry or reruns an `@reboot` job when the stored digest differs from the job's.
-The policy has three values:
+retry or reruns an `@reboot` job when the stored digest differs from the
+current digest. The policy has three values:
 
 - `always`: the value is always hashed.
 - `nondefault`: the value is hashed only when it differs from the default.
@@ -186,9 +186,8 @@ option it changes every job's digest. The tests in
 `tests/test_fingerprint.py` compare digests against fixed values and fail when
 one changes.
 
-Options that need normalization or that hold secrets are handled outside the
-table, by their own code in `cronstable/config.py` and
-`cronstable/fingerprint.py`.
+Options that need normalization or hold secrets are handled separately in
+`cronstable/config.py` and `cronstable/fingerprint.py`.
 
 ### Generated build files
 
@@ -205,8 +204,8 @@ files to the generator:
   settings, and `.github/docker-matrix.json` lists the supported image paths
   and platforms.
 
-After changing an input, regenerate with Python 3.11 or newer. The second
-command verifies that every generated file is current:
+After changing an input, regenerate the files. The second command verifies
+that every generated file is current:
 
 ```sh
 python scripts/generate_build_files.py
@@ -214,8 +213,8 @@ python scripts/generate_build_files.py --check
 ```
 
 Commit the generated files with their inputs. CI runs the same verification
-before its static checks. Builds use the checked-in files directly, including
-on Python 3.10, and never run the generator.
+before its static checks. Builds use the checked-in files directly and never
+run the generator.
 
 `requirements/min.txt` pins the minimum runtime and test dependency versions
 for `tox -e mindeps`. Each file in `pyinstaller/requirements/` holds one
@@ -227,11 +226,9 @@ which does not support free-threaded Python. With Python 3.14t or 3.15t
 installed, run `tox -e py314t-posix` or `tox -e py315t-posix` to test the
 standard-library JSON fallback with the same test suite and coverage floor.
 
-On Python 3.15, the `dev` extra skips `isal`, which has no wheel for that
-version, so the `isal` half of `tests/test_gzip.py` doesn't run there. The
-`orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39 or later.
-On an older glibc, installing the `dev` extra builds `orjson` from source,
-which requires a Rust toolchain.
+The `orjson` wheels for Python 3.15 on glibc Linux require glibc 2.39 or
+later. On an older glibc, installing the `dev` extra builds `orjson` from
+source, which requires a Rust toolchain.
 
 ### Dependency floors
 
@@ -246,23 +243,23 @@ these reasons:
   dependency.
 - A bug fix, an API, or (for `tzdata`) zone data that cronstable needs.
 - A release that PyPI withdrew or that can't be imported.
-- The first release with Python 3.10 wheels, or with a wheel for every target
-  that the requirement's marker lists.
+- The first release with wheels for the oldest supported Python (3.11), or
+  with a wheel for every target that the requirement's marker lists.
 
 Write the reason in a comment beside the requirement, and give the `dev`
 extra's copy of the requirement the same floor. A new release on its own
 doesn't move a floor. Dependabot doesn't update `requirements/min.txt`, and
 it changes a range in `pyproject.toml` only when a new release falls outside
-it. When a Dependabot alert names a floor, raise the floor, or dismiss the
-alert with the reason the advisory doesn't affect cronstable. Never lower a
-floor that a security fix set.
+it. When a Dependabot alert flags a floor, either raise the floor or dismiss the
+alert with an explanation of why the advisory doesn't affect cronstable. Never
+lower a floor that a security fix set.
 
 After you change a floor, regenerate the build files and run
-`tox -e mindeps` with Python 3.10. It installs the pins in
-`requirements/min.txt` and runs the test suite on them. The `dev` extra
-doesn't install `kubernetes` or `uvloop`, so `requirements/min.txt` has no pin
-for either, and you test a change to their floors by hand. For `kubernetes`,
-run `tests/test_backend_live.py` against an API server with that release
+`tox -e mindeps` with Python 3.11. It installs the pins in
+`requirements/min.txt` and runs the test suite on them. Because the `dev`
+extra doesn't install `kubernetes` or `uvloop`, `requirements/min.txt` omits
+both; test changes to their floors manually. For `kubernetes`, run
+`tests/test_backend_live.py` against an API server with that release
 installed.
 
 ## Running the checks
@@ -282,11 +279,10 @@ coverage floor. Each test environment exists twice, once per profile, and tox
 skips the one that doesn't match your OS, so the second command works on
 every OS.
 
-The rest of this section is reference for running one check or testing a
-specific kind of change. To run everything, or one check at a time:
+To run all environments or a single check:
 
 ```sh
-tox                # all envs: py310-py315 (each with a windows and a posix
+tox                # all envs: py311-py315 (each with a windows and a posix
                    # profile), lint, mypy, bandit, openapi
 tox -e lint        # ruff check + ruff format --check
 tox -e mypy        # mypy
@@ -389,18 +385,17 @@ systemd-run --user --scope -p Delegate=yes --quiet \
 ```
 
 A test skips when the cgroup can't enforce the caps it needs. For example,
-the tests that need the `cpu` controller skip in a `Delegate=memory pids`
-scope, the packaged unit's setting, and in a user scope on systemd 238 to
-251, which lacks that controller. See
+tests that require the `cpu` controller skip under `Delegate=memory pids`
+(the packaged unit's setting) and in user scopes on systemd 238 to 251, which
+don't delegate `cpu`. See
 [Linux setup](https://github.com/ptweezy/cronstable/wiki/Resource-Limits#linux-setup).
 The `cgroups-live` CI job runs both files in a `Delegate=yes` cgroup and sets
 `CRONSTABLE_LIVE_REQUIRED=1`, so a test that would skip fails instead. A
-second step runs them again under `Delegate=memory pids`, in a slice of its
-own and without `CRONSTABLE_LIVE_REQUIRED`, and fails when a test skips for
-any reason other than the missing `cpu` controller. Job Objects need no
-privileges, so on Windows the live tests in `tests/test_limits_live.py` and
-`tests/test_jobobjects.py` always run, including in the ordinary Windows CI
-cells.
+second step runs them in a separate slice under `Delegate=memory pids` without
+`CRONSTABLE_LIVE_REQUIRED`, and fails if any test skips for a reason other than
+the missing `cpu` controller. Job Objects need no privileges, so on Windows the
+live tests in `tests/test_limits_live.py` and `tests/test_jobobjects.py` always
+run, including in the ordinary Windows CI cells.
 
 The scheduled `nightly` workflow runs only on `main`. It runs the `deep`
 environment, the suite with `PYTHONDEVMODE=1`, and mutation tests for modules
@@ -455,8 +450,7 @@ profiles, and fails when only one side of a branch is annotated.
 
 Release pipeline tests are in `.github/tests`, and the full test suite
 includes them. To run only these tests, for example after you change a
-workflow, use Python 3.11 or newer and run these commands from the repository
-root:
+workflow, run these commands from the repository root:
 
 ```sh
 python -m pip install packaging pytest strictyaml

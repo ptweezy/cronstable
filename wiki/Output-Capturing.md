@@ -22,10 +22,8 @@ and stderr (`captureStderr`, default `true`).
   available to reporters or to the `producesStdout`/`producesStderr` failure
   checks.
 
-Whether a captured stream is re-emitted to cronstable's stdout or stderr depends
-on the original stream, not on which stream was captured. Captured stdout lines
-are written to cronstable's stdout, and captured stderr lines to cronstable's
-stderr.
+Captured stdout lines are written to cronstable's stdout, and captured stderr
+lines are written to cronstable's stderr.
 
 ## Options
 
@@ -120,9 +118,9 @@ the prefix; a custom prefix is concatenated directly with the line.
 ## saveLimit and discarded-line accounting
 
 `saveLimit` bounds how many lines per captured stream are retained for reporting.
-The `StreamReader` does not keep the most recent `N` lines. It keeps the **first
-half and the last half**, so both the beginning and the end of long output
-survive although the middle is dropped:
+`StreamReader` keeps the **first half and the last half** of the output rather
+than only the most recent `N` lines, preserving both the beginning and the end
+when the middle is dropped:
 
 - The first `saveLimit // 2` lines are stored in a top buffer.
 - After the top buffer is full, subsequent lines go into a bottom buffer holding

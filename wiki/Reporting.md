@@ -174,7 +174,7 @@ Notes on behavior:
   TLS connections (`tls` or `starttls`) to servers with self-signed or otherwise
   untrusted certificates fail.
 - The reporter sets an `RFC 5322` `Date` header
-  (`email.utils.format_datetime(datetime.now(timezone.utc))`), for example
+  (`email.utils.format_datetime(datetime.now(UTC))`), for example
   `Wed, 18 Jun 2026 12:34:56 +0000`, not ISO-8601.
 - **Empty-body success emails are skipped.** On a success report, if the
   rendered body is empty after stripping whitespace, no email is sent. (Failure
@@ -262,14 +262,10 @@ Notes on behavior:
 - Capture uses an isolated scope (`sentry_sdk.new_scope()`); the reporter
   applies the configured `fingerprint` and extras per event.
 
-**Fingerprint merge semantics:** `fingerprint` is a replace-not-append setting.
-When a `defaults` block or a job supplies its own `fingerprint`, it overrides the
-default list entirely instead of being concatenated onto the three default
-entries. This is a deliberate special case in the config merge, so you can
-customize Sentry issue grouping.
-
-All other list-valued options merge by concatenation; `environment` (the job env
-list) merges by key. See
+**Fingerprint merge semantics:** When a `defaults` block or a job supplies its
+own `fingerprint`, it replaces the default three-entry list entirely so you can
+customize Sentry issue grouping. All other list-valued options merge by
+concatenation, and `environment` (the job env list) merges by key. See
 [includes, defaults, and multi-file config](Includes-and-Defaults).
 
 Example:

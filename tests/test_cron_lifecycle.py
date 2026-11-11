@@ -1975,7 +1975,7 @@ async def test_reaper_finishes_whole_batch_when_one_job_raises(
             # and returns. Only a regression is still running here, parked in
             # the whole-loop handler's 1-second back-off.
             await asyncio.wait_for(reaper, timeout=0.5)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             reaper.cancel()
             await asyncio.gather(reaper, return_exceptions=True)
 
@@ -2461,7 +2461,7 @@ async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noq
                 ts, event, job = await asyncio.wait_for(
                     tracing_running_job._TRACE.get(), 0.1
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             try:
                 jobnum = known_jobs[job]
@@ -4361,9 +4361,7 @@ async def test_signal_reload_is_immediate_in_subminute_mode(
     # housekeeps when the minute turns, so with the clock frozen
     # mid-minute an immediate SIGHUP reload happens ONLY because
     # signal_reload clears _last_housekeeping_minute.
-    frozen_now = datetime.datetime(
-        2026, 8, 16, 12, 0, 30, tzinfo=datetime.timezone.utc
-    )
+    frozen_now = datetime.datetime(2026, 8, 16, 12, 0, 30, tzinfo=datetime.UTC)
     monkeypatch.setattr("cronstable.cron.get_now", lambda tz: frozen_now)
     monkeypatch.setattr(
         "cronstable.cron.next_sleep_interval", lambda *a: 60.0
@@ -6117,7 +6115,7 @@ async def test_lifecycle_live_pause_keep_keeps_all_on_enumerate_error(
         raise OSError("cannot list")
 
     cron.state_backend.list_stream_names = _boom
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     with caplog.at_level(logging.WARNING, logger="cronstable"):
         keep = await cron._live_pause_keep(
             cron.state_backend, {"j"}, now
@@ -6152,7 +6150,7 @@ async def test_lifecycle_live_pause_keep_skips_removed_and_unreadable_streams(
         raise OSError("cannot read")
 
     backend.list_records = _boom
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     with caplog.at_level(logging.WARNING, logger="cronstable"):
         keep = await cron._live_pause_keep(backend, {"keeper"}, now)
     assert "keeper" in keep
@@ -6397,7 +6395,7 @@ async def test_lifecycle_live_pause_keep_propagates_enumerate_cancel(
 ):
     cron = state_cron
     cron.state_backend.list_stream_names = _lifecycle_cancel
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     with pytest.raises(asyncio.CancelledError):
         await cron._live_pause_keep(cron.state_backend, {"j"}, now)
 
@@ -6410,7 +6408,7 @@ async def test_lifecycle_live_pause_keep_propagates_read_cancel(state_cron):
         {"until": "2099-01-01T00:00:00+00:00"},
     )
     backend.list_records = _lifecycle_cancel
-    now = cronstable.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.UTC)
     with pytest.raises(asyncio.CancelledError):
         await cron._live_pause_keep(backend, {"keeper"}, now)
 
@@ -6573,7 +6571,7 @@ async def _seed_gc_anchor(cron, covered=True):
     manifest ages against), so the anchor also holds under this module's
     autouse frozen clock; on a real clock it is the wall time it always was.
     """
-    now = cron_mod.get_now(datetime.timezone.utc)
+    now = cron_mod.get_now(datetime.UTC)
     backend = cron.state_backend
     await backend.append_record(
         "manifests/old-host",

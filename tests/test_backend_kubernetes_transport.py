@@ -875,9 +875,9 @@ async def test_an_apiserver_that_hangs_times_out(tmp_path):
     async with FakeKubeApiserver() as api:
         async with _connected(tmp_path, api, timeout=1) as t:
             api.inject(hang=True, times=2)
-            with pytest.raises(asyncio.TimeoutError):
+            with pytest.raises(TimeoutError):
                 await t.observe()
-            with pytest.raises(asyncio.TimeoutError):
+            with pytest.raises(TimeoutError):
                 await t.write(_lease_body(), create=True)
 
 

@@ -48,7 +48,7 @@ from cronstable.backends.kubernetes import (
 from cronstable.config import ConfigError, parse_config_string
 from tests._helpers import _utc_now_plus
 
-NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
 
 
 def _backend(extra=""):
@@ -82,6 +82,12 @@ def test_parse_microtime_canonical():
 def test_parse_microtime_fewer_fractional_digits():
     parsed = _parse_microtime("2026-01-01T12:00:00.5Z")
     assert parsed == NOW.replace(microsecond=500000)
+
+
+def test_parse_microtime_more_fractional_digits():
+    # a nanosecond stamp keeps its first six digits
+    parsed = _parse_microtime("2026-01-01T12:00:00.123456789Z")
+    assert parsed == NOW.replace(microsecond=123456)
 
 
 def test_parse_microtime_no_fraction_and_offset():

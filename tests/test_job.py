@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import Mock, patch
 
 import aiosmtplib
@@ -996,7 +996,7 @@ jobs:
             fail_reason="",
             failed=True,
             run_id="run-mock",
-            started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=timezone.utc),
+            started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=UTC),
         )
 
         shell_reporter = cronstable.job.ShellReporter()
@@ -3763,7 +3763,7 @@ async def _capture_shell_reporter_env(
         failed=failed,
         resource_usage=None,
         run_id="run-abc123",
-        started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=timezone.utc),
+        started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=UTC),
         **job_over,
     )
     await cronstable.job.ShellReporter().report(
@@ -4726,10 +4726,6 @@ class _FakeEsmtp(asyncio.Protocol):
         self.transport = transport
         self._reply(b"220 fake ESMTP")
 
-    def connection_lost(self, exc):
-        # 3.10 marks a TLS transport closed only in close()
-        self.transport.close()
-
     def data_received(self, data):
         self.buffer += data
         self._drain()
@@ -4879,7 +4875,7 @@ def _shell_job_mock(job_config):
         # a real RunningJob always carries these; set them so the mock encodes
         # to strings in the reporter's child env rather than raw Mock objects.
         run_id="run-mock",
-        started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=timezone.utc),
+        started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=UTC),
     )
 
 

@@ -42,7 +42,7 @@ from tests._helpers import (
 from tests.test_state_job_primitives import _break_record_reads
 
 _PY = sys.executable
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 
 
 def _utcnow():
@@ -1189,7 +1189,7 @@ async def test_failed_completion_record_is_retried(tmp_path, dag_cron):
 
     # the store stalls exactly when the reaper records the completion
     async def _stalled(dag_name, key, transform):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     orig = cron._dag._mutate
     cron._dag._mutate = _stalled
@@ -1247,7 +1247,7 @@ async def test_stale_sensor_poke_completion_retry_is_fenced(
     # poke 0's completion mutate COMMITS but the caller times out
     async def _partial(dag_name, key, transform):
         await orig(dag_name, key, transform)
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     orig = cron._dag._mutate
     cron._dag._mutate = _partial
@@ -1306,7 +1306,7 @@ async def test_lost_claim_is_released_and_relaunched(tmp_path, dag_cron):
         launches = getattr(adv, "launches", None) or []
         if not fired and any(li.taskkey == "b" for li in launches):
             fired.append(1)
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
         return body, result
 
     orig = cron._dag._mutate
@@ -1484,10 +1484,10 @@ async def test_failed_lost_claim_release_still_launches_the_pass(
         launches = getattr(adv, "launches", None) or []
         if not timed_out and any(li.taskkey == "b" for li in launches):
             timed_out.append("claim")
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
         if timed_out == ["claim"] and result == ["b"]:
             timed_out.append("release")
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
         return body, result
 
     orig = cron._dag._mutate
@@ -3278,7 +3278,7 @@ async def test_read_xcom_list_timeout_is_none(tmp_path, monkeypatch, dag_cron):
     cron = await dag_cron(_XC_YAML)
 
     async def _slow(*a, **k):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     monkeypatch.setattr(jobstate, "artifact_get", _slow)
     # a transient store timeout must NOT read as "published nothing": it
@@ -3654,10 +3654,10 @@ async def test_run_summaries_invalidated_when_the_write_times_out(
 
     async def landing_but_timing_out(ns, key, transform):
         await real_mutate(ns, key, transform)  # the write lands ...
-        raise asyncio.TimeoutError  # ... and the caller still sees a timeout
+        raise TimeoutError  # ... and the caller still sees a timeout
 
     backend.mutate_document = landing_but_timing_out
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(TimeoutError):
         await cron._dag._mutate("xc", "r1", _finish)
     backend.mutate_document = real_mutate
 
@@ -4176,7 +4176,7 @@ async def test_flush_run_completions_requeues_on_stall_and_settles_stale(
     real_mutate = cron._dag._mutate
 
     async def _stalled(name, key, transform):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     cron._dag._mutate = _stalled
     await cron._dag._flush_run_completions(ref, [entry])
@@ -4235,7 +4235,7 @@ async def test_reconcile_on_boot_adopts_active_and_tolerates_timeout(
 
     # a listing timeout for a dag is logged and skipped, never raised.
     async def _timeout(namespace):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     monkeypatch.setattr(cron.state_backend, "list_documents", _timeout)
     cron._dag.forget()
@@ -4845,7 +4845,7 @@ async def test_adopt_one_dag_keys_timeout_returns(
     dagcfg = cron.cron_dags["lin"]
 
     async def _timeout(ns):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     monkeypatch.setattr(cron.state_backend, "list_document_keys", _timeout)
     await cron._dag._adopt_one_dag(
@@ -4887,7 +4887,7 @@ async def test_adopt_one_dag_read_timeout_returns(
     d._terminal_run_keys.pop("lin", None)
 
     async def _timeout(ns, key):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     monkeypatch.setattr(cron.state_backend, "read_document", _timeout)
     await d._adopt_one_dag(cron.state_backend, "lin", dagcfg, full=False)
@@ -4921,7 +4921,7 @@ async def test_adopt_one_dag_full_timeout_and_nonstr_runkeys(
     dagcfg = cron.cron_dags["lin"]
 
     async def _timeout(ns):
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     monkeypatch.setattr(cron.state_backend, "list_documents", _timeout)
     await d._adopt_one_dag(cron.state_backend, "lin", dagcfg, full=True)
@@ -6452,14 +6452,14 @@ async def test_gc_pass_keeps_the_lease_of_a_delete_that_can_still_land(
         if key != keys[1]:
             return await real(namespace, key, transform)
         if ending == "timeout":
-            raise asyncio.TimeoutError
+            raise TimeoutError
         if ending == "builtin":
             raise TimeoutError
         entered.set()
         await asyncio.Event().wait()
 
     raised = {
-        "timeout": asyncio.TimeoutError,
+        "timeout": TimeoutError,
         "builtin": TimeoutError,
         "cancelled": asyncio.CancelledError,
     }[ending]
@@ -6521,7 +6521,7 @@ def test_parse_iso_edge_cases():
     assert dagrun._parse_iso("") is None
     assert dagrun._parse_iso("not-a-date") is None
     dt = dagrun._parse_iso("2026-01-01T00:00:00")  # naive: read as UTC
-    assert dt.tzinfo == datetime.timezone.utc
+    assert dt.tzinfo == datetime.UTC
 
 
 def _at(*fields, offset=0, micro=0):
@@ -6623,7 +6623,7 @@ async def test_reconcile_on_boot_isolates_a_failing_run(
 
     async def flaky(dagcfg_, ref):
         if ref[1] == "boom-run":
-            raise asyncio.TimeoutError()  # a stalled adoption RMW
+            raise TimeoutError()  # a stalled adoption RMW
         return await real(dagcfg_, ref)
 
     monkeypatch.setattr(cron._dag, "_try_own", flaky)

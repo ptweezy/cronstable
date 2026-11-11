@@ -431,7 +431,7 @@ async def test_failed_dates_keep_their_leases_behind_an_abandoned_batch_write(
             return await real(namespace, key, transform)
         abandoned.append(transform)
         if ending == "timeout":
-            raise asyncio.TimeoutError
+            raise TimeoutError
         if ending == "builtin":
             raise TimeoutError
         entered.set()
@@ -446,7 +446,7 @@ async def test_failed_dates_keep_their_leases_behind_an_abandoned_batch_write(
             await asyncio.wait_for(entered.wait(), 5)
             request.cancel()
         raised = {
-            "timeout": asyncio.TimeoutError,
+            "timeout": TimeoutError,
             "builtin": TimeoutError,
             "cancelled": asyncio.CancelledError,
         }[ending]
@@ -480,11 +480,11 @@ async def test_failed_dates_wait_behind_an_abandoned_retention_delete(
         if key != keys[1]:
             return await real(namespace, key, transform)
         abandoned.append(transform)
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     with monkeypatch.context() as patch:
         patch.setattr(backend, "mutate_document", delete)
-        with pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(TimeoutError):
             await cron._dag._delete_run_batch(
                 backend, "flow", _listed(keys[1:])
             )
@@ -520,14 +520,14 @@ async def test_recovery_keeps_the_source_lease_behind_an_abandoned_create(
             return await real(namespace, key, transform)
         abandoned.append(transform)
         if ending == "timeout":
-            raise asyncio.TimeoutError
+            raise TimeoutError
         if ending == "builtin":
             raise TimeoutError
         entered.set()
         await asyncio.Event().wait()
 
     raised = {
-        "timeout": asyncio.TimeoutError,
+        "timeout": TimeoutError,
         "builtin": TimeoutError,
         "cancelled": asyncio.CancelledError,
     }[ending]
@@ -572,7 +572,7 @@ async def test_failed_dates_free_their_leases_when_no_write_is_in_flight(
     async def listing(namespace, **kwargs):
         listed.append(namespace)
         if failure == "listing" and len(listed) == 2:
-            raise asyncio.TimeoutError
+            raise TimeoutError
         return await real_list(namespace, **kwargs)
 
     async def mutate(namespace, key, transform):
@@ -583,9 +583,7 @@ async def test_failed_dates_free_their_leases_when_no_write_is_in_flight(
     with monkeypatch.context() as patch:
         patch.setattr(backend, "list_documents", listing)
         patch.setattr(backend, "mutate_document", mutate)
-        with pytest.raises(
-            asyncio.TimeoutError if failure == "listing" else OSError
-        ):
+        with pytest.raises(TimeoutError if failure == "listing" else OSError):
             await cron._dag.recover_range(*_RANGE, plan_token=token)
     assert listed == ["dagrun/flow"] * 2
     assert await backend.read_document("recoverybatch/flow", token) is None
@@ -1166,7 +1164,7 @@ async def test_recovery_is_unavailable_for_a_lease_operation_that_raises(
     async def timed_out(name, holder, ttl):
         raised_for.append(name)
         await acquire(name, holder, ttl)
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     dates = {"from": _RANGE[1], "to": _RANGE[2]}
     requests = (

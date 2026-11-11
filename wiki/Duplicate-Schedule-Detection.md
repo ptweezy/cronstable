@@ -1,7 +1,7 @@
 # Duplicate schedule detection
 
 Find jobs with identical schedules so you can spread their runs out.
-Cronstable groups jobs by their parsed schedule and timezone, rather
+cronstable groups jobs by their parsed schedule and timezone, rather
 than the spelling of the cron expression. For example, `*/5 * * * *`
 matches `0-59/5 * * * *`, and `@hourly` matches `0 * * * *`.
 

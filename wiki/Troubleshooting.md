@@ -448,13 +448,12 @@ read '<value>' as ...`, followed by the forms the key accepts.
 
 ## Reporting
 
-### SMTP TLS certificate failures after upgrading from yacron
+### SMTP TLS certificate validation failures
 
-**Symptom.** Mail that delivered fine under yacron now fails with a TLS/certificate
-validation error.
+**Symptom.** Mail delivery fails with a TLS or certificate validation error.
 
-**Cause.** The mail `validate_certs` default is `True` (a change from yacron;
-`_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
+**Cause.** `validate_certs` defaults to `True`
+(`_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
 `validate_certs=mail["validate_certs"]` to `aiosmtplib.SMTP`, so delivery to servers
 with self-signed or otherwise invalid certificates fails.
 
@@ -635,7 +634,7 @@ the dashboard cluster panel, and an `ERROR` log line reports the duplicate.
 
 **Cause.** Two processes are running with the **same `nodeName`** (distinguished
 by their random per-process instance ids). Because each would elect itself as the
-lowest name in its own view, both could lead: a silent double-run. The daemon
+lowest name in its own view, both could lead and cause a silent double-run. The daemon
 detects this and **fails `Leader` jobs closed** until it clears (`PreferLeader`
 and `EveryNode` are not gated).
 

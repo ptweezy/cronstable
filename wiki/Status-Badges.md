@@ -58,20 +58,18 @@ memory, so after a restart a job's badge reads `pending` until the job runs
 again. With one, the daemon reads each job's newest records back from its
 [run ledger](Durable-State#the-durable-run-ledger) after a restart, and
 the badge shows the last run they hold. When a job's newest records are
-all slots that a pause skipped, the daemon looks further back for the
-job's last run after the startup reads finish, one job at a time. Until
-that look-back finishes, the badge reads `pending`, or `paused` while the
-pause holds. If a look-back times out, for example because the store is
-slow, the daemon stops looking, and the badges of that job and of the jobs
-still waiting read `pending` until each job runs again. A badge also reads
-`pending` until the job runs again when the daemon can't read the ledger
-at all after a restart.
+all pause-skipped slots, the daemon scans further back for the
+job's last run after the initial startup reads finish, one job at a time.
+While that look-back is pending, the badge reads `pending` (or `paused` while
+the pause holds). If a look-back times out or the ledger cannot be read after a
+restart, the daemon stops scanning, and affected badges read `pending` until
+their jobs run again.
 
 The ledger keeps `state.maxRunsPerJob` records per job (1000 by default),
-skipped slots included. The look-back stops after 10,000 records, even with
-`maxRunsPerJob: 0`, which keeps every record. If a pause skips as many slots
-as the ledger keeps, or 10,000 slots if that's fewer, the last run is out of
-reach, and the badge reads `pending` until the job runs again.
+skipped slots included. The look-back stops after 10,000 records, even when
+`maxRunsPerJob: 0` keeps every record. If a pause skips as many slots
+as the ledger keeps (or 10,000 slots, whichever is smaller), the last run is
+beyond the scan limit and the badge reads `pending` until the job runs again.
 
 A badge reports the runs that the node serving it has on record, as that
 node's dashboard does. In a [cluster](Clustering-and-Leader-Election), point

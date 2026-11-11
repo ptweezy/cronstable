@@ -87,8 +87,8 @@ bugs. The explainer flags both in `notes`:
   execution did. Daemon downtime, `concurrencyPolicy`, or cluster
   leadership are the usual causes.
 - **Disabled jobs** are still explained in full. The payload carries
-  `enabled: false`. A matching instant on a disabled job is its own
-  answer.
+  `enabled: false`; if the timestamp matches a disabled job, the job
+  did not run because it is disabled.
 - **`@reboot` jobs** return `reboot: true` with no checks: they run once
   at daemon startup and never fire on a timetable.
 - **DAG schedules** resolve under their synthetic `dag:<name>` job name,

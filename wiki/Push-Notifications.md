@@ -50,10 +50,9 @@ are both too old, and have no newer Rust toolchain for their
 architectures.
 
 Everywhere else, the extra installs PyNaCl alone and the daemon seals
-`x25519` only, which works on every platform. The daemon logs the suites it
-can seal at startup. If you expected post-quantum sealing and did not get
-it, that line says so. To ask a binary directly, run
-`cronstable --sealable-suites`, which prints one suite per line. On a
+`x25519` only, which works on every platform. The daemon logs its supported
+sealing suites at startup. You can also run `cronstable --sealable-suites` to
+print one supported suite per line. On a
 platform without a wheel, you can attempt post-quantum sealing by
 building `cryptography` 50.0.2 or newer from source
 (`pip install "cryptography>=50.0.2,<51"`, which needs a Rust toolchain and the
@@ -278,7 +277,8 @@ the app next launches, and the pairing screen's upgrade button remains, so
 a cluster where only some nodes carry `cryptography` does not trade the
 pairing back and forth.
 
-The heal trades sealing strength for delivery on purpose. The daemon's
+This fallback prioritizes alert delivery when post-quantum sealing is
+unavailable. The daemon's
 advertisement is authenticated only by the transport, so a party who can
 rewrite two `GET /whoami` answers can move a pairing from `xwing` down to
 `x25519`. On a transport that allows that, the same party can already read

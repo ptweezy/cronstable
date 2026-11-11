@@ -75,7 +75,7 @@ async def _raise_cancelled5(*args, **kwargs):
 
 
 async def _raise_timeout5(*args, **kwargs):
-    raise asyncio.TimeoutError
+    raise TimeoutError
 
 
 def _mem_run5(outcome, minute):
@@ -472,7 +472,7 @@ async def test_rehydrate_rehydrate_from_state_timeout_breaks(tmp_path):
 
     async def _list(stream, **kw):
         if stream.startswith("runs/"):
-            raise asyncio.TimeoutError
+            raise TimeoutError
         return []
 
     cron.state_backend.list_records = _list
@@ -700,7 +700,7 @@ async def test_rehydrate_deeper_read_timeout_spares_the_other_jobs(
         deeper = "max_matches" in kw
         reads.append((stream, deeper))
         if stream == cron._run_stream("j") and deeper:
-            raise asyncio.TimeoutError
+            raise TimeoutError
         return await read(stream, **kw)
 
     cron.state_backend.list_records = _list
@@ -1359,7 +1359,7 @@ async def test_rehydrate_rehydrate_retries_timeout_breaks(tmp_path):
 
     async def _list(stream, **kw):
         if stream.startswith("retries/"):
-            raise asyncio.TimeoutError
+            raise TimeoutError
         return []
 
     cron.state_backend.list_records = _list

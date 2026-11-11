@@ -227,11 +227,11 @@ and the other CLI clients, and the cluster's peer certificates. With OpenSSL
 - A certificate that a CA issued carries an Authority Key Identifier that
   names the CA's key.
 
-A Python linked to OpenSSL 1.1.1, such as the python.org builds of Python
-3.10 for Windows and macOS, makes fewer of these checks. It accepts a
-certificate without an Authority Key Identifier, and a CA certificate
-without a key usage extension, a Subject Key Identifier, or a critical
-`basicConstraints`. To see which OpenSSL a Python links, run
+A Python linked to OpenSSL 1.1.1, such as the python3.11 package on RHEL 8 or
+the python.org builds of Python 3.11.4 and earlier for Windows and macOS,
+makes fewer of these checks. It accepts a certificate without an Authority
+Key Identifier, and a CA certificate without a key usage extension, a
+Subject Key Identifier, or a critical `basicConstraints`. To see which OpenSSL a Python links, run
 `python -c "import ssl; print(ssl.OPENSSL_VERSION)"` with the Python that
 runs cronstable.
 
@@ -342,8 +342,7 @@ Terminating TLS in front of the endpoint is still a valid answer.
 
 ### `ca` here is not `clientCa` there
 
-The third key means the **opposite direction** in the two blocks, so it is worth
-reading twice:
+The third key acts in the **opposite direction** in the two blocks:
 
 | Key | Direction | What it does |
 | --- | --- | --- |
@@ -509,8 +508,8 @@ message names `CRONSTABLE_STATE_CACERT`. Either `state.jobApi.tls.ca` points at
 the wrong anchor for the certificate `state.jobApi.tls.cert` serves, or the
 endpoint's certificate lacks a SAN for the host in `state.jobApi.listen`. That
 URL is the configured host verbatim, so it is the name the certificate must
-cover. A job that reports the endpoint as unreachable instead is a different
-fault. That one really is a bind, port, or network problem.
+cover. A job that reports the endpoint as unreachable instead indicates a
+bind, port, or network problem rather than a TLS failure.
 
 ## See also
 

@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import psutil
@@ -81,7 +81,7 @@ class Daemon:
             '      second: "*/2"\n'
             if scheduled
             else (
-                f'      year: "{datetime.now(timezone.utc).year + 1}"\n'
+                f'      year: "{datetime.now(UTC).year + 1}"\n'
                 '      month: "1"\n      dayOfMonth: "1"\n'
                 '      hour: "0"\n      minute: "0"\n      second: "0"\n'
             )
