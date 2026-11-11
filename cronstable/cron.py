@@ -28,7 +28,6 @@ import time
 import zlib
 from collections import defaultdict, deque
 from collections.abc import (
-    AsyncIterator,
     Awaitable,
     Callable,
     Collection,
@@ -805,6 +804,25 @@ def _api_error(
             headers=clean,
         )
     return factory(text=_error_body(message), content_type="application/json")
+
+
+def _refused_body(request: Any, reason: str) -> web.HTTPException:
+    """The 400 for a request body that the API refuses, logged at WARNING.
+
+    The log line names the request and ``reason``, the sentence the caller
+    gets, so an operator can see why a caller's requests fail. ``reason``
+    holds no value from the body. A stand-in request with no method or
+    path reads as ``a request``.
+    """
+    method = getattr(request, "method", None)
+    path = getattr(request, "path", None)
+    if isinstance(method, str) and isinstance(path, str):
+        # the path is the caller's text: escaped and cut
+        target = "{} {}".format(method, json.dumps(path)[:200])
+    else:
+        target = "a request"
+    logger.warning("web: refused %s: %s", target, reason)
+    return _api_error(web.HTTPBadRequest, reason)
 
 
 def _http_for_action_error(
@@ -2426,8 +2444,12 @@ class Cron:
         # launch appends, so unserialized entries could double-launch.
         # Pruned on reload, never while held.
         self._launch_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        # name -> the task that holds its launch lock (see _launch_lock)
-        self._launch_lock_holders: dict[str, asyncio.Task[Any]] = {}
+        # name -> lock a due retry shares with a launch that carries
+        # supplied values (see _retry_launch_lock). Taken before the launch
+        # lock, and pruned like it.
+        self._retry_launch_locks: dict[str, asyncio.Lock] = defaultdict(
+            asyncio.Lock
+        )
         # name -> last launched slot, status/introspection only: the
         # forward-only next-fire index is what de-duplicates launches.
         self._last_run_slot: dict[str, datetime.datetime] = {}
@@ -3506,6 +3528,14 @@ class Cron:
             {
                 name: lock
                 for name, lock in self._launch_locks.items()
+                if name in keep or lock.locked()
+            },
+        )
+        self._retry_launch_locks = defaultdict(
+            asyncio.Lock,
+            {
+                name: lock
+                for name, lock in self._retry_launch_locks.items()
                 if name in keep or lock.locked()
             },
         )
@@ -6055,7 +6085,7 @@ class Cron:
         name = request.match_info["name"]
         # The body is optional, and a JSON object when present.
         payload = await self._web_json_body(request)
-        self._web_known_fields(payload, "start", "params")
+        self._web_known_fields(payload, "start", "params", request=request)
         try:
             started = await self.start_job(
                 name, payload.get("params"), scopes=self._web_scopes(request)
@@ -6988,17 +7018,21 @@ class Cron:
 
     @staticmethod
     def _web_known_fields(
-        payload: dict[str, Any], action: str, *known: str
+        payload: dict[str, Any],
+        action: str,
+        *known: str,
+        request: web.Request | None = None,
     ) -> None:
         """Refuse a body that holds a field ``action`` does not take.
 
         A misspelled ``params`` would otherwise be dropped, and the run
-        would start with the defaults.
+        would start with the defaults. The log line for the refusal names
+        ``request`` (see _refused_body).
         """
         unknown = sorted(set(payload) - set(known))
         if unknown:
-            raise _api_error(
-                web.HTTPBadRequest,
+            raise _refused_body(
+                request,
                 "unknown {} field {}; the body accepts {}".format(
                     action,
                     ", ".join(json.dumps(key)[:80] for key in unknown[:5]),
@@ -7036,7 +7070,12 @@ class Cron:
         name = request.match_info["name"]
         payload = await self._web_json_body(request)
         self._web_known_fields(
-            payload, "trigger", "params", "logicalDate", "requestId"
+            payload,
+            "trigger",
+            "params",
+            "logicalDate",
+            "requestId",
+            request=request,
         )
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
@@ -7179,6 +7218,12 @@ class Cron:
     async def _web_dag_backfill(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
         payload = await self._web_json_body(request)
+        # A dropped `params` would create every run with the defaults, and
+        # those dates then keep them. The check runs ahead of the dates, so
+        # the refusal names a misspelled `from` or `to`.
+        self._web_known_fields(
+            payload, "backfill", "from", "to", "params", request=request
+        )
         start = payload.get("from")
         end = payload.get("to")
         if not isinstance(start, str) or not isinstance(end, str):
@@ -7186,9 +7231,6 @@ class Cron:
                 web.HTTPBadRequest,
                 "backfill needs string `from` and `to` ISO dates",
             )
-        # A dropped `params` would create every run with the defaults, and
-        # those dates then keep them.
-        self._web_known_fields(payload, "backfill", "from", "to", "params")
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
             result = await self._dag.backfill(
@@ -7257,18 +7299,25 @@ class Cron:
 
     @staticmethod
     async def _web_json_body(request: web.Request) -> dict[str, Any]:
+        """The JSON object in the body of ``request``, or ``{}`` for no body.
+
+        A body that is empty or holds only whitespace counts as no body. A
+        chunked request with no content reads as ``can_read_body`` until
+        its last chunk arrives, so the text that was read decides.
+        """
         if not request.can_read_body:
             return {}
         try:
             body = await request.json()
         except Exception as ex:  # noqa: BLE001 - a malformed body is a 400
-            raise _api_error(
-                web.HTTPBadRequest, "request body is not valid JSON"
+            # ``doc`` is the body text that the decoder was given
+            if isinstance(ex, json.JSONDecodeError) and not ex.doc.strip():
+                return {}
+            raise _refused_body(
+                request, "request body is not valid JSON"
             ) from ex
         if not isinstance(body, dict):
-            raise _api_error(
-                web.HTTPBadRequest, "request body must be a JSON object"
-            )
+            raise _refused_body(request, "request body must be a JSON object")
         return body
 
     def job_runs_payload(self, name: str) -> dict[str, Any] | None:
@@ -12069,26 +12118,6 @@ class Cron:
         self.retry_state[job.name] = ladder
         return ladder
 
-    @contextlib.asynccontextmanager
-    async def _launch_lock(self, name: str) -> AsyncIterator[None]:
-        """Hold the per-job launch lock of ``name``.
-
-        Reentrant within the holding task: a due retry launches through
-        :meth:`maybe_launch_job` while it holds the lock (see
-        _retry_launch_lock).
-        """
-        task = asyncio.current_task()
-        if task is not None and self._launch_lock_holders.get(name) is task:
-            yield
-            return
-        async with self._launch_locks[name]:
-            if task is not None:
-                self._launch_lock_holders[name] = task
-            try:
-                yield
-            finally:
-                self._launch_lock_holders.pop(name, None)
-
     async def maybe_launch_job(
         self,
         job: JobConfig,
@@ -12128,7 +12157,22 @@ class Cron:
                 params=params,
             )
             return True
-        async with self._launch_lock(job.name):
+        # A launch that carries supplied values takes the job's retry lock
+        # before the launch lock, so it stays out of a due retry's launch
+        # (see _retry_launch_lock). A pool admission carries them in its
+        # ticket. It takes the lock under every policy and pool, because a
+        # reload can change either between the retry's snapshot of the job
+        # and this one.
+        supplied = params is not None or (
+            pool_ticket is not None
+            and isinstance(pool_ticket.payload.get("params"), dict)
+        )
+        retry_lock: contextlib.AbstractAsyncContextManager[None] = (
+            self._retry_launch_locks[job.name]
+            if supplied
+            else contextlib.nullcontext()
+        )
+        async with retry_lock, self._launch_locks[job.name]:
             if pool_ticket is not None:
                 catchup_after = _parse_iso_utc(
                     pool_ticket.payload.get("catchupAfter")
@@ -15463,17 +15507,27 @@ class Cron:
     def _retry_launch_lock(
         self, job: JobConfig
     ) -> contextlib.AbstractAsyncContextManager[None]:
-        """The lock a due retry of ``job`` holds from hold check to launch.
+        """The lock a due retry of ``job`` holds from its hold check to its
+        launch.
 
-        Under concurrencyPolicy: Forbid it is the job's launch lock. A start
-        with supplied values that is still spawning holds the retry back.
-        One that arrives while the retry settles waits, and Forbid refuses
-        it if the retry launched. Without the lock, Forbid could refuse a
-        retry whose record the consume already settled, which loses the
-        attempt. A pooled retry waits in its queue entry.
+        For a job with no pool under concurrencyPolicy: Forbid, it is the
+        job's retry lock. Any other retry holds nothing, and a pooled one
+        waits in its queue entry. Every launch that carries supplied values
+        holds the same lock around its launch, whatever its own JobConfig
+        says (see maybe_launch_job).
+
+        Such a launch that is still spawning holds the retry back. One that
+        arrives while the retry settles waits, and Forbid refuses it if the
+        retry launched. Without the lock, Forbid could refuse a retry whose
+        record the consume already settled, which loses the attempt.
+
+        Both take it before the job's launch lock, which the retry holds
+        only to launch. A scheduled fire and a start without values take
+        the launch lock alone, so neither waits for the store calls of a
+        retry that settles.
         """
         if job.pool is None and job.concurrencyPolicy == "Forbid":
-            return self._launch_lock(job.name)
+            return self._retry_launch_locks[job.name]
         return contextlib.nullcontext()
 
     def _retry_hold_reason(self, job: JobConfig) -> str | None:

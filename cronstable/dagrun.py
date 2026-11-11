@@ -1659,12 +1659,32 @@ class DagScheduler:
             return False
         return False
 
+    async def _recheck_lease(self, ref: RunRef) -> bool:
+        """Whether a pass that awaited store reads may go on to claim.
+
+        A pass reads the store to prepare a recovery run and to fetch the
+        XCom values a fan-out or a ``when:`` comparison needs. The reads
+        can outlast the advance lease, and a peer adopts a run whose lease
+        ran out, so the pass claims only on a lease this node still holds.
+        An unexpired lease passes with no store read (see
+        :meth:`_lease_usable`). When an expired lease has no new holder, or
+        the store cannot answer, this node keeps the run and the next
+        advance waits ``ADVANCE_RETRY_DELAY``.
+        """
+        lease = self._owned.get(ref)
+        if lease is not None and await self._lease_usable(ref, lease):
+            return True
+        if ref in self._owned:
+            self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
+        return False
+
     async def _do_advance(self, dagcfg: Any, ref: RunRef) -> None:
         self._pool_waiting.discard(ref)
-        if ref[1].startswith(
-            "recovery-"
-        ) and not await self._prepare_recovery_or_fail(ref):
-            return
+        if ref[1].startswith("recovery-") and not (
+            await self._prepare_recovery_or_fail(ref)
+            and await self._recheck_lease(ref)
+        ):
+            return  # the preparation failed the run, or outlasted the lease
         spec = dagcfg.spec
         now = _now()
         proc = self._cron._proc_token
@@ -1714,6 +1734,8 @@ class DagScheduler:
             # second step.
             expansions = await self._read_expansions(dagcfg, ref, run_id, body)
             conditions = await self._read_conditions(dagcfg, run_id, body)
+            if not await self._recheck_lease(ref):
+                return  # nothing is claimed yet
             unread = any(value is None for value in conditions.values())
             now = _now()
             transform = self._wrap(

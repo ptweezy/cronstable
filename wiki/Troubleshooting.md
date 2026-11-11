@@ -745,6 +745,33 @@ loaded earlier. `fleetWarnings` names such a host for 12 hours after each
 task that it starts, so the list can be empty while the host is idle. Check
 the cronstable version on every node that shares the store.
 
+### After an older build is installed, a task ignores its `when:` condition or reads no parameter
+
+**Symptom.** A node runs an older cronstable build than the one that created
+a workflow run. A task of that run starts although its `when:` condition
+does not hold for the run, or its command reads an unset
+`CRONSTABLE_PARAM_*` variable. The run document records `"engine": 2`.
+
+**Cause.** A build at
+[run engine level](Orchestration-and-DAGs#run-engine-levels) 1 does not read
+the `engine` field. It adopts a run that records level 2 and advances it
+under the rules it knows, without conditions and without parameter
+variables, and it logs nothing about the level.
+
+**Fix.** Before you install an older build on any node of the store, remove
+the level 2 keys from the configuration on every node: a workflow's
+`params:`, `when:`, `skipExitCodes`, and the trigger rules other than
+`all_success` and `all_done`. Then wait until every run whose document
+records `engine: 2` has finished. `GET /dags/{name}/runs/{run_key}` shows
+the field.
+
+If an older build has already started tasks of such a run, install the newer
+build again on each node that runs the older one, with the configuration
+that holds the level 2 keys. The upgraded node decides each task that is
+still `pending` by its `when:` condition and sets the parameter variables
+for the tasks that it starts. A task that the older build ran keeps its
+result.
+
 ### A join task is skipped when one branch skips
 
 **Symptom.** A task below two or more branches ends `skipped` although one
@@ -795,13 +822,20 @@ kind `condition` and a detail such as
 
 **Cause.** The task has a [`when:` condition](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values), and the comparison that
 the detail names did not hold for this run. The text after the colon is what
-the comparison read.
+the comparison read. When the two values look equal, as in
+`xcom extract/mode equals full: the value is full`, the published value can
+end in a space, which the detail does not show.
 
 **Fix.** Start a run whose parameters meet the condition, for example with
 `{"params": {"mode": "full"}}` in the trigger body. A scheduled run stores
 each parameter's default, so a branch that has to run on schedule needs a
 condition that the defaults meet. If a task below the skipped one was skipped
 as well, set `triggerRule: none_failed_min_one_success` on the join.
+
+Under `cmd.exe`, `echo full | cronstable xcom push --key mode` publishes
+`full` followed by a space. Write the pipe with no space before it, as in
+`echo full| cronstable xcom push --key mode`, or publish from PowerShell,
+which adds no space.
 
 ### A condition on an XCom value reads "the key is not published"
 
@@ -822,6 +856,10 @@ same key in `xcom.key`:
 ```bash
 echo "$rows" | cronstable xcom push --key row_count
 ```
+
+Under `cmd.exe`, write the pipe with no space before it, because a space
+there becomes part of the published value (see
+[a skip reason that starts with `xcom`](#a-task-is-skipped-and-its-reason-starts-with-param-or-xcom)).
 
 To skip the task whenever the value is missing, compare with `in` and list
 the accepted values, because a missing value never passes `in`.
@@ -859,18 +897,68 @@ parameter has no default. A refused request creates no run.
 from the workflow's entry in `GET /dags`. A workflow whose configuration
 sets a required parameter cannot be started without a value for it.
 
-### A Windows job or task misreads a parameter that holds `&`, `|`, or `%`
+### A start, a trigger, or a backfill answers `400` and the daemon logs `web: refused`
+
+**Symptom.** `POST /jobs/{name}/start`, `POST /dags/{name}/trigger`, or
+`POST /dags/{name}/backfill` answers `400`, and nothing starts. The `error`
+in the response is `unknown start field "by"; the body accepts params`,
+`request body is not valid JSON`, or `request body must be a JSON object`.
+The daemon logs `web: refused POST "<path>": <reason>` at `WARNING` from
+logger `cronstable`, where `<reason>` is the `error` text:
+
+```text
+web: refused POST "/jobs/report/start": unknown start field "by"; the body accepts params
+web: refused POST "/dags/etl/trigger": unknown trigger field "ref"; the body accepts params, logicalDate, requestId
+web: refused POST "/dags/etl/backfill": unknown backfill field "by", "dryRun"; the body accepts from, to, params
+web: refused POST "/jobs/report/start": request body is not valid JSON
+web: refused POST "/jobs/report/start": request body must be a JSON object
+```
+
+**Cause.** The three routes refuse a body that they cannot use in full, so a
+misspelled `params` never starts a run with the defaults. A webhook sender
+that posts its own payload, or a form-encoded body, gets this answer. The
+daemon checks the body before it looks up the name, so the answer is the
+same for a job or a workflow that is not configured. The line names up to
+five unknown fields and no value from the body.
+
+**Fix.** Send a body that the route accepts:
+
+| Route | Body |
+| --- | --- |
+| `POST /jobs/{name}/start` | No body, or a JSON object with no field other than `params` |
+| `POST /dags/{name}/trigger` | No body, or a JSON object with no field other than `params`, `logicalDate`, and `requestId` |
+| `POST /dags/{name}/backfill` | A JSON object with `from` and `to`, and optionally `params` |
+
+The other routes that read a JSON body log the two `request body` lines in
+the same form.
+
+### A Windows job or task runs part of a parameter value as a command
 
 **Symptom.** A job or a workflow task on Windows reads
-`%CRONSTABLE_PARAM_TARGET%`, and the command misbehaves for a value that
-holds `&`, `|`, or `%`.
+`%CRONSTABLE_PARAM_TARGET%`, and a value that holds `&`, `|`, or `>` runs a
+second command or writes a file. Or the command reads
+`!CRONSTABLE_PARAM_TARGET!` and receives that literal text.
 
-**Cause.** `cmd.exe` parses the text of an expanded `%VAR%` again, so a
-value's special characters act as command syntax.
+**Cause.** `cmd.exe` reads the text of an expanded `%VAR%` as command text,
+so those characters in a value act as command syntax. Double quotes around
+the reference do not protect against a value that holds a double quote.
+`cmd.exe` starts with delayed expansion off, so it does not expand `!VAR!`
+in a `command`.
 
-**Fix.** Read the variable with delayed expansion (`!CRONSTABLE_PARAM_TARGET!`)
-or from PowerShell (`$env:CRONSTABLE_PARAM_TARGET`), and constrain the
-parameter with `allowed` or `pattern` in its declaration.
+**Fix.** Read the variable from PowerShell, with `shell: powershell` and
+`$env:CRONSTABLE_PARAM_TARGET`, or from a script file that turns delayed
+expansion on:
+
+```bat
+@echo off
+setlocal EnableDelayedExpansion
+echo deploy !CRONSTABLE_PARAM_TARGET!
+```
+
+Constrain the parameter with `allowed` or `pattern` in its declaration as
+well. For a value that is the empty string, `%CRONSTABLE_PARAM_TARGET%` in a
+`command` stays as that literal text, because `cmd.exe` treats an empty
+variable as undefined.
 
 ## Concurrency and termination
 

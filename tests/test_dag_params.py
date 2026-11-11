@@ -17,11 +17,16 @@ import json
 import logging
 import math
 import sys
+import types
 
 import pytest
 
 from cronstable import dag, dagrun, params, recovery
-from cronstable.config import ConfigError, parse_config_string
+from cronstable.config import (
+    ConfigError,
+    _validate_cross_sections,
+    parse_config_string,
+)
 from cronstable.cron import (
     _WEB_ALL_SCOPES,
     WEB_PARAMS_SCOPE,
@@ -517,6 +522,19 @@ def test_a_string_default_keeps_text_that_reads_as_another_type():
             id="bad-pattern",
         ),
         pytest.param(
+            "      - name: v\n        default: a\n"
+            "        pattern: 'a{1,99999999999}'\n",
+            "pattern is not a valid regular expression: the repetition "
+            "number is too large",
+            id="pattern-repeat-count-too-large",
+        ),
+        pytest.param(
+            "      - name: v\n        default: a\n"
+            "        pattern: '{}a{}'\n".format("(" * 1000, ")" * 1000),
+            "pattern is not a valid regular expression: maximum recursion",
+            id="pattern-nested-too-deep",
+        ),
+        pytest.param(
             "      - name: v\n        default: a\n        maxLength: 0\n",
             "maxLength must be from 1 to 4096",
             id="max-length-floor",
@@ -573,6 +591,189 @@ def test_params_is_not_a_task_or_a_defaults_key():
             _STATE + "defaults:\n  params:\n    - name: v\n      default: a\n",
             "",
         )
+
+
+@pytest.mark.parametrize(
+    "pattern,nests",
+    [
+        (r"(a+)+", True),
+        (r"(a*)*", True),
+        (r"([a-z0-9]+-?)+", True),
+        (r"(\w+\s*)*", True),
+        (r"(?:a+)+", True),
+        (r"(a+?)+?", True),
+        (r"(a+){2,}", True),
+        # the inner repeat below an alternative or an optional group
+        (r"(a+|b)+", True),
+        (r"((a+)?)+", True),
+        # an optional possessive repeat beside the inner repeat
+        (r"(a+b*+)+", True),
+        # inside a lookahead or a conditional
+        (r"(?=(a+)+b)a*", True),
+        (r"(a)(?(1)(b+)+c|d)", True),
+        # the inner repeat has an upper bound and its count still varies
+        (r"([0-9]{1,3}\.?)+", True),
+        (r"([a-z0-9-]{1,63}\.?)+", True),
+        (r"(a{2,3})+", True),
+        (r"(a{0,2})*", True),
+        (r"((ab){1,3})+", True),
+        # a required item separates the repeats
+        (r"[a-z0-9]+(-[a-z0-9]+)*", False),
+        (r"OPS-[0-9]+", False),
+        (r"[0-9.]+(-rc[0-9]+)?", False),
+        (r"(\w+\s+)*", False),
+        (r"[a-z0-9]{1,63}(\.[a-z0-9]{1,63})*", False),
+        (r"(\d{1,3}\.){3}\d{1,3}", False),
+        # an anchor counts as required
+        (r"(\w+\b\s*)*", False),
+        # the inner repeat runs once at most, or a fixed number of times
+        (r"(a?)*", False),
+        (r"(a{2})+", False),
+        # varying counts with no unbounded repeat around them
+        (r"[A-Z]{2,5}-[0-9]{1,6}", False),
+        (r"(ab){1,3}c", False),
+        # an outer repeat with an upper bound is outside the check
+        (r"(a+){1,3}", False),
+        # possessive repeats and atomic groups
+        (r"(a++)+", False),
+        (r"(a+)++", False),
+        (r"(?:[a-z0-9]++-?)++", False),
+        (r"(?>a+)+", False),
+        (r"(?>(a+)+)", False),
+        # alternatives that overlap are outside the check
+        (r"(a|aa)+", False),
+    ],
+)
+def test_nested_repetition(pattern, nests):
+    assert params.nested_repetition(pattern) is nests
+
+
+@pytest.mark.parametrize(
+    "pattern,short",
+    [
+        # the two repeats are the only choices
+        (r"(a+)+", False),
+        (r"([a-z0-9]+-?)+", False),
+        (r"([0-9]{1,3}\.?)+", False),
+        (r"((a+)?)+", False),
+        (r"(a+b*+)+", False),
+        (r"(a)(?(1)(b+)+c|d)", False),
+        # a third repeat
+        (r"((a+)+)+", True),
+        (r"(\w*\d*)*", True),
+        (r"(?=((a+)+)+b)a*", True),
+        # an alternative
+        (r"(a+|a)+", True),
+        (r"(\w+|\d+)+", True),
+    ],
+)
+def test_nested_repetition_under_a_short_max_length(pattern, short):
+    assert params.SHORT_MAX_LENGTH == 16
+    assert params.nested_repetition(pattern, 16) is short
+    for longer in (17, None):
+        assert params.nested_repetition(pattern, longer) is True
+
+
+_SLUG = (
+    "      - name: slug\n        default: a\n"
+    "        pattern: '([a-z0-9]+-?)+'\n"
+)
+
+
+def _nested_repeat_warnings(caplog, yaml):
+    """The config ``yaml`` loads to, and each nested-repeat warning."""
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        config = parse_config_string(_STATE + yaml, "")
+        _validate_cross_sections(config)
+    messages = [record.getMessage() for record in caplog.records]
+    return config, [m for m in messages if "unbounded repeat" in m]
+
+
+def test_a_nested_repeat_pattern_warns_at_load_and_still_loads(caplog):
+    # the second parameter separates the same repeats with a required `-`
+    body = _SLUG + (
+        "      - name: tag\n        default: a\n"
+        "        pattern: '[a-z0-9]+(-[a-z0-9]+)*'\n"
+    )
+    job = (
+        "jobs:\n  - name: publish\n    command: 'x'\n"
+        "    schedule: '0 0 1 1 *'\n    params:\n"
+    )
+    config, warned = _nested_repeat_warnings(
+        caplog, _one_param(body) + job + body
+    )
+    assert warned == [
+        "{}: param 'slug': the pattern holds a repeat inside an unbounded "
+        "repeat with nothing required between them, as (a+)+ does. "
+        "Checking a value that does not match can take time that grows "
+        "exponentially with the length of the value, and the daemon "
+        "schedules nothing until the check ends. Require a character "
+        "between the repeats, or make the inner repeat possessive, as in "
+        "(a++)+".format(owner)
+        for owner in ("job 'publish'", "dag 'd'")
+    ]
+    for declared in (config.jobs[0].params, config.dags[0].spec.params):
+        slug = declared[0]
+        assert slug.pattern == "([a-z0-9]+-?)+"
+        assert params.check_value(slug, "release-2") is None
+
+
+def _warned_params(caplog, body):
+    """The name of each parameter of ``body`` that draws the warning."""
+    _config, warned = _nested_repeat_warnings(caplog, _one_param(body))
+    return [message.split("'")[3] for message in warned]
+
+
+def test_a_short_max_length_silences_the_nested_repeat_warning(caplog):
+    # two repeats and no other choice: quiet up to 16 characters
+    body = "".join(
+        "      - name: {}\n        default: a\n"
+        "        pattern: '([a-z0-9]+-?)+'\n{}".format(name, limit)
+        for name, limit in (
+            ("at16", "        maxLength: 16\n"),
+            ("at17", "        maxLength: 17\n"),
+            ("unlimited", ""),
+        )
+    )
+    assert _warned_params(caplog, body) == ["at17", "unlimited"]
+
+
+def test_a_short_max_length_keeps_the_warning_for_a_further_choice(caplog):
+    # a third repeat or an alternative makes a 16-character check slow
+    body = "".join(
+        "      - name: {}\n        default: a\n        maxLength: 16\n"
+        "        pattern: '{}'\n".format(name, pattern)
+        for name, pattern in (
+            ("deeper", "((a+)+)+"),
+            ("either", "(a+|a+)+"),
+            ("plain", "(a+)+"),
+        )
+    )
+    assert _warned_params(caplog, body) == ["deeper", "either"]
+
+
+def _parse_fails(pattern):
+    raise RecursionError
+
+
+@pytest.mark.parametrize(
+    "parser",
+    [
+        None,
+        types.SimpleNamespace(parse=_parse_fails),
+        types.SimpleNamespace(parse=lambda pattern: [("repeat",)]),
+    ],
+    ids=["missing", "raises", "another-tree-shape"],
+)
+def test_a_parser_failure_loses_only_the_warning(caplog, monkeypatch, parser):
+    monkeypatch.setattr(params, "_PARSER", parser)
+    assert params.nested_repetition("(a+)+") is False
+    config, warned = _nested_repeat_warnings(caplog, _one_param(_SLUG))
+    assert warned == []
+    (slug,) = config.dags[0].spec.params
+    assert slug.pattern == "([a-z0-9]+-?)+"
+    assert params.check_value(slug, "release-2") is None
+    assert params.check_value(slug, "Release") is not None
 
 
 # --------------------------------------------------------------------------

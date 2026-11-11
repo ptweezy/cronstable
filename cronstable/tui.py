@@ -1307,6 +1307,42 @@ def pad_to(text: str, width: int) -> str:
     return text + " " * (width - w)
 
 
+def input_tail(text: str, room: int) -> str:
+    """``text`` as an input row shows it in ``room`` cells: whole when it
+    fits, else its end behind an ellipsis, so the cursor stays in view."""
+    if text_width(text) <= room:
+        return text
+    start = len(text)
+    used = 1  # the ellipsis
+    while start and used + char_width(text[start - 1]) <= room:
+        start -= 1
+        used += char_width(text[start])
+    return _ELLIPSIS + text[start:]
+
+
+def wrap_cells(text: str, width: int) -> list[str]:
+    """Plain ``text`` as lines of at most ``width`` cells, broken at
+    spaces. A word wider than a line is split."""
+    lines: list[str] = []
+    line = ""
+    for word in text.split():
+        joined = "%s %s" % (line, word) if line else word
+        if text_width(joined) <= width:
+            line = joined
+            continue
+        if line:
+            lines.append(line)
+        while text_width(word) > width:
+            # a character wider than the line still takes a line
+            head = truncate(word, width, "") or word[:1]
+            lines.append(head)
+            word = word[len(head) :]
+        line = word
+    if line:
+        lines.append(line)
+    return lines
+
+
 #: Flattened-string memo for :func:`oneline`.  The schedule and command
 #: cells flatten the same poll-stable strings on every frame, so the memo
 #: is warm from the first paint; capped and reset wholesale like _CHAR_W
@@ -3360,6 +3396,18 @@ INPUT_HOMES = {
     "jobparams": "drawer",
 }
 
+#: The drawers' input rows and their labels. A row that takes parameters
+#: lists the declared ones on the line under it.
+INPUT_ROW_LABELS = {
+    "backfill": "backfill FROM..TO: ",
+    "params": "run with: ",
+    "jobparams": "run with: ",
+}
+
+#: An input row keeps at most this many cells of a refusal, because it wraps
+#: the kept text on every frame.
+REFUSAL_MAX = 2000
+
 
 #: payload types of the per-frame memo slots (see App.__init__)
 _TimelineEntry = tuple[str, str | None, str, Any, str, Any]
@@ -3502,6 +3550,9 @@ class App:
         self.booting = False
         self.focus: str | None = None
         self.inputs: dict[str, str] = dict.fromkeys(INPUT_HOMES, "")
+        # why an input row's last commit failed, as (input, toast kind,
+        # text): the row shows it until an edit
+        self.refusal: tuple[str, str, str] | None = None
         self.quit = False
         self._start_job = start_job
         self._boot_override = boot
@@ -3722,6 +3773,24 @@ class App:
         # toasts embed job names and server error strings; flatten and
         # strip escapes so API-derived text cannot reach the tty raw
         self.toasts.append((kind, oneline(message), time.monotonic() + 3.0))
+        self.mark()
+
+    def _refused(
+        self, row: str | None, kind: str, payload: Any, action: str
+    ) -> None:
+        """Report a failed ``action``. The toast leads with the daemon's
+        reasons from ``payload``, which keeps them inside the toast's cut.
+        Input ``row`` shows them on the line under it."""
+        reasons = _refusal_reasons(payload)
+        self.toast(kind, "%s (%s)" % (reasons, action) if reasons else action)
+        if row is not None:
+            self.refuse_input(row, kind, reasons or action)
+
+    def refuse_input(self, name: str, kind: str, text: str) -> None:
+        """Show ``text`` on the line under input row ``name``: why its
+        commit failed."""
+        # flattened and stripped of escapes, as a toast is, then cut
+        self.refusal = (name, kind, truncate(oneline(text), REFUSAL_MAX))
         self.mark()
 
     def top_overlay(self) -> str | None:
@@ -4821,18 +4890,17 @@ def param_hint(declared: Any) -> str:
     return "  ".join(bits)
 
 
-def _error_detail(payload: Any) -> str:
-    """The suffix a failed action's toast adds for an error envelope: the
-    daemon's reason and, for refused parameters, the reason per name."""
-    if not isinstance(payload, dict) or not payload.get("error"):
+def _refusal_reasons(payload: Any) -> str:
+    """Why the daemon refused an action, from its error envelope: the
+    reason per refused parameter, or else the envelope's own reason."""
+    if not isinstance(payload, dict):
         return ""
-    detail = " — %s" % payload["error"]
     errors = payload.get("paramErrors")
     if isinstance(errors, dict) and errors:
-        detail += ": " + "; ".join(
+        return "; ".join(
             "%s %s" % (name, why) for name, why in sorted(errors.items())
         )
-    return detail
+    return str(payload.get("error") or "")
 
 
 def _backfill_counts(payload: Any) -> str:
@@ -4857,11 +4925,14 @@ class AppActions(App):
 
     # ---- job actions (instant + toast, exactly like the page) -------
     async def run_job(
-        self, name: str, params: dict[str, Any] | None = None
+        self,
+        name: str,
+        params: dict[str, Any] | None = None,
+        row: str | None = None,
     ) -> bool:
         """POST the start; ``params`` are sent only when given. Returns
         whether the daemon accepted it: the job started, was queued, or
-        waits for its cluster slot."""
+        waits for its cluster slot. On a failure, input ``row`` shows why."""
         path = "/jobs/%s/start" % _quote(name)
         try:
             if params:
@@ -4875,10 +4946,12 @@ class AppActions(App):
             self.focus = "token"
             return False
         except TimeoutError:
-            self.toast("fail", "start %s: no answer from the daemon" % name)
+            self._refused(
+                row, "fail", None, "start %s: no answer from the daemon" % name
+            )
             return False
         except Exception as exc:  # noqa: BLE001 - toast + carry on
-            self.toast("fail", "start %s: %s" % (name, exc))
+            self._refused(row, "fail", None, "start %s: %s" % (name, exc))
             return False
         if status in (200, 202):
             if isinstance(payload, dict) and payload.get("pending") is True:
@@ -4900,16 +4973,12 @@ class AppActions(App):
         if status == 409:
             # a disabled job, or a concurrencyPolicy that admitted no run:
             # the daemon's reason says which
-            self.toast(
-                "warn",
-                "%s did not start%s" % (name, _error_detail(payload)),
-            )
+            self._refused(row, "warn", payload, "%s did not start" % name)
         elif status == 404:
-            self.toast("fail", "no such job: %s" % name)
+            self._refused(row, "fail", None, "no such job: %s" % name)
         else:
-            self.toast(
-                "fail",
-                "start %s: HTTP %d%s" % (name, status, _error_detail(payload)),
+            self._refused(
+                row, "fail", payload, "start %s: HTTP %d" % (name, status)
             )
         return False
 
@@ -4929,6 +4998,7 @@ class AppActions(App):
         elif self.top_overlay() != "drawer":
             self.open("drawer")  # beneath another overlay: raise the row
         self.inputs["jobparams"] = ""
+        self.refusal = None
         self.focus = "jobparams"
         self.mark()
 
@@ -4945,8 +5015,12 @@ class AppActions(App):
             )
         except ValueError as exc:
             self.toast("warn", "params: %s" % exc)
+            self.refuse_input("jobparams", "warn", str(exc))
             return
-        if await self.run_job(name, params) or self.focus != "jobparams":
+        if (
+            await self.run_job(name, params, row="jobparams")
+            or self.focus != "jobparams"
+        ):
             self.inputs["jobparams"] = ""
             if self.focus == "jobparams":
                 self.focus = None
@@ -5297,14 +5371,18 @@ class AppActions(App):
         elif self.top_overlay() != "dag":
             self.open("dag")  # beneath another overlay: raise the row
         self.inputs["params"] = ""
+        self.refusal = None
         self.focus = "params"
         self.mark()
 
     async def dag_trigger(
-        self, name: str, params: dict[str, Any] | None = None
+        self,
+        name: str,
+        params: dict[str, Any] | None = None,
+        row: str | None = None,
     ) -> bool:
         """POST the trigger; ``params`` are sent only when given. Returns
-        whether the run was created."""
+        whether the run was created. On a failure, input ``row`` shows why."""
         path = "/dags/%s/trigger" % _quote(name)
         try:
             if params:
@@ -5317,16 +5395,25 @@ class AppActions(App):
             self.open("token")
             self.focus = "token"
             return False
+        except TimeoutError:
+            # the daemon may have the request, so a retry can add a second run
+            self._refused(
+                row,
+                "fail",
+                None,
+                "trigger %s: no answer from the daemon; the run may still"
+                " have started" % name,
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
-            self.toast("fail", "trigger %s: %s" % (name, exc))
+            self._refused(row, "fail", None, "trigger %s: %s" % (name, exc))
             return False
         if status == 200 and isinstance(payload, dict):
             self.toast("ok", "▶ %s run %s" % (name, payload.get("runKey", "")))
             self._spawn(self._load_dag_runs())
             return True
-        self.toast(
-            "fail",
-            "trigger %s: HTTP %d%s" % (name, status, _error_detail(payload)),
+        self._refused(
+            row, "fail", payload, "trigger %s: HTTP %d" % (name, status)
         )
         return False
 
@@ -5343,8 +5430,12 @@ class AppActions(App):
             )
         except ValueError as exc:
             self.toast("warn", "params: %s" % exc)
+            self.refuse_input("params", "warn", str(exc))
             return
-        if await self.dag_trigger(name, params) or self.focus != "params":
+        if (
+            await self.dag_trigger(name, params, row="params")
+            or self.focus != "params"
+        ):
             self.inputs["params"] = ""
             if self.focus == "params":
                 self.focus = None
@@ -5375,11 +5466,12 @@ class AppActions(App):
         else:
             self.toast("fail", "%s: HTTP %d" % (decision, status))
 
-    async def dag_backfill(self, spec: str) -> None:
+    async def dag_backfill(self, spec: str) -> bool:
         """``from..to`` ISO dates from the backfill input row, and after
-        them any ``name=value`` run parameters."""
+        them any ``name=value`` run parameters. Returns whether the daemon
+        queued the backfill. On a failure, the row shows why."""
         if not self.dag_name:
-            return
+            return False
         try:
             words = split_words(spec)
             params = parse_param_words(
@@ -5388,12 +5480,15 @@ class AppActions(App):
             )
         except ValueError as exc:
             self.toast("warn", "backfill: %s" % exc)
-            return
+            self.refuse_input("backfill", "warn", str(exc))
+            return False
         dates = " ".join(w for w in words if "=" not in w)
         parts = [p.strip() for p in re.split(r"\.\.| ", dates) if p.strip()]
         if len(parts) != 2:
-            self.toast("warn", "backfill wants: FROM..TO (ISO dates)")
-            return
+            wants = "backfill wants: FROM..TO (ISO dates)"
+            self.toast("warn", wants)
+            self.refuse_input("backfill", "warn", wants)
+            return False
         body: dict[str, Any] = {"from": parts[0], "to": parts[1]}
         if params:
             body["params"] = params
@@ -5404,18 +5499,35 @@ class AppActions(App):
         except Unauthorized:
             self.open("token")
             self.focus = "token"
-            return
+            return False
+        except TimeoutError:
+            self._refused(
+                "backfill", "fail", None, "backfill: no answer from the daemon"
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
-            self.toast("fail", "backfill: %s" % exc)
-            return
+            self._refused("backfill", "fail", None, "backfill: %s" % exc)
+            return False
         if status == 200:
             self.toast("ok", "▶ backfill queued" + _backfill_counts(payload))
             self._spawn(self._load_dag_runs())
-        else:
-            self.toast(
-                "fail",
-                "backfill: HTTP %d%s" % (status, _error_detail(payload)),
-            )
+            return True
+        self._refused(
+            "backfill", "fail", payload, "backfill: HTTP %d" % status
+        )
+        return False
+
+    async def dag_backfill_from_input(self, text: str) -> None:
+        """The backfill row's commit. An empty row closes, and a refused row
+        stays focused with its text, so the operator corrects it in place."""
+        if (
+            not (text and self.dag_name)
+            or await self.dag_backfill(text)
+            or self.focus != "backfill"
+        ):
+            self.inputs["backfill"] = ""
+            if self.focus == "backfill":
+                self.focus = None
 
     def save_log(self) -> None:
         """The Logs tab's download button: write the buffer to a file."""
@@ -5947,6 +6059,7 @@ class AppKeys(AppPalette):
 
     async def _input_commit(self, name: str) -> None:
         value = self.inputs[name].strip()
+        self.refusal = None  # a commit sets its own
         if name == "filter":
             self.focus = None
         elif name == "token":
@@ -5978,11 +6091,7 @@ class AppKeys(AppPalette):
         elif name == "sandbox":
             self.focus = None  # results render live; Enter just settles
         elif name == "backfill":
-            spec = value
-            self.inputs["backfill"] = ""
-            self.focus = None
-            if spec:
-                await self.dag_backfill(spec)
+            await self.dag_backfill_from_input(value)
         elif name == "params":
             await self.dag_trigger_from_input(value)
         elif name == "jobparams":
@@ -6005,6 +6114,8 @@ class AppKeys(AppPalette):
         if buf is None:
             return
         self.inputs[name] = buf
+        if buf != before and self.refusal and self.refusal[0] == name:
+            self.refusal = None  # it was for the text before this edit
         if name == "filter":
             self.filter_text = buf
             if self._filter_hold:
@@ -6505,6 +6616,7 @@ class AppKeys(AppPalette):
             await self.dag_trigger_or_prompt(self.dag_name)
             return
         if key == "b":
+            self.refusal = None
             self.focus = "backfill"
             return
         if self.dag_tab == "runs":
@@ -8713,6 +8825,37 @@ class AppDrawers(AppOverlays):
             )
         return " " + "".join(spans) + paint.style("  ←/→ switch", "dim")
 
+    def _input_rows(
+        self, paint: Painter, name: str, declared: Any, width: int, lines: int
+    ) -> list[str]:
+        """Input row ``name`` and the lines under it: why its last commit
+        failed, or else the ``declared`` parameters."""
+        label = INPUT_ROW_LABELS[name]
+        room = max(1, width - 4)
+        rows = [
+            " "
+            + paint.style(label, "dim")
+            + paint.style(
+                input_tail(self.inputs[name], max(1, room - len(label))) + "▌",
+                "bright",
+            )
+        ]
+        refusal = self.refusal
+        if refusal is not None and refusal[0] == name:
+            # wrapped, and cut past a quarter of the panel's height
+            held = wrap_cells(refusal[2], room)
+            limit = max(1, lines // 4)
+            if len(held) > limit:
+                held[limit - 1 :] = [
+                    truncate(" ".join(held[limit - 1 :]), room)
+                ]
+            rows += [" " + paint.style(line, refusal[1]) for line in held]
+        elif declared:
+            rows.append(
+                " " + paint.style(truncate(param_hint(declared), room), "dim")
+            )
+        return rows
+
     # ---- the job drawer ---------------------------------------------
     def render_drawer_panel(
         self, paint: Painter, width: int, lines: int
@@ -8755,16 +8898,9 @@ class AppDrawers(AppOverlays):
                 )
             )
         if self.focus == "jobparams":
-            rows += [
-                " "
-                + paint.style("run with name=value (Enter runs): ", "dim")
-                + paint.style(self.inputs["jobparams"] + "▌", "bright"),
-                " "
-                + paint.style(
-                    truncate(param_hint(job.get("params")), max(1, width - 4)),
-                    "dim",
-                ),
-            ]
+            rows += self._input_rows(
+                paint, "jobparams", job.get("params"), width, lines
+            )
         rows += [
             self._tabs_row(paint, self.DRAWER_TABS, self.drawer_tab),
             paint.hline(width - 2),
@@ -9451,29 +9587,10 @@ class AppDrawers(AppOverlays):
             self._tabs_row(paint, self.DAG_TABS, self.dag_tab),
             paint.hline(width - 2),
         ]
-        declared = dag.get("params")
-        if self.focus == "backfill":
-            rows.insert(
-                2,
-                " "
-                + paint.style(
-                    "backfill FROM..TO name=value: "
-                    if declared
-                    else "backfill FROM..TO: ",
-                    "dim",
-                )
-                + paint.style(self.inputs["backfill"] + "▌", "bright"),
+        if self.focus in ("backfill", "params"):
+            rows[2:2] = self._input_rows(
+                paint, self.focus, dag.get("params"), width, lines
             )
-        elif self.focus == "params":
-            rows[2:2] = [
-                " "
-                + paint.style("run with name=value (Enter runs): ", "dim")
-                + paint.style(self.inputs["params"] + "▌", "bright"),
-                " "
-                + paint.style(
-                    truncate(param_hint(declared), max(1, width - 4)), "dim"
-                ),
-            ]
         body_lines = lines - len(rows) - 1
         if self.dag_tab == "runs":
             rows.extend(self._dag_runs_tab(paint, width, body_lines))

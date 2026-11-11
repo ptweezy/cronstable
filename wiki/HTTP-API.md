@@ -670,7 +670,9 @@ declared JSON type, and the answer lists the values the run takes:
 - A body that is not a JSON object, and one that holds any other field,
   answers `400` and starts nothing. A request that misspells `params` is
   refused, so the job does not run with its defaults in place of the values
-  the request meant to send.
+  the request meant to send. The daemon logs the refusal at `WARNING` with
+  the request path and the names of the unknown fields (see
+  [Troubleshooting](Troubleshooting#a-start-a-trigger-or-a-backfill-answers-400-and-the-daemon-logs-web-refused)).
 - The `202` of a pooled job carries `params` as well, and the queue entry
   keeps the values until the pool admits the run.
 
@@ -1266,7 +1268,7 @@ and is present for a DAG that declares parameters.
 | Status | When |
 | --- | --- |
 | `200` | The run exists. `created` says whether this request created it. |
-| `400` | Invalid JSON, an unknown body field, an unusable `logicalDate` or `requestId`, or refused parameters. |
+| `400` | A body that is not a JSON object, an unknown body field, an unusable `logicalDate` or `requestId`, or refused parameters. The daemon logs the first two at `WARNING` (see [Troubleshooting](Troubleshooting#a-start-a-trigger-or-a-backfill-answers-400-and-the-daemon-logs-web-refused)). |
 | `403` | The token lacks `control`, or the body has a non-empty `params` object and the token lacks `params`. |
 | `404` | The DAG is not configured. |
 | `409` | `requestId` names a run that has other parameters or another logical date. |
@@ -1290,7 +1292,19 @@ run unless one already exists, so repeating a backfill creates no duplicate.
 One request covers at most 100 dates.
 
 The body accepts `from`, `to`, and `params`, and any other field answers
-`400`, so a misspelled key never starts a backfill.
+`400`, so a misspelled key never starts a backfill. The daemon logs that
+refusal at `WARNING` (see
+[Troubleshooting](Troubleshooting#a-start-a-trigger-or-a-backfill-answers-400-and-the-daemon-logs-web-refused)).
+A body that holds only those fields, with `from` or `to` missing or not a
+string, answers `400` with
+``backfill needs string `from` and `to` ISO dates``, and the daemon logs
+nothing for it.
+
+`from` and `to` are each an RFC 3339 date or date and time, such as
+`2026-01-05` or `2026-01-05T02:00:00+00:00`. A value without an offset is
+read as UTC, and a date alone is read as midnight. An ISO 8601 basic form
+such as `20260105T020000Z`, a week date, and a fraction written with a
+comma answer `400` with `bad date range`.
 
 For a DAG that declares
 [run parameters](Orchestration-and-DAGs#run-parameters), the body also takes
@@ -1845,12 +1859,13 @@ read-only MCP session, the mutating tools and `cron_preview_recovery` need `cont
 `cron_decide_gate` needs `approve`. No token takes through `/mcp` an action
 this table denies it over REST.
 
-No route requires `params` by itself. The trigger and backfill handlers
-check it when the request body carries a non-empty `params` object, and so
-do `cron_trigger_dag` and `cron_backfill_dag`. The recovery handlers and
-`cron_recover_dag` check it when an execution reuses values other than the
-declared defaults. A recovery preview needs `control` alone. A daemon with no
-token configured accepts parameter values, as it accepts every action.
+No route requires `params` by itself. The job start, trigger, and backfill
+handlers check it when the request body carries a non-empty `params` object,
+and so do `cron_run_job`, `cron_trigger_dag`, and `cron_backfill_dag`. The
+recovery handlers and `cron_recover_dag` check it when an execution reuses
+values other than the declared defaults. A recovery preview needs `control`
+alone. A daemon with no token configured accepts parameter values, as it
+accepts every action.
 
 The two failure modes are distinct:
 

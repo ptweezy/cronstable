@@ -65,7 +65,7 @@ The web page's shortcut table applies verbatim to both frontends. Press
 | `/` | Focus the filter |
 | `j` / `↓`, `k` / `↑` | Select the next / previous job |
 | `Enter` | Open the selected job |
-| `r` / `x` | Run / cancel the selected job. For a job that declares [run parameters](Commands-and-Environment#params), `r` opens a row in the job's drawer that takes `name=value` pairs, and an empty row runs the job with its defaults. |
+| `r` / `x` | Run / cancel the selected job. For a job that declares [run parameters](Commands-and-Environment#params), `r` opens a row in the job's drawer that takes `name=value` pairs, and an empty row runs the job with its defaults. When the daemon refuses the start, the row stays open and shows the daemon's reasons under it until you edit the text. |
 | `p` | Pause or resume the selected job |
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
@@ -150,7 +150,10 @@ The TUI includes:
   their defaults. `Enter` on an empty row runs the workflow with the
   defaults, and a quoted value can hold spaces. The backfill row takes the
   same pairs after the dates, and the **Tasks** tab shows the values the
-  selected run stores.
+  selected run stores. When the daemon refuses a trigger or a backfill, the
+  row stays open with its text. The line under the row shows the daemon's
+  reasons, such as `batch_size must be at least 1; ticket is required`,
+  until you edit the text.
 - The **cluster panel**, **fleet matrix** (jobs × nodes, failing-only
   filter), **node resources**, **activity heatmap** punchcard, and
   **upcoming runs**.

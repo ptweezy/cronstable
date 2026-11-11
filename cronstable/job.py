@@ -930,7 +930,14 @@ class SentryReporter(Reporter):
         for line in config["fingerprint"]:
             fingerprint.append(_compiled_template(line).render(tvars))
 
-        kwargs = {}
+        # The SDK client is process-wide and turns every error-level log
+        # record of the daemon into an event. The reporter keeps frame
+        # local variables (run parameter values, the child environment)
+        # and HTTP request bodies out of those events.
+        kwargs: dict[str, Any] = {
+            "include_local_variables": False,
+            "max_request_body_size": "never",
+        }
         if config.get("maxStringLength"):
             kwargs["max_value_length"] = config["maxStringLength"]
         if config.get("environment"):

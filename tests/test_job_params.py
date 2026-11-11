@@ -13,6 +13,7 @@ The workflow side of the feature lives in tests/test_dag_params.py.
 """
 
 import asyncio
+import contextlib
 import datetime
 import json
 import sys
@@ -101,6 +102,7 @@ def _printed(cron, name):
 #   act: hold                stay up
 #   act: linger              exit 0 after one second
 #   act: pass                exit 0
+# Its first step prints a line (see _up).
 _LADDER = """
 jobs:
   - name: report
@@ -109,6 +111,7 @@ jobs:
       - '-c'
       - |
         import os, sys, time
+        print('up', flush=True)
         act = os.environ['CRONSTABLE_PARAM_ACT']
         once = sys.argv[1] if act == 'fail' and sys.argv[1:] else None
         again = once is not None and os.path.exists(once)
@@ -180,6 +183,78 @@ def _ladder_yaml(
     )
 
 
+# A retry in this file runs when its test says so. schedule_retry_job
+# sleeps out a retry's delay, and the interval between two checks of a
+# retry it deferred, with asyncio.sleep. The fixture below holds each of
+# those sleeps until the test ends it (see _wake_retry).
+_SLEEP = asyncio.sleep
+_RETRY = Cron.schedule_retry_job.__code__
+_TIMERS = {}  # retry task -> the future its held sleep waits on
+
+
+async def _held_sleep():
+    task = asyncio.current_task()
+    timer = _TIMERS[task] = asyncio.get_running_loop().create_future()
+    try:
+        await timer
+    finally:
+        _TIMERS.pop(task, None)
+
+
+@pytest.fixture(autouse=True)
+def _held_retry_timers(monkeypatch):
+    """Hold the sleeps that ``schedule_retry_job`` itself awaits."""
+
+    def sleep(delay, result=None):
+        if sys._getframe(1).f_code is _RETRY:
+            return _held_sleep()
+        return _SLEEP(delay, result)
+
+    _TIMERS.clear()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+
+@pytest.fixture
+async def dag_cron(dag_cron):
+    """The shared ``dag_cron``, with a teardown that first ends what a
+    failed test leaves.
+
+    The shared teardown waits for every live process, and a live retry or
+    Replace pursuit can launch one more. This teardown cancels both and
+    waits for them to end, then kills the processes and reaps them. A test
+    adds a daemon it builds itself to ``dag_cron.crons``.
+    """
+    crons = []
+
+    async def make(*args, **kwargs):
+        cron = await dag_cron(*args, **kwargs)
+        crons.append(cron)
+        return cron
+
+    make.crons = crons
+    yield make
+    ending = {
+        task
+        for task in asyncio.all_tasks()
+        if getattr(task.get_coro(), "cr_code", None) is _RETRY
+    }
+    for cron in crons:
+        ending.update(cron._slot_pursuits.values())
+        cron._cancel_coordination_tasks()
+    for task in ending:
+        # a second cancel would interrupt the cleanup of the first
+        if not task.cancelling():
+            task.cancel()
+    if ending:
+        await asyncio.wait(ending, timeout=10)
+    for cron in crons:
+        for running in [r for rs in cron.running_jobs.values() for r in rs]:
+            running.cancelled = True
+            if running.proc is not None and running.proc.returncode is None:
+                running.proc.kill()
+        await _settle(cron)
+
+
 async def _settle(cron):
     """Reap the running instances, then run their completions (the report
     and the retry arm) and the state writes those queue."""
@@ -200,14 +275,48 @@ async def _retry_records(cron, name="report"):
 
 async def _arm_ladder(cron, name="report"):
     """Fail a scheduled run, which takes the defaults, so that retry #1 is
-    pending. Returns the live retry state, whose task sleeps out the delay.
+    pending. Returns the live retry state, whose task waits in its held
+    sleep.
     """
     await cron.launch_scheduled_job(cron.cron_jobs[name])
     await _settle(cron)
     ladder = cron.retry_state[name]
-    assert ladder.count == 1 and not ladder.task.done()
+    assert ladder.count == 1 and ladder.task in _TIMERS
     assert (await _retry_records(cron, name))[-1] == ("pending", None, 1)
     return ladder
+
+
+async def _wake_retry(ladder):
+    """End the held sleep of ``ladder``'s retry and give the retry its turn.
+
+    The first sleep is the retry's delay, so ending it makes the retry come
+    due. Each later one precedes the next check of a deferred retry. The
+    ladder takes ``delay=0``, because ``schedule_retry_job`` sleeps again
+    for the rest of a delay that its sleep cut short.
+    """
+    _TIMERS.pop(ladder.task).set_result(None)
+    await asyncio.sleep(0)
+
+
+async def _retry_rests(ladder):
+    """Wait until ``ladder``'s retry has finished or sleeps again."""
+    task = ladder.task
+    await _wait_until(lambda: task.done() or task in _TIMERS, tries=1000)
+
+
+async def _step_retry(ladder):
+    """Wake ``ladder``'s retry and wait until it rests."""
+    await _wake_retry(ladder)
+    await _retry_rests(ladder)
+
+
+async def _up(running):
+    """Wait until the ``_LADDER`` process of ``running`` runs its command.
+
+    On Windows a graceful stop reaches a process only once it is up. One
+    sent sooner waits out ``killTimeout``.
+    """
+    await _wait_until(lambda: running.output.lines, tries=1000)
 
 
 async def _stop_ladder(cron, name="report"):
@@ -562,9 +671,11 @@ async def test_a_peer_claims_the_retry_after_a_start_with_values(dag_cron):
     await _stop_ladder(cron)
     stream = cron._retry_stream("report")
     pending = (await cron.state_backend.list_records(stream))[-1]
-    # a node that saw the run does not count it as newer than the retry
+    # a node that saw the run does not count it as newer than the retry.
+    # The newest run it counts is the failed one, and that run's end and
+    # the arm can share a clock tick
     armed = datetime.datetime.fromisoformat(pending["at"])
-    assert cron._last_completed_at["report"] < armed
+    assert cron._last_completed_at["report"] <= armed
     # and neither does the durable ledger that a claiming node reads, so
     # the claim lands
     cron._state_host = "node-b"
@@ -584,10 +695,10 @@ async def test_a_peer_claims_the_retry_after_a_start_with_values(dag_cron):
 async def _retry_in_flight(dag_cron, tmp_path, **kwargs):
     """A ``_LADDER`` daemon whose retry #1 launched and is still running."""
     cron = await dag_cron(
-        _ladder_yaml(delay=0.2, once=tmp_path / "once", **kwargs)
+        _ladder_yaml(delay=0, once=tmp_path / "once", **kwargs)
     )
     ladder = await _arm_ladder(cron)
-    await _wait_until(ladder.task.done)
+    await _step_retry(ladder)
     await _drain_pending(cron)
     (attempt,) = cron.running_jobs["report"]
     assert attempt.retry_state is ladder and ladder.count == 1
@@ -692,7 +803,7 @@ async def test_forbid_holds_a_due_retry_behind_a_start_with_values(
     dag_cron, tmp_path, monkeypatch
 ):
     cron = await dag_cron(
-        _ladder_yaml(policy="Forbid", delay=0.3, once=tmp_path / "once")
+        _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
     )
     reports = _reports(monkeypatch)
     ladder = await _arm_ladder(cron)
@@ -700,15 +811,15 @@ async def test_forbid_holds_a_due_retry_behind_a_start_with_values(
     (one_off,) = cron.running_jobs["report"]
     # the retry comes due while the one-off runs. It waits: a launch that
     # Forbid refused would spend the attempt
-    await asyncio.sleep(0.6)
+    await _step_retry(ladder)
     assert cron.running_jobs["report"] == [one_off]
     assert not ladder.task.done()
     assert (await _retry_records(cron))[-1] == ("pending", None, 1)
     await _settle(cron)
     assert cron.last_run["report"].outcome == "success"
-    # once the one-off ends, the retry runs with the defaults as the next
-    # attempt of its ladder
-    await _wait_until(lambda: cron.running_jobs.get("report"), tries=500)
+    # once the one-off ends, the retry's next check runs it with the
+    # defaults as the next attempt of its ladder
+    await _step_retry(ladder)
     (retry,) = cron.running_jobs["report"]
     assert retry.retry_state is ladder and not retry.supplied_params
     await _drain_pending(cron)
@@ -717,47 +828,63 @@ async def test_forbid_holds_a_due_retry_behind_a_start_with_values(
     await _stop_run(cron, retry)
 
 
-def _slow_start(cron, monkeypatch, seconds=0.6):
-    """Delay a start with supplied values by ``seconds`` before it spawns,
-    while it holds the job's launch lock."""
+def _due_mid_start(cron, monkeypatch, ladder, reload=None):
+    """Make ``ladder``'s retry come due while a start with supplied values
+    holds the job's launch lock, before the start spawns. ``reload`` runs
+    at that point, ahead of the retry.
+
+    The retry then sleeps on a timer other than the one it held before the
+    start, which is how a test tells that it came due.
+    """
     real = cron._prepare_job_api_run
 
     async def prepare(job, retry_state, **kwargs):
         if kwargs["params"]["region"] == "us":
-            await asyncio.sleep(seconds)
+            if reload is not None:
+                reload()
+            await _wake_retry(ladder)
         return await real(job, retry_state, **kwargs)
 
     monkeypatch.setattr(cron, "_prepare_job_api_run", prepare)
+
+
+def _reload_ladder(cron, tmp_path, yaml):
+    """Reload ``cron`` with ``yaml`` under ``dag_cron``'s state section."""
+    state = "state:\n  path: {}\n".format(tmp_path)
+    cron._apply_reload(parse_config_string(state + yaml, ""))
 
 
 @pytest.mark.parametrize("state", [True, False])
 async def test_forbid_holds_a_retry_that_comes_due_while_a_start_spawns(
     dag_cron, tmp_path, monkeypatch, state
 ):
-    yaml = _ladder_yaml(policy="Forbid", delay=0.3, once=tmp_path / "once")
+    yaml = _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
     if state:
         cron = await dag_cron(yaml)
         ladder = await _arm_ladder(cron)
     else:
         cron = Cron(None, config_yaml=yaml)
+        dag_cron.crons.append(cron)
         await cron.launch_scheduled_job(cron.cron_jobs["report"])
         await _settle(cron)
         ladder = cron.retry_state["report"]
-        assert ladder.count == 1 and not ladder.task.done()
-    _slow_start(cron, monkeypatch)
+        assert ladder.count == 1 and ladder.task in _TIMERS
+    first = _TIMERS[ladder.task]
+    _due_mid_start(cron, monkeypatch, ladder)
     # the retry comes due while the start is still launching, and waits for
     # it to spawn
     await cron.start_job("report", {"region": "us", "act": "linger"})
     (one_off,) = cron.running_jobs["report"]
-    await asyncio.sleep(0.1)
-    # then waits behind it, unspent
+    await _retry_rests(ladder)
+    # then waits behind it, unspent, in the sleep of its deferral
     assert cron.running_jobs["report"] == [one_off]
     assert not ladder.task.done()
+    assert _TIMERS[ladder.task] is not first
     if state:
         assert (await _retry_records(cron))[-1] == ("pending", None, 1)
     await _settle(cron)
     assert cron.last_run["report"].outcome == "success"
-    await _wait_until(lambda: cron.running_jobs.get("report"), tries=500)
+    await _step_retry(ladder)
     (retry,) = cron.running_jobs["report"]
     assert retry.retry_state is ladder and not retry.supplied_params
     if state:
@@ -771,7 +898,7 @@ async def test_forbid_refuses_a_start_with_values_while_a_retry_settles(
     dag_cron, tmp_path, monkeypatch, slow
 ):
     cron = await dag_cron(
-        _ladder_yaml(policy="Forbid", delay=0.3, once=tmp_path / "once")
+        _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
     )
     ladder = await _arm_ladder(cron)
     settling = []
@@ -796,6 +923,7 @@ async def test_forbid_refuses_a_start_with_values_while_a_retry_settles(
             return await real_consume(*args, **kwargs)
 
         monkeypatch.setattr(cron, "_retry_consume_ok", consume)
+    await _wake_retry(ladder)
     await _wait_until(lambda: settling, tries=500)
     # the retry came due first: it launches, and Forbid refuses the start
     with pytest.raises(ApiActionError) as err:
@@ -808,17 +936,235 @@ async def test_forbid_refuses_a_start_with_values_while_a_retry_settles(
     await _stop_run(cron, retry)
 
 
+@contextlib.asynccontextmanager
+async def _settling(cron, monkeypatch, ladder, slow):
+    """Make ``ladder``'s retry come due and stall while it settles its
+    record, until the block ends.
+
+    ``slow`` is where it stalls: ``store`` in the append of the record,
+    ``consume`` ahead of the store call.
+    """
+    gate = asyncio.Event()
+    stalled = []
+    if slow == "store":
+        backend = cron.state_backend
+        real_append = backend.append_record
+
+        async def append(stream, data, *args, **kwargs):
+            if data.get("reason") == "launched":
+                stalled.append(stream)
+                await gate.wait()
+            return await real_append(stream, data, *args, **kwargs)
+
+        monkeypatch.setattr(backend, "append_record", append)
+    else:
+        real_consume = cron._retry_consume_ok
+
+        async def consume(*args, **kwargs):
+            stalled.append(args)
+            await gate.wait()
+            return await real_consume(*args, **kwargs)
+
+        monkeypatch.setattr(cron, "_retry_consume_ok", consume)
+    await _wake_retry(ladder)
+    await _wait_until(lambda: stalled, tries=500)
+    try:
+        yield
+    finally:
+        gate.set()
+
+
+@pytest.mark.parametrize("slow", ["store", "consume"])
+async def test_a_scheduled_fire_starts_while_a_forbid_retry_settles(
+    dag_cron, tmp_path, monkeypatch, slow
+):
+    cron = await dag_cron(
+        _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
+    )
+    ladder = await _arm_ladder(cron)
+    async with _settling(cron, monkeypatch, ladder, slow):
+        # the fire takes the launch lock alone, so it starts while the
+        # retry still waits for the store
+        await asyncio.wait_for(
+            cron.launch_scheduled_job(cron.cron_jobs["report"]), 10
+        )
+        (fired,) = cron.running_jobs["report"]
+        # it ends the retry's sequence and starts its own, as a fire that
+        # finds no run of the job does
+        fresh = cron.retry_state["report"]
+        assert fired.retry_state is fresh and fresh.count == 0
+        assert fresh is not ladder and ladder.cancelled
+    await asyncio.wait([ladder.task], timeout=10)
+    assert ladder.task.cancelled()
+    assert cron.running_jobs["report"] == [fired]
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "superseded", 1)
+    await _up(fired)
+    await _stop_run(cron, fired)
+
+
+@pytest.mark.parametrize("slow", ["store", "consume"])
+async def test_a_start_without_values_starts_while_a_forbid_retry_settles(
+    dag_cron, tmp_path, monkeypatch, slow
+):
+    cron = await dag_cron(
+        _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
+    )
+    ladder = await _arm_ladder(cron)
+    async with _settling(cron, monkeypatch, ladder, slow):
+        started = await asyncio.wait_for(cron.start_job("report"), 10)
+        assert started["params"] == {"region": "eu", "act": "fail"}
+        (running,) = cron.running_jobs["report"]
+        # the run is one more attempt of the ladder, whose retry still
+        # settles
+        assert running.retry_state is ladder and not running.supplied_params
+        assert not ladder.task.done()
+    # Forbid then refuses the retry, and the run carries the ladder on
+    await _retry_rests(ladder)
+    assert ladder.task.done() and not ladder.task.cancelled()
+    assert cron.running_jobs["report"] == [running]
+    assert cron.retry_state["report"] is ladder and not ladder.cancelled
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    await _up(running)
+    await _stop_run(cron, running)
+
+
+@pytest.mark.parametrize("slow", ["store", "consume"])
+async def test_forbid_holds_a_start_with_values_while_a_retry_settles(
+    dag_cron, tmp_path, monkeypatch, slow
+):
+    cron = await dag_cron(
+        _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
+    )
+    ladder = await _arm_ladder(cron)
+    async with _settling(cron, monkeypatch, ladder, slow):
+        start = asyncio.create_task(
+            cron.start_job("report", {"region": "us", "act": "linger"})
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # the start waits for the retry, and leaves the launch lock to a
+        # scheduled fire or a start without values
+        assert not start.done() and not cron.running_jobs.get("report")
+        assert cron._retry_launch_locks["report"].locked()
+        assert not cron._launch_locks["report"].locked()
+    # the retry came due first: it launches, and Forbid refuses the start
+    with pytest.raises(ApiActionError) as err:
+        await asyncio.wait_for(start, 10)
+    assert err.value.status == 409
+    (retry,) = cron.running_jobs["report"]
+    assert retry.retry_state is ladder and not retry.supplied_params
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    await _up(retry)
+    await _stop_run(cron, retry)
+
+
+async def test_a_reload_to_allow_keeps_a_start_with_values_behind_a_retry(
+    dag_cron, tmp_path, monkeypatch
+):
+    once = tmp_path / "once"
+    cron = await dag_cron(_ladder_yaml(policy="Forbid", delay=0, once=once))
+    ladder = await _arm_ladder(cron)
+    async with _settling(cron, monkeypatch, ladder, "store"):
+        # the retry settles under Forbid, and a reload makes the job Allow
+        _reload_ladder(
+            cron, tmp_path, _ladder_yaml(policy="Allow", delay=0, once=once)
+        )
+        start = asyncio.create_task(
+            cron.start_job("report", {"region": "us", "act": "hold"})
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # the start waits for the retry under Allow too, off the launch lock
+        assert not start.done() and not cron.running_jobs.get("report")
+        assert not cron._launch_locks["report"].locked()
+    await asyncio.wait_for(start, 10)
+    await _retry_rests(ladder)
+    # the retry launched, as its record says, and Allow starts the one-off
+    # beside it
+    retry, one_off = sorted(
+        cron.running_jobs["report"], key=lambda r: r.supplied_params
+    )
+    assert retry.retry_state is ladder and not retry.supplied_params
+    assert one_off.supplied_params and one_off.retry_state is None
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    await _up(retry)
+    await _up(one_off)
+    one_off.cancelled = True
+    await one_off.cancel()
+    await _stop_run(cron, retry)
+
+
+async def test_a_reload_to_forbid_holds_a_retry_that_comes_due_mid_start(
+    dag_cron, tmp_path, monkeypatch
+):
+    once = tmp_path / "once"
+    cron = await dag_cron(_ladder_yaml(policy="Allow", delay=0, once=once))
+    ladder = await _arm_ladder(cron)
+    first = _TIMERS[ladder.task]
+    # the start spawns under Allow. A reload then makes the job Forbid, and
+    # the retry comes due
+    _due_mid_start(
+        cron,
+        monkeypatch,
+        ladder,
+        reload=lambda: _reload_ladder(
+            cron, tmp_path, _ladder_yaml(policy="Forbid", delay=0, once=once)
+        ),
+    )
+    await cron.start_job("report", {"region": "us", "act": "linger"})
+    (one_off,) = cron.running_jobs["report"]
+    await _retry_rests(ladder)
+    # the retry waited for the start to spawn, and waits behind it, unspent
+    assert cron.running_jobs["report"] == [one_off]
+    assert not ladder.task.done()
+    assert _TIMERS[ladder.task] is not first
+    assert (await _retry_records(cron))[-1] == ("pending", None, 1)
+    await _settle(cron)
+    assert cron.last_run["report"].outcome == "success"
+    # once the one-off ends, the retry runs as the next attempt
+    await _step_retry(ladder)
+    (retry,) = cron.running_jobs["report"]
+    assert retry.retry_state is ladder and not retry.supplied_params
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    await _up(retry)
+    await _stop_run(cron, retry)
+
+
+async def test_a_reload_keeps_the_retry_lock_of_a_removed_job_while_held():
+    cron = Cron(None, config_yaml=_JOBS)
+    job = cron.cron_jobs["report"]
+    job.concurrencyPolicy = "Forbid"
+    # a config without ``report``
+    reloaded = "jobs:\n" + _JOBS[_JOBS.index("  - name: plain") :]
+    held = cron._retry_launch_lock(job)
+    async with held:
+        cron._apply_reload(parse_config_string(reloaded, ""))
+        assert list(cron.cron_jobs) == ["plain"]
+        # a launch that waits on the lock still finds the same one
+        assert cron._retry_launch_locks["report"] is held
+    cron._apply_reload(parse_config_string(reloaded, ""))
+    assert "report" not in cron._retry_launch_locks
+
+
 async def test_a_restart_re_arms_a_retry_held_behind_a_start_with_values(
     dag_cron, tmp_path, monkeypatch
 ):
-    yaml = _ladder_yaml(policy="Forbid", delay=0.3, once=tmp_path / "once")
+    yaml = _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
     cron = await dag_cron(yaml)
     ladder = await _arm_ladder(cron)
-    _slow_start(cron, monkeypatch)
+    first = _TIMERS[ladder.task]
+    _due_mid_start(cron, monkeypatch, ladder)
     await cron.start_job("report", {"region": "us", "act": "hold"})
     (one_off,) = cron.running_jobs["report"]
-    await asyncio.sleep(0.1)
+    await _retry_rests(ladder)
+    # the retry came due during the start, and sleeps behind the one-off
     assert not ladder.task.done()
+    assert _TIMERS[ladder.task] is not first
     # the daemon stops while the retry waits, and the one-off dies with it
     await _stop_ladder(cron)
     one_off.proc.kill()
@@ -840,14 +1186,15 @@ async def test_only_forbid_holds_a_due_retry_behind_a_start_with_values(
     dag_cron, tmp_path, policy
 ):
     cron = await dag_cron(
-        _ladder_yaml(policy=policy, delay=0.3, once=tmp_path / "once")
+        _ladder_yaml(policy=policy, delay=0, once=tmp_path / "once")
     )
     ladder = await _arm_ladder(cron)
     await cron.start_job("report", {"region": "us", "act": "hold"})
     (one_off,) = cron.running_jobs["report"]
+    await _up(one_off)
     # the retry comes due while the one-off runs, and the policy admits it:
     # Allow starts it beside the one-off, and Replace in its place
-    await _wait_until(ladder.task.done, tries=500)
+    await _step_retry(ladder)
     await _drain_pending(cron)
     assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
     (attempt,) = [r for r in cron.running_jobs["report"] if r is not one_off]
@@ -987,7 +1334,7 @@ async def _retry_waits_for_the_slot(dag_cron, tmp_path, pools=""):
         + _ladder_yaml(
             policy="Replace",
             scope="cluster",
-            delay=0.5,
+            delay=0,
             once=tmp_path / "once",
         ),
         extra_state="  slotTtlSeconds: 6\n",
@@ -1000,7 +1347,7 @@ async def _retry_waits_for_the_slot(dag_cron, tmp_path, pools=""):
         "slots/report", "nodeB#tokB", 30.0
     )
     assert foreign is not None
-    await _wait_until(ladder.task.done, tries=500)
+    await _step_retry(ladder)
     await _drain_pending(cron)
     assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
     assert cron._slot_pursuit_launch["report"] == {
@@ -1465,7 +1812,7 @@ def _retry_count(entry):
 async def test_pooled_cancel_of_a_start_with_values_keeps_the_queued_retry(
     dag_cron, monkeypatch, policy
 ):
-    cron = await dag_cron(_ladder_yaml(policy=policy, delay=0.5, slots=1))
+    cron = await dag_cron(_ladder_yaml(policy=policy, delay=0, slots=1))
     monkeypatch.setattr(cron._pools, "service", lambda: None)
     await cron.launch_scheduled_job(cron.cron_jobs["report"])
     await cron._pools.tick()
@@ -1475,9 +1822,10 @@ async def test_pooled_cancel_of_a_start_with_values_keeps_the_queued_retry(
     await cron._pools.tick()  # the pool admits the one-off
     (one_off,) = cron.running_jobs["report"]
     assert one_off.supplied_params
+    await _up(one_off)
     # the retry comes due while the one-off runs, and queues behind it.
     # Forbid holds it there too: a pooled retry waits in its queue entry
-    await _wait_until(ladder.task.done)
+    await _step_retry(ladder)
     await _drain_pending(cron)
     assert await cron.cancel_job_by_name("report") == 1
     await _settle(cron)
@@ -1527,7 +1875,7 @@ async def test_pooled_start_with_values_that_replaces_a_retry_ends_the_ladder(
 ):
     cron = await dag_cron(
         _ladder_yaml(
-            policy="Replace", delay=0.3, once=tmp_path / "once", slots=2
+            policy="Replace", delay=0, once=tmp_path / "once", slots=2
         )
     )
     monkeypatch.setattr(cron._pools, "service", lambda: None)
@@ -1535,7 +1883,7 @@ async def test_pooled_start_with_values_that_replaces_a_retry_ends_the_ladder(
     await cron.launch_scheduled_job(job)
     await cron._pools.tick()
     await _settle(cron)  # the scheduled run fails and arms retry #1
-    await _wait_until(cron.retry_state["report"].task.done)
+    await _step_retry(cron.retry_state["report"])
     await _drain_pending(cron)
     await cron._pools.tick()  # the pool admits the retry, which stays up
     (attempt,) = cron.running_jobs["report"]
@@ -1547,6 +1895,95 @@ async def test_pooled_start_with_values_that_replaces_a_retry_ends_the_ladder(
     assert "report" not in cron.retry_state
     assert (await _retry_records(cron))[-1] == ("settled", "replaced", 1)
     assert "retry" not in cron._job_to_dict("report", job)
+
+
+async def test_a_reload_into_a_pool_keeps_an_admitted_start_behind_a_retry(
+    dag_cron, tmp_path, monkeypatch
+):
+    once = tmp_path / "once"
+    cron = await dag_cron(_ladder_yaml(policy="Forbid", delay=0, once=once))
+    monkeypatch.setattr(cron._pools, "service", lambda: None)
+    ladder = await _arm_ladder(cron)
+    admitted = []
+    real = cron.maybe_launch_job
+
+    async def launch(job, **kwargs):
+        if kwargs.get("pool_ticket") is not None:
+            admitted.append(job.name)
+        return await real(job, **kwargs)
+
+    monkeypatch.setattr(cron, "maybe_launch_job", launch)
+    async with _settling(cron, monkeypatch, ladder, "store"):
+        # the retry settles with no pool, and a reload puts the job in one
+        _reload_ladder(
+            cron,
+            tmp_path,
+            _ladder_yaml(policy="Forbid", delay=0, once=once, slots=2),
+        )
+        started = await cron.start_job(
+            "report", {"region": "us", "act": "hold"}
+        )
+        assert started["queued"] is not None
+        tick = asyncio.create_task(cron._pools.tick())
+        await _wait_until(lambda: admitted, tries=500)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # the pool admits the start, and its launch waits for the retry,
+        # off the launch lock
+        assert not tick.done() and not cron.running_jobs.get("report")
+        assert not cron._launch_locks["report"].locked()
+    await asyncio.wait_for(tick, 10)
+    await _retry_rests(ladder)
+    # the retry launched, as its record says, and Forbid sent the one-off
+    # back to its queue entry
+    (retry,) = cron.running_jobs["report"]
+    assert retry.retry_state is ladder and not retry.supplied_params
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    (entry,) = await _pool_entries(cron)
+    assert entry["id"] == started["queued"] and entry["state"] == "queued"
+    await cron._pools.cancel("database", entry["id"], "test over")
+    await _up(retry)
+    await _stop_run(cron, retry)
+
+
+async def test_a_reload_out_of_a_pool_holds_a_retry_that_comes_due_mid_start(
+    dag_cron, tmp_path, monkeypatch
+):
+    once = tmp_path / "once"
+    cron = await dag_cron(
+        _ladder_yaml(policy="Forbid", delay=0, once=once, slots=2)
+    )
+    monkeypatch.setattr(cron._pools, "service", lambda: None)
+    await cron.launch_scheduled_job(cron.cron_jobs["report"])
+    await cron._pools.tick()
+    await _settle(cron)  # the scheduled run fails and arms retry #1
+    ladder = cron.retry_state["report"]
+    first = _TIMERS[ladder.task]
+    await cron.start_job("report", {"region": "us", "act": "hold"})
+    # the pool admits the one-off. While it spawns, a reload takes the job
+    # out of the pool, and the retry comes due
+    _due_mid_start(
+        cron,
+        monkeypatch,
+        ladder,
+        reload=lambda: _reload_ladder(
+            cron, tmp_path, _ladder_yaml(policy="Forbid", delay=0, once=once)
+        ),
+    )
+    await cron._pools.tick()
+    (one_off,) = cron.running_jobs["report"]
+    assert one_off.supplied_params
+    await _retry_rests(ladder)
+    # the retry waited for the one-off to spawn, and waits behind it,
+    # unspent
+    assert cron.running_jobs["report"] == [one_off]
+    assert not ladder.task.done()
+    assert _TIMERS[ladder.task] is not first
+    assert (await _retry_records(cron))[-1] == ("pending", None, 1)
+    await _stop_ladder(cron)
+    await _up(one_off)
+    await _stop_run(cron, one_off)
 
 
 _POOLED_SLOT = (
@@ -1727,6 +2164,129 @@ async def test_http_start_with_params(dag_cron):
                 assert r.status == 404
     finally:
         await cron.start_stop_web_app(None)
+
+
+async def test_http_start_logs_a_refused_body(dag_cron, caplog):
+    import aiohttp
+
+    cron = await _cron(dag_cron)
+    base = await _start_web(cron)
+    url = base + "/jobs/report/start"
+    refused = [
+        (
+            {"json": {"ref": "zz-9", "by": {"name": "zz-9"}}},
+            'unknown start field "by", "ref"; the body accepts params',
+        ),
+        ({"data": b"region=zz-9"}, "request body is not valid JSON"),
+        ({"json": ["zz-9"]}, "request body must be a JSON object"),
+    ]
+    try:
+        async with aiohttp.ClientSession() as s:
+            with caplog.at_level("WARNING", logger="cronstable"):
+                for kwargs, reason in refused:
+                    async with s.post(url, **kwargs) as r:
+                        assert r.status == 400
+                        assert (await r.json())["error"] == reason
+                # a refusal of the values themselves logs nothing
+                body = {"params": {"region": "zz-9"}}
+                async with s.post(url, json=body) as r:
+                    assert r.status == 400 and "paramErrors" in await r.json()
+    finally:
+        await cron.start_stop_web_app(None)
+    assert not cron.running_jobs
+    # one warning for each refused body, with the reason the caller got
+    warnings = [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.getMessage().startswith("web: refused")
+    ]
+    assert warnings == [
+        ("WARNING", 'web: refused POST "/jobs/report/start": ' + reason)
+        for _kwargs, reason in refused
+    ]
+    # the lines name fields, never a value
+    assert "zz-9" not in caplog.text
+
+
+async def test_http_start_reads_an_empty_body_as_no_body(
+    dag_cron, monkeypatch, caplog
+):
+    cron = await _cron(dag_cron)
+    base = await _start_web(cron)
+    port = int(base.rsplit(":", 1)[1])
+    reading = asyncio.Event()
+    real = cron._web_json_body
+
+    async def read_body(request):
+        reading.set()
+        return await real(request)
+
+    monkeypatch.setattr(cron, "_web_json_body", read_body)
+
+    async def post(head, body=b"", late=False):
+        """POST to the start route over a raw connection. Returns the
+        status and the JSON of the answer. ``late`` holds ``body`` back
+        until the handler reads the request's body."""
+        reading.clear()
+        request = (
+            "POST /jobs/report/start HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Connection: close\r\n{}\r\n".format(head)
+        ).encode()
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            if late:
+                writer.write(request)
+                await asyncio.wait_for(reading.wait(), 10)
+                writer.write(body)
+            else:
+                writer.write(request + body)
+            await writer.drain()
+            answer = await asyncio.wait_for(reader.read(), 10)
+        finally:
+            writer.close()
+        status = int(answer.split(None, 2)[1])
+        return status, json.loads(answer.partition(b"\r\n\r\n")[2])
+
+    chunked = "Transfer-Encoding: chunked\r\n"
+    end = b"0\r\n\r\n"  # the last chunk
+    blank = b"3\r\n \r\n\r\n" + end  # one chunk of whitespace
+    values = json.dumps({"params": {"region": "us"}}).encode()
+    no_body = 200, {"started": "report", "params": _DEFAULTS}
+    try:
+        with caplog.at_level("WARNING", logger="cronstable"):
+            # no body, an empty chunked body whose last chunk arrives with
+            # the headers or while the handler reads, and a body of
+            # whitespace all start the job with its defaults
+            for head, body, late in (
+                ("", b"", False),
+                (chunked, end, False),
+                (chunked, end, True),
+                (chunked, blank, True),
+                ("Content-Length: 3\r\n", b" \r\n", True),
+            ):
+                assert await post(head, body, late) == no_body, (head, body)
+                await _finish(cron)
+            # a chunked body with content is parsed
+            sent = b"%x\r\n%s\r\n" % (len(values), values) + end
+            assert await post(chunked, sent, True) == (
+                200,
+                {"started": "report", "params": {**_DEFAULTS, "region": "us"}},
+            )
+            await _finish(cron)
+            refused = "request body is not valid JSON"
+            assert await post(chunked, b"1\r\n{\r\n" + end, True) == (
+                400,
+                {"error": refused},
+            )
+    finally:
+        await cron.start_stop_web_app(None)
+    assert not cron.running_jobs
+    # only the body with content that does not parse is refused
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("web: refused")
+    ] == ['web: refused POST "/jobs/report/start": ' + refused]
 
 
 async def test_http_start_that_waits_for_the_cluster_slot(dag_cron):

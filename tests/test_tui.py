@@ -3408,6 +3408,11 @@ async def _raise_boom(*a, **k):
     raise RuntimeError("boom")
 
 
+async def _raise_timeout(*a, **k):
+    # a request that times out carries no message
+    raise TimeoutError()
+
+
 def _reset_token(app):
     app.open_overlays = []
     app.focus = None
@@ -3454,7 +3459,7 @@ async def test_job_action_error_and_status_paths(tmp_path):
     app.toasts = []
     app.api.post = _post_status(409, {"error": "job 'j' is disabled"})
     await app.run_job("j")
-    assert "j did not start — job 'j' is disabled" in _msgs(app)
+    assert "job 'j' is disabled (j did not start)" in _msgs(app)
     app.api.post = _post_status(409)  # a daemon that sends no reason
     await app.run_job("j")
     assert _msgs(app)[-1] == "j did not start"
@@ -3464,14 +3469,16 @@ async def test_job_action_error_and_status_paths(tmp_path):
     app.api.post = _post_status(503)
     await app.run_job("j")
     assert any("HTTP 503" in m for m in _msgs(app))
-    # the daemon's reason, when it gives one, is in the toast
+    # the daemon's reason, when it gives one, leads the toast
     forbid = "job 'j' is still running and its concurrencyPolicy is Forbid"
     app.api.post = _post_status(409, {"error": forbid})
     await app.run_job("j")
-    assert _msgs(app)[-1] == "j did not start — " + forbid
+    assert _msgs(app)[-1] == forbid + " (j did not start)"
     app.api.post = _post_status(503, {"error": "the store did not answer"})
     await app.run_job("j")
-    assert _msgs(app)[-1] == "start j: HTTP 503 — the store did not answer"
+    assert _msgs(app)[-1] == "the store did not answer (start j: HTTP 503)"
+    # no input row is open, so none holds the reason
+    assert app.refusal is None
 
     # a request that times out has an empty message of its own
     async def _time_out(*a, **k):
@@ -3533,6 +3540,12 @@ async def test_dag_action_error_and_status_paths(tmp_path):
     app.api.post = _raise_boom
     await app.dag_trigger("d")
     assert any("trigger" in m for m in _msgs(app))
+    # a timeout is named, with a warning that the run may have started
+    app.api.post = _raise_timeout
+    await app.dag_trigger("d")
+    assert _msgs(app)[-1] == (
+        "trigger d: no answer from the daemon; the run may still have started"
+    )
     app.api.post = _post_status(500)
     await app.dag_trigger("d")
     assert any("HTTP 500" in m for m in _msgs(app))
@@ -3562,6 +3575,9 @@ async def test_dag_action_error_and_status_paths(tmp_path):
     _reset_token(app)
     app.api.post = _raise_boom
     await app.dag_backfill("2026-01-01..2026-01-02")
+    app.api.post = _raise_timeout
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    assert _msgs(app)[-1] == "backfill: no answer from the daemon"
     app.api.post = _post_status(500, {"error": "range too wide"})
     await app.dag_backfill("2026-01-01..2026-01-02")
     assert any("range too wide" in m for m in _msgs(app))
@@ -7252,22 +7268,28 @@ def test_parse_param_words_tolerates_a_missing_declaration():
         tui.split_words('ticket="OPS')
 
 
-def test_param_hint_and_error_detail():
+def test_param_hint_and_refusal_reasons():
     assert tui.param_hint(_DECLARED) == (
         "target=staging (staging|prod)  batch_size=500  dry=false"
         "  ratio=0.5  ticket=?"
     )
     assert tui.param_hint(None) == ""
-    assert tui._error_detail("plain text") == ""
-    assert tui._error_detail({"error": "bad date range"}) == (
-        " — bad date range"
+    assert tui._refusal_reasons("plain text") == ""
+    assert tui._refusal_reasons({}) == ""
+    assert tui._refusal_reasons({"error": "bad date range"}) == (
+        "bad date range"
     )
-    assert tui._error_detail(
+    # the reason per parameter stands in for the envelope's summary
+    assert tui._refusal_reasons(
         {
             "error": "invalid parameters for workflow 'd'",
             "paramErrors": {"ticket": "is required", "batch_size": "x"},
         }
-    ) == " — invalid parameters for workflow 'd': batch_size x; ticket is required"
+    ) == "batch_size x; ticket is required"
+    # a fault of the whole map carries no reason per parameter
+    assert tui._refusal_reasons(
+        {"error": "params must be an object", "paramErrors": {}}
+    ) == "params must be an object"
 
 
 async def _no_load(*a, **k):
@@ -7301,7 +7323,7 @@ async def test_dag_trigger_opens_the_parameter_row(tmp_path):
     assert app.focus == "params"
     assert len(posted) == 1
     panel = _txt(app.render_dag_panel(_paint(app), 100, 24))
-    assert "run with name=value (Enter runs):" in panel
+    assert " run with: ▌\n" in panel
     assert "target=staging (staging|prod)" in panel and "ticket=?" in panel
     # a word that cannot be sent keeps the row and sends nothing
     app.inputs["params"] = "batch_size=lots"
@@ -7342,21 +7364,22 @@ async def test_refused_params_keep_the_row_for_a_correction(tmp_path):
         },
     )
     await app.handle_key("enter")
-    assert any(
-        "HTTP 400" in m
-        and "batch_size must be at least 1; ticket is required" in m
-        for m in _msgs(app)
+    # the reasons lead the toast, ahead of the action and the status
+    assert _msgs(app)[-1] == (
+        "batch_size must be at least 1; ticket is required"
+        " (trigger d: HTTP 400)"
     )
     assert app.focus == "params"
     assert app.inputs["params"] == "batch_size=0"
     # a token without the params scope reads the daemon's reason
     app.api.post = _post_status(403, {"error": "token 'ci' does not grant"})
     await app.handle_key("enter")
-    assert any("HTTP 403 — token 'ci'" in m for m in _msgs(app))
+    assert _msgs(app)[-1] == "token 'ci' does not grant (trigger d: HTTP 403)"
     # a 401 hands over to the token input and drops the row's text
     app.api.post = _raise_unauth
     await app.handle_key("enter")
     assert app.focus == "token" and app.inputs["params"] == ""
+    assert app.refusal is None
     _reset_token(app)
     # with no workflow open the commit just releases the input
     app.dag_name = None
@@ -7399,12 +7422,17 @@ async def test_backfill_row_takes_params(tmp_path):
     assert any("backfill wants: FROM..TO" in m for m in _msgs(app))
     assert len(posted) == sent
     app.open("dag")
-    app.focus = "backfill"
+    await app.handle_key("b")
+    assert app.focus == "backfill"
+    # the declared parameters are listed under the row
     panel = _txt(app.render_dag_panel(_paint(app), 100, 24))
-    assert "backfill FROM..TO name=value:" in panel
+    assert " backfill FROM..TO: ▌\n target=staging (staging|prod)" in panel
     app.dags = [{"name": "d"}]
     panel = _txt(app.render_dag_panel(_paint(app), 100, 24))
-    assert "backfill FROM..TO:" in panel
+    assert " backfill FROM..TO: ▌\n" in panel and "target=" not in panel
+    # an empty row closes and sends nothing
+    await app.handle_key("enter")
+    assert app.focus is None and len(posted) == sent
     await asyncio.sleep(0.05)
 
 
@@ -7476,7 +7504,7 @@ async def test_run_opens_the_parameter_row_for_a_job_that_declares_params(
     assert app.is_open("drawer") and app.drawer_job == "report"
     assert app.focus == "jobparams" and len(posted) == 1
     panel = _txt(app.render_drawer_panel(_paint(app), 100, 24))
-    assert "run with name=value (Enter runs):" in panel
+    assert " run with: ▌\n" in panel
     assert "region=eu (eu|us)" in panel and "rows=100" in panel
     # a word that cannot be sent keeps the row and sends nothing
     app.inputs["jobparams"] = "rows=lots"
@@ -7492,7 +7520,7 @@ async def test_run_opens_the_parameter_row_for_a_job_that_declares_params(
     )
     assert app.focus is None and app.inputs["jobparams"] == ""
     # the row is gone once the run starts
-    assert "run with name=value" not in _txt(
+    assert "run with:" not in _txt(
         app.render_drawer_panel(_paint(app), 100, 24)
     )
     # an empty row starts the job with its defaults: no body
@@ -7546,24 +7574,313 @@ async def test_refused_job_params_keep_the_row_for_a_correction(tmp_path):
         },
     )
     await app.handle_key("enter")
-    assert any(
-        "HTTP 400" in m and "rows must be at least 1" in m for m in _msgs(app)
+    assert _msgs(app)[-1] == (
+        "rows must be at least 1 (start report: HTTP 400)"
     )
     assert app.focus == "jobparams" and app.inputs["jobparams"] == "rows=0"
     # a token without the params scope reads the daemon's reason
     app.api.post = _post_status(403, {"error": "token 'ci' does not grant"})
     await app.handle_key("enter")
-    assert any("HTTP 403 — token 'ci'" in m for m in _msgs(app))
+    assert _msgs(app)[-1] == (
+        "token 'ci' does not grant (start report: HTTP 403)"
+    )
     # a 401 hands over to the token input and drops the row's text
     app.api.post = _raise_unauth
     await app.handle_key("enter")
     assert app.focus == "token" and app.inputs["jobparams"] == ""
+    assert app.refusal is None
     _reset_token(app)
     # with no job open the commit just releases the input
     app.drawer_job = None
     app.focus = "jobparams"
     await app.run_job_from_input("x=1")
     assert app.focus is None
+    await asyncio.sleep(0.05)
+
+
+# --------------------------------------------------------------------------
+# the input rows on the painted screen: a refusal's reasons, a long text
+# --------------------------------------------------------------------------
+
+_ROW_COLS = [80, 120, 200]
+
+_REFUSED = {
+    "error": "invalid parameters for workflow 'deploy'",
+    "paramErrors": {
+        "batch_size": "must be at least 1",
+        "ticket": "is required",
+    },
+}
+_REASONS = "batch_size must be at least 1; ticket is required"
+_HINT = "target=staging (staging|prod)"
+
+
+def _row_app(tmp_path, cols):
+    """An app on a ``cols``-wide terminal over a workflow and a job that
+    declare parameters."""
+    app = _job_param_app(tmp_path)
+    app.term = HeadlessTerm(cols, 24)
+    app._load_dag_runs = _no_load
+    app.dags = [{"name": "deploy", "params": _DECLARED}]
+    return app
+
+
+def _drawer_rows(app):
+    """The drawer's side of the painted frame, row by row."""
+    app.paint()
+    left = tui.drawer_widths(app.term.size()[0])[1]
+    return [row[left:].rstrip() for row in app.term.screen().splitlines()]
+
+
+def _drawer_text(app):
+    """The drawer's side of the painted frame as one line, so a phrase
+    that wraps reads whole."""
+    return " ".join(" ".join(row.split()) for row in _drawer_rows(app))
+
+
+async def _press(app, text):
+    for ch in text:
+        await app.handle_key(ch)
+
+
+@pytest.mark.parametrize("cols", _ROW_COLS)
+async def test_a_refused_row_shows_the_reasons_until_an_edit(tmp_path, cols):
+    app = _row_app(tmp_path, cols)
+    app.open_dag("deploy")
+    app.api.post = _post_status(400, _REFUSED)
+    await app.handle_key("t")
+    await _press(app, "batch_size=0")
+    assert "run with: batch_size=0▌ " + _HINT in _drawer_text(app)
+    await app.handle_key("enter")
+    # the painted toast leads with the reasons, so its cut keeps the first
+    app.paint()
+    toast_row = app.term.screen().splitlines()[-2]
+    assert "batch_size must be at least 1; ticket i" in toast_row
+    # the row holds the reasons once the toast expires, in place of the
+    # hint and with nothing after them
+    app.toasts = []
+    text = _drawer_text(app)
+    assert "run with: batch_size=0▌ " + _REASONS + " ─" in text
+    assert _HINT not in text
+    # a key that changes no text leaves them in place
+    await app.handle_key("tab")
+    assert _REASONS in _drawer_text(app)
+    # an edit brings the hint back
+    await app.handle_key("1")
+    text = _drawer_text(app)
+    assert "run with: batch_size=01▌ " + _HINT in text
+    assert "at least" not in text and "is required" not in text
+    app.close("dag")
+    await asyncio.sleep(0.05)
+
+
+@pytest.mark.parametrize("cols", _ROW_COLS)
+async def test_each_input_row_shows_why_its_commit_failed(tmp_path, cols):
+    app = _row_app(tmp_path, cols)
+    scope = (
+        "token 'ci' does not grant the 'params' permission required to"
+        " supply run parameters"
+    )
+    busy = "job 'report' is still running and its concurrencyPolicy is Forbid"
+    # the workflow row: the 403 for the scope
+    app.open_dag("deploy")
+    await app.handle_key("t")
+    await _press(app, "ticket=OPS-1")
+    app.api.post = _post_status(403, {"error": scope})
+    await app.handle_key("enter")
+    app.toasts = []
+    assert "run with: ticket=OPS-1▌ " + scope + " ─" in _drawer_text(app)
+    # a word that is not sent, and a daemon that does not answer
+    await _press(app, " batch_size=lots")
+    await app.handle_key("enter")
+    app.toasts = []
+    assert "lots▌ batch_size must be an integer ─" in _drawer_text(app)
+    await app.handle_key("ctrl+u")
+    app.api.post = _raise_boom
+    await app.handle_key("enter")
+    app.toasts = []
+    assert "run with: ▌ trigger deploy: boom ─" in _drawer_text(app)
+    # a timeout has no text of its own, so the row names it
+    app.api.post = _raise_timeout
+    await app.handle_key("enter")
+    app.toasts = []
+    assert (
+        "run with: ▌ trigger deploy: no answer from the daemon; the run may"
+        " still have started ─"
+    ) in _drawer_text(app)
+    # the row closes with its drawer and opens again with the hint
+    await app.handle_key("esc")
+    await app.dag_trigger_or_prompt("deploy")
+    assert "run with: ▌ " + _HINT in _drawer_text(app)
+    await app.handle_key("esc")
+    # the backfill row stays open on a refusal, with its text
+    app.open_dag("deploy")
+    await app.handle_key("b")
+    await _press(app, "2026-01-01..2026-01-31 batch_size=0")
+    app.api.post = _post_status(400, _REFUSED)
+    await app.handle_key("enter")
+    app.toasts = []
+    assert app.focus == "backfill"
+    assert "batch_size=0▌ " + _REASONS + " ─" in _drawer_text(app)
+    await app.handle_key("backspace")
+    assert "batch_size=▌ " + _HINT in _drawer_text(app)
+    # dates it cannot read are refused before anything is sent
+    await app.handle_key("ctrl+u")
+    await _press(app, "2026-01-01")
+    await app.handle_key("enter")
+    app.toasts = []
+    assert (
+        "backfill FROM..TO: 2026-01-01▌"
+        " backfill wants: FROM..TO (ISO dates) ─"
+    ) in _drawer_text(app)
+    # a timeout keeps the row open, and the row names it
+    await _press(app, "..2026-01-31")
+    app.api.post = _raise_timeout
+    await app.handle_key("enter")
+    app.toasts = []
+    assert app.focus == "backfill"
+    assert (
+        "2026-01-31▌ backfill: no answer from the daemon ─"
+    ) in _drawer_text(app)
+    # a queued backfill closes the row
+    app.api.post = _post_status(200, {"created": 31})
+    await app.handle_key("enter")
+    assert app.focus is None and app.inputs["backfill"] == ""
+    assert "backfill FROM..TO:" not in _drawer_text(app)
+    app.close("dag")
+    # the job row: the 409 with the daemon's reason
+    await app.run_job_or_prompt("report")
+    await _press(app, "rows=5")
+    app.api.post = _post_status(409, {"error": busy})
+    await app.handle_key("enter")
+    app.toasts = []
+    assert "run with: rows=5▌ " + busy in _drawer_text(app)
+    await app.handle_key("ctrl+u")
+    assert "run with: ▌ region=eu (eu|us)" in _drawer_text(app)
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+@pytest.mark.parametrize("cols", _ROW_COLS)
+async def test_a_long_input_keeps_its_end_and_the_cursor_in_view(
+    tmp_path, cols
+):
+    app = _row_app(tmp_path, cols)
+    typed = "target=prod batch_size=250 dry=true ratio=0.25 ticket=OPS-12"
+    assert len(typed) == 60
+    width = tui.drawer_widths(cols)[0]
+
+    async def check(label):
+        for done in range(1, len(typed) + 1):
+            await app.handle_key(typed[done - 1])
+            row = next(
+                r for r in _drawer_rows(app) if r.startswith(" " + label)
+            )
+            # the cursor follows the last typed characters at every length
+            assert row.endswith(typed[:done][-20:] + "▌"), row
+            shown = row[len(label) + 1 : -1]
+            if shown != typed[:done]:
+                # the start is cut behind an ellipsis, and the row ends one
+                # cell short of the drawer's edge
+                assert shown[0] == "…", row
+                assert typed[:done].endswith(shown[1:]), row
+                assert len(row) == width - 2
+        if cols == 200:
+            assert shown == typed
+
+    app.open_dag("deploy")
+    await app.handle_key("t")
+    await check("run with: ")
+    await app.handle_key("esc")
+    app.open_dag("deploy")
+    await app.handle_key("b")
+    await check("backfill FROM..TO: ")
+    app.close("dag")
+    await app.run_job_or_prompt("report")
+    await check("run with: ")
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+def test_input_tail_and_wrap_cells_measure_cells():
+    assert tui.input_tail("abc", 3) == "abc"
+    assert tui.input_tail("abcdef", 4) == "…def"
+    assert tui.input_tail("abcdef", 1) == "…"
+    # a wide character takes two cells
+    assert tui.input_tail("ab日本", 5) == "…日本"
+    assert tui.input_tail("ab日本", 4) == "…本"
+    assert tui.wrap_cells(_REASONS, 44) == [
+        "batch_size must be at least 1; ticket is",
+        "required",
+    ]
+    assert tui.wrap_cells("", 10) == []
+    # a word wider than a line is split, by cells
+    assert tui.wrap_cells("abcdefghij kl", 4) == ["abcd", "efgh", "ij", "kl"]
+    assert tui.wrap_cells("日本語 テスト", 4) == ["日本", "語", "テス", "ト"]
+    assert tui.wrap_cells("日本", 1) == ["日", "本"]
+
+
+def test_a_refusal_is_flattened_and_held_to_a_quarter_of_the_panel(tmp_path):
+    app = _param_app(tmp_path)
+    app.dags = [{"name": "d", "params": _DECLARED}]
+    app.dag_name = "d"
+    app.open("dag")
+    app.focus = "params"
+    paint = _paint(app)
+
+    def held(lines):
+        rows = _txt(app.render_dag_panel(paint, 48, lines)).split("\n")
+        rule = next(n for n, row in enumerate(rows) if row.startswith("─"))
+        return rows[3:rule]
+
+    # the daemon's text reaches the row on one line, without its escapes
+    hostile = "is\nrequired\x1b]52;c;aGk=\x07\x1b[2J"
+    app._refused(
+        "params", "fail", {"paramErrors": {"ticket": hostile}}, "trigger d"
+    )
+    assert held(24) == [" ticket is required"]
+    raw = "".join(app.render_dag_panel(paint, 48, 24))
+    assert not any(bad in raw for bad in ("\x1b]", "\x1b[2J", "\x07", "\n"))
+    # reasons that need more than a quarter of the panel are cut with an
+    # ellipsis
+    app.refuse_input(
+        "params",
+        "fail",
+        "; ".join("p%02d must be at least 1" % n for n in range(40)),
+    )
+    rows = held(24)
+    assert len(rows) == 6 and rows[-1].endswith("…")
+    assert rows[0].startswith(" p00 must be at least 1; p01 must be")
+    assert all(len(row) <= 45 for row in rows)
+    assert len(held(6)) == 1
+
+
+@pytest.mark.parametrize("char", ["x", "語"])
+async def test_a_very_long_refusal_is_cut_where_it_is_stored(tmp_path, char):
+    """An input row keeps at most ``REFUSAL_MAX`` cells of a reason, however
+    long the reason is, so each frame wraps a bounded text."""
+    app = _row_app(tmp_path, 100)
+    width = tui.drawer_widths(100)[0]
+    await app.dag_trigger_or_prompt("deploy")
+    app.inputs["params"] = "ticket=OPS-1"
+    blob = char * 100_000
+    app.api.post = _post_status(400, {"paramErrors": {"ticket": blob}})
+    await app.dag_trigger_from_input("ticket=OPS-1")
+    assert app.focus == "params"
+    kept = app.refusal[2]
+    assert kept.startswith("ticket " + blob[:900]) and kept.endswith("…")
+    assert tui.REFUSAL_MAX - 1 <= tui.text_width(kept) <= tui.REFUSAL_MAX
+    # the row paints, with the reason under it on a quarter of the panel
+    app.toasts = []
+    rows = _drawer_rows(app)
+    at = rows.index(" run with: ticket=OPS-1▌")
+    rule = next(n for n, row in enumerate(rows) if row.startswith("─"))
+    held = rows[at + 1 : rule]
+    full = " " + char * ((width - 4) // tui.char_width(char))
+    assert held[:2] == [" ticket", full]
+    assert len(held) == 6 and held[-1].endswith("…")
+    assert all(tui.text_width(row) <= width - 3 for row in held)
+    app.close("dag")
     await asyncio.sleep(0.05)
 
 

@@ -314,6 +314,14 @@ How the command reads them:
 - Each value is a `CRONSTABLE_PARAM_<NAME>` environment variable, with the
   name in upper case. A boolean reads `true` or `false`, and a number reads
   as its JSON text. A value is never substituted into the command.
+- A POSIX shell does not parse a quoted `"$CRONSTABLE_PARAM_INDEX"` again.
+  `cmd.exe`, the default shell on Windows, reads the text of an expanded
+  `%CRONSTABLE_PARAM_INDEX%` as command text, so a `&` in a value starts a
+  second command. On Windows, read the variable from PowerShell
+  (`shell: powershell` and `$env:CRONSTABLE_PARAM_INDEX`) or from a script
+  file that turns delayed expansion on, and constrain the value with
+  `allowed` or `pattern`. See
+  [reading values in a task](Orchestration-and-DAGs#reading-values-in-a-task).
 - With a `state:` section, `cronstable param get|list|dump` reads the same
   values over the job-facing endpoint (see the
   [CLI reference](CLI-Reference#param-getlistdump-run-parameters)).

@@ -65,6 +65,14 @@ _FALSE_TEXT = frozenset({"no", "false", "off", "0", "n"})
 #: ``paramErrors`` text for a name the declaration does not hold.
 UNDECLARED = "is not a declared parameter"
 
+#: The pattern parser behind :mod:`re`. It is private to the standard
+#: library, so :func:`nested_repetition` answers False without it.
+_PARSER: Any = getattr(re, "_parser", None)
+
+#: The longest ``maxLength`` at which :func:`nested_repetition` answers
+#: False for a pattern whose only choices are its two nested repeats.
+SHORT_MAX_LENGTH = 16
+
 
 @dataclass(frozen=True, slots=True)
 class ParamSpec:
@@ -202,6 +210,104 @@ def check_value(spec: ParamSpec, value: Any) -> str | None:
             ", ".join(env_text(v) for v in spec.allowed)
         )
     return None
+
+
+def nested_repetition(pattern: str, max_length: int | None = None) -> bool:
+    """Whether ``pattern`` nests repeats the way ``(a+)+`` does.
+
+    True when a repeat with no upper bound has a body that one inner repeat
+    can match alone, because every other item in the body can match the
+    empty string. The inner repeat counts when it can run more than once
+    and its count can vary, as ``a+`` and ``a{1,3}`` can. :func:`check_value`
+    can take time that grows exponentially with the length of a value that
+    such a pattern refuses.
+
+    ``max_length`` caps the length of the values the pattern checks. At
+    :data:`SHORT_MAX_LENGTH` or less, the two repeats alone refuse a value
+    within a few milliseconds, so the answer is True only when the pattern
+    holds a further choice: an alternative, or another repeat that counts.
+
+    The check does not examine the contents of a possessive repeat or an
+    atomic group, and a pattern can still be slow inside one.
+
+    The answer comes from the parse tree, so the pattern never runs. It is
+    False when the parser is missing or its tree has an unexpected shape.
+    """
+    try:
+        tree = _PARSER.parse(pattern)
+        if not _scan(tree)[0]:
+            return False
+        if max_length is None or max_length > SHORT_MAX_LENGTH:
+            return True
+        return _choices(tree) > 2
+    except Exception:  # noqa: BLE001 - the parser is private to re
+        return False
+
+
+def _scan(items: Any) -> tuple[bool, bool, bool]:
+    """Three answers about a parsed sequence, from one walk of its tree.
+
+    Whether it holds the repeat that :func:`nested_repetition` reports,
+    whether one repeat of the kind that function counts can match it alone,
+    and whether it can match the empty string at any position. An anchor, a
+    lookaround, and a back-reference depend on the position, so each counts
+    as required.
+    """
+    sre = _PARSER
+    nests = spare = False
+    required: list[bool] = []
+    for op, av in items:
+        # the same three answers for one item
+        nested = alone = empty = False
+        if op in (sre.MAX_REPEAT, sre.MIN_REPEAT):
+            low, high, body = av
+            nested, alone, empty = _scan(body)
+            unbounded = high == sre.MAXREPEAT
+            nested = nested or (unbounded and alone)
+            alone = high > max(low, 1) or (alone and high > 0)
+            empty = empty or low == 0
+        elif op is sre.POSSESSIVE_REPEAT:
+            empty = av[0] == 0
+        elif op is sre.SUBPATTERN:
+            nested, alone, empty = _scan(av[3])
+        elif op is sre.BRANCH:
+            scans = [_scan(alternative) for alternative in av[1]]
+            nested, alone, empty = map(any, zip(*scans, strict=True))
+        elif op in (sre.ASSERT, sre.ASSERT_NOT):
+            nested = _scan(av[1])[0]
+        elif op is sre.GROUPREF_EXISTS:
+            nested = any(_scan(sub)[0] for sub in av[1:] if sub is not None)
+        nests = nests or nested
+        if empty:
+            spare = spare or alone
+        else:
+            required.append(alone)
+    # with a required item, the lone repeat has to be that item
+    if required:
+        return nests, len(required) == 1 and required[0], False
+    return nests, spare, True
+
+
+def _choices(items: Any) -> int:
+    """How many choices a parsed sequence holds, over the items that
+    :func:`_scan` examines: each repeat of the kind that
+    :func:`nested_repetition` counts, and each alternative after the
+    first."""
+    sre = _PARSER
+    count = 0
+    for op, av in items:
+        if op in (sre.MAX_REPEAT, sre.MIN_REPEAT):
+            low, high, body = av
+            count += (high > max(low, 1)) + _choices(body)
+        elif op is sre.SUBPATTERN:
+            count += _choices(av[3])
+        elif op is sre.BRANCH:
+            count += len(av[1]) - 1 + sum(map(_choices, av[1]))
+        elif op in (sre.ASSERT, sre.ASSERT_NOT):
+            count += _choices(av[1])
+        elif op is sre.GROUPREF_EXISTS:
+            count += sum(_choices(sub) for sub in av[1:] if sub is not None)
+    return count
 
 
 def stored_form(spec: ParamSpec, value: Any) -> Any:

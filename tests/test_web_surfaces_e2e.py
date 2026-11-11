@@ -1526,7 +1526,9 @@ def test_pair_qr_follows_the_daemons_link_base(browser, tmp_path):
 def test_pair_warns_for_a_token_that_passes_every_route(browser, tmp_path):
     """`params` gates no route, so the warning does not wait for it."""
     with e2e.Daemon(tmp_path, auth="full") as daemon:
-        with e2e.open_page(browser, daemon.url, token=e2e.FULL_TOKEN) as page:
+        with e2e.open_page(
+            browser, e2e.lan_url(daemon.url), token=e2e.FULL_TOKEN
+        ) as page:
             page.faults.rewrite(
                 r"/whoami",
                 lambda body: dict(

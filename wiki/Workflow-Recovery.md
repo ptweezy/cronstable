@@ -236,7 +236,9 @@ the returned `planToken` and `dryRun: false`. A batch records each created run;
 resubmitting the same token continues an interrupted batch without creating
 duplicates for completed entries. Batch progress is retained for seven days.
 Incomplete batches protect their source runs for that period. Date bounds
-are inclusive; a bound without a time zone uses UTC.
+are inclusive; a bound without a time zone uses UTC. Each bound takes the
+date forms that a [backfill](HTTP-API#post-dagsnamebackfill) takes, and a
+bound in another form answers `409` with `invalid recovery date range`.
 
 The first execution of a preview takes the lease of every source run before
 it records the batch, so retention keeps the sources of a batch that is

@@ -1226,8 +1226,8 @@ _dag_schema_dict = {
 # Bearer-token scopes for the web control API (web.authTokens[].scopes):
 # `view` = read-only GETs; `control` = mutating POSTs; `approve` = the DAG
 # approval decision only; `params` = choosing run parameter values on a
-# trigger or a backfill, or reusing chosen ones in a recovery, each of
-# which also needs `control` for the route.
+# job start, a trigger or a backfill, or reusing chosen ones in a recovery,
+# each of which also needs `control` for the route.
 # `control`/`approve`/`params` imply `view`; the scalar web.authToken is
 # all-scopes. Enforcement lives in
 # cronstable.cron.Cron._make_auth_middleware / _required_web_scope, and for
@@ -2971,7 +2971,9 @@ def _dag_param_shape(raw: dict[str, Any], kind: str) -> str | None:
     if pattern is not None:
         try:
             re.compile(pattern)
-        except re.error as ex:
+        except (re.error, OverflowError, RecursionError) as ex:
+            # the last two: a repeat count or a nesting depth beyond what
+            # re compiles
             return "pattern is not a valid regular expression: {}".format(ex)
     max_length = raw.get("maxLength")
     if max_length is not None and not (
@@ -5614,6 +5616,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _validate_eventlog_config(config)
     _warn_if_resource_limits_unsupported(config)
     _warn_if_mail_login_unencrypted(config)
+    _warn_if_param_pattern_nests_repeats(config)
 
 
 def capped_jobs(
@@ -5694,6 +5697,47 @@ def _warn_if_mail_login_unencrypted(config: CronstableConfig) -> None:
             netutil.netloc(host, port),
             username,
         )
+
+
+def _warn_if_param_pattern_nests_repeats(config: CronstableConfig) -> None:
+    """Warn for each job or DAG parameter whose ``pattern`` nests repeats.
+
+    Once per load per parameter. A parameter whose ``maxLength`` is 16 or
+    less gets the warning only when its pattern holds a choice beyond the
+    two repeats, because the two alone refuse a value that short within a
+    few milliseconds (see :func:`cronstable.params.nested_repetition`). It
+    logs instead of refusing the load, because such a pattern is slow only
+    for a long value that it refuses.
+    """
+    declared = [
+        ("job", job.name, job.params) for job in config.jobs if job.params
+    ]
+    declared += [
+        ("dag", d.name, d.spec.params) for d in config.dags if d.spec.params
+    ]
+    if not declared:
+        return
+    # deferred for the reason DagTaskConfig gives
+    from cronstable import params as run_params
+
+    for kind, name, specs in declared:
+        for spec in specs:
+            if spec.pattern is None or not run_params.nested_repetition(
+                spec.pattern, spec.max_length
+            ):
+                continue
+            logger.warning(
+                "%s %r: param %r: the pattern holds a repeat inside an "
+                "unbounded repeat with nothing required between them, as "
+                "(a+)+ does. Checking a value that does not match can take "
+                "time that grows exponentially with the length of the "
+                "value, and the daemon schedules nothing until the check "
+                "ends. Require a character between the repeats, or make "
+                "the inner repeat possessive, as in (a++)+",
+                kind,
+                name,
+                spec.name,
+            )
 
 
 def _validate_dags(config: CronstableConfig) -> None:

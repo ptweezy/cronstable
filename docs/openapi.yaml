@@ -2009,10 +2009,10 @@ components:
         all scopes, while each `web.authTokens` entry lists some of `view`
         (every read-only GET, and every /mcp method), `control` (the
         mutating POSTs), `approve` (the DAG decision route) and `params`
-        (choosing run parameter values on a DAG trigger or backfill, or
-        reusing chosen values in a DAG recovery, each of which also needs
-        `control`); `control`, `approve` and `params` each imply
-        `view`. A recognized token
+        (choosing run parameter values on a job start, a DAG trigger, or a
+        DAG backfill, or reusing chosen values in a DAG recovery, each of
+        which also needs `control`); `control`, `approve` and `params` each
+        imply `view`. A recognized token
         that lacks the scope an operation requires is 403, not 401. The
         required scope defaults to `view` for GET/HEAD and `control` for other
         methods; operations that need another carry an `x-required-scope`
@@ -2243,7 +2243,7 @@ components:
               unknown scope.
             anyOf:
               - type: string
-                enum: [view, control, approve]
+                enum: [view, control, approve, params]
               - type: string
         allScopes: { type: boolean }
         pairLinkBase:
@@ -2821,6 +2821,23 @@ components:
             The task instance keys that the recovery keeps from the source
             run, sorted.
           items: { type: string }
+        preservedSkipped:
+          type: object
+          description: >-
+            The preserved tasks that stay `skipped`, keyed by task instance
+            key. Each value is the `skipReason` that the source run recorded
+            for the task, or null when it recorded none. Present only when a
+            preserved task is `skipped`.
+          additionalProperties:
+            type: object
+            nullable: true
+            properties:
+              kind:
+                type: string
+                description: >-
+                  An open string. Known values are `exit_code`, `upstream`,
+                  `trigger_rule`, `approval`, and `condition`.
+              detail: { type: string }
         resetMappings:
           type: array
           description: >-
@@ -2855,6 +2872,12 @@ components:
           description: >-
             Whether the two revisions differ. Executing such a plan needs
             `allowConfigChange`.
+        params:
+          allOf:
+            - $ref: "#/components/schemas/DagRunParams"
+          description: >-
+            The source run's parameter values, which the recovery run
+            reuses. Present on a plan of a DAG that declares parameters.
         planToken:
           type: string
           description: >-
@@ -2988,8 +3011,22 @@ components:
           type: string
           format: date-time
           description: >-
-            The same instant as `finished_at`. Present on every row except a
-            `skipped` one, so a pause never moves the last-ran watermark.
+            The same instant as `finished_at`. Absent on a `skipped` row, so
+            a pause never moves the last-ran watermark. Also absent on the
+            row of a manual start that supplied run parameter values, which
+            carries `suppliedRanAt` in its place.
+        suppliedParams:
+          type: boolean
+          description: >-
+            Present and true on the row of a manual start that supplied run
+            parameter values. That run stays outside the job's retry
+            sequence.
+        suppliedRanAt:
+          type: string
+          format: date-time
+          description: >-
+            The same instant as `finished_at`. Present only on a row that
+            carries `suppliedParams`.
       additionalProperties: true
 
     RunResources:

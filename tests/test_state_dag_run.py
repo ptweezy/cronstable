@@ -8022,3 +8022,246 @@ async def test_list_dags_exports_when(tmp_path, dag_cron):
     assert "when" not in tasks["extract"] and "when" not in tasks["publish"]
     for task in by_name["lin"]["tasks"]:
         assert "when" not in task
+
+
+# ===========================================================================
+# The advance lease between a pass's store reads and its claim
+# ===========================================================================
+
+
+def _during_first_read(cron, reader, action):
+    """Await ``action`` while the first call of the scheduler's ``reader``
+    is pending. Returns the list that records every call."""
+    real = getattr(cron._dag, reader)
+    calls = []
+
+    async def read(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            await action()
+        return await real(*args)
+
+    setattr(cron._dag, reader, read)
+    return calls
+
+
+async def _finish_extract(cron):
+    """`extract` finishes, and the advance that follows reads its value."""
+    await _reap_running(cron)
+    await _drain_pending(cron)
+
+
+async def test_a_lease_that_lapses_during_a_condition_read_starts_no_task(
+    tmp_path, dag_cron
+):
+    # node A's renewals go unanswered while it reads the value that
+    # `incremental` compares, so its lease runs out, and node B on another
+    # host adopts the run
+    marker = tmp_path / "incremental-ran"
+    ran = [_PY, "-c", "open(r'{}', 'a').write('x')".format(marker)]
+    a = await _when_cron(dag_cron, tmp_path, b"12\n")
+    b = await _when_cron(dag_cron, tmp_path, b"12\n")
+    b._state_host = "other-host"
+    for cron in (a, b):
+        _set_cmd(cron, "cond", "incremental", ran)
+    started = await a._dag.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+
+    async def lapse():
+        a._dag._renewers[ref].cancel()
+        a._dag._owned[ref].expires_at = dagrun._now() - 5.0
+
+    reads = _during_first_read(a, "_read_xcom_text", lapse)
+    await _finish_extract(a)
+    assert len(reads) == 1
+    # A claimed nothing on the lapsed lease, so the task has no verdict
+    # and no process
+    body = await a._dag.get_run(*ref)
+    assert _states(body)["incremental"] == dag.PENDING
+    assert "whenMet" not in body["tasks"]["incremental"]
+    assert not any(a.running_jobs.values())
+    # no node took the lease over, so A keeps the run and checks again soon
+    assert ref in a._dag._owned
+    wake = a._dag._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # B adopts and starts the task, and A's next advance finds B's lease
+    await a.state_backend.release_lease(a._dag._owned[ref])
+    assert await b._dag._try_own(b.cron_dags["cond"], ref)
+    await a._dag.advance_one(ref)
+    assert ref not in a._dag._owned
+    assert not any(a.running_jobs.values())
+    body = await _drive(b, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert _states(body)["incremental"] == dag.SUCCESS
+    assert marker.read_text() == "x"  # one process ran the task
+
+
+@pytest.mark.parametrize("learned", ["from-the-store", "from-a-renewal"])
+async def test_a_lease_taken_over_during_an_expansion_read_expands_nothing(
+    tmp_path, dag_cron, learned
+):
+    cron = await dag_cron(_EXPAND)
+    run_key = await _advance_expand_setup(cron, tmp_path)
+    ref = ("xd", run_key)
+    d = cron._dag
+
+    async def take_over():
+        lease = d._owned[ref]
+        d._renewers[ref].cancel()
+        lease.expires_at = dagrun._now() - 5.0
+        await cron.state_backend.release_lease(lease)
+        peer = await cron.state_backend.acquire_lease(
+            lease.name, "peer-node", dagrun.DAG_LEASE_TTL
+        )
+        assert peer is not None and peer.fence == lease.fence + 1
+        if learned == "from-a-renewal":
+            # the store refuses the renewal, and the renew loop ends
+            # ownership
+            d._drop_owned(ref)
+
+    reads = _during_first_read(cron, "_read_xcom_list", take_over)
+    await d.advance_one(ref)
+    assert len(reads) == 1
+    assert ref not in d._owned and ref not in d._wake
+    # the pass read the list and recorded none of it
+    body = await d.get_run(*ref)
+    assert _states(body) == {"gen": dag.SUCCESS, "work": dag.PENDING}
+    assert "work" not in body.get("mapped", {})
+    assert not any(cron.running_jobs.values())
+
+
+async def test_a_lapsed_lease_the_store_cannot_confirm_starts_no_task(
+    tmp_path, monkeypatch, dag_cron
+):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    d = cron._dag
+    started = await d.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+    asked = []
+
+    async def _unreachable(name):
+        asked.append(name)
+        raise RuntimeError("store unreachable")
+
+    async def lapse():
+        d._renewers[ref].cancel()
+        d._owned[ref].expires_at = dagrun._now() - 5.0
+        monkeypatch.setattr(cron.state_backend, "read_lease", _unreachable)
+
+    reads = _during_first_read(cron, "_read_xcom_text", lapse)
+    await _finish_extract(cron)
+    assert len(reads) == 1 and asked == [d._lease_name(ref)]
+    body = await d.get_run(*ref)
+    assert _states(body)["incremental"] == dag.PENDING
+    assert not any(cron.running_jobs.values())
+    # the run stays with this node, which checks again soon
+    assert ref in d._owned
+    wake = d._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # the store answers a renewal, and the next pass starts the task
+    monkeypatch.undo()
+    d._owned[ref] = await cron.state_backend.renew_lease(
+        d._owned[ref], dagrun.DAG_LEASE_TTL
+    )
+    body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert _states(body)["incremental"] == dag.SUCCESS
+
+
+@pytest.mark.parametrize("renewed", [False, True], ids=["held", "renewed"])
+async def test_a_condition_read_under_a_live_lease_starts_the_task(
+    tmp_path, monkeypatch, dag_cron, renewed
+):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    d = cron._dag
+    backend = cron.state_backend
+    lease_reads = []
+    read_lease = backend.read_lease
+
+    async def counting(name):
+        lease_reads.append(name)
+        return await read_lease(name)
+
+    monkeypatch.setattr(backend, "read_lease", counting)
+    started = await d.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+
+    async def renew():
+        if renewed:
+            # the renew loop stores a new lease, and the one the pass
+            # started under runs out
+            held = d._owned[ref]
+            d._owned[ref] = await backend.renew_lease(
+                held, dagrun.DAG_LEASE_TTL
+            )
+            held.expires_at = dagrun._now() - 5.0
+
+    reads = _during_first_read(cron, "_read_xcom_text", renew)
+    await _finish_extract(cron)
+    assert len(reads) == 1
+    # the pass that read the value recorded the verdict and started the task
+    body = await d.get_run(*ref)
+    assert body["tasks"]["incremental"]["whenMet"] is True
+    assert _states(body)["incremental"] == dag.RUNNING
+    assert sum(map(len, cron.running_jobs.values())) == 1
+    body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    # no pass read the lease back from the store
+    assert lease_reads == []
+
+
+async def test_a_lease_that_lapses_during_recovery_preparation_starts_no_task(
+    tmp_path, dag_cron
+):
+    # node A's lease runs out while it prepares a recovery run, and node B
+    # on another host adopts the run
+    fixed = tmp_path / "b-fixed"
+    marker = tmp_path / "b-ran"
+    # `b` fails until `fixed` exists, then records that it ran
+    ran = [
+        _PY,
+        "-c",
+        "open(r'{}').close(); open(r'{}', 'a').write('x')".format(
+            fixed, marker
+        ),
+    ]
+    a = await dag_cron(_LINEAR)
+    b = await dag_cron(_LINEAR)
+    b._state_host = "other-host"
+    for cron in (a, b):
+        _set_cmd(cron, "lin", "a", _OK)
+        _set_cmd(cron, "lin", "b", ran)
+    source = (await a._dag.trigger("lin"))["runKey"]
+    body = await _drive(a, "lin", source)
+    assert body["state"] == dag.FAILED, _states(body)
+    fixed.touch()
+    token = (await a._dag.recover("lin", source))["planToken"]
+    ref = ("lin", "recovery-" + token)
+
+    async def lapse():
+        a._dag._renewers[ref].cancel()
+        a._dag._owned[ref].expires_at = dagrun._now() - 5.0
+
+    reads = _during_first_read(a, "_prepare_recovery", lapse)
+    # accepting the preview owns the recovery run and advances it once
+    accepted = await a._dag.recover("lin", source, plan_token=token)
+    await _drain_pending(a)
+    assert accepted["runKey"] == ref[1] and reads == [(ref,)]
+    # A prepared the run and claimed nothing on the lapsed lease
+    body = await a._dag.get_run(*ref)
+    assert body["recovery"]["status"] == "ready"
+    assert _states(body) == {"a": dag.SUCCESS, "b": dag.PENDING}
+    assert not any(a.running_jobs.values())
+    # no node took the lease over, so A keeps the run and checks again soon
+    assert ref in a._dag._owned
+    wake = a._dag._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # B adopts and starts the task, and A's next advance finds B's lease
+    await a.state_backend.release_lease(a._dag._owned[ref])
+    assert await b._dag._try_own(b.cron_dags["lin"], ref)
+    await a._dag.advance_one(ref)
+    assert ref not in a._dag._owned
+    assert not any(a.running_jobs.values())
+    body = await _drive(b, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert marker.read_text() == "x"  # one process ran the task

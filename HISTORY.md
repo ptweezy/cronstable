@@ -3,6 +3,63 @@
 ## 1.2.76
 
 - The `-fedora` image is built on Fedora 45 and runs Python 3.15.
+- A job or a workflow declares run parameters under `params:`, each with a
+  type and constraints such as `allowed` or `pattern`. A manual start, a
+  trigger, or a backfill supplies values, and a command reads them from
+  `CRONSTABLE_PARAM_<NAME>` variables or with `cronstable param`. With
+  scoped tokens, choosing values needs the `params` scope in addition to
+  `control`.
+- At load, the daemon logs a warning for a parameter `pattern` that holds a
+  repeat inside an unbounded repeat with nothing required between them, as
+  `(a+)+` does. Checking a value against such a pattern can take time that
+  grows exponentially with the length of the value.
+- A workflow branches on skipped tasks. A task ends `skipped` when its
+  command exits with a code in its `skipExitCodes`, or before it starts
+  when a `when:` comparison on a run parameter or an XCom value does not
+  hold. The trigger rules `none_failed`, `none_failed_min_one_success`, and
+  `all_done_min_one_failed` join branches and run failure handlers, and a
+  skipped task records why in `skipReason`.
+- A workflow that uses `params:`, `when:`, `skipExitCodes`, or one of those
+  trigger rules needs run engine level 2, and its runs record `engine: 2`.
+  An earlier release refuses such a configuration, and it advances a level 2
+  run under the rules it knows. On a store that several nodes share, upgrade
+  every node before a configuration uses one of the keys.
+- `POST /jobs/{name}/start` and `POST /dags/{name}/trigger` answer `400` for
+  a body that is not a JSON object or that holds a field the route does not
+  take, and `POST /dags/{name}/backfill` answers `400` for a field in
+  addition to `from`, `to`, and `params`. Nothing starts, and the daemon
+  logs each refusal as a warning. The body is optional on the start and
+  trigger routes.
+- A backfill's `created` counts the runs that the request created, and
+  `existing` counts the dates that already had a run. `runKeys` and
+  `existingRunKeys` list them, so a repeated backfill answers `created: 0`.
+- Backfill and failed-dates recovery read `from` and `to` as RFC 3339 dates
+  or date-times, such as `2026-01-05` or `2026-01-05T02:00:00+00:00`, on
+  every Python version. They refuse the ISO 8601 basic and week forms, such
+  as `20260105T020000Z`.
+- A mapped task whose list is empty waits for every upstream and then
+  follows its `triggerRule` as a single task does, so its downstream tasks
+  wait as well. Under the default rule, it ends `upstream_failed` when
+  another upstream fails.
+- Workflow catch-up counts missed dates from the latest scheduled or
+  catch-up run. A manual run, a backfill, and a recovery leave that point
+  where it is. Retention always keeps the run that holds it, which can be
+  one terminal run beyond `retainRuns`.
+- When another node takes over a workflow run while a node reads from the
+  state store before it starts tasks, for example the XCom values for a
+  mapped task's list or a `when:` comparison, the first node starts none of
+  the run's tasks.
+- `GET /whoami` reports `allScopes: false` for a token that lists `view`,
+  `control`, and `approve`, because `params` is a fourth scope. Such a token
+  passes every route's check and starts runs with the declared parameter
+  defaults.
+- The Sentry reporter's client sends the daemon's error events with their
+  tracebacks and without the local variables of the stack frames or the
+  body of an HTTP request.
+- In the terminal dashboard, a job start, a trigger, or a backfill that the
+  daemon refuses keeps its input row open with its text and shows the
+  daemon's reasons under the row. The toast leads with the same reasons, and
+  long input scrolls so that the cursor stays in view.
 
 ## 1.2.75
 

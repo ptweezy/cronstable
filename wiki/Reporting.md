@@ -291,6 +291,29 @@ jobs:
             shard: 3
 ```
 
+### What Sentry receives
+
+The Sentry client belongs to the whole daemon. The first report whose `dsn`
+resolves initializes it. After that, Sentry receives:
+
+- A report event. It holds the rendered `body` as its message, the `level`,
+  the `fingerprint`, and the extra context, and it has no stack trace.
+- An event for each daemon log record at `ERROR` or above, with the logger
+  name and the message. A record that carries an exception adds the
+  exception and its traceback: the file, function, and line of each frame,
+  and the source lines around it. The traceback holds no local variables.
+- With every event, the trail that the SDK keeps: the daemon's log lines at
+  `INFO` and above, the command line of each process that the daemon
+  starts, and the method and URL of each outgoing HTTP request, which
+  includes the URL of a [webhook report](#webhook-reporter). Every event
+  also names the host, the daemon's command line, and the installed Python
+  packages.
+- The request that a web listener is handling when an event is captured,
+  for a listener that started after the client was initialized: the URL,
+  the query string, the method, the client address, and the headers, with
+  the values of `Authorization` and `Cookie` filtered. The event holds no
+  request body.
+
 ## Shell reporter
 
 Runs a user-supplied command, passing job state through `CRONSTABLE_*` environment

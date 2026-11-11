@@ -143,9 +143,12 @@ created (`created`, `runKeys`) and the dates that already had a run
 For a job that declares [run parameters](Commands-and-Environment#params), `cron_list_jobs` returns the
 declaration under `params`, and `cron_run_job` takes a `params` object. The
 result lists the values the run takes. A refused value returns an error that
-names it, and nothing starts. A start that the job's `concurrencyPolicy`
-refuses returns an error too. A start that waits for another node to yield
-the job's cluster concurrency slot returns `pending: true` (see
+names it, and nothing starts. With scoped web tokens, a non-empty `params`
+object needs the `params` scope in addition to `control`, and a call without
+`params` starts the job with the declared defaults. A start that the job's
+`concurrencyPolicy` refuses returns an error too. A start that waits for
+another node to yield the job's cluster concurrency slot returns
+`pending: true` (see
 [`POST /jobs/{name}/start`](HTTP-API#post-jobsnamestart)).
 
 For a workflow that declares

@@ -492,7 +492,10 @@ What a comparison reads:
   trailing newline removed. `xcom.task` is a task upstream of this one, and
   it cannot be a mapped task, because a mapped task publishes one value per
   instance. Each comparison value is text of at most 4096 bytes, so quote a
-  value such as `"0"`.
+  value such as `"0"`. Under `cmd.exe`, the command
+  `echo full | cronstable xcom push --key mode` publishes `full` followed by
+  a space, which does not equal `full`. Publish from PowerShell, or write
+  `echo full| cronstable xcom push --key mode`.
 - A source with no value fails `equals` and `in`, and passes `notEquals` and
   `notIn`. An XCom source has no value when the task did not publish the
   key, when the published value is larger than 4096 bytes, and when it is
@@ -575,7 +578,7 @@ dags:
 | `required` | `true` means the caller supplies the value on every run. A required parameter takes no `default`, and a workflow with a `schedule` cannot have one. |
 | `allowed` | The complete list of accepted values, for a `string`, an `integer`, or a `number`. |
 | `minimum`, `maximum` | Inclusive bounds for an `integer` or a `number`. |
-| `pattern` | A regular expression in Python syntax that the whole string has to match. The daemon evaluates it for each supplied value, so keep it free of nested repetition such as `(a+)+`. |
+| `pattern` | A regular expression in Python syntax that the whole string has to match. The daemon evaluates it for each supplied value, so keep it free of nested repetition such as `(a+)+` (see [pattern cost](#pattern-cost)). |
 | `maxLength` | The longest accepted string, in characters, from 1 to 4096. |
 | `description` | Text that the dashboard shows under the field. |
 
@@ -591,6 +594,38 @@ The limits:
 - An integer is from -9007199254740991 to 9007199254740991, the range a JSON
   client reads exactly. A number is finite.
 - The values of one run are at most 16 KiB as JSON.
+
+#### Pattern cost
+
+A `pattern` that holds a repeat inside an unbounded repeat, with nothing
+required between them, can take time that grows exponentially with the
+length of a value that it refuses. `([a-z0-9]+-?)+` is such a pattern,
+because its `-` is optional. So is `([0-9]{1,3}\.?)+`, whose inner repeat
+has an upper bound. The daemon schedules nothing while it checks a value.
+It checks `maxLength` first, and that limit bounds the cost only when it is
+short, such as 16, because each further character multiplies the time.
+
+At load and under `--validate-config`, cronstable logs a warning for each
+job or workflow parameter that has such a pattern, and the configuration
+still loads:
+
+```text
+dag 'deploy': param 'slug': the pattern holds a repeat inside an unbounded repeat with nothing required between them, as (a+)+ does. Checking a value that does not match can take time that grows exponentially with the length of the value, and the daemon schedules nothing until the check ends. Require a character between the repeats, or make the inner repeat possessive, as in (a++)+
+```
+
+cronstable omits the warning for a parameter whose `maxLength` is 16 or
+less, unless its pattern also holds an alternative (`|`) or a third repeat.
+
+Either rewrite removes the exponential growth:
+
+| Rewrite | Example |
+| --- | --- |
+| Require a separator between the repeats | `[a-z0-9]+(-[a-z0-9]+)*` |
+| Make the inner repeat possessive | `(?:[a-z0-9]++-?)+` |
+
+The warning covers this one shape. A pattern can be slow in ways that it
+does not detect, such as a repeat over alternatives that overlap, as in
+`(a|aa)+`.
 
 ### Supplying values
 
@@ -660,10 +695,37 @@ cronstable param dump           # prints every value as one JSON object
 
 cronstable never substitutes a value into the command text. Quote the
 variable in a POSIX shell (`"$CRONSTABLE_PARAM_TARGET"`), which does not
-parse an expanded variable again. `cmd.exe` does parse `%VAR%` again, so a
-Windows task reads parameters from PowerShell or with delayed expansion
-(`!VAR!`), and its declaration constrains each value with `allowed` or
-`pattern`.
+parse an expanded variable again.
+
+`cmd.exe`, the default shell of a Windows task, reads the text of an
+expanded `%CRONSTABLE_PARAM_TARGET%` as command text. A `&`, `|`, or `>` in
+the value is command syntax there, so a value of the form
+`staging & <command>` runs that command. Double quotes around the reference
+do not protect against a value that holds a double quote. `cmd.exe` starts
+with delayed expansion off, so `!CRONSTABLE_PARAM_TARGET!` in a `command`
+stays as that literal text. A Windows task reads a parameter in one of
+these ways:
+
+- From PowerShell, which does not parse the value again:
+
+  ```yaml
+        - id: release
+          shell: powershell
+          command: Write-Output deploy $env:CRONSTABLE_PARAM_TARGET
+  ```
+
+- From a script file that turns delayed expansion on:
+
+  ```bat
+  @echo off
+  setlocal EnableDelayedExpansion
+  echo deploy !CRONSTABLE_PARAM_TARGET!
+  ```
+
+Constrain each value with `allowed` or `pattern` in the declaration as
+well. `cmd.exe` treats a variable whose value is the empty string as
+undefined, so for an empty value `%CRONSTABLE_PARAM_TARGET%` in a `command`
+stays as that literal text.
 
 ### What a run stores
 
@@ -681,6 +743,11 @@ Windows task reads parameters from PowerShell or with delayed expansion
   value. The built-in report templates carry no parameters. A custom report
   template that renders the task's `environment` includes the
   `CRONSTABLE_PARAM_*` variables.
+- With the [Sentry reporter](Reporting#sentry-reporter) in use, the
+  daemon's error-level log records also go to Sentry as events. An event
+  carries its traceback without the local variables of the stack frames,
+  and it carries no HTTP request body, so neither brings a parameter value
+  to Sentry.
 
 A run's parameter values are visible to every reader with the `view` scope,
 to MCP clients, and in state backups. Keep a secret in the task's
@@ -758,6 +825,11 @@ below). The claim that flips a task `pending → running` is a single
 atomic compare-and-set on the run document, a correctness backstop underneath
 the lease.
 
+A pass that reads XCom values, for a mapped task's list or a `when:`
+comparison, checks the lease again before it claims. So does a pass that
+prepares a [recovery run](Workflow-Recovery). An owner whose lease ran out
+during those reads starts no task in that pass.
+
 The owner also keeps an in-memory record of every task instance it claimed
 and queued for launch. If a store write lands after the owner's timeout
 expires (for example, on a stalled disk or network mount), the task is marked
@@ -830,6 +902,21 @@ features needs.
 
 Upgrade every node on a shared store before a configuration uses a feature
 that needs a higher level.
+
+Installing an older build needs the reverse order. A build at level 1 does
+not read the `engine` field, so it adopts a run that records `engine: 2` and
+advances it under the rules it knows. It reads no `when:` condition and
+sets no `CRONSTABLE_PARAM_*` variable, so a task that a condition would
+skip runs, and a command reads its parameters as unset. Before you install
+an older build on any node of the store:
+
+1. Remove the level 2 keys from the configuration on every node. New runs
+   then record no `engine` field. A run in progress follows the changed
+   configuration for its remaining tasks, as after any
+   [reload](#conditional-branching).
+2. Wait until every run whose document records `engine: 2` has finished.
+   [`GET /dags/{name}/runs/{run_key}`](HTTP-API#get-dagsnamerunsrun_key)
+   shows the field.
 
 ## Retention and GC
 
