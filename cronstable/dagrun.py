@@ -197,11 +197,25 @@ RunRef = tuple[str, str]  # (dag_name, run_key)
 
 
 class TriggerConflict(Exception):
-    """A trigger's ``requestId`` names a run that another request created."""
+    """A trigger's ``requestId`` names a run that another request created.
+
+    ``message`` is the sentence the caller reads.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 class TriggerInputError(ValueError):
-    """A trigger argument, other than a parameter, that cannot be used."""
+    """A trigger argument, other than a parameter, that cannot be used.
+
+    ``message`` is the sentence the caller reads.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 #: XCom payload size at or above which a mapped fan-out's parse (and its

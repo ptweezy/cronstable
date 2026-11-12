@@ -98,15 +98,17 @@ class ParamSpec:
 class ParamError(Exception):
     """Supplied values that a run cannot take.
 
-    ``errors`` maps each offending parameter name to the reason, phrased to
-    follow the name ("must be at most 10000"). It is empty when the fault
-    belongs to the map as a whole.
+    ``message`` is the sentence the caller reads: the web API and the MCP
+    server return it as the reason. ``errors`` maps each offending parameter
+    name to the reason, phrased to follow the name ("must be at most
+    10000"). It is empty when the fault belongs to the map as a whole.
     """
 
     def __init__(
         self, message: str, errors: Mapping[str, str] | None = None
     ) -> None:
         super().__init__(message)
+        self.message = message
         self.errors: dict[str, str] = dict(errors or {})
 
 

@@ -7108,7 +7108,7 @@ class Cron:
                 "{}".format(matched.label, WEB_PARAMS_SCOPE, action),
             ) from ex
         return _json_response(
-            {"error": str(ex), "paramErrors": ex.errors},
+            {"error": ex.message, "paramErrors": ex.errors},
             status=400,
             headers=self._web_headers(),
         )
@@ -7137,9 +7137,9 @@ class Cron:
         except ParamError as ex:
             return self._web_param_error(request, ex)
         except TriggerInputError as ex:
-            raise _api_error(web.HTTPBadRequest, str(ex)) from ex
+            raise _api_error(web.HTTPBadRequest, ex.message) from ex
         except TriggerConflict as ex:
-            raise _api_error(web.HTTPConflict, str(ex)) from ex
+            raise _api_error(web.HTTPConflict, ex.message) from ex
         if result is None:
             raise _api_error(
                 web.HTTPNotFound, ("workflow {!r} not found").format(name)
