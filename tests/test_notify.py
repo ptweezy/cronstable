@@ -10,9 +10,13 @@ is unit-tested here via ``_dispatch_notify``.
 
 import asyncio
 import json
+import logging
 import types
+import uuid
 
 import pytest
+import sentry_sdk
+from sentry_sdk.transport import Transport
 
 import cronstable.config as config
 import cronstable.cron
@@ -20,7 +24,11 @@ from cronstable import dag
 from cronstable.config import ConfigError
 from cronstable.cron import Cron
 from cronstable.dagrun import DagScheduler
-from cronstable.job import NotifyEventContext, _compiled_template
+from cronstable.job import (
+    NotifyEventContext,
+    SentryReporter,
+    _compiled_template,
+)
 from tests.conftest import _cron
 
 # ---------------------------------------------------------------------------
@@ -593,7 +601,7 @@ async def test_do_advance_dispatches_approval_waiting_live(
     )
     cron = await _make_cron(tmp_path, yaml)
     try:
-        run_key = await cron._dag.trigger_run("ap")
+        run_key = (await cron._dag.trigger("ap"))["runKey"]
         body = await _drive(cron, "ap", run_key)
         assert body["tasks"]["gate"]["awaitingApproval"] is True
         await _drain_notify(cron)
@@ -654,3 +662,130 @@ async def test_emit_cluster_role_logs_quorum_regain_is_silent(monkeypatch):
     await _drain_notify(cron)
     assert captured == []
     assert cron._was_quorate is True  # the transition itself was recorded
+
+
+# ---------------------------------------------------------------------------
+# SentryReporter: what the daemon's error events carry
+# ---------------------------------------------------------------------------
+
+_SENTRY_DSN = "http://key@sentry.invalid/1"
+_SENTRY_LOG = "launching task %s failed"
+
+
+@pytest.fixture
+def sentry_events(monkeypatch):
+    """Events the Sentry SDK sends, kept in memory.
+
+    Teardown rebinds the client that was bound before the test.
+    """
+    events = []
+
+    class MemoryTransport(Transport):
+        def capture_envelope(self, envelope):
+            event = envelope.get_event()
+            if event is not None:
+                events.append(event)
+
+    monkeypatch.setattr("sentry_sdk.client.make_transport", MemoryTransport)
+    scope = sentry_sdk.Scope.get_global_scope()
+    client = scope.client
+    yield events
+    scope.set_client(client)
+
+
+async def _sentry_report():
+    # one real report: it initializes the SDK the way the daemon does
+    notify_cfg = config._build_notify_config(
+        {"report": {"sentry": {"dsn": {"value": _SENTRY_DSN}}}}
+    )
+    ctx = NotifyEventContext(
+        event="dag_failure",
+        success=False,
+        name="etl",
+        subject="DAG 'etl' run r1 failed",
+        message="1 task(s) failed: t1",
+    )
+    await SentryReporter().report(False, ctx, notify_cfg["report"])
+
+
+def _log_error_holding(value):
+    # an error record with a traceback, from a frame whose locals hold `value`
+    held = {"region": value}
+    try:
+        raise RuntimeError("no answer")
+    except RuntimeError:
+        logging.getLogger("cronstable").exception(_SENTRY_LOG, "t1")
+    return held
+
+
+def _logged_event(events):
+    (event,) = [
+        event
+        for event in events
+        if (event.get("logentry") or {}).get("message") == _SENTRY_LOG
+    ]
+    return event
+
+
+def _frames(event):
+    (exception,) = event["exception"]["values"]
+    return exception["stacktrace"]["frames"]
+
+
+async def _post_to_late_listener(body):
+    # a listener built after the SDK initialized runs inside the SDK's
+    # aiohttp integration; its handler reads the body, then logs an error
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def handler(request):
+        await request.read()
+        _log_error_holding(None)
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/jobs/etl/start", handler)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/jobs/etl/start", json=body)
+        assert response.status == 200
+
+
+async def test_sentry_error_event_omits_frame_locals(sentry_events):
+    marker = uuid.uuid4().hex
+    await _sentry_report()
+    _log_error_holding(marker)
+    event = _logged_event(sentry_events)
+    frames = _frames(event)
+    # the event has the traceback, without the variables of its frames
+    assert frames[-1]["function"] == "_log_error_holding"
+    assert not any("vars" in frame for frame in frames)
+    assert marker not in json.dumps(event, default=str)
+
+
+async def test_sentry_error_event_omits_request_body(sentry_events):
+    marker = uuid.uuid4().hex
+    await _sentry_report()
+    await _post_to_late_listener({"params": {"region": marker}})
+    event = _logged_event(sentry_events)
+    # the event describes the request, without its body
+    assert event["request"]["url"].endswith("/jobs/etl/start")
+    assert marker not in json.dumps(event, default=str)
+
+
+async def test_sentry_report_keeps_its_own_event(sentry_events):
+    await _sentry_report()
+    (event,) = sentry_events
+    assert "DAG 'etl' run r1 failed" in event["message"]
+    assert event["level"] == "error"
+    assert event["fingerprint"] == ["cronstable", "dag_failure", "etl"]
+    assert event["extra"]["job"] == "etl"
+    assert event["extra"]["success"] is False
+
+
+async def test_sentry_client_sends_no_frame_locals_or_request_bodies(
+    sentry_events,
+):
+    await _sentry_report()
+    options = sentry_sdk.get_client().options
+    assert options["include_local_variables"] is False
+    assert options["max_request_body_size"] == "never"

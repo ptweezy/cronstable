@@ -54,6 +54,31 @@ async def test_verifier_inherits_working_directory_and_environment(tmp_path):
     assert run.verification["outcome"] == "success"
 
 
+async def test_verifier_reads_the_runs_parameters_and_no_others(monkeypatch):
+    # a run with parameters of its own drops the ones the daemon inherited,
+    # for the check as for the command
+    monkeypatch.setenv("CRONSTABLE_PARAM_STRAY", "from-the-daemon")
+    probe = (
+        "import os; exit('CRONSTABLE_PARAM_STRAY' in os.environ "
+        "or os.environ['CRONSTABLE_PARAM_TARGET'] != 'prod')"
+    )
+    run = job(probe, probe)
+    run.owns_params = True
+    run.extra_env = {"CRONSTABLE_PARAM_TARGET": "prod"}
+    await run.start()
+    await run.wait()
+    assert not run.failed
+    assert run.verification["outcome"] == "success"
+    # any other run keeps the environment it inherits, check included
+    kept = "import os; exit('CRONSTABLE_PARAM_STRAY' not in os.environ)"
+    run = job(kept, kept)
+    run.extra_env = {"OTHER": "1"}
+    await run.start()
+    await run.wait()
+    assert not run.failed
+    assert run.verification["outcome"] == "success"
+
+
 async def test_verification_timeout():
     run = job("pass", "import time; time.sleep(30)")
     run.config.verify["timeout"] = 0.1
@@ -121,7 +146,7 @@ dags:
     template = cron.cron_dags["flow"].task_templates["export"]
     template.command = [sys.executable, "-c", "pass"]
     template.verify["command"] = [sys.executable, "-c", "print('missing rows'); exit(1)"]
-    key = await cron._dag.trigger_run("flow")
+    key = (await cron._dag.trigger("flow"))["runKey"]
     result = await _drive(cron, "flow", key)
     assert result["tasks"]["export"]["exitCode"] == 0
     assert result["tasks"]["export"]["verification"]["outcome"] == "failure"

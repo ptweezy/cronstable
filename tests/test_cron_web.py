@@ -1983,6 +1983,111 @@ async def test_shutdown_route_refuses_on_a_listener_with_no_tokens():
         await asyncio.sleep(0.25)
 
 
+_BACKFILL_WINDOW = {
+    "from": "2026-01-01T00:00:00+00:00",
+    "to": "2026-01-01T04:30:00+00:00",
+}
+_UNKNOWN_FIELD_BODIES = [
+    (
+        "/jobs/alpha/start",
+        {"ref": "zz-9"},
+        'unknown start field "ref"; the body accepts params',
+    ),
+    (
+        "/dags/flow/trigger",
+        {"ref": "zz-9"},
+        'unknown trigger field "ref"; the body accepts params, logicalDate, '
+        "requestId",
+    ),
+    (
+        "/dags/flow/backfill",
+        {**_BACKFILL_WINDOW, "dryRun": True},
+        'unknown backfill field "dryRun"; the body accepts from, to, params',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "path, body, reason",
+    _UNKNOWN_FIELD_BODIES,
+    ids=["start", "trigger", "backfill"],
+)
+async def test_a_refused_body_is_logged_for_an_authorized_caller_only(
+    start_web_app, caplog, path, body, reason
+):
+    """The auth middleware answers before a handler reads the body, so
+    only a caller whose token may take the action reaches the warning."""
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await start_web_app(
+        cron,
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authTokens": [
+                {"label": "readonly", "scopes": ["view"], "value": "ro-tok"},
+                {"label": "admin", "scopes": ["control"], "value": "rw-tok"},
+            ],
+        },
+    )
+    url = "http://127.0.0.1:{}{}".format(cron.web_runner.addresses[0][1], path)
+    admin = {"Authorization": "Bearer rw-tok"}
+
+    def refusals():
+        return [
+            (record.levelname, record.getMessage())
+            for record in caplog.records
+            if record.getMessage().startswith("web: refused")
+        ]
+
+    with caplog.at_level("WARNING", logger="cronstable"):
+        async with aiohttp.ClientSession() as session:
+            for headers, status in (
+                ({}, 401),
+                ({"Authorization": "Bearer nope"}, 401),
+                ({"Authorization": "Bearer ro-tok"}, 403),
+            ):
+                for sent in ({"json": body}, {"data": b"ref=zz-9"}):
+                    async with session.post(
+                        url, headers=headers, **sent
+                    ) as resp:
+                        assert resp.status == status
+            assert refusals() == []
+            async with session.post(url, headers=admin, json=body) as resp:
+                assert resp.status == 400
+                assert (await resp.json())["error"] == reason
+            async with session.post(
+                url, headers=admin, data=b"ref=zz-9"
+            ) as resp:
+                assert resp.status == 400
+    target = 'web: refused POST "{}": '.format(path)
+    assert refusals() == [
+        ("WARNING", target + reason),
+        ("WARNING", target + "request body is not valid JSON"),
+    ]
+    # field names only, never a value
+    assert "zz-9" not in caplog.text
+    assert not cron.running_jobs
+
+
+def test_a_refused_body_log_line_escapes_and_cuts_the_path(caplog):
+    class _Request:
+        method = "POST"
+        path = "/jobs/a\nweb: forged/" + "x" * 300 + "/start"
+
+    reason = "request body is not valid JSON"
+    with caplog.at_level("WARNING", logger="cronstable"):
+        error = cronstable.cron._refused_body(_Request(), reason)
+        # a stand-in request that carries no path
+        cronstable.cron._refused_body(Req(), reason)
+    assert error.status == 400
+    cut = '"/jobs/a\\nweb: forged/' + "x" * 178
+    assert [record.getMessage() for record in caplog.records] == [
+        "web: refused POST {}: {}".format(cut, reason),
+        "web: refused a request: " + reason,
+    ]
+
+
 async def test_web_app_ui_path_public_but_data_paths_require_auth(
     start_web_app,
 ):
@@ -2639,6 +2744,7 @@ async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     cron._catchup_tasks.add(catchup)
     pursuit = asyncio.create_task(asyncio.sleep(100))
     cron._slot_pursuits["p"] = pursuit
+    cron._slot_pursuit_launch["p"] = {"with_retries": True, "params": None}
     # a Replace cancel still in its tail is joined, never cancelled
     replace_cancel = asyncio.create_task(asyncio.sleep(0.05))
     cron._replace_cancel_tasks.add(replace_cancel)
@@ -2656,6 +2762,7 @@ async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     assert renewer.cancelled()
     assert catchup.cancelled()
     assert pursuit.cancelled()
+    assert cron._slot_pursuit_launch == {}
     assert cron._slot_renewers == {}
 
 
@@ -2853,7 +2960,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
             Req(match={"name": "d"}, body={"from": 1, "to": 2})
         )
 
-    async def bad_backfill(name, start, end):
+    async def bad_backfill(name, start, end, **kwargs):
         return {"ok": False, "reason": "nope"}
 
     monkeypatch.setattr(cron._dag, "backfill", bad_backfill)
@@ -2865,7 +2972,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
             )
         )
 
-    async def ok_backfill(name, start, end):
+    async def ok_backfill(name, start, end, **kwargs):
         return {"ok": True, "runs": 2}
 
     monkeypatch.setattr(cron._dag, "backfill", ok_backfill)

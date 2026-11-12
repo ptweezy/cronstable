@@ -494,7 +494,7 @@ async def test_slot_unavailable_degrade_vs_fail_closed(fleet_cron):
     backend = cron.state_backend
     cron.state_backend = None
     cron._state_on_unavailable = "fail-closed"
-    assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is False
+    assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is None
     cron._state_on_unavailable = "degrade"
     assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is True
     rj = cron.running_jobs["j"][0]
@@ -516,7 +516,7 @@ async def test_slot_sick_store_follows_policy(monkeypatch, fleet_cron):
     monkeypatch.setattr(backend, "acquire_lease", _none)
     monkeypatch.setattr(backend, "read_lease", _none)
     cron._state_on_unavailable = "fail-closed"
-    assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is False
+    assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is None
     cron._state_on_unavailable = "degrade"
     assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is True
     rj = cron.running_jobs["j"][0]
@@ -535,7 +535,7 @@ async def test_slot_lock_fidelity_latch(monkeypatch, fleet_cron):
 
     monkeypatch.setattr(backend, "verify_locking", _fake)
     cron._state_on_unavailable = "fail-closed"
-    assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is False
+    assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is None
     assert cron._slot_fidelity  # latched
     cron._state_on_unavailable = "degrade"
     assert await cron.maybe_launch_job(cron.cron_jobs["j"]) is True

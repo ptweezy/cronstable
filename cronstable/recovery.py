@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 
 from cronstable import dag
+from cronstable import params as run_params
 
 
 class RecoveryError(Exception):
@@ -51,26 +52,119 @@ _LAUNCH_KEYS = (
 )
 
 
+_SPEC_KEYS = (
+    "id",
+    "type",
+    "depends_on",
+    "trigger_rule",
+    "max_attempts",
+    "retry_delay",
+    "expand",
+    "poke_interval",
+    "poke_timeout",
+    "poke_jitter",
+    "on_reject",
+)
+
+# TaskSpec fields the digest reads only when a task sets them, keyed by
+# field name with the default that is left out. A field added here leaves
+# the revision of every DAG that does not set it unchanged.
+_OPTIONAL_SPEC_KEYS = {"skip_exit_codes": (), "when": ()}
+
+
 def configuration_revision(config):
     """Digest a DAG's launch configuration.
 
     View readers see the digest, so environment contributes variable names
     only, as in the job-set ID.
+
+    The digest reads the task fields named in ``_SPEC_KEYS``, plus each
+    ``_OPTIONAL_SPEC_KEYS`` field a task sets to something other than its
+    default. A ``TaskSpec`` field in neither list leaves every stored
+    revision as it is.
+
+    A DAG that declares run parameters also digests the declaration, minus
+    each description and in name order, so neither a description nor the
+    order of the parameters changes the revision. The task list is wrapped
+    in an object only for such a DAG, so every other DAG keeps the digest
+    of the bare list.
     """
     tasks = []
     for task in config.tasks:
         job = task.job_template
         launch = {key: getattr(job, key) for key in _LAUNCH_KEYS}
         launch["environment"] = sorted(e["key"] for e in job.environment)
-        tasks.append({"spec": asdict(task.spec), "launch": launch})
-    return digest(sorted(tasks, key=lambda task: task["spec"]["id"]))
+        spec = {key: getattr(task.spec, key) for key in _SPEC_KEYS}
+        if spec["expand"] is not None:
+            spec["expand"] = asdict(spec["expand"])
+        for key, default in _OPTIONAL_SPEC_KEYS.items():
+            value = getattr(task.spec, key)
+            if value != default:
+                spec[key] = value
+        if "when" in spec:
+            spec["when"] = [asdict(cond) for cond in spec["when"]]
+        tasks.append({"spec": spec, "launch": launch})
+    tasks.sort(key=lambda task: task["spec"]["id"])
+    if not config.spec.params:
+        return digest(tasks)
+    declared = []
+    for param in config.spec.params:
+        entry = asdict(param)
+        del entry["description"]
+        declared.append(entry)
+    declared.sort(key=lambda entry: entry["name"])
+    return digest({"tasks": tasks, "params": declared})
+
+
+def _add_downstream(spec, affected):
+    """Add every task downstream of ``affected`` to it; return the ones added.
+
+    One walk of the task list builds the dependents of each task, and the
+    closure then follows each edge once.
+    """
+    dependents = {}
+    for task in spec.tasks:
+        for dep in task.depends_on:
+            dependents.setdefault(dep, []).append(task.id)
+    downstream = set()
+    frontier = list(affected)
+    while frontier:
+        for task_id in dependents.get(frontier.pop(), ()):
+            if task_id not in affected:
+                affected.add(task_id)
+                downstream.add(task_id)
+                frontier.append(task_id)
+    return downstream
 
 
 def plan(config, source, *, mode="failed", tasks=(), artifacts=()):
     if not dag.is_terminal_run(source):
         raise RecoveryError("recovery requires a finished run")
+    if not dag.supports_run(source):
+        raise RecoveryError(
+            "the run needs run engine level {!r} and this node supports "
+            "level {}; recover it from an upgraded node".format(
+                source.get("engine"), dag.ENGINE_LEVEL
+            )
+        )
     if mode not in ("failed", "from"):
         raise RecoveryError("mode must be 'failed' or 'from'")
+    # A recovery run reuses the source's parameters as they are, so they
+    # have to be a complete, valid map under the current declaration.
+    stored = source.get("params")
+    if not isinstance(stored, dict):
+        stored = {}
+    refused = run_params.check_stored(config.spec.params, stored)
+    if refused:
+        raise RecoveryError(
+            "the source run's parameters do not fit the current "
+            "declaration ({}); create a full run instead".format(
+                "; ".join(
+                    "{} {}".format(name, reason)
+                    for name, reason in sorted(refused.items())
+                )
+            )
+        )
     entries = source["tasks"]
     if {e["id"] for e in entries.values()} != set(config.spec.by_id):
         raise RecoveryError(
@@ -102,21 +196,8 @@ def plan(config, source, *, mode="failed", tasks=(), artifacts=()):
     if unknown:
         raise RecoveryError("selected tasks are absent from the configuration")
     affected = {entries[k]["id"] for k in selected}
-    # Every task downstream of a selected one runs again.  One walk of the
-    # task list builds the dependents of each task, and the closure then
-    # follows each edge once.
-    dependents = {}
-    for task in config.spec.tasks:
-        for dep in task.depends_on:
-            dependents.setdefault(dep, []).append(task.id)
-    downstream = set()
-    frontier = list(affected)
-    while frontier:
-        for task_id in dependents.get(frontier.pop(), ()):
-            if task_id not in affected:
-                affected.add(task_id)
-                downstream.add(task_id)
-                frontier.append(task_id)
+    # Every task downstream of a selected one runs again.
+    downstream = _add_downstream(config.spec, affected)
     selected.update(k for k, e in entries.items() if e["id"] in downstream)
     reset = {
         t.id
@@ -145,6 +226,18 @@ def plan(config, source, *, mode="failed", tasks=(), artifacts=()):
         "configurationChanged": source.get("configurationRevision")
         != revision,
     }
+    # A reused skipped task stays skipped, so the preview names each one
+    # with its recorded reason (None on a run that recorded none).
+    skipped = {
+        key: entries[key].get("skipReason")
+        for key in preserved
+        if entries[key]["state"] == dag.SKIPPED
+    }
+    if skipped:
+        result["preservedSkipped"] = skipped
+    if config.spec.params:
+        # the values the recovery run reuses
+        result["params"] = stored
     result["planToken"] = digest({"plan": result, "source": source})
     return result
 
@@ -160,6 +253,7 @@ def new_run(config, source, plan, now):
         kind="recovery",
         now=now,
         spec=config.spec,
+        params=copy.deepcopy(plan["params"]) if "params" in plan else None,
     )
     selected = set(plan["tasks"])
     reset = set(plan["resetMappings"])

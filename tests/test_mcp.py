@@ -422,10 +422,10 @@ async def test_run_job_reports_why_nothing_started(monkeypatch):
     h = _handler({"readOnly": False, "toolsets": ["act"]})
     reason = "job 'hello' is still running and its concurrencyPolicy is Forbid"
 
-    async def held_back(name):
+    async def held_back(name, params=None, *, scopes=None, triggered_by=None):
         raise ApiActionError(reason, status=409)
 
-    monkeypatch.setattr(h._cron, "start_job_by_name", held_back)
+    monkeypatch.setattr(h._cron, "start_job", held_back)
     result = await _call(h, "cron_run_job", {"name": "hello", "confirm": True})
     assert result["isError"] is True
     assert result["content"][0]["text"] == reason

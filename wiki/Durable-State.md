@@ -617,7 +617,12 @@ option:
   settled (`launched`), so a crash right after the launch does not replay it.
   A pending retry is also settled when the job succeeds, a fresh scheduled run
   supersedes it, it is cancelled, its budget is exhausted, the job is removed,
-  or ownership changes without cross-node resume.
+  a run outside the retry sequence takes the place of the retry's attempt
+  under `Replace`, or ownership changes without cross-node resume. The run of
+  a manual start that supplied
+  [run parameter](Commands-and-Environment#params) values is outside the
+  sequence, and its success or cancellation settles nothing (see the
+  [retry lifecycle](Failure-Detection-and-Retries#retry-lifecycle)).
 * **A graceful shutdown deliberately does *not* settle.** The pending record
   is exactly what the next boot re-arms.
 
@@ -693,7 +698,9 @@ cluster-wide, as described earlier. While resume is active:
   * checks superseded-by-run against the **durable** ledger, because the run
     that ended the retry sequence may have happened on another host, which this
     node's in-memory history knows nothing about. A newer durable run settles
-    the record `superseded-by-run` instead of claiming it.
+    the record `superseded-by-run` instead of claiming it. The run of a
+    manual start that supplied run parameter values is outside the retry
+    sequence, and neither check counts it as a newer run.
 
   Only then does the claimer append its own `pending` (with its host and
   `claimedFrom`) and wait for the write to complete before releasing the lease.
@@ -863,8 +870,9 @@ forever. The store cleans up after itself, conservatively, anchored on
 
 * Every node records a **manifest** (stream `manifests/<host>`): its host,
   job-set ID, the job names of its loaded config, plus the shared artifact
-  scopes and dag names that config can write. The node writes it on backend
-  start and every 6 hours.
+  scopes and dag names that config can write. It also carries the build's
+  [run engine level](Orchestration-and-DAGs#run-engine-levels) as
+  `dagEngine`. The node writes it on backend start and every 6 hours.
 * A **GC pass** runs every 24 hours per process, plus on demand with
   [`cronstable state gc`](#administering-the-store). It deletes a job's
   streams (runs, logs, catch-up, retries, reboot markers, in-flight records,
@@ -1008,6 +1016,13 @@ strings; an unknown scheduled time is the empty string):
 The commands read these; you rarely touch them directly. Set
 `state.jobApi.enabled: false` to keep the durable scheduler features while
 injecting nothing and running no endpoint.
+
+A [workflow](Orchestration-and-DAGs) task also sees the `CRONSTABLE_DAG_*`
+variables that identify its run, and one `CRONSTABLE_PARAM_<NAME>` variable
+for each [run parameter](Orchestration-and-DAGs#run-parameters) of that run.
+A run of a job that declares [`params`](Commands-and-Environment#params) sees the same variables for the
+values it takes. `cronstable param get|list|dump` reads the same parameter
+values over the endpoint.
 
 ### Scopes
 

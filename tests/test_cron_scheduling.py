@@ -963,7 +963,7 @@ async def test_perf_wake_is_o_due_not_o_all(monkeypatch, capsys):
 def _launch_recorder(monkeypatch, cron):
     launched = []
 
-    async def fake(job, *, with_retries=True, refusals=None):
+    async def fake(job, **kwargs):
         launched.append(job.name)
         return True
 
@@ -1035,7 +1035,7 @@ async def test_manual_start_allowed_while_paused(monkeypatch):
     await cron.pause_job_by_name("p")
     # a pause skips SCHEDULED fires only: the operator asking by hand is the
     # operator overriding their own pause (unlike the disabled 409).
-    await cron.start_job_by_name("p")
+    await cron.start_job("p")
     assert launched == ["p"]
 
 
@@ -1184,6 +1184,46 @@ async def test_pause_and_sla_pass_survives_a_broken_config(monkeypatch):
         2020, 1, 1, 13, 30, 0, tzinfo=UTC
     )
     assert cron.metrics._job("s").sla_late == {STALE: 1}
+
+
+async def test_state_chores_survive_a_refused_config(tmp_path, monkeypatch):
+    # The durable-state chores must NOT share run()'s reload try/except
+    # either: a node that refuses its configuration keeps running the jobs
+    # it loaded, and its manifest is how peers know that (the GC keep-set,
+    # the DAG fleet warning).
+    state = "state:\n  path: {}\n".format(tmp_path / "store")
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(state + _ONE_JOB)
+    cron = cronstable.cron.Cron(str(cfg))
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
+    writes = []
+    persist = cron._persist_manifest
+
+    async def counted():
+        writes.append(1)
+        await persist()
+
+    monkeypatch.setattr(cron, "_persist_manifest", counted)
+    refused = []
+
+    async def refuse():
+        refused.append(1)
+        raise cronstable.config.ConfigError("bad yaml on disk")
+
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: len(writes) == 1)  # the backend start
+        monkeypatch.setattr(cron, "reload_config", refuse)
+        await _wait_until(lambda: refused)
+        # the manifest falls due on a pass that refuses its reload
+        cron._manifest_next = 0.0
+        seen = len(refused)
+        await _wait_until(lambda: len(refused) >= seen + 3)
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+    assert len(writes) == 2
+    assert list(cron.cron_jobs) == ["j"]  # still the jobs it loaded
 
 
 async def test_sla_stale_check_breaches_and_clears(monkeypatch, caplog):

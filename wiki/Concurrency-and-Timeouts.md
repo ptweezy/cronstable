@@ -124,7 +124,11 @@ jobs:
 
 If any instance is still running, the new launch is skipped entirely. No new
 process is started. The already-running instance continues unaffected.
-This applies equally to scheduled launches and to retry-triggered launches.
+This applies equally to scheduled launches and to retry-triggered launches,
+with one exception. If the running instance is a manual start that supplied
+[run parameter](Commands-and-Environment#params) values, a retry that comes
+due on the same node waits for that run to end (see the
+[retry lifecycle](Failure-Detection-and-Retries#retry-lifecycle)).
 A scheduled fire of a job with no [`pool`](Resource-Pools) that is dropped
 this way leaves the job's
 [retry sequence](Failure-Detection-and-Retries#retry-lifecycle) as it is. The
@@ -299,9 +303,24 @@ the holder to yield instead of canceling it directly:
 3. The requester waits in a **background pursuit task**, never inline on the
    scheduler pass: waiting a holder out takes up to two slot TTLs and would
    stall every other due job. When the slot frees, by release or TTL expiry,
-   it re-attempts the launch through every normal gate and logs
+   it makes the refused launch through every normal gate and logs
    `Job <name>: launched after the previous cluster slot holder yielded
-   (concurrencyPolicy: Replace)` on success.
+   (concurrencyPolicy: Replace)` on success. The pursuit makes the launch
+   as it was requested, so a manual start runs with the values it supplied.
+   Until then, the API answers that start with `pending` (see
+   [`POST /jobs/{name}/start`](HTTP-API#post-jobsnamestart)). The values in
+   that answer, including the defaults the start filled in, have to fit the
+   job's current [`params`](Commands-and-Environment#params) declaration
+   when the slot frees. If a reload adds, renames, or removes a parameter,
+   or changes a rule so that it refuses one of those values, the pursuit
+   skips the launch and logs `Job <name>: not launching the manual start
+   that waited for the cluster slot: its values do not fit the current
+   params declaration (<parameters>)`. The message lists parameter names
+   without their values. If the slot claim refuses more launches while the
+   pursuit waits, the pursuit makes the newest one. A run of the job that
+   starts on this node first stands the pursuit down. The queue entry of a
+   job in a [resource pool](Resource-Pools) re-attempts itself, so its
+   pursuit only asks the holder to yield.
 4. The pursuit is bounded at **twice the slot TTL**. If the holder never
    yields, the requester abandons this launch: `Job <name>: the foreign
    holder (<node>) did not yield its cluster concurrency slot within <N>s;
@@ -727,7 +746,8 @@ including the no-console case where the graceful step cannot be delivered.
 - **Manual starts.** Launches through the [HTTP control API](HTTP-API)
   (`POST /jobs/{name}/start`) take the same `maybe_launch_job` path and so
   honor `concurrencyPolicy`, including the cluster slot gate for
-  `concurrencyScope: cluster` jobs.
+  `concurrencyScope: cluster` jobs. A start that the policy refuses answers
+  `409` and names the policy.
 - **Node first, cluster second.** `concurrencyScope: cluster` never changes
   the per-node behavior documented earlier. The local check runs first, and
   the [cluster gate](#concurrency-across-a-cluster) is an additional gate

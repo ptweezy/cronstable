@@ -28,18 +28,21 @@ reconciles interrupted tasks from it: at-least-once, never at-most-once.
 
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import os
 import random
+import re
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass
 from typing import Any
 
 # jobstate at module scope: it imports only state and _json, both on this
 # module's graph anyway, so a deferred import buys no laziness.
 from cronstable import _json, dag, jobstate, platform
+from cronstable import params as run_params
 from cronstable.cronexpr import CronTab
 from cronstable.dag import DagSpec
 from cronstable.job import RunningJob
@@ -68,6 +71,14 @@ DAG_LEASE_TTL = 30.0
 SCHEDULE_CHECK_INTERVAL = 20.0
 ADOPT_SCAN_INTERVAL = 30.0
 GC_INTERVAL = 3600.0
+
+# How often a node re-reads the engine level each peer's manifest advertises
+# (see DagScheduler._check_fleet), which bounds how long a fleet warning
+# outlives a peer's upgrade in place.  A peer that stops, or returns under
+# another host name, stays listed until its newest sign of life is
+# cron.MANIFEST_LIVE_SECONDS old.  A reload that changes what the loaded
+# dags need is checked on the next schedule pass.
+FLEET_CHECK_INTERVAL = 300.0
 
 # How often the adopt scan does a full body listing instead of the cheap
 # keys-only pass.  Terminality is monotonic, so the per-dag terminal-key cache
@@ -107,6 +118,9 @@ GC_LEASE_BATCH = 32
 # Hard cap on how many missed occurrences a single catch-up replays, mirroring
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
+
+# The longest requestId a manual trigger accepts.
+REQUEST_ID_MAX = 200
 
 # Durable checkpoint stream for a dag's catch-up cycles, the dag twin of the
 # job engine's ``catchup/<job>`` stream (cron.CATCHUP_STREAM_PREFIX; a
@@ -181,6 +195,15 @@ DAG_SUMMARY_LIST_TTL = 5.0
 
 RunRef = tuple[str, str]  # (dag_name, run_key)
 
+
+class TriggerConflict(Exception):
+    """A trigger's ``requestId`` names a run that another request created."""
+
+
+class TriggerInputError(ValueError):
+    """A trigger argument, other than a parameter, that cannot be used."""
+
+
 #: XCom payload size at or above which a mapped fan-out's parse (and its
 #: portability walk) runs on a worker thread instead of the scheduler's
 #: event loop.  The payload cap is dag.MAX_MAPPED_XCOM_BYTES (16 MiB), and
@@ -200,7 +223,7 @@ def _parse_portable_xcom(data: bytes) -> Any:
     translate fast path for the wide-int prescan without allocating a decoded
     str copy.
     An over-long list skips the portability walk on purpose:
-    ``_apply_expansions`` rejects it at its own MAX_MAPPED_ITEMS check, so
+    ``_apply_expansion`` rejects it at its own MAX_MAPPED_ITEMS check, so
     the O(len) walk would be pure waste on a list never embedded in the run
     document.  Raises ``_json.UnsupportedValue`` for a non-portable value
     and any other ``ValueError`` for undecodable bytes or invalid JSON,
@@ -270,6 +293,25 @@ def _recovery_references(
                 plan.get("sourceRunKey") for plan in batch.get("plans", [])
             )
     return referenced
+
+
+def _schedule_reference(
+    runs: Iterable[dict[str, Any]],
+) -> tuple[datetime.datetime, dict[str, Any]] | None:
+    """The latest logical date among the scheduled and catch-up runs of
+    ``runs``, with the first run that carries it.
+
+    Catch-up counts missed slots from this date, so retention keeps the run.
+    """
+    latest: tuple[datetime.datetime, dict[str, Any]] | None = None
+    for body in runs:
+        if body.get("kind") not in ("scheduled", "catchup"):
+            continue
+        iso = body.get("logicalDate")
+        when = _parse_iso(iso) if isinstance(iso, str) else None
+        if when is not None and (latest is None or when > latest[0]):
+            latest = (when, body)
+    return latest
 
 
 @dataclass(slots=True)
@@ -409,10 +451,34 @@ class DagScheduler:
         # gate on every pass while it is parked, so this dedups to one alert
         # per gate; a run's entries drop when it reaches a terminal state.
         self._approval_notified: set[tuple[str, str, str]] = set()
+        # run ref -> the fan-out list reads, each (run id, upstream task,
+        # XCom key), that returned a definitive empty list.  An empty list
+        # waits for the mapped task's trigger rule (dag._apply_expansion),
+        # and every pass of that wait asks for it again, so _read_expansions
+        # reads the store once and reuses the answer.  The run id keeps an
+        # entry from answering for another run under the same key; a run's
+        # entries drop when this node stops owning it.
+        self._empty_expansions: dict[RunRef, set[tuple[str, str, str]]] = {}
+        # active runs above this build's engine level (dag.supports_run),
+        # each logged once.  The adopt scan meets such a run on every pass
+        # until a newer node finishes it; pruned as its key leaves the scan.
+        self._engine_refused: set[RunRef] = set()
+        # dag name -> warnings naming the live hosts below the engine level
+        # the dag needs (see _check_fleet); list_dags serves them as
+        # ``fleetWarnings``.
+        self._fleet_warnings: dict[str, list[str]] = {}
+        # dag name -> engine level, as of the last completed check: a reload
+        # that changes it is checked without waiting out the interval.
+        self._fleet_needs: dict[str, int] = {}
+        # (dag, host, the host's level) already logged, so a warning that
+        # persists across checks is one log line, and a host that leaves
+        # one is one more.
+        self._fleet_logged: set[tuple[str, str, int]] = set()
         self._service_task: asyncio.Task | None = None
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
         self._next_gc = 0.0
+        self._next_fleet_check = 0.0
 
     # --- accessors -------------------------------------------------------
 
@@ -533,6 +599,7 @@ class DagScheduler:
             if now >= self._next_sched_check:
                 self._next_sched_check = now + SCHEDULE_CHECK_INTERVAL
                 await self._seed_dags(now)
+                await self._check_fleet(now)
             # fire due scheduled runs every pass (a cheap in-memory index
             # walk), so a fire lands at its instant, not a cadence late.
             await self._fire_scheduled(now)
@@ -814,7 +881,7 @@ class DagScheduler:
         if pending_dt is not None and (after is None or pending_dt < after):
             after = pending_dt
         if after is None:
-            return  # never ran: nothing missed to replay
+            return  # the schedule has created no run, so it has missed none
         # The cycle's reference watermark: pre-deadline-cutoff, like the job
         # engine's (the cutoff moves with the clock, so recomputation on
         # resume re-applies it against the resume-time now).
@@ -976,6 +1043,14 @@ class DagScheduler:
     async def _durable_watermark(
         self, dagcfg: Any
     ) -> datetime.datetime | None:
+        """The newest logical date the schedule has created a run for.
+
+        Only scheduled and catch-up runs count. Each one fills a slot of
+        the schedule, so the newest shows how far the scheduler has served
+        it. A manual run, a backfill, and a recovery each carry a date
+        their caller chose, and that date says nothing about the slots
+        before it.
+        """
         backend = self._backend()
         if backend is None:
             return None
@@ -983,13 +1058,8 @@ class DagScheduler:
             backend.list_documents(self._ns(dagcfg.name)),
             timeout=STATE_OP_TIMEOUT,
         )
-        latest: datetime.datetime | None = None
-        for body in docs:
-            iso = body.get("logicalDate")
-            when = _parse_iso(iso) if isinstance(iso, str) else None
-            if when is not None and (latest is None or when > latest):
-                latest = when
-        return latest
+        reference = _schedule_reference(docs)
+        return reference[0] if reference is not None else None
 
     @staticmethod
     def _catchup_stream(dag_name: str) -> str:
@@ -1059,8 +1129,22 @@ class DagScheduler:
             )
 
     async def _create_run(
-        self, dagcfg: Any, logical_dt: datetime.datetime, kind: str
-    ) -> RunRef | None:
+        self,
+        dagcfg: Any,
+        logical_dt: datetime.datetime,
+        kind: str,
+        *,
+        params: dict[str, Any] | None = None,
+        triggered_by: str | None = None,
+    ) -> tuple[RunRef, bool] | None:
+        """Create the run for ``logical_dt``; report whether this call did.
+
+        The flag is False when a run document already exists under the key.
+        ``params`` and ``triggered_by`` are stored on a run this call
+        creates (see :meth:`_create_run_doc`), and an existing run keeps
+        what it has. ``None`` when there is no state backend to hold the
+        run.
+        """
         # Canonicalise the instant to UTC before it becomes the run key. The
         # scheduled/catch-up paths already hand in UTC-aware instants, but
         # backfill preserves whatever offset the operator's ISO range carried,
@@ -1075,7 +1159,12 @@ class DagScheduler:
             logical_dt = logical_dt.astimezone(datetime.UTC)
         run_key = dag.run_key_for_logical(logical_dt.isoformat())
         created = await self._create_doc(
-            dagcfg, run_key, logical_dt.isoformat(), kind
+            dagcfg,
+            run_key,
+            logical_dt.isoformat(),
+            kind,
+            params=params,
+            triggered_by=triggered_by,
         )
         if created is None:
             # no state backend: no run is written
@@ -1083,16 +1172,78 @@ class DagScheduler:
         ref = (dagcfg.name, run_key)
         if created:
             await self._try_own(dagcfg, ref)
-        return ref
+        return ref, created
 
     async def _create_doc(
-        self, dagcfg: Any, run_key: str, logical_iso: str | None, kind: str
+        self,
+        dagcfg: Any,
+        run_key: str,
+        logical_iso: str | None,
+        kind: str,
+        *,
+        params: dict[str, Any] | None = None,
+        triggered_by: str | None = None,
     ) -> bool | None:
-        """Create the run document ``run_key`` unless the key holds one.
+        """:meth:`_create_run_doc` for a caller that asks only whether this
+        call created the document.
 
         ``True`` when this call wrote the document and ``False`` when the
         key already held one.  ``None`` when there is no state backend to
         hold the document.
+        """
+        created, existing = await self._create_run_doc(
+            dagcfg,
+            run_key,
+            logical_iso,
+            kind,
+            params=params,
+            triggered_by=triggered_by,
+        )
+        if not created and existing is None:
+            return None
+        return created
+
+    @staticmethod
+    def _resolve_params(
+        dagcfg: Any,
+        supplied: Any,
+        scopes: Collection[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """The parameters a new run of ``dagcfg`` stores.
+
+        :func:`cronstable.params.for_run` for the DAG's declaration:
+        ``None`` for a DAG that declares none when nothing is supplied, and
+        :class:`cronstable.params.ParamError` for values the declaration
+        refuses or the caller's ``scopes`` do not allow.
+        """
+        return run_params.for_run(
+            dagcfg.spec.params,
+            supplied,
+            "workflow {!r}".format(dagcfg.name),
+            scopes,
+        )
+
+    async def _create_run_doc(
+        self,
+        dagcfg: Any,
+        run_key: str,
+        logical_iso: str | None,
+        kind: str,
+        *,
+        params: dict[str, Any] | None = None,
+        triggered_by: str | None = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Create the run document if the key is free.
+
+        The one create transform for scheduled, catch-up, backfill, and
+        manual runs. Returns ``(True, None)`` when this call created the
+        document, ``(False, body)`` when one already exists under the key,
+        and ``(False, None)`` when no state backend answered.
+
+        ``params`` is the run's resolved parameter map. Without it, a DAG
+        that declares parameters stores its defaults, so every run of that
+        DAG has the same parameter names. ``triggered_by`` is the label of
+        whoever asked for the run.
         """
         run_id = os.urandom(16).hex()
         now = _now()
@@ -1100,10 +1251,12 @@ class DagScheduler:
         from cronstable.recovery import configuration_revision
 
         revision = configuration_revision(dagcfg)
+        if params is None:
+            params = self._resolve_params(dagcfg, None)
 
         def _create(current):
             if current is not None:
-                return DOC_KEEP, False
+                return DOC_KEEP, current
             body = dag.new_run_body(
                 dag=dagcfg.name,
                 run_key=run_key,
@@ -1112,13 +1265,15 @@ class DagScheduler:
                 kind=kind,
                 now=now,
                 spec=spec,
+                params=None if params is None else dict(params),
             )
             body["configurationRevision"] = revision
+            if triggered_by is not None:
+                body["triggeredBy"] = triggered_by
             return body, True
 
-        stored, created = await self._mutate(dagcfg.name, run_key, _create)
-        if stored is None:
-            return None
+        _stored, result = await self._mutate(dagcfg.name, run_key, _create)
+        created = result is True
         if created:
             # a fresh run now lives under this key: it must not inherit a
             # stale "known terminal" marking from a GC'd predecessor (an
@@ -1131,7 +1286,7 @@ class DagScheduler:
             summaries = self._dag_summary_cache.get(dagcfg.name)
             if summaries is not None:
                 summaries.pop(run_key, None)
-        return bool(created)
+        return created, (result if isinstance(result, dict) else None)
 
     # =====================================================================
     # Ownership: the per-run advance lease (the TTL lease trio, per run)
@@ -1210,6 +1365,7 @@ class DagScheduler:
         self._owned.pop(ref, None)
         self._wake.pop(ref, None)
         self._advance_again.discard(ref)
+        self._empty_expansions.pop(ref, None)
         renewer = self._renewers.pop(ref, None)
         if renewer is not None and not renewer.done():
             renewer.cancel()
@@ -1235,6 +1391,12 @@ class DagScheduler:
         full = now >= self._next_full_adopt
         if full:
             self._next_full_adopt = now + ADOPT_FULL_REFRESH
+        if self._engine_refused:
+            # a dag removed on reload is no longer scanned below.
+            live = self._dags()
+            self._engine_refused = {
+                r for r in self._engine_refused if r[0] in live
+            }
         for name, dagcfg in list(self._dags().items()):
             try:
                 await self._adopt_one_dag(backend, name, dagcfg, full=full)
@@ -1277,8 +1439,12 @@ class DagScheduler:
                         continue
                     if not isinstance(body.get("runKey"), str):
                         continue
+                    if self._refuse_engine((name, key), body):
+                        continue
                     await self._try_own(dagcfg, (name, key))
                 self._prune_launched(name, known)
+                if self._engine_refused:
+                    self._prune_refused(name, set(keys) - known)
                 return
         try:
             docs = await asyncio.wait_for(
@@ -1288,6 +1454,7 @@ class DagScheduler:
         except TimeoutError:
             return
         terminal: set[str] = set()
+        active: set[str] = set()
         for body in docs:
             run_key = body.get("runKey")
             if dag.is_terminal_run(body):
@@ -1296,8 +1463,11 @@ class DagScheduler:
                 continue
             if not isinstance(run_key, str):
                 continue
+            active.add(run_key)
             ref = (name, run_key)
             if ref in self._owned:
+                continue
+            if self._refuse_engine(ref, body):
                 continue
             await self._try_own(dagcfg, ref)
         # a full pass parsed every body: rebuild the cache from truth (also
@@ -1305,6 +1475,36 @@ class DagScheduler:
         # documents).
         self._terminal_run_keys[name] = terminal
         self._prune_launched(name, terminal)
+        self._prune_refused(name, active)
+
+    def _refuse_engine(self, ref: RunRef, body: dict[str, Any]) -> bool:
+        """Whether ``body``'s run is above this build's engine level.
+
+        Such a run is left for a newer node: this build takes no lease on it
+        and never rewrites its document.  Logged once per run.
+        """
+        if dag.supports_run(body):
+            return False
+        if ref not in self._engine_refused:
+            self._engine_refused.add(ref)
+            logger.warning(
+                "dag run %s/%s: needs run engine level %r and this build "
+                "supports level %d; leaving the run for an upgraded node",
+                ref[0],
+                ref[1],
+                body.get("engine"),
+                dag.ENGINE_LEVEL,
+            )
+        return True
+
+    def _prune_refused(self, name: str, active: set[str]) -> None:
+        """Forget the refused runs of ``name`` that are no longer active."""
+        for ref in [
+            r
+            for r in self._engine_refused
+            if r[0] == name and r[1] not in active
+        ]:
+            self._engine_refused.discard(ref)
 
     # =====================================================================
     # Advancing an owned run
@@ -1459,12 +1659,32 @@ class DagScheduler:
             return False
         return False
 
+    async def _recheck_lease(self, ref: RunRef) -> bool:
+        """Whether a pass that awaited store reads may go on to claim.
+
+        A pass reads the store to prepare a recovery run and to fetch the
+        XCom values a fan-out or a ``when:`` comparison needs. The reads
+        can outlast the advance lease, and a peer adopts a run whose lease
+        ran out, so the pass claims only on a lease this node still holds.
+        An unexpired lease passes with no store read (see
+        :meth:`_lease_usable`). When an expired lease has no new holder, or
+        the store cannot answer, this node keeps the run and the next
+        advance waits ``ADVANCE_RETRY_DELAY``.
+        """
+        lease = self._owned.get(ref)
+        if lease is not None and await self._lease_usable(ref, lease):
+            return True
+        if ref in self._owned:
+            self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
+        return False
+
     async def _do_advance(self, dagcfg: Any, ref: RunRef) -> None:
         self._pool_waiting.discard(ref)
-        if ref[1].startswith(
-            "recovery-"
-        ) and not await self._prepare_recovery_or_fail(ref):
-            return
+        if ref[1].startswith("recovery-") and not (
+            await self._prepare_recovery_or_fail(ref)
+            and await self._recheck_lease(ref)
+        ):
+            return  # the preparation failed the run, or outlasted the lease
         spec = dagcfg.spec
         now = _now()
         proc = self._cron._proc_token
@@ -1486,6 +1706,12 @@ class DagScheduler:
             # nothing to advance.
             await self._release(ref)
             return
+        if combined.unsupported:
+            # the transform kept the document untouched: hand the run to a
+            # node whose build reaches its engine level.
+            self._refuse_engine(ref, body)
+            await self._release(ref)
+            return
         if combined.reconciled:
             logger.info(
                 "dag run %s/%s: reconciled %d interrupted task(s)",
@@ -1498,14 +1724,24 @@ class DagScheduler:
             return
         run_id = str(body.get("runId"))
         result = combined.advance
-        if combined.expansions_needed:
-            # 2. mapped tasks await their upstream lists: pre-read them from
-            # the reconciled body (outside any document lock), then run the
-            # claim RMW as the second step.
-            expansions = await self._read_expansions(dagcfg, run_id, body)
+        # an XCom value a when: comparison needs that the store could not
+        # answer for; the task stays pending and the read is retried
+        unread = False
+        if combined.expansions_needed or combined.conditions_needed:
+            # 2. mapped tasks await their upstream lists, or ready tasks
+            # compare XCom values: pre-read them from the reconciled body
+            # (outside any document lock), then run the claim RMW as the
+            # second step.
+            expansions = await self._read_expansions(dagcfg, ref, run_id, body)
+            conditions = await self._read_conditions(dagcfg, run_id, body)
+            if not await self._recheck_lease(ref):
+                return  # nothing is claimed yet
+            unread = any(value is None for value in conditions.values())
             now = _now()
             transform = self._wrap(
-                dag.plan_and_claim(spec, now, proc, host, expansions)
+                dag.plan_and_claim(
+                    spec, now, proc, host, expansions, conditions
+                )
             )
             claimed, result = await self._mutate(ref[0], ref[1], transform)
             if result is None:
@@ -1524,7 +1760,14 @@ class DagScheduler:
         pid_stamps: list[tuple[str, str, int | None, int | None]] = []
         for intent in result.launches:
             try:
-                stamp = await self._launch_task(dagcfg, ref, run_id, intent)
+                stamp = await self._launch_task(
+                    dagcfg,
+                    ref,
+                    run_id,
+                    intent,
+                    body.get("params"),
+                    body.get("logicalDate"),
+                )
             except Exception:  # noqa: BLE001 - fail just this task, keep going
                 logger.exception(
                     "dag run %s/%s: launching task %s failed",
@@ -1573,15 +1816,17 @@ class DagScheduler:
             # a non-terminal run may have just parked an approval gate; alert
             # on it once (deduped) before scheduling the next wake.
             self._notify_pending_approvals(dagcfg, ref, run_id, body)
-            if result.deferred:
-                # the claim quota capped this pass (dag.MAX_CLAIMS_PER_PASS):
-                # more instances are claimable now, so re-service promptly.
+            if result.deferred or (result.again and not unread):
+                # the claim quota capped this pass (dag.MAX_CLAIMS_PER_PASS)
+                # or the pass left a step for the next one (a comparison to
+                # read, a fan-out to expand): re-service promptly.
                 self._wake[ref] = now
             else:
                 self._wake[ref] = self._compute_wake(spec, body, now)
-            if repair_owed:
-                # a failed release retries on the advance-failed backoff,
-                # not on the run's own (up to a minute) cadence.
+            if repair_owed or (result.again and unread):
+                # a failed release, or a comparison the store could not
+                # answer for, retries on the advance-failed backoff, not on
+                # the run's own (up to a minute) cadence.
                 self._wake[ref] = min(
                     self._wake[ref], now + ADVANCE_RETRY_DELAY
                 )
@@ -1692,16 +1937,114 @@ class DagScheduler:
         return False
 
     async def _read_expansions(
-        self, dagcfg: Any, run_id: str, body: dict[str, Any]
+        self, dagcfg: Any, ref: RunRef, run_id: str, body: dict[str, Any]
     ) -> dict[str, list[Any] | None]:
+        """The list each mapped task awaiting expansion fans out over.
+
+        The pass that reads a list with items records it, and a later pass
+        retries a read the store could not answer (``None``). An empty list
+        can wait many passes for the task's trigger rule (see
+        :func:`dag._apply_expansion`): a parked gate alone brings a pass
+        every few seconds. The upstream has succeeded, so its output is
+        final, and the first definitive empty read answers for the rest of
+        the wait (:attr:`_empty_expansions`). While this node owns the run,
+        the wait costs one store read, and an output that maps to empty logs
+        its warning once.
+        """
         expansions: dict[str, list[Any] | None] = {}
         for tid, from_task, key in dag.tasks_awaiting_expansion(
             dagcfg.spec, body
         ):
-            expansions[tid] = await self._read_xcom_list(
+            read = (run_id, from_task, key)
+            if read in self._empty_expansions.get(ref, ()):
+                expansions[tid] = []
+                continue
+            items = await self._read_xcom_list(
                 run_id, dagcfg.name, from_task, key
             )
+            # ownership can end during the read, and nothing drops an entry
+            # added after that
+            if items == [] and ref in self._owned:
+                self._empty_expansions.setdefault(ref, set()).add(read)
+            expansions[tid] = items
         return expansions
+
+    async def _read_conditions(
+        self, dagcfg: Any, run_id: str, body: dict[str, Any]
+    ) -> dict[tuple[str, str], Any]:
+        """The XCom values that ready tasks' ``when:`` comparisons read."""
+        conditions: dict[tuple[str, str], Any] = {}
+        for taskkey, key in dag.tasks_awaiting_conditions(dagcfg.spec, body):
+            conditions[taskkey, key] = await self._read_xcom_text(
+                run_id, dagcfg.name, taskkey, key
+            )
+        return conditions
+
+    async def _read_xcom_text(
+        self, run_id: str, dag_name: str, taskkey: str, key: str
+    ) -> "str | dag.NoXcomValue | None":
+        """The text an upstream published, for a ``when:`` comparison.
+
+        Read only once the upstream is terminal, so its output is final. The
+        published bytes are UTF-8 text with one trailing newline removed. A
+        key the upstream **definitely** did not publish, a value over
+        ``dag.MAX_CONDITION_XCOM_BYTES``, and bytes that are not UTF-8 each
+        return the :class:`dag.NoXcomValue` that says so.
+
+        A store that could not answer (a timeout, an I/O error, a record
+        this build cannot read) returns ``None``, and the task stays pending
+        for a later pass. The read is strict for the reason
+        :meth:`_read_xcom_list` gives: the decision is recorded once, so a
+        blip must never read back as "not published".
+        """
+        backend = self._backend()
+        if backend is None:
+            return None
+        scope = dag.xcom_scope(dag_name, run_id)
+        name = dag.xcom_name(taskkey, key)
+        try:
+            got = await asyncio.wait_for(
+                jobstate.artifact_get(
+                    backend,
+                    scope,
+                    name,
+                    strict=True,
+                    max_bytes=dag.MAX_CONDITION_XCOM_BYTES,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except TimeoutError:
+            return None  # transient: retry next pass
+        except jobstate.JobStateError as ex:
+            if getattr(ex, "status", None) == 413:
+                return dag.XCOM_TOO_LARGE  # refused before the blob loads
+            # the record survives but its blob is gone (410)
+            return dag.XCOM_GONE
+        except Exception as ex:  # noqa: BLE001 - the store, not the xcom
+            logger.warning(
+                "dag %s: xcom %r from %r could not be read (%s); leaving "
+                "the task that compares it pending to retry",
+                dag_name,
+                key,
+                taskkey,
+                ex,
+            )
+            return None
+        if got is None:
+            return dag.XCOM_UNPUBLISHED
+        _record, data = got
+        if len(data) > dag.MAX_CONDITION_XCOM_BYTES:
+            return dag.XCOM_TOO_LARGE  # a record with no usable size
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return dag.XCOM_NOT_TEXT
+        # one trailing newline, as `echo value | cronstable xcom push` writes
+        if text.endswith("\n"):
+            text = text[:-1]
+            if text.endswith("\r"):
+                text = text[:-1]
+        return text
 
     async def _read_xcom_list(
         self, run_id: str, dag_name: str, taskkey: str, key: str
@@ -1711,7 +2054,8 @@ class DagScheduler:
         Only ever read after the upstream has *succeeded*, so its output is
         final: a genuine list expands to itself; a **definitively** absent,
         non-list or unrecoverable output (including a swept blob) expands to
-        the **empty list** (a mapped task with no items -> success), so a
+        the **empty list** (a mapped task with no items follows its trigger
+        rule, and reads success when the rule says ready), so a
         mis-publishing upstream cannot wedge the run forever.
 
         A store failure that says nothing about what the upstream published
@@ -1958,7 +2302,13 @@ class DagScheduler:
     # =====================================================================
 
     async def _launch_task(
-        self, dagcfg: Any, ref: RunRef, run_id: str, intent
+        self,
+        dagcfg: Any,
+        ref: RunRef,
+        run_id: str,
+        intent,
+        params: dict[str, Any] | None = None,
+        logical_date: Any = None,
     ) -> tuple[str, str, int | None, int | None] | None:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
@@ -2018,7 +2368,7 @@ class DagScheduler:
                 return None
         try:
             token, env = await self._prepare_task_run(
-                dagcfg, run_id, ref[1], intent, template
+                dagcfg, run_id, ref[1], intent, template, params, logical_date
             )
         except BaseException:
             await self._cron._pools.finish(
@@ -2044,6 +2394,11 @@ class DagScheduler:
             dag_ref=dref,
         )
         running.pool_ticket = pool_ticket
+        # the codes travel with the launch: an exit code means what the
+        # command that produced it was configured to mean.
+        running.skip_exit_codes = dagcfg.spec.by_id[
+            intent.task_id
+        ].skip_exit_codes
         running.on_verifying = lambda: self.on_task_verifying(running)
         if pool_ticket is not None:
             pool_ticket.running = running
@@ -2111,7 +2466,14 @@ class DagScheduler:
         return (taskkey, dref.proc, pid, dref.attempt)
 
     async def _prepare_task_run(
-        self, dagcfg: Any, run_id: str, run_key: str, intent, template
+        self,
+        dagcfg: Any,
+        run_id: str,
+        run_key: str,
+        intent,
+        template,
+        params: dict[str, Any] | None = None,
+        logical_date: Any = None,
     ) -> tuple[str | None, dict[str, str]]:
         """Register the task run with the loopback API; return its env.
 
@@ -2121,12 +2483,23 @@ class DagScheduler:
         vars, so ``cronstable xcom`` / ``artifact`` land in the run scope.
         Secret staging (including the fromFile executor offload) lives in
         :func:`cronstable.jobapi.stage_secrets`.
+
+        ``params`` is the run document's stored parameter map. Each entry
+        becomes a ``CRONSTABLE_PARAM_*`` variable, and the loopback API
+        serves the map to ``cronstable param``. ``logical_date`` is the run
+        document's ``logicalDate``, exported as it is stored. A run with
+        none exports the empty string.
         """
+        if not isinstance(params, dict):
+            params = {}
         scope = dag.xcom_scope(dagcfg.name, run_id)
         dag_env = {
             dag.ENV_DAG_NAME: dagcfg.name,
             dag.ENV_DAG_RUN_ID: run_id,
             dag.ENV_DAG_RUN_KEY: run_key,
+            dag.ENV_DAG_LOGICAL_DATE: (
+                logical_date if isinstance(logical_date, str) else ""
+            ),
             dag.ENV_DAG_TASK: intent.task_id,
             dag.ENV_DAG_TASKKEY: intent.taskkey,
             dag.ENV_DAG_MAP_INDEX: (
@@ -2137,6 +2510,7 @@ class DagScheduler:
             ),
             dag.ENV_DAG_XCOM_SCOPE: scope,
         }
+        dag_env.update(run_params.environment(params))
         api = self._cron._job_api
         if api is None or api.base_url is None:
             return None, dag_env
@@ -2160,6 +2534,7 @@ class DagScheduler:
             default_scope=scope,
             allowed_scopes=set(template.stateAllowedScopes),
             secrets=secrets,
+            params=params,
         )
         api.register_run(ctx)
         env = run_environment(ctx, api.base_url, api.cacert)
@@ -2231,6 +2606,7 @@ class DagScheduler:
                 "taskkey": dref.taskkey,
                 "taskId": dref.task_id,
                 "success": success,
+                "skipped": running.skipped,
                 "exitCode": running.retcode,
                 "failReason": running.fail_reason,
                 "proc": dref.proc,
@@ -2301,6 +2677,7 @@ class DagScheduler:
                 {
                     "taskkey": entry["taskkey"],
                     "success": entry["success"],
+                    "skipped": entry.get("skipped", False),
                     "exit_code": entry["exitCode"],
                     "fail_reason": entry["failReason"],
                     "task": task,
@@ -2366,6 +2743,7 @@ class DagScheduler:
         attempt: int | None = None,
         poke: int | None = None,
         resources: dict[str, Any] | None = None,
+        skipped: bool = False,
     ) -> None:
         task = dagcfg.spec.by_id.get(task_id)
         if task is None:
@@ -2388,6 +2766,7 @@ class DagScheduler:
                 expected_attempt=attempt,
                 expected_poke=poke,
                 resources=resources,
+                skipped=skipped,
             )
         )
         try:
@@ -2408,6 +2787,7 @@ class DagScheduler:
                 attempt=attempt,
                 poke=poke,
                 resources=resources,
+                skipped=skipped,
             )
         else:
             # fenced out (a duplicate, a superseded attempt, or a stale poke's
@@ -2442,6 +2822,7 @@ class DagScheduler:
                 attempt=entry["attempt"],
                 poke=entry["poke"],
                 resources=entry.get("resources"),
+                skipped=entry.get("skipped", False),
             )
 
     def _queue_completion(
@@ -2457,6 +2838,7 @@ class DagScheduler:
         attempt: int | None,
         poke: int | None,
         resources: dict[str, Any] | None = None,
+        skipped: bool = False,
     ) -> None:
         key = (ref, taskkey)
         prior = self._pending_completions.get(key)
@@ -2468,6 +2850,7 @@ class DagScheduler:
             "taskkey": taskkey,
             "taskId": task_id,
             "success": success,
+            "skipped": skipped,
             "exitCode": exit_code,
             "failReason": fail_reason,
             "proc": proc,
@@ -2523,6 +2906,7 @@ class DagScheduler:
                 attempt=pc["attempt"],
                 poke=pc["poke"],
                 resources=pc.get("resources"),
+                skipped=pc.get("skipped", False),
             )
 
     # =====================================================================
@@ -2565,6 +2949,8 @@ class DagScheduler:
                     continue
                 run_key = body.get("runKey")
                 if not isinstance(run_key, str):
+                    continue
+                if self._refuse_engine((name, run_key), body):
                     continue
                 try:
                     await self._try_own(dagcfg, (name, run_key))
@@ -2734,6 +3120,7 @@ class DagScheduler:
         tasks=(),
         plan_token=None,
         allow_config_change=False,
+        scopes=None,
     ):
         from cronstable import recovery
 
@@ -2759,7 +3146,9 @@ class DagScheduler:
                     "selection differs from the accepted preview"
                 )
             config = self._dags().get(name)
-            if config is not None:
+            if config is not None and not self._refuse_engine(
+                (name, accepted_key), accepted
+            ):
                 await self._try_own(config, (name, accepted_key))
             return {
                 **{
@@ -2794,6 +3183,10 @@ class DagScheduler:
                     "revision to recover"
                 )
             config = self._dags()[name]
+            # reusing the source run's values is choosing them
+            run_params.check_reuse(
+                config.spec.params, plan.get("params", {}), scopes
+            )
             for record in plan["artifacts"]:
                 if not await asyncio.wait_for(
                     backend.blob_exists(record["sha256"], record["size"]),
@@ -2837,12 +3230,14 @@ class DagScheduler:
         *,
         plan_token=None,
         allow_config_change=False,
+        scopes=None,
     ):
         from cronstable import recovery
 
         backend = self._recovery_backend(name, "workflow not found")
+        config = self._dags().get(name)
         start, end = _parse_iso(start_iso), _parse_iso(end_iso)
-        if name not in self._dags():
+        if config is None:
             raise recovery.RecoveryError("workflow not found")
         if start is None or end is None or end < start:
             raise recovery.RecoveryError("invalid recovery date range")
@@ -2908,6 +3303,14 @@ class DagScheduler:
             raise recovery.RecoveryError(
                 "configuration differs; acknowledge the current revision"
             )
+        # Check every date before the first run starts, so a refused
+        # request starts none and records no incomplete batch to hold its
+        # source runs back from retention. recover() checks each date
+        # again as it creates the run.
+        for plan in plans:
+            run_params.check_reuse(
+                config.spec.params, plan.get("params", {}), scopes
+            )
 
         def create(current):
             if current is not None:
@@ -2936,6 +3339,7 @@ class DagScheduler:
                 source,
                 plan_token=plan["planToken"],
                 allow_config_change=allow_config_change,
+                scopes=scopes,
             )
 
             def record(current, source=source, run_key=result["runKey"]):
@@ -3084,6 +3488,9 @@ class DagScheduler:
         detail = body.get("recovery") or {}
         if detail.get("status") != "preparing":
             return
+        if not dag.supports_run(body):
+            # the advance's own transform reports the run and releases it.
+            return
         config = self._dags()[ref[0]]
         if configuration_revision(config) != body.get("configurationRevision"):
             raise RecoveryError(
@@ -3120,35 +3527,133 @@ class DagScheduler:
 
         await self._mutate(ref[0], ref[1], prepared)
 
-    async def trigger_run(
-        self, dag_name: str, *, logical_date: str | None = None
-    ) -> str | None:
-        """Create a manual run of ``dag_name`` now; return its run key.
+    async def trigger(
+        self,
+        dag_name: str,
+        *,
+        params: Any = None,
+        logical_date: Any = None,
+        request_id: Any = None,
+        triggered_by: str | None = None,
+        scopes: Collection[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Create a manual run of ``dag_name`` now.
 
-        ``None`` for an unknown dag; raises when the run document could not
-        be created (no state backend available), so the caller never gets a
-        run key for a run that does not exist (the web handler surfaces the
-        exception instead of a false 200).
+        Returns ``runKey``, ``created``, and, for a DAG that declares
+        parameters, the ``params`` the run stores. ``None`` for an unknown
+        dag.
+
+        ``params`` are the caller's values and ``scopes`` the scopes of the
+        caller's token (see :func:`cronstable.params.for_run`), checked
+        before anything is written. ``logical_date`` is an ISO 8601 instant
+        the run records as its logical date. ``request_id`` makes the call
+        repeatable: the run key is derived from it, so a second call with
+        the same id returns the first run with ``created`` false. The three
+        arrive as a request carried them, so each is checked here.
+
+        Raises :class:`cronstable.params.ParamError` for refused values,
+        :class:`TriggerInputError` for an unusable ``logical_date`` or
+        ``request_id``, :class:`TriggerConflict` when ``request_id`` names
+        a run with other parameters or another logical date, and
+        :class:`RuntimeError` when the run document could not be created
+        (no state backend available), so the caller never gets a run key
+        for a run that does not exist.
         """
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None:
             return None
-        run_key = "manual-" + os.urandom(6).hex()
-        created = await self._create_doc(
-            dagcfg, run_key, logical_date, "manual"
+        resolved = self._resolve_params(dagcfg, params, scopes)
+        if request_id is not None and not (
+            isinstance(request_id, str)
+            and 1 <= len(request_id) <= REQUEST_ID_MAX
+        ):
+            raise TriggerInputError(
+                "requestId must be a string of 1 to {} characters".format(
+                    REQUEST_ID_MAX
+                )
+            )
+        logical_iso = None
+        if logical_date is not None:
+            logical_dt = (
+                _parse_iso(logical_date)
+                if isinstance(logical_date, str)
+                else None
+            )
+            if logical_dt is None:
+                raise TriggerInputError(
+                    "logicalDate must be an ISO 8601 date and time"
+                )
+            # the instant in UTC, the form a scheduled run records
+            try:
+                logical_iso = logical_dt.astimezone(datetime.UTC).isoformat()
+            except (OverflowError, ValueError) as ex:
+                # an instant at the edge of the calendar has no UTC form
+                raise TriggerInputError(
+                    "logicalDate is outside the supported date range"
+                ) from ex
+        if request_id is None:
+            run_key = "manual-" + os.urandom(6).hex()
+        else:
+            run_key = (
+                "manual-"
+                + hashlib.sha256(
+                    # surrogatepass: a JSON string can hold a lone surrogate
+                    request_id.encode("utf-8", "surrogatepass")
+                ).hexdigest()[:32]
+            )
+        created, existing = await self._create_run_doc(
+            dagcfg,
+            run_key,
+            logical_iso,
+            "manual",
+            params=resolved,
+            triggered_by=triggered_by,
         )
         if not created:
-            # the key is random, so "already exists" is not a real case:
-            # not-created means no backend was available to write it.
-            raise RuntimeError(
-                "dag {}: the manual run could not be recorded (state "
-                "backend unavailable)".format(dag_name)
+            if existing is None or request_id is None:
+                # a random key never names an existing run, so not-created
+                # means no backend was available to write the document.
+                raise RuntimeError(
+                    "dag {}: the manual run could not be recorded (state "
+                    "backend unavailable)".format(dag_name)
+                )
+            if (
+                existing.get("params") != resolved
+                or existing.get("logicalDate") != logical_iso
+            ):
+                raise TriggerConflict(
+                    "requestId {!r} belongs to run {} of workflow {!r}, "
+                    "which has different parameters or another logical "
+                    "date".format(request_id, run_key, dag_name)
+                )
+            result: dict[str, Any] = {"runKey": run_key, "created": False}
+            if existing.get("params") is not None:
+                result["params"] = existing["params"]
+            return result
+        if params:
+            # names only: a value never reaches the log
+            logger.info(
+                "dag %s: run %s created with parameters %s%s",
+                dag_name,
+                run_key,
+                ", ".join(sorted(params)),
+                "" if triggered_by is None else " by " + triggered_by,
             )
         await self._try_own(dagcfg, (dag_name, run_key))
-        return run_key
+        result = {"runKey": run_key, "created": True}
+        if resolved is not None:
+            result["params"] = resolved
+        return result
 
     async def backfill(
-        self, dag_name: str, start_iso: str, end_iso: str
+        self,
+        dag_name: str,
+        start_iso: str,
+        end_iso: str,
+        *,
+        params: Any = None,
+        triggered_by: str | None = None,
+        scopes: Collection[str] | None = None,
     ) -> dict[str, Any]:
         """Create runs for every scheduled instant in ``[start, end]``.
 
@@ -3157,13 +3662,23 @@ class DagScheduler:
         Idempotent: each date's run key create-if-absents, so re-running a
         backfill does not duplicate runs.
 
-        ``created`` counts the instants whose run the store holds: the runs
-        that this call wrote and the ones that it found.  Without a state
-        backend the request raises :class:`BackfillUnavailable`.  A store
-        fault on a run raises, after a warning that names the run's instant
-        and the cause.  A daemon that has neither the workflow nor a
-        ``state`` section has no store to wait for, and its request is
-        refused as one for an unknown workflow.
+        The result counts the runs this call created (``created``,
+        ``runKeys``) apart from the instants that already had a run
+        (``existing``, ``existingRunKeys``).  ``truncated`` is true when
+        the bound ended the call before the range did, and ``nextFrom`` is
+        then the first instant the call left, in UTC, for the ``from`` of
+        the call that continues.  Without a state backend the
+        request raises :class:`BackfillUnavailable`, so an unwritable store
+        never reads as a range of existing runs.  A store fault on a run
+        raises, after a warning that names the run's instant and the cause.
+        A daemon that has neither the workflow nor a ``state`` section has
+        no store to wait for, and its request is refused as one for an
+        unknown workflow.
+
+        ``params`` are checked once under the caller's ``scopes``, before
+        any run is created, and stored on every run this call creates. A
+        date that already has a run keeps that run's parameters. Raises
+        :class:`cronstable.params.ParamError` for refused values.
         """
         if self._backend() is None and (
             dag_name in self._dags() or self._cron._state_configured
@@ -3185,13 +3700,28 @@ class DagScheduler:
         end = _parse_iso(end_iso)
         if start is None or end is None or end < start:
             return {"ok": False, "reason": "bad date range"}
-        created = 0
+        resolved = self._resolve_params(dagcfg, params, scopes)
+        created: list[str] = []
+        existing: list[str] = []
         # step from just before start so an instant exactly at start counts
-        cursor = start - datetime.timedelta(seconds=1)
+        try:
+            cursor = start - datetime.timedelta(seconds=1)
+        except OverflowError:
+            return {"ok": False, "reason": "bad date range"}
         nxt = self._next_fire(sched, cursor)
-        while nxt is not None and nxt <= end and created < DAG_MAX_CATCHUP:
+        while (
+            nxt is not None
+            and nxt <= end
+            and len(created) + len(existing) < DAG_MAX_CATCHUP
+        ):
             try:
-                ref = await self._create_run(dagcfg, nxt, "backfill")
+                run = await self._create_run(
+                    dagcfg,
+                    nxt,
+                    "backfill",
+                    params=resolved,
+                    triggered_by=triggered_by,
+                )
             except (TimeoutError, OSError, _DocumentUnreadable) as ex:
                 # a timeout carries no message
                 logger.warning(
@@ -3201,18 +3731,147 @@ class DagScheduler:
                     str(ex) or type(ex).__name__,
                 )
                 raise
-            if ref is None:
+            if run is None:
                 # the backend stopped during the request
                 raise BackfillUnavailable()
-            created += 1
+            ref, was_created = run
+            (created if was_created else existing).append(ref[1])
             nxt = self._next_fire(sched, nxt)
-        return {"ok": True, "created": created}
+        if params and created:
+            # names only: a value never reaches the log
+            logger.info(
+                "dag %s: backfill created %d run(s) with parameters %s%s",
+                dag_name,
+                len(created),
+                ", ".join(sorted(params)),
+                "" if triggered_by is None else " by " + triggered_by,
+            )
+        result: dict[str, Any] = {
+            "ok": True,
+            "created": len(created),
+            "existing": len(existing),
+            "runKeys": created,
+            "existingRunKeys": existing,
+            # the loop ended with an instant of the range still unvisited
+            "truncated": nxt is not None and nxt <= end,
+        }
+        if result["truncated"]:
+            assert nxt is not None
+            result["nextFrom"] = nxt.astimezone(datetime.UTC).isoformat()
+        return result
+
+    async def _check_fleet(self, now: float) -> None:
+        """Warn about live peers below the engine level a loaded dag needs.
+
+        Such a peer leaves the dag's runs for a newer node.  A build with no
+        engine check advances them under the rules it knows, which is why
+        the operator is told to upgrade it.  That build also records no
+        manifest while it refuses its configuration, so a peer is live on
+        either sign of life: its newest manifest, or a task it started
+        (:meth:`_task_starts`, ``Cron._peer_dag_engines``).  A peer that
+        leaves a warning is logged with the reason.  Every build reaches
+        ``dag.BASE_ENGINE_LEVEL``, so the store is read only while a loaded
+        dag needs more.
+        """
+        needs = {
+            name: cfg.spec.engine
+            for name, cfg in self._dags().items()
+            if cfg.spec.engine > dag.BASE_ENGINE_LEVEL
+        }
+        if not needs:
+            self._fleet_needs = needs
+            self._fleet_warnings = {}
+            self._fleet_logged.clear()
+            return
+        if needs == self._fleet_needs and now < self._next_fleet_check:
+            return
+        # both recorded before the read, so a store that cannot answer is
+        # asked again once the interval is over
+        self._next_fleet_check = now + FLEET_CHECK_INTERVAL
+        self._fleet_needs = needs
+        started = await self._task_starts()
+        if started is None:
+            return  # the store could not answer: keep the last result
+        peers = await self._cron._peer_dag_engines(started)
+        if peers is None:
+            return  # as above
+        warnings: dict[str, list[str]] = {}
+        logged: set[tuple[str, str, int]] = set()
+        for name, level in needs.items():
+            for host, peer_level in sorted(peers.items()):
+                if peer_level >= level:
+                    continue
+                text = (
+                    "host {} runs a build at run engine level {} and this "
+                    "workflow needs level {}; upgrade cronstable on that "
+                    "host".format(host, peer_level, level)
+                )
+                warnings.setdefault(name, []).append(text)
+                seen = (name, host, peer_level)
+                logged.add(seen)
+                if seen not in self._fleet_logged:
+                    logger.warning("dag %s: %s", name, text)
+        # Imported here: cron imports this module at load (see _fire_past_gap).
+        from cronstable.cron import MANIFEST_LIVE_SECONDS
+
+        # A host that leaves a dag's warning is logged with what the store
+        # shows.  Two exits log nothing: a reload that ends the dag's own
+        # need, and a host listed again at another level.
+        listed = {(name, host) for name, host, _ in logged}
+        for name, host, _ in sorted(self._fleet_logged - logged):
+            if name not in needs or (name, host) in listed:
+                continue
+            if host in peers:
+                reason = "its manifest advertises run engine level {}".format(
+                    peers[host]
+                )
+            else:
+                reason = (
+                    "this node finds no manifest or task start from it in "
+                    "the last {:g} hours".format(MANIFEST_LIVE_SECONDS / 3600)
+                )
+            logger.info(
+                "dag %s: host %s leaves the fleet warning: %s",
+                name,
+                host,
+                reason,
+            )
+        self._fleet_needs = needs
+        self._fleet_warnings = warnings
+        self._fleet_logged = logged
+
+    async def _task_starts(self) -> dict[str, float] | None:
+        """When each host last started a task in a run of a loaded dag.
+
+        Host to epoch seconds, over every retained run.  A host that starts
+        a task is running, whatever its manifest says, and a task start is
+        the one sign of life a build leaves while it records no manifest
+        (see :meth:`_check_fleet`).  Read through the run summaries, which
+        parse a finished run once.  ``None`` when the store cannot answer.
+        """
+        backend = self._backend()
+        if backend is None:
+            return None
+        started: dict[str, float] = {}
+        try:
+            for name in list(self._dags()):
+                summaries = await self._run_summaries(backend, name)
+                if summaries is None:
+                    return None
+                for summary in summaries:
+                    for host, at in summary["taskStarts"].items():
+                        started[host] = max(at, started.get(host, 0.0))
+        except Exception as ex:  # noqa: BLE001 - advisory; retried later
+            logger.debug("dag: cannot read the task starts: %s", ex)
+            return None
+        return started
 
     async def list_dags(self) -> list[dict[str, Any]]:
         """Per-DAG summary for the dashboard index.
 
         Carries the static graph (nodes + edges + per-task type/triggerRule/
-        retries/fan-out marker) plus, when a backend is present, the latest
+        retries/fan-out marker, and ``skipExitCodes`` and ``when`` on a task
+        that sets them) plus, when a backend is present, the latest
         run's state and a run-state histogram, enough to render a health
         card without an N+1 of per-DAG ``/runs`` calls.  The durable read is
         best-effort: a slow/absent backend simply omits the run rollup rather
@@ -3248,6 +3907,23 @@ class DagScheduler:
                     for t in dagcfg.tasks
                 ],
             }
+            if dagcfg.spec.engine > dag.BASE_ENGINE_LEVEL:
+                # only a dag above the base level can carry either key, so
+                # every other dag skips this second walk.
+                for exported, t in zip(
+                    entry["tasks"], dagcfg.tasks, strict=True
+                ):
+                    if t.spec.skip_exit_codes:
+                        exported["skipExitCodes"] = list(
+                            t.spec.skip_exit_codes
+                        )
+                    if t.spec.when:
+                        exported["when"] = dag.when_export(t.spec.when)
+            if dagcfg.spec.params:
+                entry["params"] = run_params.declaration(dagcfg.spec.params)
+            fleet = self._fleet_warnings.get(name)
+            if fleet:
+                entry["fleetWarnings"] = list(fleet)
             if backend is not None:
                 rollup = await self._dag_run_rollup(backend, name)
                 if rollup:
@@ -3265,12 +3941,21 @@ class DagScheduler:
         cache entry per run, filled once, rather than each caller re-reading
         and re-parsing every retained document.  The task histogram is a walk
         of the body the caller has already parsed, which is cheap next to the
-        parse it saves on later calls.
+        parse it saves on later calls.  The same walk collects
+        ``taskStarts``, the newest task start per host, for
+        :meth:`_task_starts`.
         """
         counts: dict[str, int] = {}
+        starts: dict[str, float] = {}
         for entry in body.get("tasks", {}).values():
             st = entry.get("state", "unknown")
             counts[st] = counts.get(st, 0) + 1
+            # startedAt, never updatedAt: only the host that claims a task
+            # stamps it, while a peer that reconciles a dead host's task
+            # stamps updatedAt on an entry that still names the dead host.
+            host, at = entry.get("host"), entry.get("startedAt")
+            if isinstance(host, str) and isinstance(at, (int, float)):
+                starts[host] = max(at, starts.get(host, 0.0))
         return {
             "runKey": body.get("runKey"),
             "runId": body.get("runId"),
@@ -3280,6 +3965,7 @@ class DagScheduler:
             "createdAt": body.get("createdAt"),
             "updatedAt": body.get("updatedAt"),
             "taskStates": counts,
+            "taskStarts": starts,
             "terminal": dag.is_terminal_run(body),
         }
 
@@ -3606,6 +4292,14 @@ class DagScheduler:
         # A first cut that spares the leases of the runs it names.
         # _delete_run_batch reads the references again under the leases.
         protected = _recovery_references(docs, kept, now)
+        # Catch-up counts from this run. Only a run created after this
+        # listing can take its place, and this pass cannot delete that run,
+        # so the check needs no second read under the leases.
+        reference = _schedule_reference(docs)
+        if reference is not None and isinstance(
+            reference[1].get("runKey"), str
+        ):
+            protected.add(reference[1]["runKey"])
         terminal = [b for b in docs if dag.is_terminal_run(b)]
         # this pass parsed every body anyway: rebuild the adopt scan's
         # terminal-key cache from truth (its periodic self-heal).
@@ -3952,6 +4646,7 @@ class DagScheduler:
         self._renewers.clear()
         self._owned.clear()
         self._wake.clear()
+        self._empty_expansions.clear()
         self._advance_pending.clear()
         self._locks.clear()
         self._next_logical.clear()
@@ -3983,10 +4678,17 @@ class DagScheduler:
         self._summaries_gen += 1
         self._terminal_run_keys.clear()
         self._advance_again.clear()
+        # the refused runs and the peers behind the fleet warnings belong to
+        # the old store.
+        self._engine_refused.clear()
+        self._fleet_warnings = {}
+        self._fleet_needs = {}
+        self._fleet_logged.clear()
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
         self._next_full_adopt = 0.0
         self._next_gc = 0.0
+        self._next_fleet_check = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -3994,26 +4696,64 @@ class DagScheduler:
 # --------------------------------------------------------------------------
 
 
+# The date and time forms a request or a stored record carries: an RFC 3339
+# date-time and its shorter forms. The time, its minutes and seconds, and
+# the offset are each optional. A space can replace the "T", and an offset
+# can drop its colon or its minutes.
+_ISO_INSTANT = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[Tt ](\d{2})(?::(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
+    r"(?:[Zz]|([+-])(\d{2})(?::?([0-5]\d))?)?)?",
+    re.ASCII,
+)
+
+
 def _parse_iso(value: str | None) -> datetime.datetime | None:
-    if not value:
+    """Read an ISO 8601 date and time as an aware datetime, or ``None``.
+
+    The pattern :data:`_ISO_INSTANT` is the whole grammar, so every
+    interpreter reads the same forms. This function avoids
+    ``datetime.fromisoformat``, which reads a different set of forms on
+    each Python version. A value without an offset reads as UTC, and the
+    fraction keeps its first six digits.
+    """
+    match = _ISO_INSTANT.fullmatch(value) if value else None
+    if match is None:
         return None
+    year, month, day, hour, minute, second, fraction, sign, off_h, off_m = (
+        match.groups()
+    )
     try:
-        dt = datetime.datetime.fromisoformat(value)
+        zone = datetime.UTC
+        if sign:
+            offset = datetime.timedelta(
+                hours=int(off_h), minutes=int(off_m or 0)
+            )
+            zone = datetime.timezone(-offset if sign == "-" else offset)
+        return datetime.datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour or 0),
+            int(minute or 0),
+            int(second or 0),
+            # the first six fraction digits are the microseconds
+            int((fraction or "")[:6].ljust(6, "0")),
+            zone,
+        )
     except ValueError:
+        # a field outside the calendar, the clock, or a day's offset
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.UTC)
-    return dt
 
 
 def _listed_run(summary: dict[str, Any]) -> dict[str, Any]:
     """One run summary as the run-list payload.
 
     Rebuilt field by field rather than returned as-is: a summary carries the
-    rollup's private ``terminal`` flag, and callers must never see it (nor be
-    able to mutate the cached dict it may have come from).  The single
-    definition of that payload, so the cached and full-listing paths of
-    :meth:`DagScheduler.list_runs` cannot drift apart.
+    private ``terminal`` flag and ``taskStarts`` map, and callers must never
+    see them (nor be able to mutate the cached dict it may have come from).
+    The single definition of that payload, so the cached and full-listing
+    paths of :meth:`DagScheduler.list_runs` cannot drift apart.
     """
     return {
         "runKey": summary.get("runKey"),

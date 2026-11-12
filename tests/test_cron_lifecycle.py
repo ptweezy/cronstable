@@ -386,7 +386,7 @@ async def test_manual_start_that_forbid_holds_back_is_refused():
         first = cron.running_jobs["test"][0]
         await _wait_until(lambda: bool(first.output.lines))
         with pytest.raises(cron_mod.ApiActionError) as caught:
-            await cron.start_job_by_name("test")
+            await cron.start_job("test")
         assert (caught.value.status, caught.value.message) == (409, reason)
         with pytest.raises(web.HTTPConflict) as conflict:
             await cron._web_start_job(Req(match={"name": "test"}))
@@ -706,7 +706,7 @@ def _cluster_slot(cron, monkeypatch, job):
     """
     holder = {"free": True}
 
-    async def claim(job, refusals=None):
+    async def claim(job, launch=None, refusals=None):
         return holder["free"]
 
     async def release(job):
@@ -2536,7 +2536,9 @@ async def test_schedule_retry_job_abandoned_when_no_longer_owner():
         has_conflict=lambda: False,
         view_settled=lambda: True,  # a converged view, not the settle hold
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
+    job = types.SimpleNamespace(
+        name="j", clusterPolicy="Leader", pool=None, concurrencyPolicy="Allow"
+    )
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.1, 2, 1)
     cron.retry_state["j"] = state  # a pending retry
@@ -2577,7 +2579,9 @@ async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
         "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
+    job = types.SimpleNamespace(
+        name="j", clusterPolicy="Leader", pool=None, concurrencyPolicy="Allow"
+    )
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.01, 1, 0.01)
     cron.retry_state["j"] = state
@@ -2618,7 +2622,12 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
         view_settled=lambda: settled,
     )
     # while unsettled, the gate denial must read as transient, never a move
-    job = types.SimpleNamespace(name="j", clusterPolicy="PreferLeader", pool=None)
+    job = types.SimpleNamespace(
+        name="j",
+        clusterPolicy="PreferLeader",
+        pool=None,
+        concurrencyPolicy="Allow",
+    )
     assert cron._cluster_owner_moved(job) is False
     launched = []
     monkeypatch.setattr(
@@ -2674,7 +2683,9 @@ async def test_retry_abandonment_cancels_state_and_records(caplog):
         has_conflict=lambda: False,
         view_settled=lambda: True,
     )
-    job = types.SimpleNamespace(name="j", clusterPolicy="Leader", pool=None)
+    job = types.SimpleNamespace(
+        name="j", clusterPolicy="Leader", pool=None, concurrencyPolicy="Allow"
+    )
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.1, 2, 1)
     cron.retry_state["j"] = state
@@ -3400,9 +3411,10 @@ def reboot_cron(monkeypatch):
             cron.web_config = {}
         launched = []
 
-        def capture(job, **kwargs):
+        async def capture(job, **kwargs):
             launched.append(job.name if record == "name" else job)
-            return _noop()
+            # maybe_launch_job answers whether it launched
+            return True if launch == "maybe_launch_job" else None
 
         monkeypatch.setattr(cron, launch, capture)
         return cron, launched
@@ -3976,7 +3988,7 @@ async def test_deferred_reboot_pass_skips_an_entry_a_manual_start_retired(
     async def launch_scheduled(job):
         scheduled.append(job.name)
         if job.name == "a":
-            await cron.start_job_by_name("b")
+            await cron.start_job("b")
 
     monkeypatch.setattr(cron, "launch_scheduled_job", launch_scheduled)
     await cron._process_pending_reboots()
@@ -4021,7 +4033,7 @@ async def test_deferred_reboot_pass_during_a_manual_start_push(
         "launch_scheduled_job",
         lambda job: scheduled.append(job.name) or _noop(),
     )
-    start = asyncio.create_task(cron.start_job_by_name("boot"))
+    start = asyncio.create_task(cron.start_job("boot"))
     await parked.wait()
     if teardown:
         cron.cluster_manager = None  # a reload stopped the manager mid-push
@@ -5982,6 +5994,9 @@ async def test_lifecycle_state_teardown_cancels_slot_and_retry_tasks(
     claim = asyncio.ensure_future(_idle())
     cron._slot_renewers["j"] = renewer
     cron._slot_pursuits["j"] = pursuit
+    # the launch that the pursuit holds goes with it: a later pursuit of
+    # the job must not make it
+    cron._slot_pursuit_launch["j"] = {"with_retries": True, "params": None}
     cron._retry_claim_task = claim
     await asyncio.sleep(0)  # let the tasks reach their await points
 
@@ -5990,6 +6005,7 @@ async def test_lifecycle_state_teardown_cancels_slot_and_retry_tasks(
     assert cron.state_backend is None
     assert cron._slot_renewers == {}
     assert cron._slot_pursuits == {}
+    assert cron._slot_pursuit_launch == {}
     assert cron._retry_claim_task is None
     await asyncio.sleep(0)
     assert renewer.cancelled()

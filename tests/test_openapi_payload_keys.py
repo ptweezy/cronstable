@@ -204,6 +204,12 @@ jobs:
     command: echo hi
     schedule: "*/5 * * * *"
     monitorResources: true
+  - name: tuned
+    command: echo hi
+    schedule: "*/5 * * * *"
+    params:
+      - name: region
+        default: eu
 """
 
 
@@ -245,7 +251,21 @@ def _usage(series=None):
     )
 
 
-def _finished(outcome, *, seconds=1.0, usage=None, limits=None, skip=None):
+def _finished(
+    outcome,
+    *,
+    seconds=1.0,
+    usage=None,
+    limits=None,
+    skip=None,
+    params=None,
+    supplied=False,
+):
+    """A finished run.
+
+    ``params`` holds the run's parameter values, and ``supplied`` says
+    that a manual start chose them.
+    """
     now = datetime.datetime.now(_UTC)
     return JobRunInfo(
         outcome=outcome,
@@ -259,6 +279,8 @@ def _finished(outcome, *, seconds=1.0, usage=None, limits=None, skip=None):
         resource_usage=usage,
         skip_reason=skip,
         limits=limits,
+        params=params,
+        supplied_params=supplied,
     )
 
 
@@ -305,13 +327,19 @@ async def test_job_entries_declare_every_key():
     cron.run_history["plain"].append(_finished("success", usage=_usage()))
     cron.last_run["plain"] = cron.run_history["plain"][-1]
     await cron.pause_job_by_name("plain", duration=600, note="maintenance")
+    # the last run of `tuned` came from a manual start that supplied a value
+    cron.run_history["tuned"].append(
+        _finished("success", params={"region": "us"}, supplied=True)
+    )
+    cron.last_run["tuned"] = cron.run_history["tuned"][-1]
 
     jobs = cron.jobs_payload()
     await cron._attach_job_queues(jobs)
     by_name = {job["name"]: job for job in jobs}
     for job in jobs:
         _declares("Job", job, "/jobs[{}]".format(job["name"]))
-    _declares("Job", cron.job_detail_payload("watched"), "/jobs/watched")
+    for name in ("watched", "tuned"):
+        _declares("Job", cron.job_detail_payload(name), "/jobs/" + name)
 
     # each conditional key the fixtures set up is on the wire
     assert "schedule_resolved" in by_name["hashed"]
@@ -330,6 +358,12 @@ async def test_job_entries_declare_every_key():
     assert by_name["checked"]["verification"]["configured"] is True
     assert by_name["plain"]["paused"]["note"] == "maintenance"
     assert by_name["plain"]["last_run"]["resources"]["samples"] == 3
+    assert by_name["tuned"]["params"][0]["name"] == "region"
+    for last in (
+        by_name["tuned"]["last_run"],
+        cron.job_detail_payload("tuned")["last_run"],
+    ):
+        assert last["suppliedParams"] is True and "suppliedRanAt" in last
 
 
 async def test_job_runs_and_stats_declare_every_key():
@@ -352,6 +386,20 @@ async def test_job_runs_and_stats_declare_every_key():
         assert key in stats
     # a mean over bytes, so a client must read it as a number
     assert stats["avg_rss_bytes"] is not None
+
+    # a job that declares parameters: one run took the defaults, and a
+    # manual start supplied a value for the other
+    tuned = cron.run_history["tuned"]
+    tuned.append(_finished("success", params={"region": "eu"}))
+    tuned.append(_finished("success", params={"region": "us"}, supplied=True))
+    body = _body(await cron._web_job_runs(Req(match={"name": "tuned"})))
+    _declares("JobRuns", body, "/jobs/tuned/runs")
+    (default,) = [run for run in body["runs"] if "ranAt" in run]
+    (supplied,) = [run for run in body["runs"] if "suppliedParams" in run]
+    assert default["params"] == {"region": "eu"}
+    assert supplied["params"] == {"region": "us"}
+    assert supplied["suppliedParams"] is True and "ranAt" not in supplied
+    assert supplied["suppliedRanAt"] == supplied["finished_at"]
 
 
 async def test_job_resources_declare_every_key():
@@ -407,7 +455,15 @@ jobs:
     pool: disks
 dags:
   - name: shape
+    params:
+      - name: mode
+        default: incremental
     tasks:
+      - id: full
+        command: x
+        when:
+          - param: mode
+            equals: full
       - id: gen
         command: x
         verify:
@@ -510,6 +566,9 @@ async def test_dag_payloads_declare_every_key(dag_cron, tmp_path, monkeypatch):
     assert tasks["work#0"]["resources"]["samples"] > 0
     assert tasks["gen"]["verification"]["outcome"] == "success"
     assert waiting["mapped"]["work"]["items"] == ["alpha", "beta"]
+    # the run took the declared default, so the `when` task is skipped
+    assert waiting["params"] == {"mode": "incremental"} and waiting["engine"]
+    assert tasks["full"]["skipReason"]["kind"] == "condition"
     served = _body(
         await cron._web_dag_run(Req(match={"name": "shape", "run_key": key}))
     )
@@ -558,6 +617,7 @@ async def test_dag_payloads_declare_every_key(dag_cron, tmp_path, monkeypatch):
     rules = {task["id"]: task for task in shape["tasks"]}
     assert rules["tidy"]["triggerRule"] == "all_done"
     assert rules["flaky"]["retries"] == 1 and rules["work"]["mapped"] is True
+    assert shape["params"][0]["name"] == "mode" and rules["full"]["when"]
     runs = _body(await cron._web_dag_runs(Req(match={"name": "shape"})))
     _declares(_route("/dags/{name}/runs"), runs, "/dags/shape/runs")
     assert "createdAt" in runs["runs"][0] and "updatedAt" in runs["runs"][0]
@@ -570,6 +630,9 @@ async def test_dag_payloads_declare_every_key(dag_cron, tmp_path, monkeypatch):
     )
     _declares("RecoveryRunResult", preview, "recovery preview")
     assert preview["dryRun"] is True and preview["artifacts"]
+    # the plan reuses the source's values and keeps the skipped task
+    assert preview["params"] == {"mode": "incremental"}
+    assert preview["preservedSkipped"]["full"]["kind"] == "condition"
     executed = _body(
         await cron._web_dag_recover(
             Req(
@@ -595,6 +658,7 @@ async def test_dag_payloads_declare_every_key(dag_cron, tmp_path, monkeypatch):
     recovered = await cron._dag.get_run("shape", executed["runKey"])
     _declares("DagRunDocument", recovered, "recovery run document")
     assert recovered["recovery"]["status"]
+    assert {"params", "preservedSkipped"} <= recovered["recovery"].keys()
     assert any("reusedFrom" in entry for entry in recovered["tasks"].values())
     assert "configurationRevision" in recovered
     # a failed scheduled run inside the window, which the range selects
@@ -625,6 +689,7 @@ async def test_dag_payloads_declare_every_key(dag_cron, tmp_path, monkeypatch):
     )
     _declares("RecoveryRangeResult", done, "range execution")
     assert [plan["sourceRunKey"] for plan in dry["plans"]] == ["date-2"]
+    assert {"params", "preservedSkipped"} <= dry["plans"][0].keys()
     assert len(done["runs"]) == 1 and done["complete"] is True
 
 

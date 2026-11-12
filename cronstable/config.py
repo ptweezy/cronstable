@@ -14,7 +14,7 @@ import threading
 import types
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, BinaryIO, Literal, NamedTuple, NewType
 from urllib.parse import ParseResult, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1145,7 +1145,37 @@ _dag_task_schema_dict.update(
         Opt("command"): Str() | Seq(Str()),
         Opt("type"): Enum(["task", "sensor", "approval"]),
         Opt("dependsOn"): Seq(Str()),
-        Opt("triggerRule"): Enum(["all_success", "all_done"]),
+        # the values of cronstable.dag.TRIGGER_RULES, which this module
+        # imports only once a config has a dags: section
+        Opt("triggerRule"): Enum(
+            [
+                "all_success",
+                "all_done",
+                "none_failed",
+                "none_failed_min_one_success",
+                "all_done_min_one_failed",
+            ]
+        ),
+        Opt("skipExitCodes"): Seq(Int()),
+        # Each entry names one source (`param` or `xcom`) and one operator.
+        # A comparison value is read as text, like a param's `default`, and
+        # DagTaskConfig converts a param's values to its declared type.
+        Opt("when"): Seq(
+            Map(
+                {
+                    Opt("param"): Str(),
+                    Opt("xcom"): Map({"task": Str(), "key": Str()}),
+                    Opt("equals"): Str(),
+                    Opt("notEquals"): Str(),
+                    Opt("in"): Seq(Str()),
+                    Opt("notIn"): Seq(Str()),
+                    Opt("lessThan"): Str(),
+                    Opt("lessThanOrEqual"): Str(),
+                    Opt("greaterThan"): Str(),
+                    Opt("greaterThanOrEqual"): Str(),
+                }
+            )
+        ),
         Opt("retries"): Int(),
         Opt("retryDelaySeconds"): Int() | Float(),
         Opt("expand"): Map({"fromTask": Str(), "key": Str()}),
@@ -1160,8 +1190,31 @@ _dag_task_schema_dict.update(
     }
 )
 
+# A run parameter. `default` and `allowed` are read as text and converted to
+# the declared `type` by DagConfig, because one strictyaml key has one scalar
+# type. The `type` values are cronstable.params.PARAM_TYPES.
+_dag_param_schema = Map(
+    {
+        "name": Str(),
+        Opt("type"): Enum(["string", "integer", "number", "boolean"]),
+        Opt("default"): Str(),
+        Opt("required"): Bool(),
+        Opt("allowed"): Seq(Str()),
+        Opt("minimum"): Int() | Float(),
+        Opt("maximum"): Int() | Float(),
+        Opt("pattern"): Str(),
+        Opt("maxLength"): Int(),
+        Opt("description"): Str(),
+    }
+)
+
+# A job declares run parameters the way a workflow does. The key is on the
+# job itself and never in a `defaults:` block.
+_job_schema_dict[Opt("params")] = Seq(_dag_param_schema)
+
 _dag_schema_dict = {
     "name": Str(),
+    Opt("params"): Seq(_dag_param_schema),
     Opt("schedule"): _schedule_schema,
     Opt("timezone"): Str(),
     Opt("utc"): Bool(),
@@ -1176,10 +1229,14 @@ _dag_schema_dict = {
 
 # Bearer-token scopes for the web control API (web.authTokens[].scopes):
 # `view` = read-only GETs; `control` = mutating POSTs; `approve` = the DAG
-# approval decision only. `control`/`approve` imply `view`; the scalar
-# web.authToken is all-scopes. Enforcement lives in
-# cronstable.cron.Cron._make_auth_middleware / _required_web_scope.
-WEB_TOKEN_SCOPES = ("view", "control", "approve")
+# approval decision only; `params` = choosing run parameter values on a
+# job start, a trigger or a backfill, or reusing chosen ones in a recovery,
+# each of which also needs `control` for the route.
+# `control`/`approve`/`params` imply `view`; the scalar web.authToken is
+# all-scopes. Enforcement lives in
+# cronstable.cron.Cron._make_auth_middleware / _required_web_scope, and for
+# `params` in cronstable.params (for_run, check_reuse).
+WEB_TOKEN_SCOPES = ("view", "control", "approve", "params")
 
 CONFIG_SCHEMA = EmptyDict() | Map(
     {
@@ -1936,6 +1993,7 @@ class JobConfig:
         "poolSlots",
         "queuePriority",
         "queueTimeout",
+        "params",
     )
 
     def __init__(
@@ -2047,6 +2105,14 @@ class JobConfig:
         self.secrets = config.pop("secrets")
         self._validate_secrets()
         self.stateAllowedScopes = config.pop("stateAllowedScopes")
+        # The run parameters a manual start can supply, as
+        # cronstable.params.ParamSpec values. Empty for a job that declares
+        # none and for the launch template of a DAG task, whose parameters
+        # belong to its DAG.
+        raw_params = config.pop("params", None)
+        self.params: tuple[Any, ...] = (
+            _job_params(self.name, raw_params) if raw_params else ()
+        )
         if self.env_file is not None:
             self._merge_env_file(env_cache)
         # Where the job's process starts; None keeps the daemon's own CWD.
@@ -2634,8 +2700,157 @@ _DAG_TASK_NODE_KEYS = frozenset(
         "pokeTimeoutSeconds",
         "pokeJitterSeconds",
         "onReject",
+        "skipExitCodes",
+        "when",
     }
 )
+
+
+def _dag_threshold(op: str, text: str) -> int | float:
+    """The number an ordering ``when:`` operator compares its source with.
+
+    ``text`` is read as a ``number`` parameter's value is, and takes the
+    same stored form. Raises :class:`ValueError` for text that is not a
+    finite number. The compared parameter's ``minimum``, ``maximum``, and
+    ``allowed`` do not apply, because a threshold bounds the parameter's
+    values and need not be one of them.
+    """
+    from cronstable import params as run_params
+
+    number = run_params.ParamSpec(name=op, type=run_params.NUMBER)
+    try:
+        value = run_params.parse_text(run_params.NUMBER, text)
+    except ValueError as ex:
+        raise ValueError("`{}` value {!r} {}".format(op, text, ex)) from ex
+    refused = run_params.check_value(number, value)
+    if refused is not None:
+        raise ValueError("`{}` value {!r} {}".format(op, text, refused))
+    threshold: int | float = run_params.stored_form(number, value)
+    return threshold
+
+
+def _dag_condition(raw: dict[str, Any], declared: dict[str, Any]) -> Any:
+    """One ``when:`` entry as a ``cronstable.dag.Condition``.
+
+    Raises :class:`ValueError` with the reason the entry is unusable.
+    ``declared`` maps each parameter name of the workflow to its
+    ``ParamSpec``. A parameter's comparison values are converted to its type
+    and checked like a supplied value, so a value the parameter can never
+    hold fails the load. The value of an ordering operator, such as
+    ``lessThan``, is a number for either source, and the parameter it
+    compares is an ``integer`` or a ``number``.
+    """
+    from cronstable import dag
+    from cronstable import params as run_params
+
+    sources = [key for key in (dag.WHEN_PARAM, dag.WHEN_XCOM) if key in raw]
+    if len(sources) != 1:
+        raise ValueError("names exactly one source: `param` or `xcom`")
+    operators = [key for key in dag.WHEN_OPERATORS if key in raw]
+    if len(operators) != 1:
+        raise ValueError(
+            "names exactly one operator: {}, or `{}`".format(
+                ", ".join("`{}`".format(o) for o in dag.WHEN_OPERATORS[:-1]),
+                dag.WHEN_OPERATORS[-1],
+            )
+        )
+    op = operators[0]
+    texts = raw[op] if isinstance(raw[op], list) else [raw[op]]
+    if not texts:
+        raise ValueError("`{}` needs at least one value".format(op))
+    threshold = None
+    if op in dag.WHEN_ORDERING:
+        threshold = _dag_threshold(op, texts[0])
+    if sources[0] == dag.WHEN_XCOM:
+        xcom = raw["xcom"]
+        if not xcom["task"] or not xcom["key"]:
+            raise ValueError("`xcom` needs a `task` and a `key`")
+        if threshold is not None:
+            return dag.Condition(
+                source=dag.WHEN_XCOM,
+                name=xcom["task"],
+                key=xcom["key"],
+                op=op,
+                values=(threshold,),
+            )
+        for text in texts:
+            if len(text.encode("utf-8")) > dag.MAX_CONDITION_XCOM_BYTES:
+                raise ValueError(
+                    "an XCom comparison value is at most {} bytes".format(
+                        dag.MAX_CONDITION_XCOM_BYTES
+                    )
+                )
+        return dag.Condition(
+            source=dag.WHEN_XCOM,
+            name=xcom["task"],
+            key=xcom["key"],
+            op=op,
+            values=tuple(dict.fromkeys(texts)),
+        )
+    name = raw["param"]
+    spec = declared.get(name)
+    if spec is None:
+        raise ValueError(
+            "param {!r} is not a parameter this workflow declares".format(name)
+        )
+    if threshold is not None:
+        if spec.type not in (run_params.INTEGER, run_params.NUMBER):
+            raise ValueError(
+                "`{}` compares numbers, and param {!r} has the type {}".format(
+                    op, name, spec.type
+                )
+            )
+        return dag.Condition(
+            source=dag.WHEN_PARAM, name=name, op=op, values=(threshold,)
+        )
+    values: list[Any] = []
+    for text in texts:
+        try:
+            value = run_params.parse_text(spec.type, text)
+        except ValueError as ex:
+            raise ValueError(
+                "param {!r}: value {!r} {}".format(name, text, ex)
+            ) from ex
+        refused = run_params.check_value(spec, value)
+        if refused is not None:
+            raise ValueError(
+                "param {!r}: value {!r} {}, so the parameter never holds "
+                "it".format(name, text, refused)
+            )
+        value = run_params.stored_form(spec, value)
+        # not dict.fromkeys: True and 1 are one dict key
+        if not any(type(v) is type(value) and v == value for v in values):
+            values.append(value)
+    return dag.Condition(
+        source=dag.WHEN_PARAM, name=name, op=op, values=tuple(values)
+    )
+
+
+def _dag_when(
+    dag_name: str,
+    task_id: str,
+    raw_when: list[dict[str, Any]],
+    params: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """A task's ``when:`` as ``cronstable.dag.Condition``s.
+
+    ``params`` is the workflow's parameter declaration, which a comparison
+    on a parameter is checked against. A fault in an entry is a
+    :class:`ConfigError` that names the entry by its position. The graph
+    rules for an XCom source are checked by ``dag.validate_graph``.
+    """
+    declared = {spec.name: spec for spec in params}
+    conditions = []
+    for index, raw in enumerate(raw_when, 1):
+        try:
+            conditions.append(_dag_condition(raw, declared))
+        except ValueError as ex:
+            raise ConfigError(
+                "dag {!r}: task {!r}: when entry {}: {}".format(
+                    dag_name, task_id, index, ex
+                )
+            ) from ex
+    return tuple(conditions)
 
 
 class DagTaskConfig:
@@ -2654,6 +2869,7 @@ class DagTaskConfig:
         dag_name: str,
         raw_task: dict,
         defaults: dict[str, Any] | None = None,
+        params: tuple[Any, ...] = (),
         env_cache: dict[str, dict[str, str]] | None = None,
     ) -> None:
         # Imported at the point of use: only a config with a dags: section
@@ -2695,6 +2911,25 @@ class DagTaskConfig:
                 "-1 retry-forever sentinel is not supported for dag "
                 "tasks)".format(dag_name, self.id)
             )
+        skip_codes = tuple(node.get("skipExitCodes") or ())
+        if skip_codes:
+            if self.type == "approval":
+                raise ConfigError(
+                    "dag {!r}: task {!r}: an approval gate runs no command, "
+                    "so it cannot set skipExitCodes".format(dag_name, self.id)
+                )
+            bad = sorted({c for c in skip_codes if not 1 <= c <= 255})
+            if bad:
+                raise ConfigError(
+                    "dag {!r}: task {!r}: skipExitCodes must be exit codes "
+                    "from 1 to 255, got {}".format(
+                        dag_name, self.id, ", ".join(map(str, bad))
+                    )
+                )
+        raw_when = node.get("when")
+        when = (
+            _dag_when(dag_name, self.id, raw_when, params) if raw_when else ()
+        )
         job_dict = mergedicts(base, merged)
         if self.type == "approval":
             if (
@@ -2748,7 +2983,214 @@ class DagTaskConfig:
             on_reject=dag.SKIPPED
             if node["onReject"] == "skip"
             else dag.FAILED,
+            # deduplicated and ordered, so two spellings of one set read the
+            # same in the graph export and the recovery revision
+            skip_exit_codes=tuple(sorted(set(skip_codes))),
+            when=when,
         )
+
+
+def _dag_param_shape(raw: dict[str, Any], kind: str) -> str | None:
+    """Why a param's constraint keys are unusable, or ``None``.
+
+    Covers what can be decided without a value: a key that does not apply
+    to the type, a bound that is not a number of that type, an inverted
+    range, an invalid pattern, and a ``maxLength`` out of range.
+    """
+    from cronstable import params as run_params
+
+    numeric = kind in (run_params.INTEGER, run_params.NUMBER)
+    for key, applies in (
+        ("minimum", numeric),
+        ("maximum", numeric),
+        ("pattern", kind == run_params.STRING),
+        ("maxLength", kind == run_params.STRING),
+        ("allowed", kind != run_params.BOOLEAN),
+    ):
+        if key in raw and not applies:
+            return "{} does not apply to the type {}".format(key, kind)
+    minimum, maximum = raw.get("minimum"), raw.get("maximum")
+    for key, bound in (("minimum", minimum), ("maximum", maximum)):
+        if bound is None:
+            continue
+        if kind == run_params.INTEGER and not isinstance(bound, int):
+            return "{} must be an integer".format(key)
+        if isinstance(bound, float) and not math.isfinite(bound):
+            return "{} must be a finite number".format(key)
+    if minimum is not None and maximum is not None and minimum > maximum:
+        return "minimum is greater than maximum"
+    pattern = raw.get("pattern")
+    if pattern is not None:
+        try:
+            re.compile(pattern)
+        except (re.error, OverflowError, RecursionError) as ex:
+            # the last two: a repeat count or a nesting depth beyond what
+            # re compiles
+            return "pattern is not a valid regular expression: {}".format(ex)
+    max_length = raw.get("maxLength")
+    if max_length is not None and not (
+        1 <= max_length <= run_params.MAX_STRING_BYTES
+    ):
+        return "maxLength must be from 1 to {}".format(
+            run_params.MAX_STRING_BYTES
+        )
+    return None
+
+
+def _dag_param(raw: dict[str, Any], no_required: str | None) -> Any:
+    """One ``params:`` entry as a ``cronstable.params.ParamSpec``.
+
+    Raises :class:`ValueError` with the reason the entry is unusable. The
+    name is the caller's to check, because uniqueness spans the list.
+    ``no_required`` is the reason the declaration cannot hold a required
+    parameter, or ``None`` when it can.
+    """
+    from cronstable import params as run_params
+
+    kind = raw.get("type", run_params.STRING)
+    problem = _dag_param_shape(raw, kind)
+    if problem is not None:
+        raise ValueError(problem)
+    required = bool(raw.get("required", False))
+    spec = run_params.ParamSpec(
+        name=raw["name"],
+        type=kind,
+        required=required,
+        minimum=raw.get("minimum"),
+        maximum=raw.get("maximum"),
+        pattern=raw.get("pattern"),
+        max_length=raw.get("maxLength"),
+        description=raw.get("description", ""),
+    )
+
+    def typed(text: str, what: str) -> Any:
+        # the value in the declared type, checked against every constraint
+        # ``spec`` holds at the time of the call
+        try:
+            value = run_params.parse_text(kind, text)
+        except ValueError as ex:
+            raise ValueError("{} {!r} {}".format(what, text, ex)) from ex
+        refused = run_params.check_value(spec, value)
+        if refused is not None:
+            raise ValueError("{} {!r} {}".format(what, text, refused))
+        return run_params.stored_form(spec, value)
+
+    if "allowed" in raw:
+        allowed = tuple(
+            dict.fromkeys(
+                typed(text, "allowed value") for text in raw["allowed"]
+            )
+        )
+        if not allowed:
+            raise ValueError("allowed needs at least one value")
+        spec = replace(spec, allowed=allowed)
+    if not required:
+        if "default" not in raw:
+            raise ValueError("needs a default, or `required: true`")
+        return replace(spec, default=typed(raw["default"], "default"))
+    if "default" in raw:
+        raise ValueError(
+            "a required parameter takes no default, because the caller "
+            "always supplies the value"
+        )
+    if no_required is not None:
+        raise ValueError(no_required)
+    return spec
+
+
+def _dag_params(
+    dag_name: str, raw_params: list[dict[str, Any]], scheduled: bool
+) -> tuple[Any, ...]:
+    """A DAG's ``params:`` declaration as ``cronstable.params.ParamSpec``s.
+
+    ``scheduled`` bars ``required``, because a scheduled run stores the
+    defaults. See :func:`_param_specs` for the faults.
+    """
+    return _param_specs(
+        "dag {!r}".format(dag_name),
+        raw_params,
+        "a workflow with a schedule cannot require a parameter, because a "
+        "scheduled run uses the defaults"
+        if scheduled
+        else None,
+    )
+
+
+def _job_params(
+    job_name: str, raw_params: list[dict[str, Any]]
+) -> tuple[Any, ...]:
+    """A job's ``params:`` declaration as ``cronstable.params.ParamSpec``s.
+
+    Every parameter of a job has a default, because every job has a
+    schedule and a scheduled run uses the defaults.
+    """
+    return _param_specs(
+        "job {!r}".format(job_name),
+        raw_params,
+        "a job cannot require a parameter, because its scheduled runs use "
+        "the defaults; give the parameter a default",
+    )
+
+
+def _param_specs(
+    subject: str, raw_params: list[dict[str, Any]], no_required: str | None
+) -> tuple[Any, ...]:
+    """A ``params:`` declaration as ``cronstable.params.ParamSpec``s.
+
+    ``subject`` names the owner in each error, for example ``dag 'deploy'``.
+    Every fault is a :class:`ConfigError` at load: a bad or duplicate name,
+    a name that reads as a secret, a constraint that does not fit the type,
+    and a default or an allowed value the parameter's own constraints
+    refuse. ``no_required`` is passed to :func:`_dag_param`.
+    """
+    # deferred for the reason DagTaskConfig gives; redact compiles its
+    # patterns at import, and only a declaration needs them here.
+    from cronstable import params as run_params
+    from cronstable.redact import is_secret_name
+
+    if len(raw_params) > run_params.MAX_PARAMS:
+        raise ConfigError(
+            "{}: declares {} params; the limit is {}".format(
+                subject, len(raw_params), run_params.MAX_PARAMS
+            )
+        )
+    specs: list[Any] = []
+    seen: dict[str, str] = {}
+    for raw in raw_params:
+        name = raw["name"]
+        try:
+            if not run_params.valid_name(name):
+                raise ValueError(
+                    "a name starts with a letter and holds at most 64 "
+                    "letters, digits, and underscores"
+                )
+            clash = seen.get(name.lower())
+            if clash is not None:
+                raise ValueError(
+                    "the name repeats {!r}; names are unique ignoring "
+                    "case".format(clash)
+                )
+            seen[name.lower()] = name
+            if is_secret_name(name):
+                raise ValueError(
+                    "the name reads as a secret, and every reader with the "
+                    "`view` scope sees a run's parameters. Keep the secret "
+                    "in a `secrets:` block; a parameter can carry the "
+                    "secret's name"
+                )
+            specs.append(_dag_param(raw, no_required))
+        except ValueError as ex:
+            raise ConfigError(
+                "{}: param {!r}: {}".format(subject, name, ex)
+            ) from ex
+    defaults = {s.name: s.default for s in specs if not s.required}
+    if run_params.encoded_size(defaults) > run_params.MAX_PARAMS_BYTES:
+        raise ConfigError(
+            "{}: the param defaults are larger than {} bytes as JSON".format(
+                subject, run_params.MAX_PARAMS_BYTES
+            )
+        )
+    return tuple(specs)
 
 
 #: Prefix of a scheduled DAG's synthetic schedule job, ``dag:<dag name>``.
@@ -2798,13 +3240,27 @@ class DagConfig:
             raise ConfigError(
                 "dag {!r}: needs at least one task".format(self.name)
             )
+        # the declaration first: a task's `when:` is checked against it
+        params_raw = raw.pop("params", None)
+        params = (
+            _dag_params(
+                self.name,
+                params_raw,
+                scheduled=raw.get("schedule") is not None,
+            )
+            if params_raw
+            else ()
+        )
         self.tasks = [
-            DagTaskConfig(self.name, t, defaults, env_cache) for t in tasks_raw
+            DagTaskConfig(self.name, t, defaults, params, env_cache)
+            for t in tasks_raw
         ]
         self.task_templates: dict[str, JobConfig] = {
             t.id: t.job_template for t in self.tasks
         }
-        self.spec = dag.DagSpec.build(self.name, [t.spec for t in self.tasks])
+        self.spec = dag.DagSpec.build(
+            self.name, [t.spec for t in self.tasks], params
+        )
         try:
             dag.validate_graph(self.spec)
         except dag.DagValidationError as ex:
@@ -5212,6 +5668,9 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _validate_eventlog_config(config)
     _warn_if_resource_limits_unsupported(config)
     _warn_if_mail_login_unencrypted(config)
+    _warn_if_param_pattern_nests_repeats(config)
+    _warn_if_param_references_misfire(config)
+    _warn_if_skip_exit_codes_hide_failures(config)
 
 
 def capped_jobs(
@@ -5294,6 +5753,176 @@ def _warn_if_mail_login_unencrypted(config: CronstableConfig) -> None:
         )
 
 
+def _warn_if_param_pattern_nests_repeats(config: CronstableConfig) -> None:
+    """Warn for each job or DAG parameter whose ``pattern`` nests repeats.
+
+    Once per load per parameter. A parameter whose ``maxLength`` is 16 or
+    less gets the warning only when its pattern holds a choice beyond the
+    two repeats, because the two alone refuse a value that short within a
+    few milliseconds (see :func:`cronstable.params.nested_repetition`). It
+    logs instead of refusing the load, because such a pattern is slow only
+    for a long value that it refuses.
+    """
+    declared = [
+        ("job", job.name, job.params) for job in config.jobs if job.params
+    ]
+    declared += [
+        ("dag", d.name, d.spec.params) for d in config.dags if d.spec.params
+    ]
+    if not declared:
+        return
+    # deferred for the reason DagTaskConfig gives
+    from cronstable import params as run_params
+
+    for kind, name, specs in declared:
+        for spec in specs:
+            if spec.pattern is None or not run_params.nested_repetition(
+                spec.pattern, spec.max_length
+            ):
+                continue
+            logger.warning(
+                "%s %r: param %r: the pattern holds a repeat inside an "
+                "unbounded repeat with nothing required between them, as "
+                "(a+)+ does. Checking a value that does not match can take "
+                "time that grows exponentially with the length of the "
+                "value, and the daemon schedules nothing until the check "
+                "ends. Require a character between the repeats, or make "
+                "the inner repeat possessive, as in (a++)+",
+                kind,
+                name,
+                spec.name,
+            )
+
+
+#: A parameter variable as a command names it, in any shell's syntax. The
+#: group is the part after the prefix.
+_PARAM_REFERENCE = re.compile(r"CRONSTABLE_PARAM_([A-Za-z0-9_]+)")
+#: The same variable in the form that cmd.exe replaces with its value before
+#: it parses the command line. cmd.exe ignores case in a variable name.
+_CMD_PARAM_REFERENCE = re.compile(r"(?i)%CRONSTABLE_PARAM_([A-Za-z0-9_]+)%")
+
+
+def _reaches_cmd(job: JobConfig, windows: bool) -> bool:
+    """Whether cmd.exe parses ``job``'s command: a string command under the
+    Windows default shell or ``shell: cmd``, or an argument list that
+    starts with cmd.exe."""
+    command = job.command
+    if isinstance(command, list):
+        return bool(command) and platform.is_cmd_shell(str(command[0]))
+    return windows and (not job.shell or platform.is_cmd_shell(job.shell))
+
+
+def _warn_if_param_references_misfire(
+    config: CronstableConfig, windows: bool | None = None
+) -> None:
+    """Warn for a command that reads a run parameter in a way that goes
+    wrong at run time.
+
+    Two checks, each once per load for each command and parameter:
+
+    * The command names a ``CRONSTABLE_PARAM_*`` variable for a parameter
+      that its job or DAG does not declare, so the variable is unset.
+    * cmd.exe parses the command, the command holds
+      ``%CRONSTABLE_PARAM_<NAME>%``, and the parameter is a string with no
+      ``allowed`` and no ``pattern``. cmd.exe replaces the reference with
+      the value before it parses the line, so the value can add commands.
+
+    ``windows`` says whether this host runs string commands through cmd.exe
+    by default. It defaults to :data:`cronstable.platform.IS_WINDOWS`.
+    """
+    if windows is None:
+        windows = platform.IS_WINDOWS
+    commands: list[tuple[str, str, JobConfig, tuple[Any, ...]]] = [
+        ("job {!r}".format(job.name), "the job", job, job.params)
+        for job in config.jobs
+    ]
+    for d in config.dags:
+        commands += [
+            (
+                "dag {!r}: task {!r}".format(d.name, task.id),
+                "the workflow",
+                task.job_template,
+                d.spec.params,
+            )
+            for task in d.tasks
+            if task.type != "approval"  # a gate runs no command
+        ]
+    for subject, owner, job, specs in commands:
+        command = job.command
+        text = " ".join(command) if isinstance(command, list) else command
+        if "CRONSTABLE_PARAM_" not in text:
+            continue
+        declared = {spec.name.upper(): spec for spec in specs}
+        for name in sorted(
+            {
+                found
+                for found in _PARAM_REFERENCE.findall(text)
+                if found.upper() not in declared
+            }
+        ):
+            logger.warning(
+                "%s: the command reads CRONSTABLE_PARAM_%s, and %s declares "
+                "no parameter of that name, so the variable is unset when "
+                "the command runs",
+                subject,
+                name,
+                owner,
+            )
+        if not _reaches_cmd(job, windows):
+            continue
+        for name in sorted(
+            {found.upper() for found in _CMD_PARAM_REFERENCE.findall(text)}
+        ):
+            spec = declared.get(name)
+            if (
+                spec is None
+                or spec.type != "string"
+                or spec.allowed
+                or spec.pattern is not None
+            ):
+                continue
+            logger.warning(
+                "%s: cmd.exe replaces %%CRONSTABLE_PARAM_%s%% with the "
+                "value before it parses the command, and param %r takes "
+                "any string. A value that holds &, |, <, >, or a double "
+                "quote runs as part of the command line. Give the "
+                "parameter an allowed list or a pattern, or read the "
+                "variable from PowerShell or a script file",
+                subject,
+                name,
+                spec.name,
+            )
+
+
+#: Exit codes that a shell or a failing program returns without the command
+#: choosing them: 1 and 2 for an ordinary error, 126 for a file that cannot
+#: run, and 127 for a command that is not found.
+_AMBIGUOUS_SKIP_CODES = frozenset({1, 2, 126, 127})
+
+
+def _warn_if_skip_exit_codes_hide_failures(config: CronstableConfig) -> None:
+    """Warn for each DAG task whose ``skipExitCodes`` holds a code that an
+    ordinary failure also produces, once per load per task."""
+    for d in config.dags:
+        for task in d.tasks:
+            codes = sorted(
+                _AMBIGUOUS_SKIP_CODES.intersection(task.spec.skip_exit_codes)
+            )
+            if not codes:
+                continue
+            logger.warning(
+                "dag %r: task %r: skipExitCodes holds %s. A shell or a "
+                "failing program exits with 1 or 2 for an ordinary error, "
+                "126 for a file it cannot run, and 127 for a command it "
+                "cannot find, so a broken command would end the task "
+                "skipped. Use a code that only the command's own skip "
+                "decision returns, such as 99",
+                d.name,
+                task.id,
+                ", ".join(map(str, codes)),
+            )
+
+
 def _validate_dags(config: CronstableConfig) -> None:
     """Cross-section invariants for the orchestration DAGs.
 
@@ -5361,6 +5990,32 @@ def _validate_dags(config: CronstableConfig) -> None:
                 "`dags`: {}"
             ).format(", ".join(sorted(names)))
         )
+    from cronstable import dag
+
+    for d in config.dags:
+        # The advised rule needs BRANCHING_PARAMS_ENGINE_LEVEL. Taking the
+        # advice raises only a workflow below that level, so only its line
+        # names the level.
+        level_note = ""
+        if d.spec.engine < dag.BRANCHING_PARAMS_ENGINE_LEVEL:
+            level_note = (
+                ". That rule needs run engine level {}, so upgrade every "
+                "node that shares the state store first".format(
+                    dag.BRANCHING_PARAMS_ENGINE_LEVEL
+                )
+            )
+        for task_id, upstreams in dag.skippable_joins(d.spec):
+            logger.warning(
+                "dag %r: task %r uses triggerRule all_success and joins "
+                "upstreams that can end skipped (%s), so it is skipped when "
+                "one of them is skipped and the rest of its upstreams "
+                "succeed. If they are alternative branches, set "
+                "triggerRule: none_failed_min_one_success%s",
+                d.name,
+                task_id,
+                ", ".join(upstreams),
+                level_note,
+            )
 
 
 def parse_config(

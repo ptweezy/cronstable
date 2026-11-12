@@ -239,3 +239,9 @@ webui.week_walk_500x20
 # surfaces, so each metric skips on the baseline side and the pairing has
 # nothing to compare.  Add each one when the baseline is a release that
 # carries its surface.
+#
+# dag.join_verdict_2k times the none_failed, none_failed_min_one_success and
+# all_done_min_one_failed trigger rules.  Run against a baseline tree that
+# predates them it skips with "dag branching trigger rules not present", so
+# the pairing has nothing to compare.  Add it once a release carrying the
+# rules is the baseline.

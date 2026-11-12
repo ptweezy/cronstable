@@ -68,7 +68,7 @@ decides approval gates. The command prints a warning to stderr in these cases:
 
 | Warning | Meaning |
 | --- | --- |
-| The token grants full access | The token holds every scope. Pair with a scoped token to limit the phone. |
+| The token grants full access | The token holds `view`, `control`, and `approve`, so it passes every route's check, with or without `params`. Pair with a scoped token to limit the phone. |
 | The server authenticated no access token | The daemon requires no token, or it allows anonymous access and the command presented none. The code carries no token, and the app connects without one. |
 | The connection lacks the `control` scope | The app can read the server, and `POST /push/devices` refuses to register the phone for alerts. |
 

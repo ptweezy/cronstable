@@ -27,13 +27,21 @@ recomputed, so a crash-resumed run reconstructs the identical mapped set rather
 than re-deriving it from a possibly-changed upstream output.
 """
 
+import math
+import operator
 import re
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from functools import cached_property
 from typing import Any
 
 from cronstable import _json
+from cronstable.params import (
+    CONTROL_CHARACTERS,
+    NUMBER,
+    ParamSpec,
+    env_text,
+    parse_text,
+)
 
 # --------------------------------------------------------------------------
 # Durable namespaces (under the backend's docs/ and records/ trees)
@@ -68,6 +76,9 @@ XCOM_SCOPE_PREFIX = "dagxcom/"
 ENV_DAG_NAME = "CRONSTABLE_DAG_NAME"
 ENV_DAG_RUN_ID = "CRONSTABLE_DAG_RUN_ID"
 ENV_DAG_RUN_KEY = "CRONSTABLE_DAG_RUN_KEY"
+# the run's logical date as the run document holds it: an ISO 8601 instant in
+# UTC, or empty for a run that has none
+ENV_DAG_LOGICAL_DATE = "CRONSTABLE_DAG_LOGICAL_DATE"
 ENV_DAG_TASK = "CRONSTABLE_DAG_TASK"  # the base task id
 ENV_DAG_TASKKEY = "CRONSTABLE_DAG_TASKKEY"  # the instance key (id or id#index)
 ENV_DAG_MAP_INDEX = "CRONSTABLE_DAG_MAP_INDEX"
@@ -110,6 +121,75 @@ APPROVAL = "approval"
 
 ALL_SUCCESS = "all_success"
 ALL_DONE = "all_done"
+NONE_FAILED = "none_failed"
+NONE_FAILED_MIN_ONE_SUCCESS = "none_failed_min_one_success"
+ALL_DONE_MIN_ONE_FAILED = "all_done_min_one_failed"
+
+#: Every ``triggerRule`` value, in documentation order. Each rule is evaluated
+#: once every upstream is terminal (see :func:`_deps_verdict`).
+TRIGGER_RULES = (
+    ALL_SUCCESS,
+    ALL_DONE,
+    NONE_FAILED,
+    NONE_FAILED_MIN_ONE_SUCCESS,
+    ALL_DONE_MIN_ONE_FAILED,
+)
+#: The rules every build evaluates. A DAG that uses any other rule needs
+#: :data:`BRANCHING_PARAMS_ENGINE_LEVEL`.
+_BASE_TRIGGER_RULES = frozenset({ALL_SUCCESS, ALL_DONE})
+#: The rules that count upstream outcomes. A task with no upstream can never
+#: meet one, so :func:`validate_graph` refuses the pairing.
+_COUNTING_TRIGGER_RULES = frozenset(
+    {NONE_FAILED_MIN_ONE_SUCCESS, ALL_DONE_MIN_ONE_FAILED}
+)
+
+#: ``skipReason.kind`` values: why a task entry is ``skipped``.
+SKIP_EXIT_CODE = "exit_code"  # its command exited with a skipExitCodes code
+SKIP_UPSTREAM = "upstream"  # an upstream was skipped (all_success)
+SKIP_TRIGGER_RULE = "trigger_rule"  # its rule skips on these upstream states
+SKIP_APPROVAL = "approval"  # its gate was rejected with onReject: skip
+SKIP_CONDITION = "condition"  # a when: comparison did not hold
+
+#: ``when:`` sources: where a comparison reads its value from.
+WHEN_PARAM = "param"
+WHEN_XCOM = "xcom"
+
+#: ``when:`` operators, in documentation order. ``equals`` and ``in`` hold
+#: when the source equals one of the values, and ``notEquals`` and ``notIn``
+#: when it equals none of them. The other four read the source as a number
+#: and compare it with one number (see :data:`WHEN_ORDERING`).
+WHEN_EQUALS = "equals"
+WHEN_NOT_EQUALS = "notEquals"
+WHEN_IN = "in"
+WHEN_NOT_IN = "notIn"
+WHEN_LESS_THAN = "lessThan"
+WHEN_LESS_THAN_OR_EQUAL = "lessThanOrEqual"
+WHEN_GREATER_THAN = "greaterThan"
+WHEN_GREATER_THAN_OR_EQUAL = "greaterThanOrEqual"
+WHEN_OPERATORS = (
+    WHEN_EQUALS,
+    WHEN_NOT_EQUALS,
+    WHEN_IN,
+    WHEN_NOT_IN,
+    WHEN_LESS_THAN,
+    WHEN_LESS_THAN_OR_EQUAL,
+    WHEN_GREATER_THAN,
+    WHEN_GREATER_THAN_OR_EQUAL,
+)
+_WHEN_POSITIVE = frozenset({WHEN_EQUALS, WHEN_IN})
+#: The operators that compare numbers, each with the test it applies to the
+#: source and the comparison's one value. A source that holds no number
+#: fails every one of them.
+WHEN_ORDERING = {
+    WHEN_LESS_THAN: operator.lt,
+    WHEN_LESS_THAN_OR_EQUAL: operator.le,
+    WHEN_GREATER_THAN: operator.gt,
+    WHEN_GREATER_THAN_OR_EQUAL: operator.ge,
+}
+
+#: Byte ceiling on an XCom value a ``when:`` comparison reads, and on each
+#: value it compares with. A larger published value reads as no value.
+MAX_CONDITION_XCOM_BYTES = 4096
 
 #: Hard cap on a mapped task's fan-out: a cron daemon shares its host, so an
 #: unbounded XCom list must not become an unbounded instance set (run-document
@@ -131,6 +211,21 @@ MAX_MAPPED_XCOM_BYTES = 16 * 1024 * 1024
 #: (``AdvanceResult.deferred``), bounding any single pass's spawn burst.
 MAX_CLAIMS_PER_PASS = 32
 
+#: The engine level every build supports. A run document with no ``engine``
+#: key is at this level, and so is a node whose manifest has no ``dagEngine``.
+BASE_ENGINE_LEVEL = 1
+
+#: The level a DAG needs once it branches or takes run parameters: a task
+#: uses ``skipExitCodes``, ``when:``, or a trigger rule outside
+#: ``all_success`` and ``all_done``, or the DAG declares ``params:``. The
+#: features share one level because every build has all of them or none.
+BRANCHING_PARAMS_ENGINE_LEVEL = 2
+
+#: The highest run engine level this build advances. A run records the level
+#: its DAG needs when it is created (``DagSpec.engine``), and a build leaves a
+#: run above its own level untouched for a newer node (:func:`supports_run`).
+ENGINE_LEVEL = BRANCHING_PARAMS_ENGINE_LEVEL
+
 
 # --------------------------------------------------------------------------
 # Static DAG specification (built by config.py, consumed here)
@@ -143,6 +238,46 @@ class ExpandSpec:
 
     from_task: str
     key: str
+
+
+@dataclass(frozen=True, slots=True)
+class Condition:
+    """One ``when:`` comparison: a source, an operator, and its values.
+
+    ``source`` is :data:`WHEN_PARAM` or :data:`WHEN_XCOM`. ``name`` is the
+    parameter name or the id of the task that published the XCom value, and
+    ``key`` is the XCom key (empty for a parameter). ``values`` holds the
+    whole list for ``in`` and ``notIn`` and one value for every other
+    operator: text for XCom, and the declared type for a parameter. The
+    one value of a :data:`WHEN_ORDERING` operator is a number for either
+    source.
+    """
+
+    source: str
+    name: str
+    op: str
+    values: tuple[Any, ...]
+    key: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class NoXcomValue:
+    """Why an XCom source holds no value a ``when:`` comparison can read.
+
+    The driver hands one of these to :func:`plan_and_claim` in place of the
+    text. ``reason`` ends the ``skipReason`` detail.
+    """
+
+    reason: str
+
+
+XCOM_UNPUBLISHED = NoXcomValue("the key is not published")
+XCOM_TOO_LARGE = NoXcomValue(
+    "the value is over {} bytes".format(MAX_CONDITION_XCOM_BYTES)
+)
+XCOM_NOT_TEXT = NoXcomValue("the value is not UTF-8 text")
+XCOM_GONE = NoXcomValue("the published value is no longer stored")
+_XCOM_NOT_IN_RUN = NoXcomValue("the task is not in this run")
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +302,10 @@ class TaskSpec:
     poke_jitter: float = 0.0
     # approval gate: what a rejected gate does to the graph
     on_reject: str = FAILED  # FAILED or SKIPPED
+    # exit codes with which the task's command skips the task
+    skip_exit_codes: tuple[int, ...] = ()
+    # comparisons that all have to hold for the task to run
+    when: tuple[Condition, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -177,31 +316,106 @@ class DagSpec:
     because :func:`tasks_awaiting_expansion` runs on every advance and the
     overwhelmingly common DAG has none: the check becomes O(1) instead of a
     full spec walk per pass.
+
+    ``conditional_tasks`` is the subset whose ``when:`` reads an XCom value,
+    precomputed for the same reason: :func:`tasks_awaiting_conditions` runs
+    on every advance.
+
+    ``engine`` is the run engine level the DAG's features need. Each run
+    created from the spec records it (see :func:`new_run_body`).
+
+    ``params`` is the DAG's run parameter declaration, empty for a DAG that
+    declares none.
+
+    ``upstream_first`` holds the same tasks, each one after every task it
+    depends on. An advance pass visits them in this order (see
+    :func:`_propagate_and_claim`). ``tasks`` keeps the order the
+    configuration lists them in, which the API and the dashboards show.
     """
 
     name: str
     tasks: tuple[TaskSpec, ...]
     by_id: dict[str, TaskSpec] = field(default_factory=dict)
     mapped_tasks: tuple[TaskSpec, ...] = ()
+    engine: int = BASE_ENGINE_LEVEL
+    params: tuple[ParamSpec, ...] = ()
+    conditional_tasks: tuple[TaskSpec, ...] = ()
+    upstream_first: tuple[TaskSpec, ...] = ()
 
     @staticmethod
-    def build(name: str, tasks: list[TaskSpec]) -> "DagSpec":
+    def build(
+        name: str, tasks: list[TaskSpec], params: tuple[ParamSpec, ...] = ()
+    ) -> "DagSpec":
+        gated = [t for t in tasks if t.when]
+        if (
+            gated
+            or params
+            or any(
+                t.skip_exit_codes or t.trigger_rule not in _BASE_TRIGGER_RULES
+                for t in tasks
+            )
+        ):
+            engine = BRANCHING_PARAMS_ENGINE_LEVEL
+        else:
+            engine = BASE_ENGINE_LEVEL
+        listed = tuple(tasks)
+        by_id = {t.id: t for t in tasks}
         return DagSpec(
             name=name,
-            tasks=tuple(tasks),
-            by_id={t.id: t for t in tasks},
+            tasks=listed,
+            by_id=by_id,
             mapped_tasks=tuple(t for t in tasks if t.expand is not None),
+            engine=engine,
+            params=tuple(params),
+            conditional_tasks=tuple(
+                t for t in gated if any(c.source == WHEN_XCOM for c in t.when)
+            ),
+            upstream_first=_upstream_first(listed, by_id),
         )
 
-    @cached_property
-    def upstream_first(self) -> "list[TaskSpec] | None":
-        """The tasks ordered so each one follows its upstreams, or ``None``
-        when :attr:`tasks` already lists them that way.
 
-        A function of the frozen spec, built by the first advance pass in
-        which a task ended and shared by the passes after it.
-        """
-        return _upstream_first(self)
+def _upstream_first(
+    tasks: tuple[TaskSpec, ...], by_id: dict[str, TaskSpec]
+) -> tuple[TaskSpec, ...]:
+    """``tasks`` with each task after every task it depends on.
+
+    A task keeps its listed place unless one of its upstreams comes after
+    it. That upstream then moves to just before the task, behind its own
+    upstreams. A listing that already puts upstreams first comes back as
+    the same tuple.
+
+    :meth:`DagSpec.build` calls this before :func:`validate_graph` has seen
+    the graph, so it accepts what validation refuses: it passes over a
+    ``dependsOn`` id that names no task and places each task of a cycle
+    once.
+    """
+    placed: set[str] = set()
+    for task in tasks:
+        if not placed.issuperset(task.depends_on):
+            break
+        placed.add(task.id)
+    else:
+        return tasks
+    placed.clear()
+    ordered: list[TaskSpec] = []
+    for root in tasks:
+        if root.id in placed:
+            continue
+        placed.add(root.id)
+        # depth-first on an explicit stack: a chain listed last task first
+        # is as deep as the DAG is long
+        stack = [(root, iter(root.depends_on))]
+        while stack:
+            task, deps = stack[-1]
+            for dep in deps:
+                if dep in by_id and dep not in placed:
+                    placed.add(dep)
+                    stack.append((by_id[dep], iter(by_id[dep].depends_on)))
+                    break
+            else:
+                stack.pop()
+                ordered.append(task)
+    return tuple(ordered)
 
 
 class DagValidationError(Exception):
@@ -218,11 +432,13 @@ def validate_graph(spec: DagSpec) -> None:
     """Raise :class:`DagValidationError` on an unusable graph.
 
     Checks unknown/duplicate ids, a safe id charset, that every ``dependsOn``
-    resolves, that an ``expand.fromTask`` is a *direct*, non-mapped dependency,
-    that mapped tasks are plain ``task`` nodes, and that the dependency graph
-    is acyclic (a cycle would never advance).  Called from config parsing so a
-    bad DAG is a :class:`~cronstable.config.ConfigError` at load, not a runtime
-    hang.
+    resolves, that a rule which counts upstream outcomes has an upstream to
+    count, that an ``expand.fromTask`` is a *direct*, non-mapped dependency,
+    that mapped tasks are plain ``task`` nodes, that a ``when:`` comparison
+    reads XCom from a non-mapped task upstream of its own, and that the
+    dependency graph is acyclic (a cycle would never advance).  Called from
+    config parsing so a bad DAG is a :class:`~cronstable.config.ConfigError`
+    at load, not a runtime hang.
     """
     seen: dict[str, TaskSpec] = {}
     for task in spec.tasks:
@@ -261,9 +477,145 @@ def validate_graph(spec: DagSpec) -> None:
                 raise DagValidationError(
                     "task {!r} dependsOn itself".format(task.id)
                 )
+        if (
+            not task.depends_on
+            and task.trigger_rule in _COUNTING_TRIGGER_RULES
+        ):
+            raise DagValidationError(
+                "task {!r}: triggerRule {} counts upstream outcomes, so the "
+                "task needs a dependsOn entry".format(
+                    task.id, task.trigger_rule
+                )
+            )
         if task.expand is not None:
             _validate_expand(task, seen)
     _check_acyclic(spec)
+    # after the cycle check, so the upstream walk below always ends
+    for task in spec.conditional_tasks:
+        _validate_when(task, seen)
+
+
+def _validate_when(task: TaskSpec, seen: dict[str, TaskSpec]) -> None:
+    """Check the XCom sources of ``task``'s ``when:`` comparisons.
+
+    Each one names a task upstream of ``task`` through ``dependsOn`` edges,
+    so the value is final by the time the comparison is read, and a task
+    that is not mapped, because a mapped task publishes one value per
+    instance.
+    """
+    upstream: set[str] = set()
+    pending = list(task.depends_on)
+    while pending:
+        dep = pending.pop()
+        if dep not in upstream:
+            upstream.add(dep)
+            pending.extend(seen[dep].depends_on)
+    for cond in task.when:
+        if cond.source != WHEN_XCOM:
+            continue
+        if cond.name not in seen:
+            raise DagValidationError(
+                "task {!r}: when: xcom task {!r} is not a task".format(
+                    task.id, cond.name
+                )
+            )
+        if cond.name not in upstream:
+            raise DagValidationError(
+                "task {!r}: when: xcom task {!r} is not upstream of this "
+                "task; add it to dependsOn, or depend on a task that runs "
+                "after it".format(task.id, cond.name)
+            )
+        if seen[cond.name].expand is not None:
+            raise DagValidationError(
+                "task {!r}: when: xcom task {!r} is mapped and publishes "
+                "one value per instance, so a comparison cannot read "
+                "it".format(task.id, cond.name)
+            )
+
+
+def skippable_joins(spec: DagSpec) -> list[tuple[str, list[str]]]:
+    """``all_success`` tasks that join upstreams with different skip sources.
+
+    Such a join is skipped when one of those upstreams is skipped and the
+    rest of its upstreams succeed, which is rarely what a join below
+    alternative branches wants. Returns each join's id with its upstreams
+    that can skip, in spec order, for the load-time warning.
+
+    A skip source is a task that can end skipped by itself: its command
+    can skip it (``skip_exit_codes``), it has a ``when:`` condition, it is
+    a gate with ``onReject: skip``, or its rule is
+    ``all_done_min_one_failed``.
+
+    Each task carries the set of sources whose skip reaches it.
+    ``all_success`` passes on the sources of every upstream, and a mapped
+    task carries those of its expand source under every rule.
+    ``none_failed_min_one_success`` skips only when every upstream does.
+    Once every upstream can skip, the task takes their sources when they
+    all carry the same set and is a source itself when they differ. It is
+    also a source itself when one of them is a fan-out whose instances can
+    skip themselves, because it runs when that fan-out reads skipped and
+    one of the instances succeeded.
+
+    Upstreams that carry the same set only ever skip together, the way two
+    branches below one gate do, so the lint reports a join when two of its
+    upstreams carry different sets.
+    """
+    sources = {
+        t.id
+        for t in spec.tasks
+        if t.skip_exit_codes
+        or t.when
+        or t.trigger_rule == ALL_DONE_MIN_ONE_FAILED
+        or (t.type == APPROVAL and t.on_reject == SKIPPED)
+    }
+    if not sources:
+        return []
+    # A fan-out whose instances skip themselves can read skipped and still
+    # count as a success for none_failed_min_one_success (see
+    # _any_upstream_succeeded).
+    part_skips = {t.id for t in spec.mapped_tasks if t.skip_exit_codes}
+    # skipped_by[t] is the set of sources whose skip reaches ``t``, as an
+    # int with one bit per source. A union is an OR and a comparison is one
+    # test. Each int can be as wide as the number of sources, so the walk
+    # costs tasks plus edges, times sources over the word size.
+    skipped_by: dict[str, int] = {}
+    bit = 1
+    # upstreams first, so each task reads the final set of every upstream
+    for t in spec.upstream_first:
+        ups = [skipped_by.get(dep, 0) for dep in t.depends_on]
+        own = t.id in sources
+        mask = 0
+        if t.trigger_rule == NONE_FAILED_MIN_ONE_SUCCESS:
+            # A mapped task skips with its expand source, which is one of
+            # its upstreams, so the rule adds no skip of its own.
+            if t.expand is None and ups and all(ups):
+                if len(set(ups)) == 1 and part_skips.isdisjoint(t.depends_on):
+                    mask = ups[0]
+                else:
+                    own = True
+        elif t.trigger_rule not in (
+            ALL_DONE,
+            NONE_FAILED,
+            ALL_DONE_MIN_ONE_FAILED,
+        ):
+            for up in ups:
+                mask |= up
+        if t.expand is not None:
+            mask |= skipped_by.get(t.expand.from_task, 0)
+        if own:
+            mask |= bit
+            bit <<= 1
+        skipped_by[t.id] = mask
+    joins = []
+    for t in spec.tasks:
+        if t.trigger_rule != ALL_SUCCESS:
+            continue
+        upstreams = [
+            dep for dep in dict.fromkeys(t.depends_on) if skipped_by.get(dep)
+        ]
+        if len({skipped_by[dep] for dep in upstreams}) > 1:
+            joins.append((t.id, upstreams))
+    return joins
 
 
 def _validate_expand(task: TaskSpec, seen: dict[str, TaskSpec]) -> None:
@@ -392,15 +744,21 @@ def new_run_body(
     kind: str,
     now: float,
     spec: DagSpec,
+    params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The initial ``dag_run`` document: every task pending, run running.
 
     Mapped tasks start as a single ``pending`` placeholder carrying
     ``mapped: true``; they materialise into ``<id>#<i>`` instances once their
     upstream produces the item list (see :func:`plan_and_claim`).
+
+    The document carries ``engine`` only when the DAG needs more than
+    :data:`BASE_ENGINE_LEVEL`, and ``params`` only when the caller passes
+    the run's resolved parameters, which it does for a DAG that declares
+    them. No transform changes ``params`` afterwards.
     """
     tasks = {task.id: _new_task_entry(task, now) for task in spec.tasks}
-    return {
+    body: dict[str, Any] = {
         "dag": dag,
         "runKey": run_key,
         "runId": run_id,
@@ -412,6 +770,11 @@ def new_run_body(
         "tasks": tasks,
         "mapped": {},
     }
+    if spec.engine > BASE_ENGINE_LEVEL:
+        body["engine"] = spec.engine
+    if params is not None:
+        body["params"] = params
+    return body
 
 
 #: The constant shape of a fresh task entry, copied rather than rebuilt: one
@@ -456,6 +819,16 @@ def is_terminal_run(body: dict[str, Any]) -> bool:
     return body.get("state") in (SUCCESS, FAILED)
 
 
+def supports_run(body: dict[str, Any]) -> bool:
+    """Whether this build may adopt and advance the run in ``body``.
+
+    False for a run above :data:`ENGINE_LEVEL` and for an ``engine`` value
+    that is not an integer, so a build never applies rules it does not know.
+    """
+    level = body.get("engine", BASE_ENGINE_LEVEL)
+    return type(level) is int and level <= ENGINE_LEVEL
+
+
 # --------------------------------------------------------------------------
 # Launch intents returned by the claim transform
 # --------------------------------------------------------------------------
@@ -484,10 +857,11 @@ class AdvanceResult:
     # claims hit MAX_CLAIMS_PER_PASS: more instances are claimable right now,
     # so the driver should re-service promptly rather than wait for a wake.
     deferred: bool = False
-    # how many task entries the pass brought to a terminal state.  One that
-    # ends during a walk can unblock a dependent listed before it (see
-    # _propagate_and_claim).
-    ended: int = 0
+    # the pass left a step only the next pass can take: a comparison needs
+    # an XCom value the driver has not read, or a mapped task's condition
+    # held and its fan-out can now expand.  The driver advances again
+    # promptly, as for ``deferred``, but claims in this pass go on.
+    again: bool = False
 
 
 @dataclass
@@ -505,8 +879,14 @@ class ReconcileAdvanceResult:
     # applied (``advance`` is None then), and the driver must pre-read the
     # upstream XCom lists and run :func:`plan_and_claim` as a second RMW.
     expansions_needed: bool = False
+    # ready tasks have when: comparisons over XCom values: the same split as
+    # ``expansions_needed``, with the driver pre-reading those values.
+    conditions_needed: bool = False
     # the claim half's result when it ran inside this same RMW.
     advance: AdvanceResult | None = None
+    # the run is above this build's engine level (see supports_run): the
+    # document was kept untouched and the driver must release the run.
+    unsupported: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -626,13 +1006,27 @@ def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
     """Resolve a task's upstreams into one of: ready / wait / fail / skip.
 
     ``ready``: launch it; ``wait``: upstreams still running; ``fail``:
-    an upstream failed (``all_success``); ``skip``: an upstream was skipped
-    (``all_success``).  ``all_done`` only ever returns ready or wait.
+    the task ends ``upstream_failed``; ``skip``: the task ends ``skipped``.
+
+    Every rule waits until each upstream is terminal. ``all_done`` is then
+    ready. With no failed and no skipped upstream, ``all_done_min_one_failed``
+    skips and every other rule is ready. Otherwise:
+
+    * ``all_done_min_one_failed`` is ready on a failure and skips without one.
+    * A failure fails every other rule.
+    * On a skip without a failure, ``none_failed`` is ready,
+      ``none_failed_min_one_success`` is ready when an upstream succeeded,
+      and ``all_success`` skips.
+
+    An upstream with no entry in the run is left out. A rule string this
+    build does not know reads as ``all_success``. A task with no upstream
+    is ready: :func:`validate_graph` refuses the rules that count upstream
+    outcomes on such a task.
     """
     if not task.depends_on:
-        # a root task is ready under either trigger rule (no upstream can be
-        # non-terminal, failed or skipped); this is the common shape in a wide
-        # DAG and it skips the whole reduction below.
+        # a root task has no upstream to wait for, and the rules that count
+        # one never reach here; this is the common shape in a wide DAG and it
+        # skips the whole reduction below.
         return "ready"
     # ``or {}`` rather than a ``.get`` default: the default is built on every
     # call, key present or not, and this resolves once per task per pass.
@@ -671,14 +1065,78 @@ def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
             # one non-terminal upstream settles it: the remaining reductions
             # (each an O(instances) walk for a mapped upstream) are dead work.
             return "wait"
-    if task.trigger_rule == ALL_DONE:
+    rule = task.trigger_rule
+    if rule == ALL_DONE:
         return "ready"
-    # all_success
+    if not failed and not skipped:
+        return "skip" if rule == ALL_DONE_MIN_ONE_FAILED else "ready"
+    if rule == ALL_DONE_MIN_ONE_FAILED:
+        return "ready" if failed else "skip"
     if failed:
         return "fail"
-    if skipped:
-        return "skip"
-    return "ready"
+    # an upstream was skipped and none failed
+    if rule == NONE_FAILED:
+        return "ready"
+    if rule == NONE_FAILED_MIN_ONE_SUCCESS:
+        return "ready" if _any_upstream_succeeded(body, task) else "skip"
+    return "skip"
+
+
+def _any_upstream_succeeded(body: dict[str, Any], task: TaskSpec) -> bool:
+    """Whether one of ``task``'s upstreams counts as a success.
+
+    The ``none_failed_min_one_success`` check, reached only once every
+    upstream is terminal and at least one is skipped. A fan-out that reads
+    ``skipped`` as a group still counts when one of its instances succeeded,
+    so a join runs after a fan-out in which some items skipped themselves.
+    """
+    tasks = body["tasks"]
+    mapped_all = body.get("mapped")
+    for dep in task.depends_on:
+        entry = tasks.get(dep)
+        if entry is None:
+            continue
+        mapped = mapped_all.get(dep) if mapped_all else None
+        if mapped is None:
+            if entry.get("state") == SUCCESS:
+                return True
+            continue
+        items = mapped.get("items", [])
+        if not items:
+            return True  # an empty expansion reads success
+        prefix = dep + "#"
+        for i in range(len(items)):
+            instance = tasks.get(prefix + str(i))
+            if instance is not None and instance.get("state") == SUCCESS:
+                return True
+    return False
+
+
+def _verdict_skip_reason(
+    spec: DagSpec, body: dict[str, Any], task: TaskSpec
+) -> dict[str, str]:
+    """The ``skipReason`` for a task whose deps verdict is ``skip``."""
+    rule = task.trigger_rule
+    if rule == ALL_DONE_MIN_ONE_FAILED:
+        return {
+            "kind": SKIP_TRIGGER_RULE,
+            "detail": "{}: no upstream failed".format(rule),
+        }
+    if rule == NONE_FAILED_MIN_ONE_SUCCESS:
+        return {
+            "kind": SKIP_TRIGGER_RULE,
+            "detail": "{}: no upstream succeeded".format(rule),
+        }
+    tasks = body["tasks"]
+    skipped = [
+        dep
+        for dep in task.depends_on
+        if dep in tasks and effective_state(spec, body, dep) == SKIPPED
+    ]
+    return {
+        "kind": SKIP_UPSTREAM,
+        "detail": "upstream skipped: {}".format(", ".join(skipped)),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -714,9 +1172,250 @@ def tasks_awaiting_expansion(
             # failed/skipped, or the fan-out failed the item cap): re-reading
             # its XCom every pass would be wasted work forever.
             continue
+        if task.when and not (entry is not None and entry.get("whenMet")):
+            # its condition is undecided and may still skip the whole
+            # fan-out: no list is read until the placeholder records it met
+            continue
         if effective_state(spec, body, exp.from_task) == SUCCESS:
             out.append((task.id, exp.from_task, exp.key))
     return out
+
+
+def tasks_awaiting_conditions(
+    spec: DagSpec, body: dict[str, Any]
+) -> list[tuple[str, str]]:
+    """The XCom values that ready tasks' ``when:`` comparisons need read.
+
+    Returns ``(task_id, key)`` pairs, each the publishing task and its key,
+    so the driver can pre-read the values before the claim RMW, the way
+    :func:`tasks_awaiting_expansion` hands it the lists to read. A task
+    contributes its pairs once it is pending with no recorded ``whenMet``,
+    its trigger rule says ready, no comparison it can decide without a read
+    already fails, and every task it reads from is terminal. Until then a
+    read could not decide it. A mapped task is its placeholder here.
+
+    Derived from a plain document read, like the expansion list: the claim
+    transform evaluates against the fresh body, so a stale snapshot costs a
+    wasted read and never a wrong decision.
+    """
+    out: list[tuple[str, str]] = []
+    if not spec.conditional_tasks:
+        return out  # no comparison in this DAG reads XCom
+    if is_terminal_run(body):
+        return out
+    tasks = body.get("tasks") or {}
+    for task in spec.conditional_tasks:
+        entry = tasks.get(task.id)
+        if (
+            entry is None
+            or entry.get("state") != PENDING
+            or entry.get("whenMet")
+        ):
+            continue
+        if _deps_verdict(spec, body, task) != "ready":
+            continue
+        if _when_outcome(spec, body, task, None) is not None:
+            continue  # decided without a read
+        pairs: list[tuple[str, str]] = []
+        for cond in task.when:
+            if cond.source != WHEN_XCOM or cond.name not in tasks:
+                continue
+            if effective_state(spec, body, cond.name) not in TERMINAL_STATES:
+                break  # still running: no read decides the task yet
+            pairs.append((cond.name, cond.key))
+        else:
+            out.extend(pair for pair in pairs if pair not in out)
+    return out
+
+
+def when_export(conditions: tuple[Condition, ...]) -> list[dict[str, Any]]:
+    """A task's ``when:`` in the shape the configuration writes it.
+
+    The form ``GET /dags`` serves. ``equals`` and ``notEquals`` carry one
+    value, and ``in`` and ``notIn`` carry the list.
+    """
+    out = []
+    for cond in conditions:
+        entry: dict[str, Any] = {}
+        if cond.source == WHEN_PARAM:
+            entry["param"] = cond.name
+        else:
+            entry["xcom"] = {"task": cond.name, "key": cond.key}
+        if cond.op in (WHEN_IN, WHEN_NOT_IN):
+            entry[cond.op] = list(cond.values)
+        else:
+            entry[cond.op] = cond.values[0]
+        out.append(entry)
+    return out
+
+
+def _same_value(left: Any, right: Any) -> bool:
+    """Equality for a comparison: a boolean equals only a boolean, so
+    ``true`` never equals ``1``."""
+    return (type(left) is bool) == (type(right) is bool) and left == right
+
+
+def _number(value: Any) -> int | float | None:
+    """``value`` as the number a :data:`WHEN_ORDERING` operator compares,
+    or ``None`` when it holds none.
+
+    An integer or a finite float is itself. Text, which is what an XCom
+    source holds, is read the way a configuration reads a ``number``
+    value. A boolean is no number.
+    """
+    if isinstance(value, str):
+        try:
+            value = parse_text(NUMBER, value)
+        except ValueError:
+            return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _one_line(text: str) -> str:
+    """``text`` with each control character as its backslash escape.
+
+    A ``skipReason`` detail reaches terminals and logs as one line, and an
+    XCom value can hold any of these characters.
+    """
+    if text.isprintable():
+        return text
+    return CONTROL_CHARACTERS.sub(
+        lambda m: m.group().encode("unicode_escape").decode("ascii"), text
+    )
+
+
+def _clip(text: str, limit: int = 80) -> str:
+    """``text`` on one line and cut to ``limit`` characters, for a detail."""
+    text = _one_line(text)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _condition_text(cond: Condition) -> str:
+    """A comparison as a ``skipReason`` detail names it."""
+    if cond.source == WHEN_PARAM:
+        source = "param {}".format(cond.name)
+    else:
+        source = "xcom {}/{}".format(cond.name, _one_line(cond.key))
+    values = ", ".join(_clip(env_text(value)) for value in cond.values)
+    return "{} {} {}".format(source, cond.op, _clip(values, 240))
+
+
+def _xcom_source(
+    spec: DagSpec,
+    body: dict[str, Any],
+    cond: Condition,
+    conditions: dict[tuple[str, str], Any] | None,
+) -> Any:
+    """The value an XCom comparison reads: the text, a :class:`NoXcomValue`,
+    or ``None`` while the value is not known.
+
+    Not known means the publishing task is not terminal yet, the driver has
+    not read the value, or the store could not answer. A task with no entry
+    in the run was added by a reload after the run was created and never
+    runs in it, so it has published nothing.
+    """
+    if cond.name not in (body.get("tasks") or {}) or cond.name not in (
+        spec.by_id
+    ):
+        return _XCOM_NOT_IN_RUN
+    if effective_state(spec, body, cond.name) not in TERMINAL_STATES:
+        return None
+    if conditions is None:
+        return None
+    return conditions.get((cond.name, cond.key))
+
+
+def _when_outcome(
+    spec: DagSpec,
+    body: dict[str, Any],
+    task: TaskSpec,
+    conditions: dict[tuple[str, str], Any] | None,
+) -> bool | str | None:
+    """Decide ``task``'s ``when:`` comparisons against the run.
+
+    ``True`` when every comparison holds, the ``skipReason`` detail of the
+    first one that does not, or ``None`` when none fails and an XCom value
+    is not known yet. ``conditions`` maps ``(task, key)`` to what the driver
+    read: the text, a :class:`NoXcomValue`, or ``None`` when the store could
+    not answer.
+
+    A source with no value fails ``equals`` and ``in`` and passes
+    ``notEquals`` and ``notIn``. It fails each :data:`WHEN_ORDERING`
+    operator, and so does a value that is not a number.
+    """
+    params = body.get("params")
+    unknown = False
+    for cond in task.when:
+        reason: str | None = None
+        value: Any = None
+        if cond.source == WHEN_PARAM:
+            if isinstance(params, dict) and cond.name in params:
+                value = params[cond.name]
+            else:
+                reason = "the run has no such parameter"
+        else:
+            value = _xcom_source(spec, body, cond, conditions)
+            if value is None:
+                unknown = True
+                continue
+            if isinstance(value, NoXcomValue):
+                reason = value.reason
+        ordering = WHEN_ORDERING.get(cond.op)
+        if ordering is not None:
+            number = None if reason is not None else _number(value)
+            holds = number is not None and ordering(number, cond.values[0])
+            if reason is None and number is None:
+                shown = _clip(env_text(value))
+                reason = (
+                    "the value is {}, which is not a number".format(shown)
+                    if shown
+                    else "the value is empty"
+                )
+        else:
+            found = reason is None and any(
+                _same_value(value, wanted) for wanted in cond.values
+            )
+            holds = found == (cond.op in _WHEN_POSITIVE)
+        if not holds:
+            if reason is None:
+                reason = "the value is {}".format(_clip(env_text(value)))
+            return "{}: {}".format(_condition_text(cond), reason)
+    return None if unknown else True
+
+
+def _decide_when(
+    spec: DagSpec,
+    body: dict[str, Any],
+    task: TaskSpec,
+    entry: dict[str, Any],
+    now: float,
+    result: AdvanceResult,
+    conditions: dict[tuple[str, str], Any] | None,
+) -> bool:
+    """Apply ``task``'s ``when:`` to its pending entry; True when it held.
+
+    A met condition is recorded as ``whenMet`` and never read again, so a
+    claim that waits for a later pass, a retry, and a reload all keep the
+    decision. An unmet one ends the entry ``skipped``. An unknown one leaves
+    the entry pending for a later pass.
+    """
+    outcome = _when_outcome(spec, body, task, conditions)
+    if outcome is None:
+        return False
+    if outcome is True:
+        entry["whenMet"] = True
+        entry["updatedAt"] = now
+        result.changed = True
+        return True
+    entry["skipReason"] = {"kind": SKIP_CONDITION, "detail": outcome}
+    _terminalise_task(entry, SKIPPED, now, result)
+    return False
 
 
 def _refuse_null_shapes(body: dict[str, Any]) -> None:
@@ -746,15 +1445,21 @@ def plan_and_claim(
     proc: str,
     host: str,
     expansions: dict[str, list[Any] | None],
+    conditions: dict[tuple[str, str], Any] | None = None,
 ):
     """Build the ``mutate_document`` transform that advances one run.
 
     The returned callable is a pure ``transform(body) -> (new_body, result)``
-    for :meth:`StateBackend.mutate_document`.  In one atomic pass it:
+    for :meth:`StateBackend.mutate_document`.  In one atomic pass over the
+    tasks, upstreams first (see :func:`_propagate_and_claim`), it:
 
-    * applies any pre-read ``expansions`` (materialises ``<id>#<i>`` instances,
-      or resolves an empty map straight to success);
+    * applies any pre-read ``expansions``: it creates the ``<id>#<i>``
+      instances of a list with items, and records an empty list, which
+      reads success, when the task's trigger rule says ready;
     * propagates ``upstream_failed`` / ``skipped`` down the graph;
+    * decides each ready task's ``when:`` comparisons, reading XCom values
+      from the pre-read ``conditions`` (see :func:`_when_outcome`), and
+      skips a task whose condition does not hold;
     * claims every ready plain/sensor task ``pending -> running`` (and
       re-claims a failed task whose retry delay has elapsed, and re-pokes a due
       sensor), recording the claim and a :class:`LaunchIntent` in the result;
@@ -775,6 +1480,9 @@ def plan_and_claim(
         result = AdvanceResult()
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, result
+        if not supports_run(body):
+            # reconcile_and_plan reports this on the next pass.
+            return _DOC_KEEP, result
         _refuse_null_shapes(body)
         if _is_quiescent(spec, body, now, proc, expansions):
             # the pre-scan proved nothing below can change this body: skip
@@ -788,9 +1496,11 @@ def plan_and_claim(
         # round trip keeps the in-lock copy cost of a large run document
         # (up to MAX_MAPPED_ITEMS task entries) low.
         working = _json.deepcopy_json(body)
-        _apply_expansions(spec, working, expansions, now, result)
-        _propagate_and_claim(spec, working, now, proc, host, result)
+        _propagate_and_claim(
+            spec, working, now, proc, host, result, conditions, expansions
+        )
         _maybe_terminalise(spec, working, now, result)
+        _flag_unread_conditions(spec, working, result)
         if not result.changed:
             return _DOC_KEEP, result
         working["updatedAt"] = now
@@ -814,65 +1524,82 @@ def is_keep(value: Any) -> bool:
     return isinstance(value, _DocKeep)
 
 
-def _apply_expansions(
+def _apply_expansion(
     spec: DagSpec,
     body: dict[str, Any],
-    expansions: dict[str, list[Any] | None],
+    task: TaskSpec,
+    items: list[Any],
     now: float,
     result: AdvanceResult,
-) -> None:
-    for task_id, items in expansions.items():
-        if items is None:
-            continue
-        task = spec.by_id.get(task_id)
-        if task is None or task.expand is None:
-            continue
-        mapped_all = body.get("mapped")
-        if mapped_all and task_id in mapped_all:
-            continue  # already expanded (stale pre-read); idempotent
-        if effective_state(spec, body, task.expand.from_task) != SUCCESS:
-            continue  # upstream no longer success under this fresh body
-        if len(items) > MAX_MAPPED_ITEMS:
-            # an oversized fan-out is a per-task failure, never a run wedge:
-            # the placeholder terminalises with a clear reason (downstreams
-            # see upstream_failed) instead of materialising the flood.
-            placeholder = body["tasks"].get(task_id)
-            if placeholder is not None and (
-                placeholder.get("state") == PENDING
-            ):
-                placeholder["failReason"] = (
-                    "mapped fan-out of {} items exceeds the cap of {}".format(
-                        len(items), MAX_MAPPED_ITEMS
-                    )
+) -> bool:
+    """Record ``task``'s fan-out over ``items``; True when it records one.
+
+    :func:`_propagate_and_claim` calls this at the task's visit with the
+    list the driver pre-read. It checks the list against this fresh body,
+    so a stale pre-read expands nothing.
+
+    It records a list with items whatever the trigger rule says so far:
+    the instances start pending, and each takes the rule's verdict as any
+    task does. An empty list has no instance to take the verdict, and the
+    group reads ``success`` as soon as the run holds the list, so it
+    records an empty list only when the rule says ready. Until then the
+    placeholder stays pending, and :func:`_propagate_placeholder` ends it
+    on a ``fail`` or ``skip`` verdict.
+    """
+    assert task.expand is not None
+    placeholder = body["tasks"].get(task.id)
+    if task.when and not (placeholder or {}).get("whenMet"):
+        return False  # its condition is undecided under this fresh body
+    if effective_state(spec, body, task.expand.from_task) != SUCCESS:
+        return False  # upstream no longer success under this fresh body
+    if len(items) > MAX_MAPPED_ITEMS:
+        # an oversized fan-out is a per-task failure, never a run wedge:
+        # the placeholder terminalises with a clear reason (downstreams
+        # see upstream_failed) instead of materialising the flood.
+        if placeholder is not None and placeholder.get("state") == PENDING:
+            placeholder["failReason"] = (
+                "mapped fan-out of {} items exceeds the cap of {}".format(
+                    len(items), MAX_MAPPED_ITEMS
                 )
-                _terminalise_task(placeholder, FAILED, now, result)
-            continue
-        body.setdefault("mapped", {})[task_id] = {
-            "items": list(items),
-            "expandedAt": now,
-        }
-        # the placeholder becomes a non-terminal group marker; instances carry
-        # the real work.
-        placeholder = body["tasks"].get(task_id)
-        if placeholder is not None:
-            placeholder["state"] = EXPANDED
-            placeholder["updatedAt"] = now
-        # Materialise the instances from one built entry: the rest are shallow
-        # copies carrying their own mapIndex/mapItem.  Every template value is
-        # an immutable scalar, so the copies share nothing mutable, and
-        # copy-then-overwrite preserves the key order.
-        tasks = body["tasks"]
-        prefix = task_id + "#"
-        template = _new_task_entry(task, now)
-        # task.expand is not None here (checked above), so the flag is always
-        # present; an instance is not the group placeholder.
-        del template["mapped"]
-        for i, item in enumerate(items):
-            entry = template.copy()
-            entry["mapIndex"] = i
-            entry["mapItem"] = item
-            tasks[prefix + str(i)] = entry
-        result.changed = True
+            )
+            _terminalise_task(placeholder, FAILED, now, result)
+        return False
+    if (
+        not items
+        and placeholder is not None
+        and _deps_verdict(spec, body, task) != "ready"
+    ):
+        # No instance would take the rule's verdict, so the placeholder
+        # keeps it (see the docstring).  A task with no placeholder is one
+        # a reload added after the run was created: nothing in the run
+        # reads its state, so its empty list goes on record at once.
+        return False
+    body.setdefault("mapped", {})[task.id] = {
+        "items": list(items),
+        "expandedAt": now,
+    }
+    # the placeholder becomes a non-terminal group marker; instances carry
+    # the real work.
+    if placeholder is not None:
+        placeholder["state"] = EXPANDED
+        placeholder["updatedAt"] = now
+    # Materialise the instances from one built entry: the rest are shallow
+    # copies carrying their own mapIndex/mapItem.  Every template value is an
+    # immutable scalar, so the copies share nothing mutable, and
+    # copy-then-overwrite preserves the key order.
+    tasks = body["tasks"]
+    prefix = task.id + "#"
+    template = _new_task_entry(task, now)
+    # the task is mapped (asserted above), so the flag is always present;
+    # an instance is not the group placeholder.
+    del template["mapped"]
+    for i, item in enumerate(items):
+        entry = template.copy()
+        entry["mapIndex"] = i
+        entry["mapItem"] = item
+        tasks[prefix + str(i)] = entry
+    result.changed = True
+    return True
 
 
 def _instances_of(
@@ -911,125 +1638,43 @@ def _propagate_and_claim(
     proc: str,
     host: str,
     result: AdvanceResult,
+    conditions: dict[tuple[str, str], Any] | None = None,
+    expansions: dict[str, list[Any] | None] | None = None,
 ) -> None:
-    """Propagate upstream outcomes and claim every ready instance.
+    """Visit each task once, upstreams first, and decide it at that visit.
 
-    One walk in declaration order, which is also claim order, settles a
-    spec that lists each task after its upstreams.  Under any other listing
-    a task can still be pending after an upstream listed later ended in the
-    same walk, so :func:`_settle_dependents` carries the verdicts through
-    the graph upstream-first and one more walk claims what that made ready.
+    The pass settles a task it skips, fails, or expands before it visits
+    that task's dependents, wherever the configuration lists them, so one
+    pass finishes everything it can decide without a driver read.
     """
-    settled = result.ended
-    _walk_and_claim(spec, body, now, proc, host, result)
-    while result.ended > settled:
-        order = spec.upstream_first
-        if order is None:
-            return
-        _settle_dependents(spec, order, body, now, result)
-        settled = result.ended
-        _walk_and_claim(spec, body, now, proc, host, result)
-
-
-def _upstream_first(spec: DagSpec) -> list[TaskSpec] | None:
-    """The spec's tasks ordered so each one follows its upstreams.
-
-    ``None`` when ``spec.tasks`` already lists them that way.  Read through
-    :attr:`DagSpec.upstream_first`, which keeps the answer.  An undefined
-    dependency constrains nothing and a task on a cycle is left out;
-    :func:`validate_graph` rejects both at load.
-    """
-    listed: set[str] = set()
-    for task in spec.tasks:
-        if not listed.issuperset(task.depends_on):
-            break
-        listed.add(task.id)
-    else:
-        return None
-    by_id = spec.by_id
-    waiting: dict[str, int] = {}
-    dependents: dict[str, list[TaskSpec]] = {}
-    order: list[TaskSpec] = []
-    for task in spec.tasks:
-        deps = {dep for dep in task.depends_on if dep in by_id}
-        if not deps:
-            order.append(task)
-            continue
-        waiting[task.id] = len(deps)
-        for dep in deps:
-            dependents.setdefault(dep, []).append(task)
-    # ``order`` doubles as the work queue: a task joins it after every one
-    # of its upstreams is ahead of it.
-    placed = 0
-    while placed < len(order):
-        for down in dependents.get(order[placed].id, ()):
-            waiting[down.id] -= 1
-            if not waiting[down.id]:
-                order.append(down)
-        placed += 1
-    return order
-
-
-def _settle_dependents(
-    spec: DagSpec,
-    order: list[TaskSpec],
-    body: dict[str, Any],
-    now: float,
-    result: AdvanceResult,
-) -> None:
-    """End every pending entry whose upstreams failed or were skipped.
-
-    ``order`` is upstream-first, so one sweep settles a cascade of any
-    depth.  Only the propagation arms of :func:`_advance_task` run here; a
-    task the cascade makes ready stays pending for the declaration-order
-    walk, which owns claiming and its quota.
-    """
-    tasks = body["tasks"]
-    mapped_all: Any = body.get("mapped")
-    for task in order:
-        expanded = bool(mapped_all) and task.id in mapped_all
-        if task.expand is not None and not expanded:
-            _propagate_placeholder(spec, body, task, now, result)
-            continue
-        verdict: str | None = None
-        for taskkey, _map_index, _item in _instances_of(spec, body, task):
-            entry = tasks.get(taskkey)
-            if entry is None or entry.get("state") != PENDING:
-                continue
-            if verdict is None:
-                verdict = _deps_verdict(spec, body, task)
-            if verdict == "fail":
-                _terminalise_task(entry, UPSTREAM_FAILED, now, result)
-            elif verdict == "skip":
-                _terminalise_task(entry, SKIPPED, now, result)
-            else:
-                break  # wait or ready: nothing to propagate to this task
-
-
-def _walk_and_claim(
-    spec: DagSpec,
-    body: dict[str, Any],
-    now: float,
-    proc: str,
-    host: str,
-    result: AdvanceResult,
-) -> None:
-    """Advance every task instance once, in declaration order."""
     # Hoisted out of the loops so a wide DAG or a large fan-out resolves
     # both dicts once per pass.  Nothing below replaces either dict; it only
-    # mutates them (_resolve_missing_instance adds a task entry, and no path
-    # here records a fan-out), so the loop still sees every write.
+    # mutates them (_resolve_missing_instance and _apply_expansion add task
+    # entries), so the loop still sees every write.  Through ``mapped_all``
+    # the loop reads only fan-outs recorded before this pass:
+    # _apply_expansion records one for the task being visited, and that
+    # visit sets ``expanded`` itself.
     tasks = body["tasks"]
     mapped_all: Any = body.get("mapped")
-    for task in spec.tasks:
+    for task in spec.upstream_first:
         expanded = bool(mapped_all) and task.id in mapped_all
         if task.expand is not None and not expanded:
-            # un-expanded mapped placeholder: only propagate an upstream
-            # failure/skip to it (readiness -> expansion needs an out-of-band
-            # XCom read, applied in _apply_expansions, so leave a ready one
-            # pending here for the next pass).
-            _propagate_placeholder(spec, body, task, now, result)
-            continue
+            # un-expanded mapped placeholder: record its fan-out when the
+            # driver read the list for this pass.  Without a list, or with
+            # one this visit cannot record yet, _propagate_placeholder ends
+            # it when its expand source failed or was skipped, or when its
+            # trigger rule says fail or skip, and decides its own condition.
+            # A ready one stays pending for the pass that brings its list.
+            items = expansions.get(task.id) if expansions else None
+            if items is None or not _apply_expansion(
+                spec, body, task, items, now, result
+            ):
+                _propagate_placeholder(
+                    spec, body, task, now, result, conditions
+                )
+                continue
+            # this visit recorded the fan-out, so it goes on to the instances
+            expanded = True
         if not expanded:
             # A plain task with no recorded fan-out is one instance keyed by
             # its id (:func:`_instances_of`'s single-instance branch, inlined
@@ -1047,9 +1692,11 @@ def _walk_and_claim(
                     result.deferred
                     and not task.depends_on
                     and task.type != APPROVAL
+                    and not task.when
                 ):
                     # quota spent: a root is always ready, so _advance_task
-                    # would return at its deferred check untouched
+                    # would return at its deferred check untouched (a root
+                    # with a condition still has that to decide)
                     continue
                 verdict = _deps_verdict(spec, body, task)
             _advance_task(
@@ -1065,6 +1712,8 @@ def _walk_and_claim(
                 host,
                 result,
                 verdict,
+                None,
+                conditions,
             )
             continue
         # The deps verdict is a function of the task (all map instances
@@ -1076,6 +1725,9 @@ def _walk_and_claim(
         # state reductions per pass.  Computed lazily so a task with no
         # pending instance skips it entirely.
         verdict = None
+        # resolved with a "skip" verdict, once per task; each skipped
+        # instance records its own copy.
+        skip_reason: dict[str, str] | None = None
         for taskkey, map_index, item in _instances_of(spec, body, task):
             entry = tasks.get(taskkey)
             if entry is None:
@@ -1096,6 +1748,8 @@ def _walk_and_claim(
                 continue
             if verdict is None and entry.get("state") == PENDING:
                 verdict = _deps_verdict(spec, body, task)
+                if verdict == "skip":
+                    skip_reason = _verdict_skip_reason(spec, body, task)
             _advance_task(
                 spec,
                 body,
@@ -1109,10 +1763,14 @@ def _walk_and_claim(
                 host,
                 result,
                 verdict,
+                skip_reason,
+                conditions,
             )
 
 
-def _propagate_placeholder(spec, body, task, now, result) -> None:
+def _propagate_placeholder(
+    spec, body, task, now, result, conditions=None
+) -> None:
     entry = body["tasks"].get(task.id)
     if entry is None:
         return
@@ -1157,13 +1815,43 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
             _terminalise_task(entry, UPSTREAM_FAILED, now, result)
             return
         if src == SKIPPED:
+            entry["skipReason"] = {
+                "kind": SKIP_UPSTREAM,
+                "detail": "upstream skipped: {}".format(from_task),
+            }
             _terminalise_task(entry, SKIPPED, now, result)
             return
     verdict = _deps_verdict(spec, body, task)
     if verdict == "fail":
         _terminalise_task(entry, UPSTREAM_FAILED, now, result)
     elif verdict == "skip":
+        entry["skipReason"] = _verdict_skip_reason(spec, body, task)
         _terminalise_task(entry, SKIPPED, now, result)
+    elif verdict == "ready" and task.when and not entry.get("whenMet"):
+        # A mapped task's condition is decided once, here, before any
+        # instance exists. Unmet ends the placeholder skipped. Met lets the
+        # fan-out expand, which takes the driver's list read and one more
+        # pass (see tasks_awaiting_expansion).
+        if _decide_when(spec, body, task, entry, now, result, conditions):
+            result.again = True
+
+
+def _flag_unread_conditions(
+    spec: DagSpec, body: dict[str, Any], result: AdvanceResult
+) -> None:
+    """Ask for another pass when a comparison still needs an XCom read.
+
+    A task can become ready inside a pass, after the driver's pre-read: a
+    skip or a failure that this pass propagated finished its last upstream.
+    Its comparison then has no value to read in this pass, and nothing else
+    would wake the run before its idle floor.
+    """
+    if (
+        spec.conditional_tasks
+        and not result.run_terminal
+        and tasks_awaiting_conditions(spec, body)
+    ):
+        result.again = True
 
 
 def _resolve_unmaterialised_source(task, entry, now, result) -> None:
@@ -1198,7 +1886,7 @@ def _resolve_missing_instance(
     """Materialise and fail a mapped instance the run records but lacks.
 
     The run document's own ``mapped[<task>].items`` records this index, so
-    :func:`_apply_expansions` wrote an entry for it and something later
+    :func:`_apply_expansion` wrote an entry for it and something later
     removed it: a partial backup restore, a hand edit, or a peer on a
     different build.  The entry cannot be recovered, and leaving the hole is
     worse than failing it: :func:`_fold_mapped_instances` reads an absent
@@ -1274,6 +1962,8 @@ def _advance_task(
     host,
     result,
     verdict=None,
+    skip_reason=None,
+    conditions=None,
 ) -> None:
     state = entry.get("state")
     if state in _INERT_TASK_STATES:
@@ -1303,8 +1993,20 @@ def _advance_task(
         _terminalise_task(entry, UPSTREAM_FAILED, now, result)
         return
     if verdict == "skip":
+        entry["skipReason"] = (
+            _verdict_skip_reason(spec, body, task)
+            if skip_reason is None
+            else skip_reason.copy()
+        )
         _terminalise_task(entry, SKIPPED, now, result)
         return
+    if task.when and map_index is None and not entry.get("whenMet"):
+        # Ahead of the quota check below, so a skip never waits for claim
+        # quota and a met condition is recorded even when the claim is
+        # deferred. An instance of a mapped task has none to decide: its
+        # placeholder did (see _propagate_placeholder).
+        if not _decide_when(spec, body, task, entry, now, result, conditions):
+            return
     if result.deferred and task.type != APPROVAL:
         # Quota spent this pass (only _claims_full sets deferred, and
         # launches never shrink within a pass): _claim_task would return
@@ -1453,7 +2155,6 @@ def _terminalise_task(entry, state, now, result) -> None:
     entry["pid"] = None
     entry["updatedAt"] = now
     result.changed = True
-    result.ended += 1
 
 
 def _maybe_terminalise(spec, body, now, result) -> None:
@@ -1900,6 +2601,7 @@ def mark_task_finished(
     expected_attempt: int | None = None,
     expected_poke: int | None = None,
     resources: dict[str, Any] | None = None,
+    skipped: bool = False,
 ):
     """Transform moving a finished instance to its terminal (or retry) state.
 
@@ -1907,6 +2609,10 @@ def mark_task_finished(
     rather than failed, until it succeeds or times out.  A failed plain task
     with retries left is parked ``up_for_retry`` with ``nextRetryAt`` set; the
     next advance re-claims it.  Otherwise the instance is terminal.
+
+    ``skipped`` says the command exited with one of the task's
+    ``skipExitCodes`` (decided by ``RunningJob.skipped``). The instance ends
+    ``skipped`` whatever ``success`` says, and a plain task uses no attempt.
 
     ``resources`` is the finished instance's sampled CPU/memory usage as an
     already-serialised dict (``ResourceUsage.to_dict()``), recorded verbatim
@@ -1964,7 +2670,9 @@ def mark_task_finished(
             # a stale poke's completion (see the docstring: proc/attempt do
             # not distinguish pokes).
             return _DOC_KEEP, False
-        if task.type == SENSOR:
+        if skipped:
+            _finish_skipped(entry, exit_code, now, task, resources)
+        elif task.type == SENSOR:
             _finish_sensor(entry, success, now, task, jitter, resources)
         else:
             _finish_plain(
@@ -1985,7 +2693,8 @@ def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
     ``fail_reason``, ``task`` (the :class:`TaskSpec`), ``jitter``, and the
     ``expected_proc`` / ``expected_attempt`` / ``expected_poke`` fences, plus
     optional serialised ``resources``, ``verification`` and ``limits``
-    dicts; the last two enter the task entry only when present.
+    dicts (the last two enter the task entry only when present) and an
+    optional ``skipped`` flag.
 
     Batching is safe for the same reason :func:`set_task_pids` is: every
     mark is fenced and applied against only its own task's entry, so applying
@@ -2032,7 +2741,15 @@ def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
             ):
                 continue  # a later poke is live (the poke fence)
             task = mark["task"]
-            if task.type == SENSOR:
+            if mark.get("skipped"):
+                _finish_skipped(
+                    entry,
+                    mark.get("exit_code"),
+                    now,
+                    task,
+                    mark.get("resources"),
+                )
+            elif task.type == SENSOR:
                 _finish_sensor(
                     entry,
                     mark["success"],
@@ -2085,6 +2802,29 @@ def _finish_sensor(entry, success, now, task, jitter, resources=None) -> None:
     entry["updatedAt"] = now
 
 
+def _finish_skipped(entry, exit_code, now, task, resources=None) -> None:
+    """End an instance ``skipped`` because its command exited with a skip code.
+
+    Terminal for a plain task and a sensor alike. A plain task keeps its
+    attempt count, so a skip after failed attempts uses none of the rest.
+    """
+    entry["proc"] = None
+    entry["pid"] = None
+    entry["exitCode"] = exit_code
+    if resources is not None:
+        entry["resources"] = resources
+    if task.type == SENSOR:
+        entry["pokeCount"] = int(entry.get("pokeCount", 0)) + 1
+    entry["state"] = SKIPPED
+    entry["finishedAt"] = now
+    entry["failReason"] = None
+    entry["skipReason"] = {
+        "kind": SKIP_EXIT_CODE,
+        "detail": "exit code {}".format(exit_code),
+    }
+    entry["updatedAt"] = now
+
+
 def _finish_plain(
     entry, success, exit_code, fail_reason, now, task, resources=None
 ) -> None:
@@ -2121,7 +2861,8 @@ def apply_approval(
 
     Approve -> the gate succeeds and the graph proceeds; reject -> it fails
     (or, when the gate's ``onReject`` is ``skip``, it is skipped, cascading a
-    ``skipped`` to its ``all_success`` downstream).
+    ``skipped`` to its ``all_success`` downstream, with a ``skipReason``
+    naming who rejected it).
     """
 
     def transform(body):
@@ -2144,8 +2885,14 @@ def apply_approval(
         entry["finishedAt"] = now
         if approved:
             entry["state"] = SUCCESS
+        elif on_reject == SKIPPED:
+            entry["state"] = SKIPPED
+            entry["skipReason"] = {
+                "kind": SKIP_APPROVAL,
+                "detail": "rejected by {}".format(by),
+            }
         else:
-            entry["state"] = SKIPPED if on_reject == SKIPPED else FAILED
+            entry["state"] = FAILED
         entry["updatedAt"] = now
         body["updatedAt"] = now
         return body, {"ok": True, "state": entry["state"]}
@@ -2174,6 +2921,8 @@ def reconcile_crashed(
 
     def transform(body):
         if body is None or is_terminal_run(body):
+            return _DOC_KEEP, 0
+        if not supports_run(body):
             return _DOC_KEEP, 0
         changed = _reconcile_entries(spec, body, now, proc, host, is_pid_alive)
         if changed:
@@ -2253,6 +3002,9 @@ def reconcile_and_plan(
         result = ReconcileAdvanceResult(advance=advance)
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, result
+        if not supports_run(body):
+            result.unsupported = True
+            return _DOC_KEEP, result
         _refuse_null_shapes(body)
         if _is_quiescent(spec, body, now, proc, None):
             return _DOC_KEEP, result
@@ -2262,12 +3014,18 @@ def reconcile_and_plan(
         result.reconciled = _reconcile_entries(
             spec, working, now, proc, host, is_pid_alive
         )
-        if tasks_awaiting_expansion(spec, working):
-            # expansion needs out-of-band XCom reads the driver must do
-            # between the halves: persist only the reconcile half and hand
-            # the decision back (advance=None says the claim half did not
-            # run, so the driver never mistakes this for an empty claim).
-            result.expansions_needed = True
+        result.expansions_needed = bool(
+            tasks_awaiting_expansion(spec, working)
+        )
+        result.conditions_needed = bool(
+            tasks_awaiting_conditions(spec, working)
+        )
+        if result.expansions_needed or result.conditions_needed:
+            # expansion and an XCom comparison both need out-of-band XCom
+            # reads the driver must do between the halves: persist only the
+            # reconcile half and hand the decision back (advance=None says
+            # the claim half did not run, so the driver never mistakes this
+            # for an empty claim).
             result.advance = None
             if result.reconciled:
                 working["updatedAt"] = now
@@ -2275,6 +3033,7 @@ def reconcile_and_plan(
             return _DOC_KEEP, result
         _propagate_and_claim(spec, working, now, proc, host, advance)
         _maybe_terminalise(spec, working, now, advance)
+        _flag_unread_conditions(spec, working, advance)
         if not advance.changed and not result.reconciled:
             return _DOC_KEEP, result
         working["updatedAt"] = now

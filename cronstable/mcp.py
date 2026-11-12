@@ -66,8 +66,15 @@ from cronstable.cron import (
     _load_index_bytes,
 )
 from cronstable.croninfo import PRESSURE_DEFAULT_HOURS, PRESSURE_MAX_HOURS
-from cronstable.dagrun import DAG_MAX_CATCHUP
+from cronstable.dagrun import (
+    DAG_MAX_CATCHUP,
+    REQUEST_ID_MAX,
+    DagScheduler,
+    TriggerConflict,
+    TriggerInputError,
+)
 from cronstable.job import LIVE_LOG_LIMIT
+from cronstable.params import ParamError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost / no cycle
     from cronstable.cron import Cron
@@ -1323,7 +1330,14 @@ class MCPHandler:
                 "Use it for a run "
                 "outside the schedule; use cron_resume_job to restart "
                 "scheduled runs.",
-                obj({"name": _JOB_ARG, "confirm": _CONFIRM_ARG}, ["name"]),
+                obj(
+                    {
+                        "name": _JOB_ARG,
+                        "params": _params_arg("job", "cron_list_jobs"),
+                        "confirm": _CONFIRM_ARG,
+                    },
+                    ["name"],
+                ),
                 self._t_run_job,
                 mutating=True,
                 destructive=True,
@@ -1395,7 +1409,30 @@ class MCPHandler:
                 "Start a workflow run now. Requires confirm=true. Use it "
                 "for a run outside the schedule; use cron_backfill_dag for "
                 "past dates, or cron_recover_dag to rerun failed tasks.",
-                obj({"dag": _DAG_ARG, "confirm": _CONFIRM_ARG}, ["dag"]),
+                obj(
+                    {
+                        "dag": _DAG_ARG,
+                        "params": _params_arg("workflow", "cron_list_dags"),
+                        "logical_date": _arg(
+                            _STR,
+                            "Logical date the run records, stored in UTC. "
+                            "Without it, the run has no logical date. "
+                            + _ISO_UTC,
+                        ),
+                        "request_id": _arg(
+                            _STR,
+                            "Makes the call repeatable: a second call with "
+                            "the same request_id returns the first run while "
+                            "that run is retained, and returns an error if "
+                            "it asks for other params or another "
+                            "logical_date.",
+                            minLength=1,
+                            maxLength=REQUEST_ID_MAX,
+                        ),
+                        "confirm": _CONFIRM_ARG,
+                    },
+                    ["dag"],
+                ),
                 self._t_trigger_dag,
                 mutating=True,
                 destructive=True,
@@ -1408,12 +1445,13 @@ class MCPHandler:
                 "Run a scheduled workflow for each of its scheduled times "
                 "in a date range, earliest first, up to {} times per call. "
                 "Times that already have a run count toward that limit and "
-                "get no second run, so split a longer range into several "
-                "calls. By default it's a dry run that creates nothing; to "
-                "create the runs, set dry_run=false and confirm=true. Use "
-                "it for scheduled times the workflow missed; use "
-                "cron_recover_dag to rerun failed tasks in existing "
-                "runs.".format(DAG_MAX_CATCHUP),
+                "get no second run. A call that stops at the limit returns "
+                "truncated=true and nextFrom; call again with from set to "
+                "nextFrom to continue. By default it's a dry run that "
+                "creates nothing; to create the runs, set dry_run=false "
+                "and confirm=true. Use it for scheduled times the workflow "
+                "missed; use cron_recover_dag to rerun failed tasks in "
+                "existing runs.".format(DAG_MAX_CATCHUP),
                 obj(
                     {
                         "dag": _DAG_ARG,
@@ -1425,6 +1463,13 @@ class MCPHandler:
                         "to": _arg(
                             _STR,
                             "End of the range, read the same way as from.",
+                        ),
+                        "params": _params_arg(
+                            "workflow",
+                            "cron_list_dags",
+                            "They apply to the runs this call creates; a "
+                            "scheduled time that already has a run keeps "
+                            "that run's values.",
                         ),
                         "dry_run": _arg(
                             _BOOL,
@@ -1453,7 +1498,8 @@ class MCPHandler:
                 "confirm=true. Creates a new run preserving successful work. "
                 "Run cron_preview_recovery first with the same arguments to "
                 "review the plan; its result's top-level planToken is the "
-                "plan_token.",
+                "plan_token. With scoped web tokens, a plan whose params "
+                "differ from the declared defaults needs the params scope.",
                 obj(
                     {
                         **_RECOVERY_ARGS,
@@ -1910,13 +1956,33 @@ class MCPHandler:
     async def _t_run_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "running")
-        queued = await self._cron.start_job_by_name(name)
-        if queued is not None:
+        try:
+            started = await self._cron.start_job(
+                name,
+                args.get("params"),
+                scopes=_scopes(),
+                triggered_by=_attribution(None),
+            )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
+        # the values the run takes, for a job that declares parameters
+        values = (
+            {} if started["params"] is None else {"params": started["params"]}
+        )
+        if started["queued"] is not None:
             return _result(
-                {"queued": name, "queueId": queued},
+                {"queued": name, "queueId": started["queued"], **values},
                 "queued job {!r}".format(name),
             )
-        return _result({"started": name}, "started job {!r}".format(name))
+        if started.get("pending"):
+            return _result(
+                {"started": name, **values, "pending": True},
+                "job {!r} starts when another node yields its cluster "
+                "concurrency slot".format(name),
+            )
+        return _result(
+            {"started": name, **values}, "started job {!r}".format(name)
+        )
 
     async def _t_cancel_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
@@ -2028,6 +2094,7 @@ class MCPHandler:
                     tasks=tasks,
                     plan_token=token,
                     allow_config_change=allow_change,
+                    scopes=_scopes(),
                 )
             else:
                 if tasks or mode != "failed":
@@ -2041,7 +2108,10 @@ class MCPHandler:
                     _req_str(args, "to"),
                     plan_token=token,
                     allow_config_change=allow_change,
+                    scopes=_scopes(),
                 )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
         except _RECOVERY_UNAVAILABLE:
             return _tool_error("recovery state is unavailable")
         except RecoveryError as ex:
@@ -2053,12 +2123,28 @@ class MCPHandler:
     async def _t_trigger_dag(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         _require_confirm(args, "triggering")
-        run_key = await self._cron._dag.trigger_run(dag)
-        if run_key is None:
+        try:
+            result = await self._cron._dag.trigger(
+                dag,
+                params=args.get("params"),
+                logical_date=args.get("logical_date"),
+                request_id=args.get("request_id"),
+                triggered_by=_attribution(None),
+                scopes=_scopes(),
+            )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
+        except (TriggerInputError, TriggerConflict) as ex:
+            return _tool_error(str(ex))
+        if result is None:
             return _tool_error("dag not found: {!r}".format(dag))
         return _result(
-            {"dag": dag, "runKey": run_key},
-            "triggered dag {!r} (run {})".format(dag, run_key),
+            {"dag": dag, **result},
+            (
+                "triggered dag {!r} (run {})"
+                if result["created"]
+                else "dag {!r} already has run {} for this request_id"
+            ).format(dag, result["runKey"]),
         )
 
     async def _t_backfill_dag(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -2067,6 +2153,15 @@ class MCPHandler:
         end = _req_str(args, "to")
         if dag not in self._cron.cron_dags:
             return _tool_error("dag not found: {!r}".format(dag))
+        params = args.get("params")
+        try:
+            # checked before the preview, so a dry run reports the values a
+            # real run would refuse
+            resolved = DagScheduler._resolve_params(
+                self._cron.cron_dags[dag], params, _scopes()
+            )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
         # dry_run defaults to True and is checked by identity (`is not False`),
         # matching _require_confirm: only the literal boolean False runs the
         # backfill. Checking `args.get("dry_run", True)` would apply the
@@ -2080,6 +2175,7 @@ class MCPHandler:
                     "to": end,
                     "dryRun": True,
                     "wouldExecute": False,
+                    **({} if resolved is None else {"params": resolved}),
                 },
                 "DRY RUN: would backfill dag {!r} from {} to {}. Call again "
                 "with dry_run=false and confirm=true to execute.".format(
@@ -2088,14 +2184,32 @@ class MCPHandler:
             )
         _require_confirm(args, "backfilling")
         try:
-            result = await self._cron._dag.backfill(dag, start, end)
+            result = await self._cron._dag.backfill(
+                dag,
+                start,
+                end,
+                params=params,
+                triggered_by=_attribution(None),
+                scopes=_scopes(),
+            )
+        except ParamError as ex:
+            return _tool_error(_param_error_text(ex))
         except _BACKFILL_UNAVAILABLE:
             return _tool_error("backfill state is unavailable")
         if not result.get("ok"):
             return _tool_error(str(result.get("reason")))
-        return _result(
-            result, "backfilled dag {!r} from {} to {}".format(dag, start, end)
+        summary = (
+            "backfilled dag {!r} from {} to {}: {} created, {} already "
+            "existed".format(
+                dag, start, end, result["created"], result["existing"]
+            )
         )
+        if result["truncated"]:
+            summary += (
+                ". The call stopped at its limit of scheduled times; call "
+                "again with from={} to continue".format(result["nextFrom"])
+            )
+        return _result(result, summary)
 
     async def _t_decide_gate(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
@@ -2725,6 +2839,23 @@ def _rows_arg(what: str, cap: int) -> dict[str, Any]:
     )
 
 
+def _params_arg(subject: str, lister: str, *notes: str) -> dict[str, Any]:
+    """The ``params`` argument of a tool that starts runs."""
+    return _arg(
+        _OBJ,
+        " ".join(
+            (
+                "Values for the run parameters the {} declares, keyed by "
+                "name; {} lists them. A parameter left out takes its "
+                "default.".format(subject, lister),
+                *notes,
+                "With a scoped web token, supplying params needs the params "
+                "scope.",
+            )
+        ),
+    )
+
+
 # cron_explain_schedule's default run count: the handler applies it and
 # the input schema advertises it.
 _EXPLAIN_COUNT_DEFAULT = 5
@@ -3106,6 +3237,27 @@ def _require_confirm(args: dict[str, Any], gerund: str) -> None:
                 gerund
             )
         )
+
+
+def _scopes() -> "frozenset[str] | None":
+    """The scopes of the current caller's token, or ``None`` when no token
+    auth applies. A tool that starts runs passes them on, so its REST twin
+    and the tool apply one check to the parameter values a run takes."""
+    caller = _caller.get()
+    return None if caller is None else caller.scopes
+
+
+def _param_error_text(ex: ParamError) -> str:
+    """A refused parameter map as one line the model can correct from."""
+    if not ex.errors:
+        return str(ex)
+    return "{}: {}".format(
+        ex,
+        "; ".join(
+            "{} {}".format(name, reason)
+            for name, reason in sorted(ex.errors.items())
+        ),
+    )
 
 
 def _attribution(supplied: Any) -> str:

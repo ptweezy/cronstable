@@ -217,6 +217,7 @@ def test_bench_smoke_produces_results(tmp_path):
 # Gating benchmarks that expected_gated.txt leaves out, each for the reason
 # given at the bottom of that file.
 _UNLISTED_GATING = {
+    "dag.join_verdict_2k",
     "pair.qr_encode_14",
     "webapi.activity_capped_bytes_500",
     "webui.swim_400x49",

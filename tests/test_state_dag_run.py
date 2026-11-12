@@ -20,6 +20,7 @@ over the loopback endpoint.
 
 import asyncio
 import copy
+import dataclasses
 import datetime
 import json
 import logging
@@ -124,7 +125,7 @@ async def test_linear_dag_runs_to_success(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     body = await _drive(cron, "lin", run_key)
     assert body["state"] == dag.SUCCESS
     assert _states(body) == {"a": dag.SUCCESS, "b": dag.SUCCESS}
@@ -138,7 +139,7 @@ async def test_settle_dag_cron_drains_downstream_launches(dag_cron):
     )
     for task_id in ("a", "b", "c"):
         _set_cmd(cron, "lin", task_id, [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     try:
         await _settle_dag_cron(cron)
         assert not any(cron.running_jobs.values())
@@ -154,7 +155,7 @@ async def test_failure_propagates_downstream(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "import sys; sys.exit(3)"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     body = await _drive(cron, "lin", run_key)
     assert body["state"] == dag.FAILED
     assert body["tasks"]["a"]["state"] == dag.FAILED
@@ -176,7 +177,7 @@ async def test_task_retry_then_success(tmp_path, dag_cron):
     )
     cron = await dag_cron(yaml)
     _set_cmd(cron, "r", "a", [_PY, "-c", script])
-    run_key = await cron._dag.trigger_run("r")
+    run_key = (await cron._dag.trigger("r"))["runKey"]
     body = await _drive(cron, "r", run_key)
     assert body["state"] == dag.SUCCESS
     assert body["tasks"]["a"]["attempt"] == 1  # one retry consumed
@@ -281,7 +282,7 @@ async def test_e2e_fanout_and_xcom(tmp_path, dag_cron):
         ],
     )
 
-    run_key = await cron._dag.trigger_run("fan")
+    run_key = (await cron._dag.trigger("fan"))["runKey"]
     body = await _drive(cron, "fan", run_key, max_rounds=80)
 
     assert body["state"] == dag.SUCCESS, _states(body)
@@ -318,7 +319,7 @@ async def test_mapped_upstream_publishes_nothing_expands_empty(
     _set_cmd(cron, "em", "gen", [_PY, "-c", "pass"])  # publishes nothing
     _set_cmd(cron, "em", "work", [_PY, "-c", "pass"])
     _set_cmd(cron, "em", "after", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("em")
+    run_key = (await cron._dag.trigger("em"))["runKey"]
     body = await _drive(cron, "em", run_key)
     assert body["state"] == dag.SUCCESS, _states(body)
     assert body["mapped"]["work"]["items"] == []
@@ -451,7 +452,7 @@ async def test_mapped_upstream_nonportable_value_does_not_wedge(
     )
     _set_cmd(cron, "np", "work", [_PY, "-c", "pass"])
     _set_cmd(cron, "np", "after", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("np")
+    run_key = (await cron._dag.trigger("np"))["runKey"]
     body = await _drive(cron, "np", run_key, max_rounds=80)
     assert body["state"] == dag.SUCCESS, _states(body)  # not wedged
     assert body["tasks"]["after"]["state"] == dag.SUCCESS
@@ -467,7 +468,7 @@ async def test_e2e_crash_resume(tmp_path, dag_cron):
     cron = await dag_cron(yaml)
     _set_cmd(cron, "cr", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "cr", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("cr")
+    run_key = (await cron._dag.trigger("cr"))["runKey"]
     ns = dag.DAG_RUN_NS_PREFIX + "cr"
 
     # Simulate a crash mid-run: a PRIOR daemon claimed+launched task `a`
@@ -515,7 +516,7 @@ async def test_approval_gate_blocks_then_resumes(tmp_path, dag_cron):
     cron = await dag_cron(yaml)
     _set_cmd(cron, "ap", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "ap", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("ap")
+    run_key = (await cron._dag.trigger("ap"))["runKey"]
     body = await _drive(cron, "ap", run_key)
     # blocked at the gate: not terminal, b not started
     assert body["state"] == dag.RUNNING
@@ -549,7 +550,7 @@ async def test_approval_reject_skip_cascades(tmp_path, dag_cron):
     )
     cron = await dag_cron(yaml)
     _set_cmd(cron, "rj", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("rj")
+    run_key = (await cron._dag.trigger("rj"))["runKey"]
     await _drive(cron, "rj", run_key)
     res = await cron._dag.approve(
         "rj", run_key, "gate", approved=False, by="bob"
@@ -573,7 +574,7 @@ async def test_trigger_and_introspection(tmp_path, dag_cron):
     dags = await cron._dag.list_dags()
     assert dags[0]["name"] == "lin"
     assert {t["id"] for t in dags[0]["tasks"]} == {"a", "b"}
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     await _drive(cron, "lin", run_key)
     runs = await cron._dag.list_runs("lin")
     assert len(runs) == 1
@@ -582,7 +583,7 @@ async def test_trigger_and_introspection(tmp_path, dag_cron):
     one = await cron._dag.get_run("lin", run_key)
     assert one["runKey"] == run_key
     assert await cron._dag.get_run("lin", "nope") is None
-    assert await cron._dag.trigger_run("ghost") is None
+    assert await cron._dag.trigger("ghost") is None
 
 
 async def test_list_dags_caches_terminal_runs(tmp_path, dag_cron):
@@ -594,7 +595,7 @@ async def test_list_dags_caches_terminal_runs(tmp_path, dag_cron):
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
     for _ in range(3):
-        rk = await cron._dag.trigger_run("lin")
+        rk = (await cron._dag.trigger("lin"))["runKey"]
         body = await _drive(cron, "lin", rk)
         assert body["state"] == dag.SUCCESS
 
@@ -652,7 +653,7 @@ async def test_list_dags_memoizes_the_keys_listing(
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    rk = await cron._dag.trigger_run("lin")
+    rk = (await cron._dag.trigger("lin"))["runKey"]
     body = await _drive(cron, "lin", rk)
     assert body["state"] == dag.SUCCESS
 
@@ -681,7 +682,7 @@ async def test_list_dags_memoizes_the_keys_listing(
 
     # a local write (a new run document) must render on the very next
     # poll: the memo is popped, so the store is listed again.
-    await cron._dag.trigger_run("lin")
+    await cron._dag.trigger("lin")
     fresh = await cron._dag.list_dags()
     assert next(d for d in fresh if d["name"] == "lin")["totalRuns"] == 2
     assert len(listings) == 2
@@ -716,7 +717,7 @@ async def test_parallel_completions_recorded_in_one_batched_rmw(
         return real(marks, now)
 
     monkeypatch.setattr(dagrun.dag, "mark_tasks_finished", spy)
-    run_key = await cron._dag.trigger_run("fan")
+    run_key = (await cron._dag.trigger("fan"))["runKey"]
     body = await _drive(cron, "fan", run_key)
     assert body["state"] == dag.SUCCESS
     assert all(
@@ -739,16 +740,104 @@ async def test_backfill_creates_runs(tmp_path, dag_cron):
     )
     assert res["ok"] is True
     assert res["created"] == 3
-    # idempotent: re-running the same backfill creates no duplicates
+    assert res["existing"] == 0
+    assert res["existingRunKeys"] == []
+    first_keys = res["runKeys"]
+    assert first_keys == [
+        dag.run_key_for_logical("2026-01-01T0{}:00:00+00:00".format(hour))
+        for hour in range(3)
+    ]
+    # idempotent: re-running the same backfill creates no duplicates, and
+    # the response says so
     res2 = await cron._dag.backfill(
         "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T02:30:00+00:00"
     )
-    assert res2["created"] == 3  # stepped again, but create-if-absent
+    assert res2["created"] == 0
+    assert res2["runKeys"] == []
+    assert res2["existing"] == 3
+    assert res2["existingRunKeys"] == first_keys
     runs = await cron._dag.list_runs("bf")
     keys = {r["runKey"] for r in runs}
-    assert len(keys) == 3  # exactly three distinct runs
+    assert keys == set(first_keys)  # exactly three distinct runs
+    # a wider range reports the new dates apart from the ones it left alone
+    res3 = await cron._dag.backfill(
+        "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T04:30:00+00:00"
+    )
+    assert (res3["created"], res3["existing"]) == (2, 3)
+    assert res3["existingRunKeys"] == first_keys
+    assert set(res3["runKeys"]).isdisjoint(first_keys)
     bad = await cron._dag.backfill("bf", "bad", "worse")
     assert bad["ok"] is False
+
+
+async def test_backfill_cap_counts_created_and_existing(
+    tmp_path, monkeypatch, dag_cron
+):
+    # DAG_MAX_CATCHUP bounds the instants one call visits, whether each one
+    # creates a run or finds one.
+    yaml = (
+        "dags:\n  - name: bf\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "bf", "a", [_PY, "-c", "pass"])
+    monkeypatch.setattr(dagrun, "DAG_MAX_CATCHUP", 2)
+    window = ("2026-01-01T00:00:00+00:00", "2026-01-01T05:30:00+00:00")
+    first = await cron._dag.backfill("bf", *window)
+    assert (first["created"], first["existing"]) == (2, 0)
+    again = await cron._dag.backfill("bf", *window)
+    assert (again["created"], again["existing"]) == (0, 2)
+    assert again["existingRunKeys"] == first["runKeys"]
+    # a call that the bound cuts short says so, and names where the next
+    # call starts
+    assert first["truncated"] is True and again["truncated"] is True
+    assert first["nextFrom"] == "2026-01-01T02:00:00+00:00"
+    # an offset in the range leaves nextFrom in UTC
+    shifted = await cron._dag.backfill(
+        "bf", "2026-01-01T01:00:00+01:00", "2026-01-01T06:30:00+01:00"
+    )
+    assert shifted["nextFrom"] == "2026-01-01T02:00:00+00:00"
+    # calls that each start at the last one's nextFrom cover the range
+    result, calls = first, 1
+    while result["truncated"]:
+        result = await cron._dag.backfill("bf", result["nextFrom"], window[1])
+        calls += 1
+    assert calls == 3 and "nextFrom" not in result
+    assert len(await cron._dag.list_runs("bf")) == 6
+    # a range that ends on the bound's last instant is whole
+    exact = await cron._dag.backfill(
+        "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+00:00"
+    )
+    assert exact["truncated"] is False and "nextFrom" not in exact
+
+
+async def test_backfill_without_a_backend_raises(tmp_path, dag_cron):
+    # an unavailable store must not read as a range of runs that already
+    # existed.
+    yaml = (
+        "dags:\n  - name: bf\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    import aiohttp
+
+    cron = await dag_cron(yaml)
+    base = await _start_web(cron)
+    window = {
+        "from": "2026-01-01T00:00:00+00:00",
+        "to": "2026-01-01T02:30:00+00:00",
+    }
+    backend = cron.state_backend
+    cron.state_backend = None
+    try:
+        with pytest.raises(dagrun.BackfillUnavailable):
+            await cron._dag.backfill("bf", window["from"], window["to"])
+        # over HTTP that is a 503
+        async with aiohttp.ClientSession() as s:
+            async with s.post(base + "/dags/bf/backfill", json=window) as r:
+                assert r.status == 503
+    finally:
+        cron.state_backend = backend
+        await cron.start_stop_web_app(None)
 
 
 async def test_backfill_nonutc_range_dedupes_with_utc(tmp_path, dag_cron):
@@ -860,9 +949,10 @@ async def test_backfill_counts_no_run_that_it_could_not_write(
             await cron._dag.backfill("bf", *_BACKFILL_RANGE)
     assert await backend.list_document_keys("dagrun/bf") == written
     assert len(written) == 2
-    # the count includes the two runs that the store already holds
+    # the two runs that the store already holds count as existing
     res = await cron._dag.backfill("bf", *_BACKFILL_RANGE)
-    assert res == {"ok": True, "created": 5}
+    assert (res["ok"], res["created"], res["existing"]) == (True, 3, 2)
+    assert res["existingRunKeys"] == written
     assert len(await backend.list_document_keys("dagrun/bf")) == 5
 
 
@@ -984,7 +1074,7 @@ async def test_finish_removed_task_is_noop(tmp_path, dag_cron):
     # crash (its spec is gone).
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     await cron._dag._finish_task(
         cron.cron_dags["lin"],
         ("lin", run_key),
@@ -1015,7 +1105,7 @@ async def test_decision_on_unowned_run_does_not_pin_wake(tmp_path, dag_cron):
     )
     cron = await dag_cron(yaml)
     _set_cmd(cron, "ap2", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("ap2")
+    run_key = (await cron._dag.trigger("ap2"))["runKey"]
     body = await _drive(cron, "ap2", run_key)
     assert body["tasks"]["gate"]["awaitingApproval"] is True
     ref = ("ap2", run_key)
@@ -1115,7 +1205,7 @@ async def test_failed_completion_record_is_retried(tmp_path, dag_cron):
     )
     cron = await dag_cron(yaml)
     _set_cmd(cron, "fc", "a", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("fc")
+    run_key = (await cron._dag.trigger("fc"))["runKey"]
     ref = ("fc", run_key)
 
     # the store stalls exactly when the reaper records the completion
@@ -1172,7 +1262,7 @@ async def test_stale_sensor_poke_completion_retry_is_fenced(
             ),
         ],
     )
-    run_key = await cron._dag.trigger_run("sn")
+    run_key = (await cron._dag.trigger("sn"))["runKey"]
     ref = ("sn", run_key)
 
     # poke 0's completion mutate COMMITS but the caller times out
@@ -1225,7 +1315,7 @@ async def test_lost_claim_is_released_and_relaunched(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     ref = ("lin", run_key)
     assert ("a", 0, 0) in cron._dag._launched[ref]
     fired = []
@@ -1276,7 +1366,7 @@ async def test_lost_claim_release_is_fenced_to_the_live_entry(
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     ref = ("lin", run_key)
     body = await cron._dag.get_run("lin", run_key)
     stale = copy.deepcopy(body)
@@ -1302,7 +1392,7 @@ async def test_lost_claim_release_cancellation_is_not_swallowed(
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     ref = ("lin", run_key)
     body = await cron._dag.get_run("lin", run_key)
     stale = copy.deepcopy(body)
@@ -1343,7 +1433,7 @@ async def test_own_claim_awaiting_its_completion_is_not_released(
     cron = await dag_cron(yaml)
     for tid in ("a", "b", "c"):
         _set_cmd(cron, "bc", tid, [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("bc")
+    run_key = (await cron._dag.trigger("bc"))["runKey"]
     ref = ("bc", run_key)
     assert cron._dag._launched[ref] == {("a", 0, 0), ("b", 0, 0)}
     # reap a WITHOUT flushing: its completion is buffered, its RunningJob
@@ -1404,7 +1494,7 @@ async def test_failed_lost_claim_release_still_launches_the_pass(
         _set_cmd(cron, "two", tid, [_PY, "-c", "pass"])
     flag = tmp_path / "go"
     _set_cmd(cron, "two", "d", [_PY, "-c", _wait_for_flag_script(flag)])
-    run_key = await cron._dag.trigger_run("two")
+    run_key = (await cron._dag.trigger("two"))["runKey"]
     ref = ("two", run_key)
     timed_out = []
 
@@ -1554,16 +1644,16 @@ async def test_one_dag_seed_failure_does_not_starve_others(tmp_path, dag_cron):
 
 
 async def test_trigger_with_backend_down_raises(tmp_path, dag_cron):
-    # regression: trigger_run returned a runKey (-> HTTP 200 + a success
+    # regression: trigger returned a runKey (-> HTTP 200 + a success
     # toast) even when the run document was never written because no state
     # backend was available; the run silently never existed.
     cron = await dag_cron(_LINEAR)
     backend = cron.state_backend
     cron.state_backend = None  # the store failed to start / is down
     with pytest.raises(RuntimeError, match="could not be recorded"):
-        await cron._dag.trigger_run("lin")
+        await cron._dag.trigger("lin")
     cron.state_backend = backend
-    assert await cron._dag.trigger_run("ghost") is None  # unknown: 404
+    assert await cron._dag.trigger("ghost") is None  # unknown: 404
 
 
 # --------------------------------------------------------------------------
@@ -1627,7 +1717,7 @@ async def test_http_approval_decision_and_backfill(tmp_path, dag_cron):
     # as above: the try/finally survives only to stop the web app.
     try:
         _set_cmd(cron, "g", "b", [_PY, "-c", "pass"])
-        run_key = await cron._dag.trigger_run("g")
+        run_key = (await cron._dag.trigger("g"))["runKey"]
         await _drive(cron, "g", run_key)
         async with aiohttp.ClientSession() as s:
             dec = base + "/dags/g/runs/{}/tasks/gate/decision".format(run_key)
@@ -1655,7 +1745,11 @@ async def test_http_approval_decision_and_backfill(tmp_path, dag_cron):
                 },
             ) as r:
                 assert r.status == 200
-                assert (await r.json())["created"] == 2
+                result = await r.json()
+                assert result["created"] == 2
+                assert result["existing"] == 0
+                assert len(result["runKeys"]) == 2
+                assert result["existingRunKeys"] == []
     finally:
         await cron.start_stop_web_app(None)
 
@@ -1692,7 +1786,7 @@ async def test_retention_prune_releases_xcom_blobs_to_the_sweep(
     backend = cron.state_backend
     keys, digests = [], []
     for i in range(2):
-        run_key = await cron._dag.trigger_run("rt")
+        run_key = (await cron._dag.trigger("rt"))["runKey"]
         body = await _drive(cron, "rt", run_key)
         assert body["state"] == dag.SUCCESS
         keys.append(run_key)
@@ -1725,7 +1819,7 @@ async def test_gc_removed_dags_grace_and_active_run_protection(
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
     backend = cron.state_backend
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     body = await _drive(cron, "lin", run_key)
     assert body["state"] == dag.SUCCESS
     # still configured: nothing may be collected even when named.
@@ -1777,7 +1871,7 @@ async def test_removed_dag_history_collected_by_daemon_gc_pass(
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
     backend = cron.state_backend
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     body = await _drive(cron, "lin", run_key)
     assert body["state"] == dag.SUCCESS
     scope = dag.xcom_scope("lin", str(body["runId"]))
@@ -1797,7 +1891,7 @@ async def test_removed_dag_history_collected_by_daemon_gc_pass(
 
     await backend.mutate_document("dagrun/lin", run_key, _age)
     # a second, still-active run: trigger only, never driven.
-    run_key2 = await cron._dag.trigger_run("lin")
+    run_key2 = (await cron._dag.trigger("lin"))["runKey"]
     await _drain_pending(cron)
     cron.cron_dags.clear()  # the dag is removed from config
     now = _utcnow()
@@ -1842,7 +1936,7 @@ async def test_monitored_task_resources_land_in_run_record(tmp_path, dag_cron):
     )
     cron = await dag_cron(yaml)
     _set_cmd(cron, "mon", "a", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("mon")
+    run_key = (await cron._dag.trigger("mon"))["runKey"]
     await _drain_pending(cron)
     if not any(cron.running_jobs.values()):
         await cron._dag.advance_one(("mon", run_key))
@@ -1883,7 +1977,7 @@ async def test_capped_task_limits_land_in_run_record(tmp_path, dag_cron):
     cron = await dag_cron(yaml)
     _set_cmd(cron, "cap", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "cap", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("cap")
+    run_key = (await cron._dag.trigger("cap"))["runKey"]
     await _drain_pending(cron)
     if not any(cron.running_jobs.values()):
         await cron._dag.advance_one(("cap", run_key))
@@ -1954,7 +2048,7 @@ async def test_launch_batch_stamps_pids_in_one_rmw(tmp_path, dag_cron):
         await orig(ref, stamps)
 
     cron._dag._set_pids = spy
-    run_key = await cron._dag.trigger_run("par")
+    run_key = (await cron._dag.trigger("par"))["runKey"]
     await _drain_pending(cron)
     # one batched write covered all three launches
     assert len(stamped) == 1
@@ -1983,7 +2077,7 @@ async def test_quiescent_advance_is_single_kept_rmw(tmp_path, dag_cron):
     cron = await dag_cron(yaml)
     flag = tmp_path / "go"
     _set_cmd(cron, "q1", "a", [_PY, "-c", _wait_for_flag_script(flag)])
-    run_key = await cron._dag.trigger_run("q1")
+    run_key = (await cron._dag.trigger("q1"))["runKey"]
     await _drain_pending(cron)
     ref = ("q1", run_key)
     before = await cron._dag.get_run("q1", run_key)
@@ -2039,7 +2133,7 @@ async def test_expansion_advance_falls_back_to_two_rmws(tmp_path, dag_cron):
         ],
     )
     _set_cmd(cron, "fb", "work", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("fb")
+    run_key = (await cron._dag.trigger("fb"))["runKey"]
     ref = ("fb", run_key)
     # let gen finish and its completion land, WITHOUT the follow-up
     # advance observing it yet
@@ -2086,7 +2180,7 @@ async def test_combined_advance_reconciles_crashed_task_inline(
     cron = await dag_cron(yaml)
     flag = tmp_path / "go"
     _set_cmd(cron, "rc", "a", [_PY, "-c", _wait_for_flag_script(flag)])
-    run_key = await cron._dag.trigger_run("rc")
+    run_key = (await cron._dag.trigger("rc"))["runKey"]
     ref = ("rc", run_key)
     await _drain_pending(cron)
 
@@ -2128,7 +2222,7 @@ async def test_failed_batch_pid_write_does_not_fail_tasks(tmp_path, dag_cron):
 
     orig = cron._dag._set_pids
     cron._dag._set_pids = broken
-    run_key = await cron._dag.trigger_run("bp")
+    run_key = (await cron._dag.trigger("bp"))["runKey"]
     await _drain_pending(cron)
     body = await cron._dag.get_run("bp", run_key)
     entry = body["tasks"]["a"]
@@ -2155,13 +2249,13 @@ async def test_one_launch_failure_does_not_skip_the_batch(tmp_path, dag_cron):
     _set_cmd(cron, "lf", "b", [_PY, "-c", "pass"])
     orig = cron._dag._launch_task
 
-    async def flaky(dagcfg, ref, run_id, intent):
+    async def flaky(dagcfg, ref, run_id, intent, *rest):
         if intent.task_id == "a":
             raise RuntimeError("boom")
-        return await orig(dagcfg, ref, run_id, intent)
+        return await orig(dagcfg, ref, run_id, intent, *rest)
 
     cron._dag._launch_task = flaky
-    run_key = await cron._dag.trigger_run("lf")
+    run_key = (await cron._dag.trigger("lf"))["runKey"]
     await _drain_pending(cron)
     body = await cron._dag.get_run("lf", run_key)
     assert body["tasks"]["a"]["state"] == dag.FAILED
@@ -2198,7 +2292,7 @@ async def test_subprocess_start_failure_fails_task_cleanly(
         raise RuntimeError("start blew up")
 
     monkeypatch.setattr(RunningJob, "start", boom)
-    run_key = await cron._dag.trigger_run("sf")
+    run_key = (await cron._dag.trigger("sf"))["runKey"]
     monkeypatch.undo()
     await _drain_pending(cron)
     body = await _drive(cron, "sf", run_key)
@@ -2235,7 +2329,7 @@ async def test_cancelled_launch_is_not_recorded_as_task_failure(
     monkeypatch.setattr(RunningJob, "start", cancelled)
     run_key = None
     try:
-        run_key = await cron._dag.trigger_run("cl")
+        run_key = (await cron._dag.trigger("cl"))["runKey"]
     except asyncio.CancelledError:
         pass  # propagated out of an inline advance: the fix working
     monkeypatch.undo()
@@ -2274,7 +2368,7 @@ async def test_cancelled_launch_drops_its_registry_key_and_is_relaunched(
     monkeypatch.setattr(RunningJob, "start", cancelled)
     run_key = None
     try:
-        run_key = await cron._dag.trigger_run("cl")
+        run_key = (await cron._dag.trigger("cl"))["runKey"]
     except asyncio.CancelledError:
         pass
     monkeypatch.undo()
@@ -2319,7 +2413,7 @@ async def test_cancel_after_the_spawn_keeps_the_registry_key(
     monkeypatch.setattr(RunningJob, "start", spawned_then_cancelled)
     run_key = None
     try:
-        run_key = await cron._dag.trigger_run("cl")
+        run_key = (await cron._dag.trigger("cl"))["runKey"]
     except asyncio.CancelledError:
         pass
     monkeypatch.undo()
@@ -2404,7 +2498,7 @@ async def test_a_start_discarded_during_its_attach_is_released(
     run_key = None
     with monkeypatch.context() as patch:
         patch.setattr(RunningJob, "start", start)
-        trigger = asyncio.ensure_future(cron._dag.trigger_run("cl"))
+        trigger = asyncio.ensure_future(cron._dag.trigger("cl"))
         try:
             assert await asyncio.to_thread(entered.wait, 10)
             ((running, launching),) = launches
@@ -2412,7 +2506,7 @@ async def test_a_start_discarded_during_its_attach_is_released(
         finally:
             gate.set()
         try:
-            run_key = await trigger
+            run_key = (await trigger)["runKey"]
         except asyncio.CancelledError:
             pass  # the launch ran inline in the trigger
         await _drain_pending(cron)
@@ -2453,7 +2547,7 @@ async def test_adopt_scan_prunes_the_registry_of_runs_finished_elsewhere(
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     body = await _drive(cron, "lin", run_key)
     assert body["state"] == dag.SUCCESS
     ref = ("lin", run_key)
@@ -2807,6 +2901,52 @@ async def test_catch_up_without_prior_run_is_noop(tmp_path, dag_cron):
     assert await cron._dag.list_runs("cu", limit=10) == []
 
 
+async def test_catch_up_ignores_a_manual_runs_logical_date(tmp_path, dag_cron):
+    # A manual run records the logical date its caller chose, which says
+    # nothing about the slots before it: the three hours the schedule
+    # missed are owed.
+    cron = await dag_cron(_HOURLY)
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+    for name, owed in (("cu", 3), ("cu1", 1)):  # run-all, run-once
+        dagcfg = cron.cron_dags[name]
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag.trigger(name, logical_date="2026-01-02T00:00:00Z")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        runs = await cron._dag.list_runs(name, limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == owed, name
+
+
+async def test_catch_up_does_not_start_from_a_manual_run(tmp_path, dag_cron):
+    # the schedule has created no run, so it has missed none
+    cron = await dag_cron(_HOURLY)
+    dagcfg = cron.cron_dags["cu"]
+    now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+    await cron._dag.trigger("cu", logical_date="2025-12-31T22:00:00Z")
+    await cron._dag._catch_up(dagcfg, now_dt)
+    runs = await cron._dag.list_runs("cu", limit=10)
+    assert [r["kind"] for r in runs] == ["manual"]
+
+
+async def test_boot_seed_replays_past_a_manual_run_dated_year_9999(
+    tmp_path, caplog, dag_cron
+):
+    # The restart: a second scheduler seeds from the documents the first
+    # one left on the store. No schedule arithmetic starts from the manual
+    # run's date, so the last second of the calendar cannot overflow it.
+    first = await dag_cron(_HOURLY)
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+    await first._dag._create_run(first.cron_dags["cu"], base, "scheduled")
+    await first._dag.trigger("cu", logical_date="9999-12-31T23:59:59Z")
+    second = await dag_cron(_HOURLY)
+    with caplog.at_level(logging.ERROR, logger="cronstable.dagrun"):
+        await second._dag._seed_dag(second.cron_dags["cu"], now_dt)
+    assert "catch-up seed failed" not in caplog.text
+    runs = await second._dag.list_runs("cu", limit=10)
+    assert [r["kind"] for r in runs].count("catchup") == 3
+
+
 async def test_renew_loop_retries_then_drops_on_takeover(
     tmp_path, monkeypatch, dag_cron
 ):
@@ -2884,9 +3024,9 @@ async def test_adopt_orphans_keys_pass_and_full_pass(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    done_key = await cron._dag.trigger_run("lin")
+    done_key = (await cron._dag.trigger("lin"))["runKey"]
     await _drive(cron, "lin", done_key)  # terminal
-    open_key = await cron._dag.trigger_run("lin")
+    open_key = (await cron._dag.trigger("lin"))["runKey"]
     # simulate this daemon losing every hold (a restarted peer's view)
     for ref in list(cron._dag._owned):
         cron._dag._drop_owned(ref)
@@ -3139,7 +3279,7 @@ async def test_read_xcom_list_oversized_blob_is_empty(
 async def test_read_xcom_list_over_item_cap_returns_unchanged(
     tmp_path, monkeypatch, dag_cron
 ):
-    # Past MAX_MAPPED_ITEMS the list is returned as-is for _apply_expansions to
+    # Past MAX_MAPPED_ITEMS the list is returned as-is for _apply_expansion to
     # fail the task; _read_xcom_list must skip the O(len) portability walk here
     # rather than map to empty. Shrink the cap so a short list trips it.
     monkeypatch.setattr(dag, "MAX_MAPPED_ITEMS", 3)
@@ -3221,6 +3361,59 @@ async def test_read_xcom_list_non_portable_value_is_empty(
     monkeypatch.setattr(dagrun._json, "ensure_portable", _reject)
     got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
     assert got == []  # mapped to empty rather than wedging every advance
+
+
+async def test_read_expansions_remembers_an_empty_list_of_a_run_it_owns(
+    monkeypatch, dag_cron
+):
+    cron = await dag_cron(_EXPAND)
+    d = cron._dag
+    dagcfg = cron.cron_dags["xd"]
+    ref = ("xd", "rk")
+    body = dag.new_run_body(
+        dag="xd",
+        run_key="rk",
+        run_id="rid",
+        logical_date=None,
+        kind="manual",
+        now=0.0,
+        spec=dagcfg.spec,
+    )
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    answers = {"rid": [], "blip": None, "other": ["a"]}
+    reads = []
+
+    async def read_list(run_id, *_):
+        reads.append(run_id)
+        return answers[run_id]
+
+    monkeypatch.setattr(d, "_read_xcom_list", read_list)
+
+    async def twice(run_id):
+        return [
+            (await d._read_expansions(dagcfg, ref, run_id, body))["work"]
+            for _ in range(2)
+        ]
+
+    # nothing drops an entry for a run this node does not own, so every
+    # pass reads the store
+    assert await twice("rid") == [[], []]
+    assert reads == ["rid", "rid"] and not d._empty_expansions
+    d._owned[ref] = Lease(
+        name="l", holder="h", fence=1, expires_at=dagrun._now() + 3600.0
+    )
+    # owned: the passes that follow reuse the first empty answer
+    assert await twice("rid") == [[], []]
+    assert reads == ["rid"] * 3
+    # the driver retries a read the store could not answer, and that read
+    # never comes back as empty
+    assert await twice("blip") == [None, None]
+    # the entry names the run by its id: another run under the same key
+    # reads the store, and a list with items leaves no entry
+    assert await twice("other") == [["a"], ["a"]]
+    assert reads == ["rid"] * 3 + ["blip", "blip", "other", "other"]
+    d._drop_owned(ref)
+    assert not d._empty_expansions
 
 
 # --------------------------------------------------------------------------
@@ -3349,6 +3542,32 @@ async def test_dag_run_rollup_prunes_gone_cache_keys(tmp_path, dag_cron):
     assert "stale" not in cron._dag._dag_summary_cache["xc"]
     assert roll["totalRuns"] == 1
     assert roll["latestRun"]["runKey"] == "r1"
+
+
+async def test_run_summary_carries_the_newest_task_start_per_host(
+    tmp_path, dag_cron
+):
+    cron = await dag_cron(_XC_YAML)
+    body = {
+        "tasks": {
+            # a peer that reconciles h1's task stamps the later updatedAt
+            "a": {"host": "h1", "startedAt": 10.0, "updatedAt": 99.0},
+            "b": {"host": "h1", "startedAt": 20.0},
+            "c": {"host": "h1", "startedAt": 15.0},
+            "d": {"host": "h2", "startedAt": 5.0},
+            "gate": {"host": None, "startedAt": 50.0},  # an approval gate
+            "freed": {"host": "h3", "startedAt": None},  # a released claim
+        }
+    }
+    assert cron._dag._summarize_run(body)["taskStarts"] == {
+        "h1": 20.0,
+        "h2": 5.0,
+    }
+    # the map feeds the fleet check and stays out of every listing
+    await _mint_run(cron, "r1")
+    (run,) = await cron._dag.list_runs("xc")
+    assert "taskStarts" not in run
+    assert "taskStarts" not in str(await cron._dag.list_dags())
 
 
 async def test_dag_run_rollup_degrades_on_read_error(
@@ -3493,6 +3712,7 @@ async def test_forget_clears_every_per_store_cache(tmp_path, dag_cron):
     d._renewers[ref] = renewer
     d._locks[ref] = asyncio.Lock()
     d._wake[ref] = 1.0
+    d._empty_expansions[ref] = {("rid", "a", "items")}
     d._next_logical["xc"] = _utcnow()
     d._seeded["xc"] = "sig"
     d._seed_failed["xc"] = "sig"
@@ -3515,6 +3735,7 @@ async def test_forget_clears_every_per_store_cache(tmp_path, dag_cron):
     assert not d._renewers
     assert not d._locks
     assert not d._wake
+    assert not d._empty_expansions
     assert not d._next_logical
     assert not d._seeded
     assert not d._seed_failed
@@ -3549,7 +3770,7 @@ async def test_forget_drops_stale_terminal_summary_across_backend_swap(
 
         # store A: one run driven to SUCCESS, then rolled up so its summary is
         # cached. A terminal summary is immutable, so nothing ever re-reads it.
-        run_key = await cron._dag.trigger_run("lin")
+        run_key = (await cron._dag.trigger("lin"))["runKey"]
         assert (await _drive(cron, "lin", run_key))["state"] == dag.SUCCESS
         roll = await cron._dag._dag_run_rollup(cron.state_backend, "lin")
         assert roll["runCounts"] == {dag.SUCCESS: 1}
@@ -3693,7 +3914,7 @@ async def test_adopt_one_dag_keys_only_then_full(tmp_path, dag_cron):
 
     # one terminal run, plus an active run created directly (unowned, no
     # subprocess launched).
-    term_key = await cron._dag.trigger_run("lin")
+    term_key = (await cron._dag.trigger("lin"))["runKey"]
     assert (await _drive(cron, "lin", term_key))["state"] == dag.SUCCESS
     assert await cron._dag._create_doc(dagcfg, "full-active", None, "manual")
     full_ref = ("lin", "full-active")
@@ -3842,6 +4063,55 @@ async def test_prepare_task_run_env_and_secrets(tmp_path, caplog, dag_cron):
     assert ctx.secrets == {"GOOD": "sval"}  # BAD dropped, not fatal
     assert env[dag.ENV_DAG_NAME] == "sec"
     await cron._job_api.finish_run(token)  # unregister; no leak
+
+    # the logical date is exported as the run document holds it, and a
+    # run with none, or with a damaged one, exports the empty string
+    cron._job_api = None
+    for stored, exported in (
+        ("2026-01-05T02:00:00+00:00", "2026-01-05T02:00:00+00:00"),
+        (None, ""),
+        (20260105, ""),
+    ):
+        _token, env = await cron._dag._prepare_task_run(
+            dagcfg, run_id, "manual-1", intent, template, None, stored
+        )
+        assert env[dag.ENV_DAG_LOGICAL_DATE] == exported
+    cron._job_api = api
+
+
+async def test_a_task_reads_the_logical_date_of_its_run(tmp_path, dag_cron):
+    # a backfill run reads the date it was created for, whatever day its
+    # task runs on
+    out = tmp_path / "dates.txt"
+    yaml = (
+        "dags:\n  - name: ld\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    script = (
+        "import os\n"
+        "date = os.environ['CRONSTABLE_DAG_LOGICAL_DATE']\n"
+        "open({!r}, 'a').write(date + '\\n')\n".format(str(out))
+    )
+    _set_cmd(cron, "ld", "a", [_PY, "-c", script])
+    res = await cron._dag.backfill(
+        "ld", "2026-01-04T05:00:00+00:00", "2026-01-04T05:30:00+00:00"
+    )
+    (backfilled,) = res["runKeys"]
+    assert (await _drive(cron, "ld", backfilled))["state"] == dag.SUCCESS
+    # a trigger that names a date exports it in UTC, as the run stores it
+    named = await cron._dag.trigger(
+        "ld", logical_date="2026-01-05T01:00:00+02:00"
+    )
+    assert (await _drive(cron, "ld", named["runKey"]))["state"] == dag.SUCCESS
+    # a manual run that names none exports the empty string
+    bare = await cron._dag.trigger("ld")
+    assert (await _drive(cron, "ld", bare["runKey"]))["state"] == dag.SUCCESS
+    assert out.read_text().splitlines() == [
+        "2026-01-04T05:00:00+00:00",
+        "2026-01-04T23:00:00+00:00",
+        "",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -4022,7 +4292,7 @@ async def test_reconcile_on_boot_adopts_active_and_tolerates_timeout(
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
     dagcfg = cron.cron_dags["lin"]
 
-    term_key = await cron._dag.trigger_run("lin")
+    term_key = (await cron._dag.trigger("lin"))["runKey"]
     assert (await _drive(cron, "lin", term_key))["state"] == dag.SUCCESS
     assert await cron._dag._create_doc(dagcfg, "manual-active", None, "manual")
     active_ref = ("lin", "manual-active")
@@ -4058,7 +4328,7 @@ async def test_gc_removed_dags_deletes_old_terminal_keeps_recent_and_owned(
     )
     cron = await dag_cron(yaml)
     _set_cmd(cron, "gc", "a", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("gc")
+    run_key = (await cron._dag.trigger("gc"))["runKey"]
     assert (await _drive(cron, "gc", run_key))["state"] == dag.SUCCESS
     dagcfg = cron.cron_dags["gc"]
     backend = cron.state_backend
@@ -4359,6 +4629,23 @@ async def test_fire_forward_gap_hands_the_gap_to_onmissed(
     )
 
 
+async def test_fire_forward_gap_replays_past_a_manual_runs_logical_date(
+    tmp_path, dag_cron
+):
+    # the gap path reads the same watermark as the boot seed
+    cron = await dag_cron(_HOURLY)
+    d = cron._dag
+    dagcfg = cron.cron_dags["cu"]
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+    await d._create_run(dagcfg, base, "scheduled")
+    await d.trigger("cu", logical_date="2026-01-02T00:00:00Z")
+    d._next_logical["cu"] = base + datetime.timedelta(hours=1)
+    await d._fire_forward(dagcfg, now_dt)
+    runs = await d.list_runs("cu", limit=10)
+    assert [r["kind"] for r in runs].count("catchup") == 3
+
+
 # ===========================================================================
 # Catch-up + durable watermark branches.
 # ===========================================================================
@@ -4391,7 +4678,7 @@ async def test_catch_up_no_missed_slots_returns(tmp_path, dag_cron):
     assert [r["kind"] for r in runs].count("catchup") == 0
 
 
-async def test_durable_watermark_no_backend_and_skips_undated(
+async def test_durable_watermark_counts_scheduled_and_catchup_runs(
     tmp_path, dag_cron
 ):
     cron = await dag_cron(_HOURLY)
@@ -4401,13 +4688,119 @@ async def test_durable_watermark_no_backend_and_skips_undated(
     assert await cron._dag._durable_watermark(dagcfg) is None
     cron.state_backend = backend
 
-    # a manual run has no logicalDate and is skipped by the scan; the
-    # scheduled run's date is the watermark.
     base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    later = datetime.datetime(2026, 1, 2, 0, 0, tzinfo=_UTC)
+    # the scan skips an undated run and the dated runs whose date a caller
+    # chose; the scheduled run's date is the watermark.
     await cron._dag._create_doc(dagcfg, "manual-x", None, "manual")
-    await cron._dag._create_doc(dagcfg, "sched-x", base.isoformat(), "sc")
-    wm = await cron._dag._durable_watermark(dagcfg)
-    assert wm == base
+    for kind in ("manual", "backfill", "recovery"):
+        await cron._dag._create_doc(
+            dagcfg, kind + "-later", later.isoformat(), kind
+        )
+    assert await cron._dag._durable_watermark(dagcfg) is None
+    await cron._dag._create_doc(
+        dagcfg, "sched-x", base.isoformat(), "scheduled"
+    )
+    assert await cron._dag._durable_watermark(dagcfg) == base
+    # a catch-up run is the schedule's own, like a scheduled one
+    await cron._dag._create_doc(dagcfg, "cu-x", later.isoformat(), "catchup")
+    assert await cron._dag._durable_watermark(dagcfg) == later
+
+
+_HOURLY_RETAIN_3 = (
+    "dags:\n  - name: cu\n    schedule: '0 * * * *'\n"
+    "    onMissed: run-all\n    retainRuns: 3\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+)
+
+
+async def _finish_at(cron, run_key, created_at):
+    """Finish run ``run_key`` of dag ``cu`` with the given ``createdAt``."""
+
+    def _done(current):
+        current["state"] = dag.SUCCESS
+        current["createdAt"] = created_at
+        return current, None
+
+    await cron._dag._mutate("cu", run_key, _done)
+    await cron._dag._release(("cu", run_key))
+
+
+async def test_gc_keeps_the_catch_up_reference_behind_a_backfill(
+    tmp_path, dag_cron
+):
+    # The backfill's runs are the newest by createdAt, so retention's
+    # excess holds every scheduled run, the reference among them.
+    cron = await dag_cron(_HOURLY_RETAIN_3)
+    d = cron._dag
+    backend = cron.state_backend
+    dagcfg = cron.cron_dags["cu"]
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    for i, hours in enumerate((-2, -1, 0)):
+        when = base + datetime.timedelta(hours=hours)
+        ref, _ = await d._create_run(dagcfg, when, "scheduled")
+        await _finish_at(cron, ref[1], 1000.0 + i)
+    result = await d.backfill(
+        "cu", "2025-12-01T01:00:00+00:00", "2025-12-01T03:00:00+00:00"
+    )
+    assert result["created"] == 3
+    for i, run_key in enumerate(result["runKeys"]):
+        await _finish_at(cron, run_key, 2000.0 + i)
+    await d._gc_one_dag(backend, "cu", dagcfg)
+    docs = await backend.list_documents("dagrun/cu")
+    # one run past retainRuns: the reference
+    assert sorted((b["kind"], b["logicalDate"]) for b in docs) == [
+        ("backfill", "2025-12-01T01:00:00+00:00"),
+        ("backfill", "2025-12-01T02:00:00+00:00"),
+        ("backfill", "2025-12-01T03:00:00+00:00"),
+        ("scheduled", base.isoformat()),
+    ]
+    assert await d._durable_watermark(dagcfg) == base
+    # a restart at 03:30 owes 01:00, 02:00, and 03:00
+    d._seeded.pop("cu", None)
+    await d._seed_dag(dagcfg, base + datetime.timedelta(hours=3, minutes=30))
+    docs = await backend.list_documents("dagrun/cu")
+    catchups = sorted(b["logicalDate"] for b in docs if b["kind"] == "catchup")
+    assert catchups == [
+        (base + datetime.timedelta(hours=h)).isoformat() for h in (1, 2, 3)
+    ]
+
+
+async def test_gc_reference_is_the_latest_logical_date(tmp_path, dag_cron):
+    cron = await dag_cron(_HOURLY_RETAIN_3)
+    d = cron._dag
+    backend = cron.state_backend
+    dagcfg = cron.cron_dags["cu"]
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    # in creation order; s04 has the latest logical date of the
+    # schedule's runs and the second oldest createdAt
+    runs = (
+        ("s00", 0, "scheduled"),
+        ("s04", 4, "scheduled"),
+        ("c01", 1, "catchup"),
+        ("c02", 2, "catchup"),
+        ("c03", 3, "catchup"),
+        ("m24", 24, "manual"),
+    )
+    for i, (run_key, hours, kind) in enumerate(runs):
+        when = base + datetime.timedelta(hours=hours)
+        await d._create_doc(dagcfg, run_key, when.isoformat(), kind)
+        await _finish_at(cron, run_key, 1000.0 + i)
+    # the excess is s00, s04, and c01; ordinary retention takes the
+    # other two
+    await d._gc_one_dag(backend, "cu", dagcfg)
+    docs = await backend.list_documents("dagrun/cu")
+    assert sorted(b["runKey"] for b in docs) == ["c02", "c03", "m24", "s04"]
+    assert await d._durable_watermark(dagcfg) == base + datetime.timedelta(
+        hours=4
+    )
+    # the newest three by createdAt plus the reference are all that remain
+    await d._gc_one_dag(backend, "cu", dagcfg)
+    assert len(await backend.list_documents("dagrun/cu")) == 4
+    # a DAG gone from the configuration keeps no reference
+    cron.cron_dags.clear()
+    await d.gc_removed_dags(backend, {"cu"}, 0.0)
+    assert await backend.list_documents("dagrun/cu") == []
 
 
 async def test_create_run_naive_datetime_is_read_as_utc(tmp_path, dag_cron):
@@ -4415,7 +4808,8 @@ async def test_create_run_naive_datetime_is_read_as_utc(tmp_path, dag_cron):
     _set_cmd(cron, "cu", "a", [_PY, "-c", "pass"])
     dagcfg = cron.cron_dags["cu"]
     naive = datetime.datetime(2026, 5, 1, 12, 0)  # no tzinfo
-    ref = await cron._dag._create_run(dagcfg, naive, "backfill")
+    ref, created = await cron._dag._create_run(dagcfg, naive, "backfill")
+    assert created
     assert ref[1].startswith("2026-05-01T12")  # keyed canonically as UTC
     await _drive(cron, "cu", ref[1])
 
@@ -4537,7 +4931,7 @@ async def test_adopt_one_dag_keys_none_falls_back_to_full(
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
     d = cron._dag
     dagcfg = cron.cron_dags["lin"]
-    open_key = await d.trigger_run("lin")
+    open_key = (await d.trigger("lin"))["runKey"]
     for ref in list(d._owned):
         d._drop_owned(ref)
 
@@ -4625,7 +5019,7 @@ async def test_advance_owned_advances_due_ref(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     ref = ("lin", run_key)
     if ref in cron._dag._owned:
         cron._dag._wake[ref] = 0.0
@@ -4728,7 +5122,7 @@ async def _advance_expand_setup(cron, tmp_path):
         ],
     )
     _set_cmd(cron, "xd", "work", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("xd")
+    run_key = (await cron._dag.trigger("xd"))["runKey"]
     await _reap_running(cron)  # gen finishes; its completion lands
     pend = [t for t in list(cron._pending_state_writes) if not t.done()]
     for t in pend:
@@ -4790,12 +5184,12 @@ async def test_launch_cancel_propagates_out_of_advance(
     cron = await dag_cron(yaml)
     _set_cmd(cron, "lp", "a", [_PY, "-c", "pass"])
 
-    async def _cancel(dagcfg, ref, run_id, intent):
+    async def _cancel(dagcfg, ref, run_id, intent, *rest):
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(cron._dag, "_launch_task", _cancel)
     with pytest.raises(asyncio.CancelledError):
-        await cron._dag.trigger_run("lp")
+        await cron._dag.trigger("lp")
 
 
 async def test_wide_fanout_defers_then_completes(tmp_path, dag_cron):
@@ -4819,7 +5213,7 @@ async def test_wide_fanout_defers_then_completes(tmp_path, dag_cron):
         ],
     )
     _set_cmd(cron, "xd", "work", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("xd")
+    run_key = (await cron._dag.trigger("xd"))["runKey"]
     # a fan-out wider than the claim quota defers the surplus to a prompt
     # re-service, then converges.
     body = await _drive(cron, "xd", run_key, max_rounds=200)
@@ -4838,7 +5232,7 @@ async def test_empty_fanout_terminalises_after_claim(tmp_path, dag_cron):
     cron = await dag_cron(yaml)
     _set_cmd(cron, "ez", "gen", [_PY, "-c", "pass"])  # publishes nothing
     _set_cmd(cron, "ez", "work", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("ez")
+    run_key = (await cron._dag.trigger("ez"))["runKey"]
     # gen succeeds without a list, so the mapped task expands to zero
     # instances and the run terminalises on the claim RMW.
     body = await _drive(cron, "ez", run_key)
@@ -6200,6 +6594,86 @@ def test_parse_iso_edge_cases():
     assert dt.tzinfo == datetime.UTC
 
 
+def _at(*fields, offset=0, micro=0):
+    zone = datetime.timezone(datetime.timedelta(minutes=offset))
+    return datetime.datetime(*fields, micro, zone)
+
+
+def test_parse_iso_reads_one_grammar_on_every_python():
+    # Each half pins the grammar against one side of the interpreter's own
+    # parser: an older datetime.fromisoformat refuses most of the first
+    # table, and a newer one reads the forms the second table opens with.
+    noon = (2026, 10, 9, 12, 0, 0)
+    reads = {
+        # an RFC 3339 date-time, with any number of fraction digits
+        "2026-10-09T12:00:00Z": _at(*noon),
+        "2026-10-09t12:00:00z": _at(*noon),
+        "2026-10-09T12:00:00+00:00": _at(*noon),
+        "2026-10-09T12:00:00-00:00": _at(*noon),
+        "2026-10-09T07:00:00-05:00": _at(2026, 10, 9, 7, 0, 0, offset=-300),
+        "2026-10-09T17:30:00+05:30": _at(2026, 10, 9, 17, 30, 0, offset=330),
+        "2026-10-09T12:00:00.5Z": _at(*noon, micro=500000),
+        "2026-10-09T12:00:00.12Z": _at(*noon, micro=120000),
+        "2026-10-09T12:00:00.500Z": _at(*noon, micro=500000),
+        "2026-10-09T12:00:00.123456Z": _at(*noon, micro=123456),
+        "2026-10-09T12:00:00.5+00:00": _at(*noon, micro=500000),
+        # the fraction keeps its first six digits
+        "2026-10-09T12:00:00.123456789Z": _at(*noon, micro=123456),
+        "2026-10-09T12:00:00." + "9" * 5000 + "Z": _at(*noon, micro=999999),
+        # an offset without its colon, or without its minutes
+        "2026-10-09T12:00:00+0000": _at(*noon),
+        "2026-10-09T12:00:00+00": _at(*noon),
+        "2026-10-09T12:00:00-0530": _at(*noon, offset=-330),
+        # the shorter forms: no offset (read as UTC), a space, less time
+        "2026-10-09T12:00:00": _at(*noon),
+        "2026-10-09 12:00:00": _at(*noon),
+        "2026-10-09T12:00": _at(*noon),
+        "2026-10-09T12": _at(*noon),
+        "2026-10-09T12:00Z": _at(*noon),
+        "2026-10-09": _at(2026, 10, 9, 0, 0, 0),
+        # the edges of the calendar
+        "0001-01-01T00:00:00+00:01": _at(1, 1, 1, 0, 0, 0, offset=1),
+        "9999-12-31T23:59:59-05:00": _at(
+            9999, 12, 31, 23, 59, 59, offset=-300
+        ),
+    }
+    for text, expected in reads.items():
+        got = dagrun._parse_iso(text)
+        assert got == expected, text
+        assert got.utcoffset() == expected.utcoffset(), text
+    refused = (
+        # forms only a newer datetime.fromisoformat reads
+        "20261009T120000Z",
+        "20261009",
+        "2026-W41-5",
+        "2026-10-09T12:00:00,5Z",
+        "2026-10-09T24:00:00Z",
+        # forms only an older one reads
+        "2026-10-09T12:00:00.Z",
+        "2026-10-09T12:00:00ZZ",
+        # forms every one reads, two of them as another instant
+        "2026-10-09+05:30",
+        "2026-10-09T12:00:00+05:60",
+        "2026-10-09_12:00:00",
+        "2026-10-09T12:00:00 Z",
+        "2026-10-09T12:00:00+05:30:15",
+        # no date and time at all
+        "2026-10-09T",
+        "2026-10-09T12:00:00.",
+        "2026-13-01T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+        "2026-10-09T12:60:00Z",
+        "2026-10-09T12:00:60Z",
+        "2026-10-09T12:00:00+24:00",
+        "2026-10-9T12:00:00Z",
+        " 2026-10-09T12:00:00Z",
+        "2026-10-09T12:00:00Z\n",
+        "٢٠٢٦-10-09T12:00:00Z",  # digits, but not ASCII
+    )
+    for text in refused:
+        assert dagrun._parse_iso(text) is None, text
+
+
 async def test_reconcile_on_boot_isolates_a_failing_run(
     tmp_path, monkeypatch, dag_cron
 ):
@@ -6239,7 +6713,7 @@ async def test_dropped_completion_keeps_its_launch_key(tmp_path, dag_cron):
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     ref = ("lin", run_key)
     # a finishes; the reaper hands its completion over but the flush
     # never runs before the store is rebuilt
@@ -6270,7 +6744,7 @@ async def test_same_store_forget_keeps_buffered_completions(
     cron = await dag_cron(_LINEAR)
     _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
     _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-    run_key = await cron._dag.trigger_run("lin")
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
     ref = ("lin", run_key)
     orig_flush = cron._dag.flush_completions
     cron._dag.flush_completions = _noop_flush
@@ -6290,3 +6764,1659 @@ async def test_same_store_forget_keeps_buffered_completions(
 
 async def _noop_flush():
     return None
+
+
+# ===========================================================================
+# Run engine level: a build adopts and advances only runs at or below
+# dag.ENGINE_LEVEL, and warns about live peers below a level its dags need.
+# ===========================================================================
+
+
+async def _raise_engine(cron, dag_name, run_key, level):
+    """Rewrite a run document as one a newer build created at ``level``."""
+
+    def _raise(body):
+        body["engine"] = level
+        return body, None
+
+    await cron._dag._mutate(dag_name, run_key, _raise)
+
+
+def _refusals(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "leaving the run for an upgraded node" in r.getMessage()
+    ]
+
+
+async def test_adopt_scan_leaves_a_run_above_the_engine_level(
+    tmp_path, caplog, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    backend = cron.state_backend
+    assert await cron._dag._create_doc(dagcfg, "newer", None, "manual")
+    await _raise_engine(cron, "lin", "newer", dag.ENGINE_LEVEL + 1)
+    before = await cron._dag.get_run("lin", "newer")
+    ref = ("lin", "newer")
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        # both scan shapes, twice over: never owned, never rewritten, and
+        # one log line for the run however often the scan meets it
+        for full in (False, True, False, True):
+            await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=full)
+        await cron._dag.reconcile_on_boot()
+    assert ref not in cron._dag._owned
+    assert await backend.read_lease(cron._dag._lease_name(ref)) is None
+    assert await cron._dag.get_run("lin", "newer") == before
+    assert not any(cron.running_jobs.values())
+    (line,) = _refusals(caplog)
+    assert "lin/newer" in line
+    assert "level {} and".format(dag.ENGINE_LEVEL + 1) in line
+    assert cron._dag._engine_refused == {ref}
+
+    # a newer node finishes the run: the scan drops it from the refused set
+    def _finish(body):
+        body["state"] = dag.SUCCESS
+        return body, None
+
+    await cron._dag._mutate("lin", "newer", _finish)
+    await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=False)
+    assert cron._dag._engine_refused == set()
+
+
+async def test_adopt_full_pass_prunes_a_refused_run_that_was_deleted(
+    tmp_path, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    cron._dag._engine_refused.add(("lin", "gone"))
+    cron._dag._engine_refused.add(("removed-dag", "x"))
+    await cron._dag._adopt_one_dag(
+        cron.state_backend, "lin", dagcfg, full=True
+    )
+    assert cron._dag._engine_refused == {("removed-dag", "x")}
+    # the scan's entry point forgets refused runs of dags no longer loaded
+    await cron._dag._adopt_orphans()
+    assert cron._dag._engine_refused == set()
+
+
+async def test_advance_releases_an_owned_run_above_the_engine_level(
+    tmp_path, caplog, dag_cron
+):
+    # the backstop under the scan checks: a run this node already owns
+    # turns out to be above its level (the document was re-created under
+    # the same key by a newer node).
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    assert await cron._dag._create_doc(dagcfg, "newer", None, "manual")
+    await _raise_engine(cron, "lin", "newer", dag.ENGINE_LEVEL + 1)
+    before = await cron._dag.get_run("lin", "newer")
+    ref = ("lin", "newer")
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        assert await cron._dag._try_own(dagcfg, ref)
+    await _drain_pending(cron)
+    assert ref not in cron._dag._owned
+    assert ref not in cron._dag._wake
+    # released, not left to lapse out its TTL: a capable node can take the
+    # run at once
+    lease = await cron.state_backend.read_lease(cron._dag._lease_name(ref))
+    assert lease is None
+    assert await cron._dag.get_run("lin", "newer") == before
+    assert not any(cron.running_jobs.values())
+    assert len(_refusals(caplog)) == 1
+
+
+async def test_recovery_run_above_the_engine_level_is_not_prepared(
+    tmp_path, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    dagcfg = cron.cron_dags["lin"]
+    key = "recovery-" + "0" * 64
+    assert await cron._dag._create_doc(dagcfg, key, None, "recovery")
+
+    def _as_newer_recovery(body):
+        body["engine"] = dag.ENGINE_LEVEL + 1
+        body["recovery"] = {"status": "preparing", "artifacts": []}
+        return body, None
+
+    await cron._dag._mutate("lin", key, _as_newer_recovery)
+    before = await cron._dag.get_run("lin", key)
+    assert await cron._dag._try_own(dagcfg, ("lin", key))
+    await _drain_pending(cron)
+    # neither prepared nor failed: the document is exactly as the newer
+    # node left it
+    assert await cron._dag.get_run("lin", key) == before
+    assert ("lin", key) not in cron._dag._owned
+
+
+async def test_run_records_and_completes_at_its_dags_engine_level(
+    tmp_path, monkeypatch, dag_cron
+):
+    monkeypatch.setattr(dag, "ENGINE_LEVEL", 2)
+    cron = await dag_cron(_LINEAR)
+    _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+    _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+    dagcfg = cron.cron_dags["lin"]
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
+    body = await _drive(cron, "lin", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert body["engine"] == 2
+    # a base-level dag's document carries no key at all
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=1)
+    run_key = (await cron._dag.trigger("lin"))["runKey"]
+    plain = await _drive(cron, "lin", run_key)
+    assert plain["state"] == dag.SUCCESS
+    assert "engine" not in plain
+
+
+async def _manifest(cron, host, *, age=0.0, **fields):
+    at = _utcnow() - datetime.timedelta(seconds=age)
+    record = {"host": host, "at": at.isoformat(), **fields}
+    await cron.state_backend.append_record("manifests/" + host, record)
+
+
+async def _task_start(cron, run_key, host, *, age=0.0, dag_name="lin"):
+    """A run of ``dag_name`` whose task ``a`` was started by ``host``."""
+    dagcfg = cron.cron_dags[dag_name]
+    assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+
+    def _claim(body):
+        entry = body["tasks"]["a"]
+        entry["state"] = dag.RUNNING
+        entry["host"] = host
+        entry["startedAt"] = dagrun._now() - age
+        return body, None
+
+    await cron._dag._mutate(dag_name, run_key, _claim)
+
+
+async def _fleet_check(cron):
+    """Run one fleet check, whatever the interval says."""
+    cron._dag._next_fleet_check = 0.0
+    await cron._dag._check_fleet(dagrun._now())
+
+
+def _fleet_exits(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO
+        and "leaves the fleet warning" in r.getMessage()
+    ]
+
+
+# `lin` plus a second dag, for a fleet whose dags need different levels
+_TWO_DAGS = (
+    _LINEAR
+    + """
+  - name: other
+    tasks:
+      - id: a
+        command: 'x'
+"""
+)
+
+
+async def test_manifest_advertises_the_engine_level(tmp_path, dag_cron):
+    cron = await dag_cron(_LINEAR)
+    await cron._persist_manifest()
+    records = await cron.state_backend.list_records(
+        cron._manifest_stream(), limit=1, newest_first=True
+    )
+    assert records[0]["dagEngine"] == dag.ENGINE_LEVEL
+
+
+async def test_peer_dag_engines_reads_each_live_hosts_newest_manifest(
+    tmp_path, monkeypatch, dag_cron
+):
+    from cronstable import cron as cron_mod
+
+    cron = await dag_cron(_LINEAR)
+    await cron._persist_manifest()  # this node's own stream is not a peer
+    await _manifest(cron, "pre-engine")  # a build with no dagEngine key
+    await _manifest(cron, "upgraded", age=60.0, dagEngine=1)
+    await _manifest(cron, "upgraded", dagEngine=3)  # the newest record wins
+    await _manifest(cron, "garbled", dagEngine="3")
+    await _manifest(
+        cron, "stopped", age=cron_mod.MANIFEST_LIVE_SECONDS + 60, dagEngine=1
+    )
+    await cron.state_backend.append_record("manifests/no-clock", {"x": 1})
+    assert await cron._peer_dag_engines({}) == {
+        "pre-engine": 1,
+        "upgraded": 3,
+        "garbled": 1,
+    }
+
+    async def _boom(prefix):
+        raise OSError("mount gone")
+
+    monkeypatch.setattr(cron.state_backend, "list_stream_names_audit", _boom)
+    assert await cron._peer_dag_engines({}) is None
+    monkeypatch.undo()
+    backend = cron.state_backend
+    cron.state_backend = None
+    try:
+        assert await cron._peer_dag_engines({}) is None
+    finally:
+        cron.state_backend = backend
+
+
+async def test_peer_dag_engines_counts_a_task_start_as_a_sign_of_life(
+    tmp_path, monkeypatch, dag_cron
+):
+    from cronstable import cron as cron_mod
+
+    cron = await dag_cron(_LINEAR)
+    await cron._persist_manifest()
+    lapsed = cron_mod.MANIFEST_LIVE_SECONDS + 60
+    await _manifest(cron, "silent", age=lapsed)  # a build with no dagEngine
+    await _manifest(cron, "upgraded", age=lapsed, dagEngine=2)
+    await _manifest(cron, "stopped", age=lapsed, dagEngine=1)
+    now = dagrun._now()
+    started = {
+        "silent": now - 30,  # its manifest lapsed and it still starts tasks
+        "upgraded": now - 30,  # live, at the level its manifest advertises
+        "stopped": now - lapsed,  # nothing inside the window
+        "streamless": now - 30,  # garbage collection took its manifests
+        cron._state_host: now,  # this node is not its own peer
+    }
+    assert await cron._peer_dag_engines(started) == {
+        "silent": 1,
+        "upgraded": 2,
+        "streamless": 1,
+    }
+    # the base level is for a host with no stream: one whose stream gave no
+    # level has a manifest this read could not use, which is no answer
+    await cron.state_backend.append_record("manifests/no-clock", {"x": 1})
+    assert await cron._peer_dag_engines({"no-clock": now}) is None
+
+    # a listing that cannot name every stream answers from the manifests it
+    # read, unless a live host has none: the stream left out may be that
+    # host's.  One that names no stream at all is no answer.
+    def _lists(*streams):
+        async def _partial(prefix):
+            return list(streams), False
+
+        monkeypatch.setattr(
+            cron.state_backend, "list_stream_names_audit", _partial
+        )
+
+    _lists("manifests/upgraded")
+    assert await cron._peer_dag_engines({"upgraded": now}) == {"upgraded": 2}
+    assert await cron._peer_dag_engines(started) is None
+    _lists()
+    assert await cron._peer_dag_engines({}) is None
+
+
+async def test_peer_dag_engines_reads_the_manifests_a_batch_at_a_time(
+    tmp_path, monkeypatch, dag_cron
+):
+    from cronstable import cron as cron_mod
+
+    cron = await dag_cron(_LINEAR)
+    batch = cron_mod._REHYDRATE_CONCURRENCY
+    hosts = ["h{:02d}".format(i) for i in range(batch + 3)]
+    for host in hosts:
+        await _manifest(cron, host, dagEngine=2)
+    backend = cron.state_backend
+    list_records = backend.list_records
+    live = peak = 0
+
+    async def _counted(stream, **kwargs):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        try:
+            await asyncio.sleep(0)  # let the rest of the batch start
+            return await list_records(stream, **kwargs)
+        finally:
+            live -= 1
+
+    monkeypatch.setattr(backend, "list_records", _counted)
+    assert await cron._peer_dag_engines({}) == dict.fromkeys(hosts, 2)
+    assert peak == batch
+
+    # one unreadable stream fails the read: a partial answer would clear
+    # the warning about a host it left out
+    async def _one_down(stream, **kwargs):
+        if stream.endswith("h03"):
+            raise OSError("mount gone")
+        return await list_records(stream, **kwargs)
+
+    monkeypatch.setattr(backend, "list_records", _one_down)
+    assert await cron._peer_dag_engines({}) is None
+
+    # ...and so does one whose records the store skips as unreadable, when
+    # its host started a task: the base level would misreport that host
+    async def _one_skipped(stream, **kwargs):
+        if stream.endswith("h03"):
+            return []
+        return await list_records(stream, **kwargs)
+
+    monkeypatch.setattr(backend, "list_records", _one_skipped)
+    assert await cron._peer_dag_engines({"h03": dagrun._now()}) is None
+
+
+async def test_peer_dag_engines_reads_a_working_hosts_manifest_past_the_cap(
+    tmp_path, monkeypatch, dag_cron
+):
+    from cronstable import cron as cron_mod
+
+    cron = await dag_cron(_LINEAR)
+    await cron._persist_manifest()  # the own stream does not use the cap up
+    monkeypatch.setattr(cron_mod, "MANIFEST_HOSTS_CAP", 2)
+    for host in ("a", "b", "zz-working"):
+        await _manifest(cron, host, dagEngine=2)
+    assert await cron._peer_dag_engines({}) == {"a": 2, "b": 2}
+    # by name alone the cap leaves zz-working unread, and the level of a
+    # host that starts tasks is in its manifest
+    now = dagrun._now()
+    assert await cron._peer_dag_engines({"zz-working": now}) == {
+        "a": 2,
+        "zz-working": 2,
+    }
+    # more working hosts than the cap leave one of them unread, which is no
+    # answer: the base level would misreport a host at level 2
+    working = dict.fromkeys(("a", "b", "zz-working"), now)
+    assert await cron._peer_dag_engines(working) is None
+
+
+async def test_fleet_check_waits_out_the_interval_after_an_unreadable_store(
+    tmp_path, monkeypatch, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    sched = cron._dag
+    dagcfg = cron.cron_dags["lin"]
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    reads = []
+
+    async def _unreadable(started):
+        reads.append(1)
+        return None
+
+    monkeypatch.setattr(cron, "_peer_dag_engines", _unreadable)
+    # the first check a dag's level asks for finds the store down: the next
+    # passes leave it alone until the interval is over
+    for _ in range(3):
+        await sched._check_fleet(dagrun._now())
+    assert len(reads) == 1
+    sched._next_fleet_check = 0.0
+    await sched._check_fleet(dagrun._now())
+    assert len(reads) == 2
+
+
+async def test_fleet_check_warns_about_peers_below_a_dags_level(
+    tmp_path, monkeypatch, caplog, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    sched = cron._dag
+    dagcfg = cron.cron_dags["lin"]
+    reads = []
+    read_peers = cron._peer_dag_engines
+
+    async def _counted(started):
+        reads.append(1)
+        return await read_peers(started)
+
+    monkeypatch.setattr(cron, "_peer_dag_engines", _counted)
+
+    # every dag at the base level: no store read, no warning
+    await sched._check_fleet(dagrun._now())
+    assert reads == []
+    assert "fleetWarnings" not in (await sched.list_dags())[0]
+
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    await _manifest(cron, "old-host")
+    await _manifest(cron, "new-host", dagEngine=2)
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        await sched._check_fleet(dagrun._now())
+        assert len(reads) == 1
+        (entry,) = await sched.list_dags()
+        (warning,) = entry["fleetWarnings"]
+        assert "old-host" in warning and "level 1" in warning
+        assert "needs level 2" in warning
+        # inside the interval nothing is re-read...
+        await sched._check_fleet(dagrun._now())
+        assert len(reads) == 1
+        # ...and past it the same finding is not logged again
+        sched._next_fleet_check = 0.0
+        await sched._check_fleet(dagrun._now())
+        assert len(reads) == 2
+    logged = [r for r in caplog.records if "old-host" in r.getMessage()]
+    assert len(logged) == 1
+
+    # a store that cannot answer keeps the last result
+    async def _unreadable(started):
+        return None
+
+    monkeypatch.setattr(cron, "_peer_dag_engines", _unreadable)
+    sched._next_fleet_check = 0.0
+    await sched._check_fleet(dagrun._now())
+    assert (await sched.list_dags())[0]["fleetWarnings"] == [warning]
+    monkeypatch.setattr(cron, "_peer_dag_engines", _counted)
+
+    # ...and so do runs that cannot be read, or that the summary walk
+    # cannot take (a foreign document whose `tasks` is not a mapping): the
+    # manifests are left alone, and the error stays inside the check
+    async def _no_summaries(backend, name):
+        return None
+
+    async def _foreign_run(backend, name):
+        raise AttributeError("'NoneType' object has no attribute 'values'")
+
+    for unreadable in (_no_summaries, _foreign_run):
+        with monkeypatch.context() as patch:
+            patch.setattr(sched, "_run_summaries", unreadable)
+            await _fleet_check(cron)
+        assert len(reads) == 2
+        assert sched._fleet_warnings == {"lin": [warning]}
+
+    # the peer upgrades: the warning clears at the next check
+    await _manifest(cron, "old-host", dagEngine=2)
+    sched._next_fleet_check = 0.0
+    await sched._check_fleet(dagrun._now())
+    assert "fleetWarnings" not in (await sched.list_dags())[0]
+    assert sched._fleet_logged == set()
+
+
+async def test_fleet_check_keeps_a_host_that_starts_tasks_without_manifesting(
+    tmp_path, caplog, dag_cron
+):
+    from cronstable import cron as cron_mod
+
+    lapsed = cron_mod.MANIFEST_LIVE_SECONDS + 60
+    cron = await dag_cron(_LINEAR)
+    sched = cron._dag
+    dagcfg = cron.cron_dags["lin"]
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+
+    def _warned(host):
+        return [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and host in r.getMessage()
+        ]
+
+    # a build with no engine levels refused the configuration that needs
+    # level 2: it records no manifest from then on and keeps advancing the
+    # runs of the dag it loaded earlier
+    await _manifest(cron, "old-host", age=lapsed)
+    with caplog.at_level(logging.INFO, logger="cronstable.dagrun"):
+        await _fleet_check(cron)
+        assert sched._fleet_warnings == {}
+        await _task_start(cron, "r1", "old-host", age=30.0)
+        await _fleet_check(cron)
+        (warning,) = (await sched.list_dags())[0]["fleetWarnings"]
+        assert "old-host" in warning and "level 1" in warning
+        # a host whose manifest stream garbage collection has removed is
+        # listed the same way, at the base level
+        await _task_start(cron, "r0", "collected-host", age=30.0)
+        await _fleet_check(cron)
+        collected, again = sched._fleet_warnings["lin"]
+        assert again == warning
+        assert "collected-host" in collected and "level 1" in collected
+        assert len(_warned("old-host")) == 1
+        assert _fleet_exits(caplog) == []
+
+        # no sign of life for the whole window: it leaves, and the log says
+        # what the store shows
+        def _age(body):
+            body["tasks"]["a"]["startedAt"] = dagrun._now() - lapsed
+            return body, None
+
+        await sched._mutate("lin", "r1", _age)
+        await _fleet_check(cron)
+        assert sched._fleet_warnings == {"lin": [collected]}
+        assert _fleet_exits(caplog) == [
+            "dag lin: host old-host leaves the fleet warning: this node "
+            "finds no manifest or task start from it in the last 12 hours"
+        ]
+        # its next task start lists it again, and logs it again
+        await _task_start(cron, "r2", "old-host", age=5.0)
+        await _fleet_check(cron)
+        assert sched._fleet_warnings == {"lin": [collected, warning]}
+        assert len(_warned("old-host")) == 2
+
+    # without a backend there are no runs to read
+    backend = cron.state_backend
+    cron.state_backend = None
+    try:
+        assert await sched._task_starts() is None
+    finally:
+        cron.state_backend = backend
+
+
+async def test_fleet_check_reads_task_starts_from_every_loaded_dag(
+    tmp_path, dag_cron
+):
+    from cronstable import cron as cron_mod
+
+    cron = await dag_cron(_TWO_DAGS)
+    sched = cron._dag
+    dagcfg = cron.cron_dags["other"]
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    await _manifest(cron, "old-host", age=cron_mod.MANIFEST_LIVE_SECONDS + 60)
+    # the host's only recent work is in `lin`, which every build advances:
+    # it is running all the same, so `other` names it
+    await _task_start(cron, "r1", "old-host", age=30.0)
+    await _fleet_check(cron)
+    assert list(sched._fleet_warnings) == ["other"]
+    (warning,) = sched._fleet_warnings["other"]
+    assert "old-host" in warning
+    # the newest start counts, whichever run or dag the store lists last
+    await _task_start(cron, "r0", "old-host", age=90.0)
+    await _task_start(cron, "r2", "old-host", age=60.0)
+    await _task_start(cron, "r1", "old-host", age=45.0, dag_name="other")
+    newest = (await sched.get_run("lin", "r1"))["tasks"]["a"]["startedAt"]
+    assert await sched._task_starts() == {"old-host": newest}
+
+
+async def test_fleet_check_logs_why_a_host_left(tmp_path, caplog, dag_cron):
+    cron = await dag_cron(_TWO_DAGS)
+    sched = cron._dag
+
+    def _need(name, level):
+        dagcfg = cron.cron_dags[name]
+        dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=level)
+
+    _need("lin", 3)
+    _need("other", 3)
+    await _manifest(cron, "peer", dagEngine=1)
+    with caplog.at_level(logging.INFO, logger="cronstable.dagrun"):
+        await _fleet_check(cron)
+        assert sorted(sched._fleet_warnings) == ["lin", "other"]
+        # still short, at another level: warned about anew, nothing leaves
+        await _manifest(cron, "peer", dagEngine=2)
+        await _fleet_check(cron)
+        # a reload ends what `lin` needs: the operator's own change
+        _need("lin", 1)
+        await _fleet_check(cron)
+        assert sorted(sched._fleet_warnings) == ["other"]
+        assert _fleet_exits(caplog) == []
+        # the peer upgrades in place
+        await _manifest(cron, "peer", dagEngine=3)
+        await _fleet_check(cron)
+    assert sched._fleet_warnings == {}
+    assert _fleet_exits(caplog) == [
+        "dag other: host peer leaves the fleet warning: its manifest "
+        "advertises run engine level 3"
+    ]
+
+
+async def test_fleet_check_runs_at_once_when_a_reload_changes_the_needs(
+    tmp_path, dag_cron
+):
+    cron = await dag_cron(_LINEAR)
+    sched = cron._dag
+    dagcfg = cron.cron_dags["lin"]
+    await _manifest(cron, "peer", dagEngine=2)
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=2)
+    await sched._check_fleet(dagrun._now())
+    assert sched._fleet_warnings == {}
+    # a reload raises what the dag needs: checked on the next pass, well
+    # inside FLEET_CHECK_INTERVAL
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=3)
+    await sched._check_fleet(dagrun._now())
+    assert list(sched._fleet_warnings) == ["lin"]
+    # ...and a reload back to the base level clears it without a read
+    dagcfg.spec = dataclasses.replace(dagcfg.spec, engine=1)
+    await sched._check_fleet(dagrun._now())
+    assert sched._fleet_warnings == {} and sched._fleet_needs == {}
+    # a backend swap drops the old store's findings and re-anchors the check
+    sched._fleet_warnings = {"lin": ["stale"]}
+    sched._engine_refused.add(("lin", "x"))
+    sched.forget()
+    assert sched._fleet_warnings == {} and sched._engine_refused == set()
+    assert sched._next_fleet_check == 0.0
+
+
+# ===========================================================================
+# Branching: skip exit codes and the join rules, with real task processes
+# ===========================================================================
+
+_BRANCH = """
+dags:
+  - name: load
+    tasks:
+      - id: extract
+        command: 'x'
+      - id: full
+        command: 'x'
+        dependsOn:
+          - extract
+        skipExitCodes:
+          - 99
+      - id: incremental
+        command: 'x'
+        dependsOn:
+          - extract
+        skipExitCodes:
+          - 99
+      - id: publish
+        command: 'x'
+        dependsOn:
+          - full
+          - incremental
+        triggerRule: none_failed_min_one_success
+      - id: alert
+        command: 'x'
+        dependsOn:
+          - full
+          - incremental
+          - publish
+        triggerRule: all_done_min_one_failed
+"""
+
+_OK = [_PY, "-c", "pass"]
+
+
+def _exit(code):
+    return [_PY, "-c", "import sys; sys.exit({})".format(code)]
+
+
+async def _branch_cron(dag_cron, **commands):
+    cron = await dag_cron(_BRANCH)
+    for task_id in ("extract", "full", "incremental", "publish", "alert"):
+        _set_cmd(cron, "load", task_id, commands.get(task_id, _OK))
+    return cron
+
+
+async def test_branch_runs_the_side_whose_guard_did_not_skip(
+    tmp_path, dag_cron
+):
+    cron = await _branch_cron(dag_cron, incremental=_exit(99))
+    run_key = (await cron._dag.trigger("load"))["runKey"]
+    body = await _drive(cron, "load", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SUCCESS,
+        "incremental": dag.SKIPPED,
+        "publish": dag.SUCCESS,
+        "alert": dag.SKIPPED,
+    }
+    skipped = body["tasks"]["incremental"]
+    assert skipped["exitCode"] == 99
+    assert skipped["failReason"] is None
+    assert skipped["skipReason"] == {
+        "kind": "exit_code",
+        "detail": "exit code 99",
+    }
+    assert body["tasks"]["alert"]["skipReason"]["kind"] == "trigger_rule"
+    # the run records the level a node needs to advance it
+    assert body["engine"] == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert cron._dag._summarize_run(body)["taskStates"] == {
+        "success": 3,
+        "skipped": 2,
+    }
+
+
+async def test_branch_failure_reaches_the_handler_and_fails_the_run(
+    tmp_path, dag_cron
+):
+    cron = await _branch_cron(
+        dag_cron, full=_exit(1), incremental=_exit(99)
+    )
+    run_key = (await cron._dag.trigger("load"))["runKey"]
+    body = await _drive(cron, "load", run_key)
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.FAILED,
+        "incremental": dag.SKIPPED,
+        "publish": dag.UPSTREAM_FAILED,
+        "alert": dag.SUCCESS,
+    }
+    # the handler ran and succeeded, and the run is still failed
+    assert body["state"] == dag.FAILED
+    assert "skipReason" not in body["tasks"]["full"]
+
+
+async def test_both_guards_skipping_ends_the_run_successful_with_no_work(
+    tmp_path, dag_cron
+):
+    cron = await _branch_cron(dag_cron, full=_exit(99), incremental=_exit(99))
+    run_key = (await cron._dag.trigger("load"))["runKey"]
+    body = await _drive(cron, "load", run_key)
+    assert body["state"] == dag.SUCCESS
+    assert _states(body)["publish"] == dag.SKIPPED
+    assert body["tasks"]["publish"]["skipReason"] == {
+        "kind": "trigger_rule",
+        "detail": "none_failed_min_one_success: no upstream succeeded",
+    }
+
+
+async def test_an_unlisted_exit_code_still_fails(tmp_path, dag_cron):
+    cron = await _branch_cron(dag_cron, full=_exit(98))
+    run_key = (await cron._dag.trigger("load"))["runKey"]
+    body = await _drive(cron, "load", run_key)
+    assert _states(body)["full"] == dag.FAILED
+    assert body["tasks"]["full"]["exitCode"] == 98
+    assert body["state"] == dag.FAILED
+
+
+async def test_list_dags_exports_rules_and_skip_codes(tmp_path, dag_cron):
+    cron = await dag_cron(_BRANCH + _LINEAR.replace("dags:\n", ""))
+    by_name = {d["name"]: d for d in await cron._dag.list_dags()}
+    tasks = {t["id"]: t for t in by_name["load"]["tasks"]}
+    assert tasks["full"]["skipExitCodes"] == [99]
+    assert tasks["publish"]["triggerRule"] == "none_failed_min_one_success"
+    assert tasks["alert"]["triggerRule"] == "all_done_min_one_failed"
+    # the key appears only on a task that sets it
+    assert "skipExitCodes" not in tasks["extract"]
+    assert "skipExitCodes" not in tasks["publish"]
+    for task in by_name["lin"]["tasks"]:
+        assert "skipExitCodes" not in task
+        assert task["triggerRule"] == "all_success"
+
+
+async def test_a_skip_runs_no_verify_step(tmp_path, dag_cron):
+    marker = tmp_path / "verified"
+    yaml = (
+        "dags:\n  - name: v\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "        skipExitCodes:\n          - 99\n"
+        "        verify:\n          command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    template = cron.cron_dags["v"].task_templates["a"]
+    template.verify["command"] = [
+        _PY,
+        "-c",
+        "open({!r}, 'w').close()".format(str(marker)),
+    ]
+    _set_cmd(cron, "v", "a", _exit(99))
+    body = await _drive(cron, "v", (await cron._dag.trigger("v"))["runKey"])
+    assert _states(body) == {"a": dag.SKIPPED}
+    assert not marker.exists()
+    assert body["tasks"]["a"]["verification"] == {
+        "outcome": "skipped",
+        "fail_reason": "command skipped the task",
+    }
+    # the same task without the skip does run its check
+    _set_cmd(cron, "v", "a", _OK)
+    body = await _drive(cron, "v", (await cron._dag.trigger("v"))["runKey"])
+    assert _states(body) == {"a": dag.SUCCESS}
+    assert marker.exists()
+
+
+async def test_a_skip_after_a_failed_attempt_uses_no_further_attempt(
+    tmp_path, dag_cron
+):
+    marker = tmp_path / "second-attempt"
+    yaml = (
+        "dags:\n  - name: r\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n        retries: 2\n"
+        "        skipExitCodes:\n          - 99\n"
+    )
+    cron = await dag_cron(yaml)
+    # attempt 0 fails; attempt 1 exits with the skip code
+    script = (
+        "import sys; from pathlib import Path; p = Path({!r}); "
+        "code = 99 if p.exists() else 1; p.touch(); sys.exit(code)"
+    ).format(str(marker))
+    _set_cmd(cron, "r", "a", [_PY, "-c", script])
+    body = await _drive(cron, "r", (await cron._dag.trigger("r"))["runKey"])
+    entry = body["tasks"]["a"]
+    assert entry["state"] == dag.SKIPPED
+    assert entry["attempt"] == 1  # one failed attempt, and the skip used none
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_a_sensor_poke_that_exits_with_a_skip_code_skips_the_sensor(
+    tmp_path, dag_cron
+):
+    yaml = (
+        "dags:\n  - name: s\n    tasks:\n"
+        "      - id: wait\n        type: sensor\n        command: 'x'\n"
+        "        pokeIntervalSeconds: 0\n"
+        "        skipExitCodes:\n          - 99\n"
+        "      - id: after\n        command: 'x'\n"
+        "        dependsOn:\n          - wait\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "s", "wait", _exit(99))
+    _set_cmd(cron, "s", "after", _OK)
+    body = await _drive(cron, "s", (await cron._dag.trigger("s"))["runKey"])
+    assert _states(body) == {"wait": dag.SKIPPED, "after": dag.SKIPPED}
+    assert body["tasks"]["wait"]["pokeCount"] == 1
+    assert body["tasks"]["after"]["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: wait",
+    }
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_skip_codes_travel_with_the_launch_across_a_reload(
+    tmp_path, dag_cron
+):
+    # an exit code means what the command that produced it was configured
+    # to mean, so a reload changes the codes of instances launched after it
+    cron = await _branch_cron(dag_cron, full=_exit(99), incremental=_exit(99))
+    dagcfg = cron.cron_dags["load"]
+    run_key = (await cron._dag.trigger("load"))["runKey"]
+    # `extract` is running; finish it so both guards launch
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    running = {
+        rj.dag_ref.task_id: rj
+        for jobs in cron.running_jobs.values()
+        for rj in jobs
+    }
+    assert set(running) == {"full", "incremental"}
+    assert running["full"].skip_exit_codes == (99,)
+    # the reload: `full` no longer lists any skip code
+    tasks = [
+        dataclasses.replace(t, skip_exit_codes=()) if t.id == "full" else t
+        for t in dagcfg.spec.tasks
+    ]
+    dagcfg.spec = dag.DagSpec.build("load", tasks)
+    body = await _drive(cron, "load", run_key)
+    # the in-flight instance keeps the codes it launched with
+    assert _states(body)["full"] == dag.SKIPPED
+    # an instance launched after the reload fails on the same exit
+    run_key = (await cron._dag.trigger("load"))["runKey"]
+    body = await _drive(cron, "load", run_key)
+    assert _states(body)["full"] == dag.FAILED
+    assert _states(body)["incremental"] == dag.SKIPPED
+
+
+async def test_a_queued_skip_completion_is_retried_as_a_skip(
+    tmp_path, dag_cron
+):
+    # the retry queue carries the skip: a completion RMW that failed must
+    # not come back as the failure its exit code would otherwise be
+    yaml = (
+        "dags:\n  - name: q\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "        skipExitCodes:\n          - 99\n"
+    )
+    cron = await dag_cron(yaml)
+    _set_cmd(cron, "q", "a", _exit(99))
+    run_key = (await cron._dag.trigger("q"))["runKey"]
+    ref = ("q", run_key)
+
+    async def _stalled(dag_name, key, transform):
+        raise asyncio.TimeoutError()
+
+    orig = cron._dag._mutate
+    cron._dag._mutate = _stalled
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    cron._dag._mutate = orig
+    queued = cron._dag._pending_completions[(ref, "a")]
+    assert queued["skipped"] is True and queued["exitCode"] == 99
+    queued["nextTryAt"] = 0.0
+    await cron._dag._retry_completions(dagrun._now())
+    await _drain_pending(cron)
+    assert not cron._dag._pending_completions
+    body = await _drive(cron, "q", run_key)
+    assert _states(body) == {"a": dag.SKIPPED}
+    assert body["state"] == dag.SUCCESS
+
+
+# ===========================================================================
+# when: conditions over parameters and XCom, with real task processes
+# ===========================================================================
+
+_WHEN = """
+dags:
+  - name: cond
+    params:
+      - name: mode
+        default: incremental
+        allowed:
+          - incremental
+          - full
+    tasks:
+      - id: extract
+        command: 'x'
+      - id: full
+        command: 'x'
+        dependsOn:
+          - extract
+        when:
+          - param: mode
+            equals: full
+      - id: incremental
+        command: 'x'
+        dependsOn:
+          - extract
+        when:
+          - param: mode
+            notEquals: full
+          - xcom:
+              task: extract
+              key: row_count
+            notIn:
+              - '0'
+      - id: publish
+        command: 'x'
+        dependsOn:
+          - full
+          - incremental
+        triggerRule: none_failed_min_one_success
+"""
+
+
+def _push(key, path):
+    return [_PY, "-m", "cronstable", "xcom", "push", "--key", key, str(path)]
+
+
+async def _when_cron(dag_cron, tmp_path, published):
+    """The `cond` workflow with `extract` publishing ``published`` (bytes)
+    as ``row_count``, or nothing when it is ``None``."""
+    cron = await dag_cron(_WHEN)
+    for task_id in ("full", "incremental", "publish"):
+        _set_cmd(cron, "cond", task_id, _OK)
+    if published is None:
+        _set_cmd(cron, "cond", "extract", _OK)
+    else:
+        value = tmp_path / "row_count"
+        value.write_bytes(published)
+        _set_cmd(cron, "cond", "extract", _push("row_count", value))
+    return cron
+
+
+async def _trigger_when(cron, mode):
+    started = await cron._dag.trigger("cond", params={"mode": mode})
+    return await _drive(cron, "cond", started["runKey"])
+
+
+async def test_when_on_a_parameter_picks_the_branch(tmp_path, dag_cron):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    body = await _trigger_when(cron, "full")
+    assert body["state"] == dag.SUCCESS
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SUCCESS,
+        "incremental": dag.SKIPPED,
+        "publish": dag.SUCCESS,
+    }
+    assert body["engine"] == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert body["tasks"]["full"]["whenMet"] is True
+    skipped = body["tasks"]["incremental"]
+    assert skipped["skipReason"] == {
+        "kind": "condition",
+        "detail": "param mode notEquals full: the value is full",
+    }
+    # no process started for it: no attempt, no pid, no exit code
+    assert skipped["attempt"] == 0 and skipped["startedAt"] is None
+    assert skipped["exitCode"] is None and "whenMet" not in skipped
+
+
+async def test_a_trigger_settles_a_workflow_listed_last_task_first(
+    tmp_path, dag_cron
+):
+    yaml = (
+        "dags:\n  - name: lf\n    params:\n"
+        "      - name: mode\n        default: incremental\n"
+        "    tasks:\n"
+        "      - id: last\n        command: 'x'\n"
+        "        dependsOn:\n          - mid\n"
+        "      - id: report\n        command: 'x'\n"
+        "        dependsOn:\n          - gate\n"
+        "        triggerRule: all_done\n"
+        "      - id: mid\n        command: 'x'\n"
+        "        dependsOn:\n          - gate\n"
+        "      - id: gate\n        command: 'x'\n"
+        "        when:\n          - param: mode\n            equals: full\n"
+    )
+    cron = await dag_cron(yaml)
+    for task_id in ("last", "report", "mid", "gate"):
+        _set_cmd(cron, "lf", task_id, _OK)
+    started = await cron._dag.trigger("lf")
+    ref = ("lf", started["runKey"])
+    # read before anything forces another advance: the trigger's own pass
+    # skips `gate` and everything below it and starts `report`, so nothing
+    # waits for the run's idle floor
+    body = await cron._dag.get_run(*ref)
+    assert _states(body) == {
+        "last": dag.SKIPPED,
+        "report": dag.RUNNING,
+        "mid": dag.SKIPPED,
+        "gate": dag.SKIPPED,
+    }
+    body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS
+    # the listing keeps the order the configuration gives
+    listed = (await cron._dag.list_dags())[0]["tasks"]
+    assert [t["id"] for t in listed] == ["last", "report", "mid", "gate"]
+
+
+async def test_when_on_an_xcom_value_runs_the_task(tmp_path, dag_cron):
+    # the published bytes end in one newline, which the comparison drops
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    body = await _trigger_when(cron, "incremental")
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SKIPPED,
+        "incremental": dag.SUCCESS,
+        "publish": dag.SUCCESS,
+    }
+    assert body["tasks"]["incremental"]["whenMet"] is True
+    assert body["tasks"]["full"]["skipReason"]["detail"] == (
+        "param mode equals full: the value is incremental"
+    )
+
+
+@pytest.mark.parametrize(
+    "published, incremental, detail",
+    [
+        pytest.param(b"0\n", dag.SKIPPED, "the value is 0", id="a-value-listed"),
+        pytest.param(b"0\r\n", dag.SKIPPED, "the value is 0", id="crlf"),
+        # only one trailing newline is dropped
+        pytest.param(b"0\n\n", dag.SUCCESS, None, id="two-newlines"),
+        # no usable value passes notIn
+        pytest.param(None, dag.SUCCESS, None, id="unpublished"),
+        pytest.param(b"0" * 4097, dag.SUCCESS, None, id="oversized"),
+        pytest.param(b"\xff\xfe0", dag.SUCCESS, None, id="not-utf-8"),
+    ],
+)
+async def test_when_xcom_values_the_comparison_reads(
+    tmp_path, dag_cron, published, incremental, detail
+):
+    cron = await _when_cron(dag_cron, tmp_path, published)
+    body = await _trigger_when(cron, "incremental")
+    assert _states(body)["incremental"] == incremental
+    if detail is None:
+        assert _states(body)["publish"] == dag.SUCCESS
+    else:
+        assert body["tasks"]["incremental"]["skipReason"] == {
+            "kind": "condition",
+            "detail": "xcom extract/row_count notIn 0: " + detail,
+        }
+        # both branches skipped, so the join has nothing to publish
+        assert _states(body)["publish"] == dag.SKIPPED
+    assert body["state"] == dag.SUCCESS
+
+
+# The same branch on a count: the load runs when `extract` published more
+# rows than the run's `floor` parameter, and at least one row.
+_COUNTED = """
+dags:
+  - name: counted
+    params:
+      - name: floor
+        type: integer
+        default: 0
+    tasks:
+      - id: extract
+        command: 'x'
+      - id: load
+        command: 'x'
+        dependsOn:
+          - extract
+        when:
+          - xcom:
+              task: extract
+              key: rows
+            greaterThan: '0'
+          - param: floor
+            lessThan: '10'
+"""
+
+
+@pytest.mark.parametrize(
+    "published, floor, detail",
+    [
+        pytest.param(b"12\n", 0, None, id="rows-above-zero"),
+        pytest.param(
+            b"0\n",
+            0,
+            "xcom extract/rows greaterThan 0: the value is 0",
+            id="no-rows",
+        ),
+        pytest.param(
+            b"none\n",
+            0,
+            "xcom extract/rows greaterThan 0: the value is none, which is "
+            "not a number",
+            id="not-a-number",
+        ),
+        pytest.param(
+            None,
+            0,
+            "xcom extract/rows greaterThan 0: the key is not published",
+            id="unpublished",
+        ),
+        pytest.param(
+            b"12\n",
+            10,
+            "param floor lessThan 10: the value is 10",
+            id="parameter-at-the-bound",
+        ),
+    ],
+)
+async def test_when_compares_numbers(
+    tmp_path, dag_cron, published, floor, detail
+):
+    cron = await dag_cron(_COUNTED)
+    _set_cmd(cron, "counted", "load", _OK)
+    if published is None:
+        _set_cmd(cron, "counted", "extract", _OK)
+    else:
+        value = tmp_path / "rows"
+        value.write_bytes(published)
+        _set_cmd(cron, "counted", "extract", _push("rows", value))
+    started = await cron._dag.trigger("counted", params={"floor": floor})
+    body = await _drive(cron, "counted", started["runKey"])
+    assert body["state"] == dag.SUCCESS
+    load = body["tasks"]["load"]
+    if detail is None:
+        assert load["state"] == dag.SUCCESS and load["whenMet"] is True
+    else:
+        assert load["state"] == dag.SKIPPED
+        assert load["skipReason"] == {"kind": "condition", "detail": detail}
+    # GET /dags serves each comparison with its number
+    (listed,) = await cron._dag.list_dags()
+    assert listed["tasks"][1]["when"] == [
+        {"xcom": {"task": "extract", "key": "rows"}, "greaterThan": 0},
+        {"param": "floor", "lessThan": 10},
+    ]
+
+
+async def test_read_xcom_text_outcomes(tmp_path, dag_cron, monkeypatch):
+    cron = await dag_cron(_WHEN)
+    backend = cron.state_backend
+    scope = dag.xcom_scope("cond", "run-1")
+
+    async def put(key, data):
+        await jobstate.artifact_put(
+            backend, scope, dag.xcom_name("extract", key), data
+        )
+
+    read = cron._dag._read_xcom_text
+    await put("plain", b"full")
+    await put("line", b"full\n")
+    await put("crlf", b"full\r\n")
+    await put("lines", b"a\nb\n")
+    await put("empty", b"")
+    await put("edge", b"x" * dag.MAX_CONDITION_XCOM_BYTES)
+    await put("big", b"x" * (dag.MAX_CONDITION_XCOM_BYTES + 1))
+    await put("binary", b"\xff\xfe")
+    await put("accent", "café\n".encode())
+    assert await read("run-1", "cond", "extract", "plain") == "full"
+    assert await read("run-1", "cond", "extract", "line") == "full"
+    assert await read("run-1", "cond", "extract", "crlf") == "full"
+    assert await read("run-1", "cond", "extract", "lines") == "a\nb"
+    assert await read("run-1", "cond", "extract", "empty") == ""
+    assert await read("run-1", "cond", "extract", "edge") == "x" * 4096
+    assert await read("run-1", "cond", "extract", "accent") == "café"
+    assert await read("run-1", "cond", "extract", "big") is dag.XCOM_TOO_LARGE
+    assert (
+        await read("run-1", "cond", "extract", "binary") is dag.XCOM_NOT_TEXT
+    )
+    assert (
+        await read("run-1", "cond", "extract", "never")
+        is dag.XCOM_UNPUBLISHED
+    )
+    # another run's value is not this run's
+    assert (
+        await read("run-2", "cond", "extract", "plain")
+        is dag.XCOM_UNPUBLISHED
+    )
+    # a store that cannot answer is unknown, never "not published"
+    _break_record_reads(
+        monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + scope
+    )
+    assert await read("run-1", "cond", "extract", "plain") is None
+    monkeypatch.undo()
+    assert await read("run-1", "cond", "extract", "plain") == "full"
+
+    async def _hang(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(jobstate, "artifact_get", _hang)
+    assert await read("run-1", "cond", "extract", "plain") is None
+
+
+async def test_a_condition_read_that_fails_is_retried_not_guessed(
+    tmp_path, dag_cron
+):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    started = await cron._dag.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+    real = cron._dag._read_xcom_text
+    calls = []
+
+    async def _unanswered(run_id, dag_name, taskkey, key):
+        calls.append((taskkey, key))
+        return None
+
+    cron._dag._read_xcom_text = _unanswered
+    # `extract` finishes; the advance that follows cannot read the value
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    body = await cron._dag.get_run(*ref)
+    assert calls and set(calls) == {("extract", "row_count")}
+    assert _states(body)["incremental"] == dag.PENDING
+    assert "whenMet" not in body["tasks"]["incremental"]
+    # the parameter comparison on the other branch needed no read
+    assert _states(body)["full"] == dag.SKIPPED
+    # the read is retried on the advance-failed backoff, not the idle floor
+    wake = cron._dag._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # the store answers on the next pass and the task runs
+    cron._dag._read_xcom_text = real
+    body = await _drive(cron, *ref)
+    assert _states(body) == {
+        "extract": dag.SUCCESS,
+        "full": dag.SKIPPED,
+        "incremental": dag.SUCCESS,
+        "publish": dag.SUCCESS,
+    }
+    assert body["state"] == dag.SUCCESS
+
+
+async def test_a_mapped_task_with_a_met_condition_expands_without_a_wait(
+    tmp_path, dag_cron
+):
+    yaml = (
+        "dags:\n  - name: mw\n    params:\n"
+        "      - name: go\n        type: boolean\n        default: true\n"
+        "    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n"
+        "        dependsOn:\n          - gen\n"
+        "        expand:\n          fromTask: gen\n          key: items\n"
+        "        when:\n          - param: go\n            equals: 'true'\n"
+    )
+    cron = await dag_cron(yaml)
+    items = tmp_path / "items.json"
+    items.write_text('["a", "b"]')
+    _set_cmd(cron, "mw", "gen", _push("items", items))
+    _set_cmd(cron, "mw", "work", _OK)
+    started = await cron._dag.trigger("mw")
+    ref = ("mw", started["runKey"])
+    await _reap_running(cron)
+    await _drain_pending(cron)
+    body = await cron._dag.get_run(*ref)
+    # the placeholder recorded its condition, and the run asked to be
+    # advanced again at once: the fan-out does not wait out the idle floor
+    assert body["tasks"]["work"]["whenMet"] is True
+    assert cron._dag._wake[ref] <= dagrun._now()
+    body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS
+    assert _states(body) == {
+        "gen": dag.SUCCESS,
+        "work": dag.EXPANDED,
+        "work#0": dag.SUCCESS,
+        "work#1": dag.SUCCESS,
+    }
+    # with the condition unmet, no instance is ever created
+    started = await cron._dag.trigger("mw", params={"go": False})
+    body = await _drive(cron, "mw", started["runKey"])
+    assert _states(body) == {"gen": dag.SUCCESS, "work": dag.SKIPPED}
+    assert body["mapped"] == {}
+    assert body["tasks"]["work"]["skipReason"] == {
+        "kind": "condition",
+        "detail": "param go equals true: the value is false",
+    }
+
+
+@pytest.mark.parametrize("items", [[], [1]], ids=["empty", "one-item"])
+async def test_a_fan_out_below_a_skipped_branch_skips_the_task_after_it(
+    tmp_path, dag_cron, items
+):
+    # its condition skips `check`, and the skip cascades to `work` and
+    # `after` whether `gen` publishes items or an empty list
+    yaml = (
+        "dags:\n  - name: sk\n    params:\n"
+        "      - name: mode\n        default: incremental\n"
+        "    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: check\n        command: 'x'\n"
+        "        when:\n          - param: mode\n            equals: full\n"
+        "      - id: work\n        command: 'x'\n"
+        "        dependsOn:\n          - gen\n          - check\n"
+        "        expand:\n          fromTask: gen\n          key: items\n"
+        "      - id: after\n        command: 'x'\n"
+        "        dependsOn:\n          - work\n"
+    )
+    cron = await dag_cron(yaml)
+    published = tmp_path / "items.json"
+    published.write_text(json.dumps(items))
+    marker = tmp_path / "after-ran"
+    _set_cmd(cron, "sk", "gen", _push("items", published))
+    for task_id in ("check", "work"):
+        _set_cmd(cron, "sk", task_id, _OK)
+    _set_cmd(
+        cron,
+        "sk",
+        "after",
+        [_PY, "-c", "open(r'{}', 'w').close()".format(marker)],
+    )
+    started = await cron._dag.trigger("sk")
+    body = await _drive(cron, "sk", started["runKey"])
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert not marker.exists()  # the command of `after` never ran
+    assert body["tasks"]["after"]["state"] == dag.SKIPPED
+    assert body["tasks"]["after"]["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: work",
+    }
+    below_check = {"kind": "upstream", "detail": "upstream skipped: check"}
+    if items:
+        assert _states(body)["work"] == dag.EXPANDED
+        assert body["tasks"]["work#0"]["state"] == dag.SKIPPED
+        assert body["tasks"]["work#0"]["skipReason"] == below_check
+    else:
+        # no instance exists to take the verdict, so the placeholder does
+        assert body["tasks"]["work"]["state"] == dag.SKIPPED
+        assert body["tasks"]["work"]["skipReason"] == below_check
+        assert body["mapped"] == {}
+
+
+async def test_an_empty_fan_out_behind_a_parked_gate_reads_its_list_once(
+    tmp_path, monkeypatch, caplog, dag_cron
+):
+    # `gen` publishes an object, which maps to an empty fan-out with a
+    # warning. The empty list waits for the gate, and the owner advances a
+    # run with a parked gate every few seconds: one read and one warning
+    # cover the whole wait
+    yaml = (
+        "dags:\n  - name: gt\n    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: ok\n        type: approval\n"
+        "      - id: work\n        command: 'x'\n"
+        "        dependsOn:\n          - gen\n          - ok\n"
+        "        expand:\n          fromTask: gen\n          key: items\n"
+        "      - id: after\n        command: 'x'\n"
+        "        dependsOn:\n          - work\n"
+    )
+    cron = await dag_cron(yaml)
+    published = tmp_path / "items.json"
+    published.write_text('{"not": "a list"}')
+    _set_cmd(cron, "gt", "gen", _push("items", published))
+    for task_id in ("work", "after"):
+        _set_cmd(cron, "gt", task_id, _OK)
+    reads = []
+    read_list = cron._dag._read_xcom_list
+
+    async def counting(*args):
+        reads.append(args)
+        return await read_list(*args)
+
+    monkeypatch.setattr(cron._dag, "_read_xcom_list", counting)
+    with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+        started = await cron._dag.trigger("gt")
+        ref = ("gt", started["runKey"])
+        await _drive(cron, *ref)  # `gen` succeeds and the gate parks
+        for _ in range(5):
+            await cron._dag.advance_one(ref)
+        body = await cron._dag.get_run(*ref)
+        assert _states(body) == {
+            "gen": dag.SUCCESS,
+            "ok": dag.RUNNING,
+            "work": dag.PENDING,
+            "after": dag.PENDING,
+        }
+        await cron._dag.approve("gt", ref[1], "ok", approved=True, by="op")
+        body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert body["mapped"]["work"]["items"] == []
+    assert len(reads) == 1
+    warned = [r for r in caplog.records if "empty fan-out" in r.getMessage()]
+    assert len(warned) == 1
+    # the run is finished, so the driver holds no remembered read for it
+    assert not cron._dag._empty_expansions
+
+
+async def test_list_dags_exports_when(tmp_path, dag_cron):
+    cron = await dag_cron(_WHEN + _LINEAR.replace("dags:\n", ""))
+    by_name = {d["name"]: d for d in await cron._dag.list_dags()}
+    tasks = {t["id"]: t for t in by_name["cond"]["tasks"]}
+    assert tasks["full"]["when"] == [{"param": "mode", "equals": "full"}]
+    assert tasks["incremental"]["when"] == [
+        {"param": "mode", "notEquals": "full"},
+        {"xcom": {"task": "extract", "key": "row_count"}, "notIn": ["0"]},
+    ]
+    # the key appears only on a task that sets it
+    assert "when" not in tasks["extract"] and "when" not in tasks["publish"]
+    for task in by_name["lin"]["tasks"]:
+        assert "when" not in task
+
+
+# ===========================================================================
+# The advance lease between a pass's store reads and its claim
+# ===========================================================================
+
+
+def _during_first_read(cron, reader, action):
+    """Await ``action`` while the first call of the scheduler's ``reader``
+    is pending. Returns the list that records every call."""
+    real = getattr(cron._dag, reader)
+    calls = []
+
+    async def read(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            await action()
+        return await real(*args)
+
+    setattr(cron._dag, reader, read)
+    return calls
+
+
+async def _finish_extract(cron):
+    """`extract` finishes, and the advance that follows reads its value."""
+    await _reap_running(cron)
+    await _drain_pending(cron)
+
+
+async def test_a_lease_that_lapses_during_a_condition_read_starts_no_task(
+    tmp_path, dag_cron
+):
+    # node A's renewals go unanswered while it reads the value that
+    # `incremental` compares, so its lease runs out, and node B on another
+    # host adopts the run
+    marker = tmp_path / "incremental-ran"
+    ran = [_PY, "-c", "open(r'{}', 'a').write('x')".format(marker)]
+    a = await _when_cron(dag_cron, tmp_path, b"12\n")
+    b = await _when_cron(dag_cron, tmp_path, b"12\n")
+    b._state_host = "other-host"
+    for cron in (a, b):
+        _set_cmd(cron, "cond", "incremental", ran)
+    started = await a._dag.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+
+    async def lapse():
+        a._dag._renewers[ref].cancel()
+        a._dag._owned[ref].expires_at = dagrun._now() - 5.0
+
+    reads = _during_first_read(a, "_read_xcom_text", lapse)
+    await _finish_extract(a)
+    assert len(reads) == 1
+    # A claimed nothing on the lapsed lease, so the task has no verdict
+    # and no process
+    body = await a._dag.get_run(*ref)
+    assert _states(body)["incremental"] == dag.PENDING
+    assert "whenMet" not in body["tasks"]["incremental"]
+    assert not any(a.running_jobs.values())
+    # no node took the lease over, so A keeps the run and checks again soon
+    assert ref in a._dag._owned
+    wake = a._dag._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # B adopts and starts the task, and A's next advance finds B's lease
+    await a.state_backend.release_lease(a._dag._owned[ref])
+    assert await b._dag._try_own(b.cron_dags["cond"], ref)
+    await a._dag.advance_one(ref)
+    assert ref not in a._dag._owned
+    assert not any(a.running_jobs.values())
+    body = await _drive(b, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert _states(body)["incremental"] == dag.SUCCESS
+    assert marker.read_text() == "x"  # one process ran the task
+
+
+@pytest.mark.parametrize("learned", ["from-the-store", "from-a-renewal"])
+async def test_a_lease_taken_over_during_an_expansion_read_expands_nothing(
+    tmp_path, dag_cron, learned
+):
+    cron = await dag_cron(_EXPAND)
+    run_key = await _advance_expand_setup(cron, tmp_path)
+    ref = ("xd", run_key)
+    d = cron._dag
+
+    async def take_over():
+        lease = d._owned[ref]
+        d._renewers[ref].cancel()
+        lease.expires_at = dagrun._now() - 5.0
+        await cron.state_backend.release_lease(lease)
+        peer = await cron.state_backend.acquire_lease(
+            lease.name, "peer-node", dagrun.DAG_LEASE_TTL
+        )
+        assert peer is not None and peer.fence == lease.fence + 1
+        if learned == "from-a-renewal":
+            # the store refuses the renewal, and the renew loop ends
+            # ownership
+            d._drop_owned(ref)
+
+    reads = _during_first_read(cron, "_read_xcom_list", take_over)
+    await d.advance_one(ref)
+    assert len(reads) == 1
+    assert ref not in d._owned and ref not in d._wake
+    # the pass read the list and recorded none of it
+    body = await d.get_run(*ref)
+    assert _states(body) == {"gen": dag.SUCCESS, "work": dag.PENDING}
+    assert "work" not in body.get("mapped", {})
+    assert not any(cron.running_jobs.values())
+
+
+async def test_a_lapsed_lease_the_store_cannot_confirm_starts_no_task(
+    tmp_path, monkeypatch, dag_cron
+):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    d = cron._dag
+    started = await d.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+    asked = []
+
+    async def _unreachable(name):
+        asked.append(name)
+        raise RuntimeError("store unreachable")
+
+    async def lapse():
+        d._renewers[ref].cancel()
+        d._owned[ref].expires_at = dagrun._now() - 5.0
+        monkeypatch.setattr(cron.state_backend, "read_lease", _unreachable)
+
+    reads = _during_first_read(cron, "_read_xcom_text", lapse)
+    await _finish_extract(cron)
+    assert len(reads) == 1 and asked == [d._lease_name(ref)]
+    body = await d.get_run(*ref)
+    assert _states(body)["incremental"] == dag.PENDING
+    assert not any(cron.running_jobs.values())
+    # the run stays with this node, which checks again soon
+    assert ref in d._owned
+    wake = d._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # the store answers a renewal, and the next pass starts the task
+    monkeypatch.undo()
+    d._owned[ref] = await cron.state_backend.renew_lease(
+        d._owned[ref], dagrun.DAG_LEASE_TTL
+    )
+    body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert _states(body)["incremental"] == dag.SUCCESS
+
+
+@pytest.mark.parametrize("renewed", [False, True], ids=["held", "renewed"])
+async def test_a_condition_read_under_a_live_lease_starts_the_task(
+    tmp_path, monkeypatch, dag_cron, renewed
+):
+    cron = await _when_cron(dag_cron, tmp_path, b"12\n")
+    d = cron._dag
+    backend = cron.state_backend
+    lease_reads = []
+    read_lease = backend.read_lease
+
+    async def counting(name):
+        lease_reads.append(name)
+        return await read_lease(name)
+
+    monkeypatch.setattr(backend, "read_lease", counting)
+    started = await d.trigger("cond", params={"mode": "incremental"})
+    ref = ("cond", started["runKey"])
+
+    async def renew():
+        if renewed:
+            # the renew loop stores a new lease, and the one the pass
+            # started under runs out
+            held = d._owned[ref]
+            d._owned[ref] = await backend.renew_lease(
+                held, dagrun.DAG_LEASE_TTL
+            )
+            held.expires_at = dagrun._now() - 5.0
+
+    reads = _during_first_read(cron, "_read_xcom_text", renew)
+    await _finish_extract(cron)
+    assert len(reads) == 1
+    # the pass that read the value recorded the verdict and started the task
+    body = await d.get_run(*ref)
+    assert body["tasks"]["incremental"]["whenMet"] is True
+    assert _states(body)["incremental"] == dag.RUNNING
+    assert sum(map(len, cron.running_jobs.values())) == 1
+    body = await _drive(cron, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    # no pass read the lease back from the store
+    assert lease_reads == []
+
+
+async def test_a_lease_that_lapses_during_recovery_preparation_starts_no_task(
+    tmp_path, dag_cron
+):
+    # node A's lease runs out while it prepares a recovery run, and node B
+    # on another host adopts the run
+    fixed = tmp_path / "b-fixed"
+    marker = tmp_path / "b-ran"
+    # `b` fails until `fixed` exists, then records that it ran
+    ran = [
+        _PY,
+        "-c",
+        "open(r'{}').close(); open(r'{}', 'a').write('x')".format(
+            fixed, marker
+        ),
+    ]
+    a = await dag_cron(_LINEAR)
+    b = await dag_cron(_LINEAR)
+    b._state_host = "other-host"
+    for cron in (a, b):
+        _set_cmd(cron, "lin", "a", _OK)
+        _set_cmd(cron, "lin", "b", ran)
+    source = (await a._dag.trigger("lin"))["runKey"]
+    body = await _drive(a, "lin", source)
+    assert body["state"] == dag.FAILED, _states(body)
+    fixed.touch()
+    token = (await a._dag.recover("lin", source))["planToken"]
+    ref = ("lin", "recovery-" + token)
+
+    async def lapse():
+        a._dag._renewers[ref].cancel()
+        a._dag._owned[ref].expires_at = dagrun._now() - 5.0
+
+    reads = _during_first_read(a, "_prepare_recovery", lapse)
+    # accepting the preview owns the recovery run and advances it once
+    accepted = await a._dag.recover("lin", source, plan_token=token)
+    await _drain_pending(a)
+    assert accepted["runKey"] == ref[1] and reads == [(ref,)]
+    # A prepared the run and claimed nothing on the lapsed lease
+    body = await a._dag.get_run(*ref)
+    assert body["recovery"]["status"] == "ready"
+    assert _states(body) == {"a": dag.SUCCESS, "b": dag.PENDING}
+    assert not any(a.running_jobs.values())
+    # no node took the lease over, so A keeps the run and checks again soon
+    assert ref in a._dag._owned
+    wake = a._dag._wake[ref] - dagrun._now()
+    assert 0 < wake <= dagrun.ADVANCE_RETRY_DELAY
+    # B adopts and starts the task, and A's next advance finds B's lease
+    await a.state_backend.release_lease(a._dag._owned[ref])
+    assert await b._dag._try_own(b.cron_dags["lin"], ref)
+    await a._dag.advance_one(ref)
+    assert ref not in a._dag._owned
+    assert not any(a.running_jobs.values())
+    body = await _drive(b, *ref)
+    assert body["state"] == dag.SUCCESS, _states(body)
+    assert marker.read_text() == "x"  # one process ran the task

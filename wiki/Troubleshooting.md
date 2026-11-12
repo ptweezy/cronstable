@@ -717,6 +717,317 @@ the preceding 2-node case, which is rejected).
 node, or grow by one to tolerate an extra failure. See
 [sizing the cluster](Clustering-and-Leader-Election#sizing-the-cluster).
 
+## Workflows
+
+### A workflow run stays `running` and a node logs "leaving the run for an upgraded node"
+
+**Symptom.** A run stays `running` with its tasks `pending`, and a node logs
+`dag run <dag>/<run>: needs run engine level <N> and this build supports level
+<M>; leaving the run for an upgraded node`. `GET /dags` can list
+`fleetWarnings` for the same workflow, and the web dashboard and the
+terminal dashboard show those lines on the workflow.
+
+**Cause.** The nodes on the shared store run different cronstable versions,
+and the run's workflow uses a feature that the logging node's build does not
+support. A node advances only runs at or below its own
+[run engine level](Orchestration-and-DAGs#run-engine-levels), so it leaves
+this run for a node that reaches the level.
+
+**Fix.** Upgrade cronstable on the node that logged the line and on each host
+that a `fleetWarnings` entry names. An upgraded node adopts the run on its
+next adoption scan, which runs every 30 seconds. To avoid the wait during a
+rollout, upgrade every node on the store before a configuration uses the
+newer feature.
+
+A host on a build at level 1 never logs that line. It refuses a
+configuration that uses a newer feature, logs `Error in configuration
+file(s)`, and keeps advancing runs with the version of the workflow that it
+loaded earlier. `fleetWarnings` names such a host for 12 hours after each
+task that it starts, so the list can be empty while the host is idle. Check
+the cronstable version on every node that shares the store.
+
+### After an older build is installed, a task ignores its `when:` condition or reads no parameter
+
+**Symptom.** A node runs an older cronstable build than the one that created
+a workflow run. A task of that run starts although its `when:` condition
+does not hold for the run, or its command reads an unset
+`CRONSTABLE_PARAM_*` variable. The run document records `"engine": 2`.
+
+**Cause.** A build at
+[run engine level](Orchestration-and-DAGs#run-engine-levels) 1 does not read
+the `engine` field. It adopts a run that records level 2 and advances it
+under the rules it knows, without conditions and without parameter
+variables, and it logs nothing about the level.
+
+**Fix.** Before you install an older build on any node of the store, remove
+the level 2 keys from the configuration on every node: a workflow's
+`params:`, `when:`, `skipExitCodes`, and the trigger rules other than
+`all_success` and `all_done`. Then wait until every run whose document
+records `engine: 2` has finished. `GET /dags/{name}/runs/{run_key}` shows
+the field.
+
+If an older build has already started tasks of such a run, install the newer
+build again on each node that runs the older one, with the configuration
+that holds the level 2 keys. The upgraded node decides each task that is
+still `pending` by its `when:` condition and sets the parameter variables
+for the tasks that it starts. A task that the older build ran keeps its
+result.
+
+### A join task is skipped when one branch skips
+
+**Symptom.** A task below two or more branches ends `skipped` although one
+branch ran, and its `skipReason` reads `upstream skipped: <task>`. At load the
+daemon logs `dag '<dag>': task '<task>' uses triggerRule all_success and joins
+upstreams that can end skipped`.
+
+**Cause.** The task's `triggerRule` is `all_success`, the default. Under that
+rule a skipped upstream cascades `skipped` to the task, so a join below
+alternative branches is skipped when one branch skips itself, even though the
+other branch ran. The daemon logs the line for a task with two or more
+upstreams that can end `skipped`. It logs nothing when it detects that those
+upstreams only ever skip together, as two tasks below one gate do.
+
+**Fix.** If the upstreams are alternative branches, set
+`triggerRule: none_failed_min_one_success` on the join. It then runs after
+the branch that ran and is skipped only when every branch skipped. Use
+`none_failed` to run the join in that case too. Both rules need
+[run engine level 2](Orchestration-and-DAGs#run-engine-levels). On a store
+that several nodes share, upgrade every node before the configuration uses
+either rule. If the task needs every upstream, as a deploy below two approval
+gates does, keep `all_success`. The skip is then intended, and you can ignore
+the line. See
+[conditional branching](Orchestration-and-DAGs#conditional-branching).
+
+### A task fails with an exit code that was meant to skip it
+
+**Symptom.** A task ends `failed` with `command exited with code 99`, and the
+command exits `99` to say that it has nothing to do.
+
+**Cause.** No exit code skips a task by default. A task ends `skipped` only
+when its command exits with a code listed in the task's own `skipExitCodes`.
+A `defaults:` block cannot set the key, because it is a graph field. A run
+stopped by `executionTimeout` or a cancel also never skips.
+
+**Fix.** List the code on the task:
+
+```yaml
+        skipExitCodes:
+          - 99
+```
+
+### A task ends `skipped` although its command is broken
+
+**Symptom.** A task ends `skipped` with `skipReason` `exit code 127`, `126`,
+`1`, or `2`, and its command never did its work. At load the daemon logs
+`dag '<dag>': task '<task>': skipExitCodes holds <codes>`.
+
+**Cause.** The task lists a code that a failure also returns. A shell or a
+failing program exits with `1` or `2` for an ordinary error, with `126` for
+a file that it cannot run, and with `127` for a command that it cannot find.
+
+**Fix.** Have the command exit with a code that only its own skip decision
+returns, such as `99`, and list that code in `skipExitCodes`.
+
+### A backfill, catch-up, or recovery run takes the branch of the wrong day
+
+**Symptom.** A task that branches on the date, for example with
+`date +%u`, takes one branch in the scheduled run and another in a run that
+a backfill, a catch-up, or a recovery created for the same date.
+
+**Cause.** The command reads the clock, and those runs start after the date
+they stand for.
+
+**Fix.** Read the run's logical date from `CRONSTABLE_DAG_LOGICAL_DATE`, an
+ISO 8601 instant in UTC:
+
+```yaml
+        command: |
+          day=$(date -u -d "${CRONSTABLE_DAG_LOGICAL_DATE:-now}" +%u)
+          [ "$day" = 7 ] || exit 99
+          ./load.sh --full
+```
+
+The variable is the empty string for a manual run that names no
+`logicalDate`. See
+[conditional branching](Orchestration-and-DAGs#conditional-branching).
+
+### A backfill of a long range creates 100 runs
+
+**Symptom.** `POST /dags/{name}/backfill` answers `created` and `existing`
+that add up to 100, and the later dates of the range have no run.
+
+**Cause.** One backfill request covers at most 100 scheduled dates, earliest
+first. The response says so with `"truncated": true`.
+
+**Fix.** Send the request again with `from` set to the response's `nextFrom`
+and the same `to`, until `truncated` is `false`. The web dashboard's
+backfill form and the terminal dashboard's backfill row fill in `nextFrom`
+for you.
+
+### A task is skipped and its reason starts with `param` or `xcom`
+
+**Symptom.** A task ends `skipped` without starting. Its `skipReason` has the
+kind `condition` and a detail such as
+`param mode equals full: the value is incremental`.
+
+**Cause.** The task has a [`when:` condition](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values), and the comparison that
+the detail names did not hold for this run. The text after the colon is what
+the comparison read. When the two values look equal, as in
+`xcom extract/mode equals full: the value is full`, the published value can
+end in a space, which the detail does not show. A numeric comparison such as
+`greaterThan` adds `which is not a number` when the source holds text that
+it cannot read as a number.
+
+**Fix.** Start a run whose parameters meet the condition, for example with
+`{"params": {"mode": "full"}}` in the trigger body. A scheduled run stores
+each parameter's default, so a branch that has to run on schedule needs a
+condition that the defaults meet. If a task below the skipped one was skipped
+as well, set `triggerRule: none_failed_min_one_success` on the join.
+
+Under `cmd.exe`, `echo full | cronstable xcom push --key mode` publishes
+`full` followed by a space. Write the pipe with no space before it, as in
+`echo full| cronstable xcom push --key mode`, or publish from PowerShell,
+which adds no space.
+
+### A condition on an XCom value reads "the key is not published"
+
+**Symptom.** A task ends `skipped`, and its `skipReason` detail reads
+`xcom extract/row_count equals full: the key is not published`. In the
+reverse case, a task with `notEquals` or `notIn` runs although the upstream
+task published nothing.
+
+**Cause.** The comparison found no value to read. The upstream task did not
+publish the key in this run, or it published under another key name. A
+published value larger than 4096 bytes and one that is not UTF-8 text also
+count as no value, and the detail says which. A source with no value fails
+`equals` and `in`, and passes `notEquals` and `notIn`.
+
+**Fix.** Publish the value in the upstream task before it exits, and use the
+same key in `xcom.key`:
+
+```bash
+echo "$rows" | cronstable xcom push --key row_count
+```
+
+Under `cmd.exe`, write the pipe with no space before it, because a space
+there becomes part of the published value (see
+[a skip reason that starts with `xcom`](#a-task-is-skipped-and-its-reason-starts-with-param-or-xcom)).
+
+To skip the task whenever the value is missing, compare with `in` and list
+the accepted values, because a missing value never passes `in`.
+
+### A start or a trigger answers `403` although the token has `control`
+
+**Symptom.** `POST /jobs/{name}/start`, `POST /dags/{name}/trigger`, or
+`POST /dags/{name}/backfill` answers `403` with `token '<label>' does not
+grant the 'params' permission required to supply run parameters`. The same
+token starts the run when the request has no `params`.
+
+**Cause.** Choosing
+[run parameter](Orchestration-and-DAGs#run-parameters) values needs the
+`params` scope in addition to `control`. A token with `control` alone starts
+runs with the declared defaults.
+
+**Fix.** Add `params` to the token's `scopes` in
+[`web.authTokens`](HTTP-API#scoped-tokens-webauthtokens), or send the request
+without `params` to use the defaults. The scalar `web.authToken` holds every
+scope.
+
+### A start or a trigger answers `400` with `paramErrors`
+
+**Symptom.** A job start, a trigger, or a backfill answers `400`, and the
+body lists a reason for each parameter under `paramErrors`, such as
+`must be an integer`, `is not a declared parameter`, or `is required`.
+
+**Cause.** cronstable checks the values against the job's or the workflow's
+`params:` declaration and coerces nothing. A job or a workflow that declares
+no parameters refuses every value. The string `"500"` is refused for an
+`integer`, a name the workflow does not declare is refused, and a `required`
+parameter has no default. A refused request creates no run.
+
+**Fix.** Send each value in its declared JSON type, and read the declaration
+from the workflow's entry in `GET /dags`. A workflow whose configuration
+sets a required parameter cannot be started without a value for it.
+
+### A start, a trigger, or a backfill answers `400` and the daemon logs `web: refused`
+
+**Symptom.** `POST /jobs/{name}/start`, `POST /dags/{name}/trigger`, or
+`POST /dags/{name}/backfill` answers `400`, and nothing starts. The `error`
+in the response is `unknown start field "by"; the body accepts params`,
+`request body is not valid JSON`, or `request body must be a JSON object`.
+The daemon logs `web: refused POST "<path>": <reason>` at `WARNING` from
+logger `cronstable`, where `<reason>` is the `error` text:
+
+```text
+web: refused POST "/jobs/report/start": unknown start field "by"; the body accepts params
+web: refused POST "/dags/etl/trigger": unknown trigger field "ref"; the body accepts params, logicalDate, requestId
+web: refused POST "/dags/etl/backfill": unknown backfill field "by", "dryRun"; the body accepts from, to, params
+web: refused POST "/jobs/report/start": request body is not valid JSON
+web: refused POST "/jobs/report/start": request body must be a JSON object
+```
+
+**Cause.** The three routes refuse a body that they cannot use in full, so a
+misspelled `params` never starts a run with the defaults. A webhook sender
+that posts its own payload, or a form-encoded body, gets this answer. The
+daemon checks the body before it looks up the name, so the answer is the
+same for a job or a workflow that is not configured. The line names up to
+five unknown fields and no value from the body.
+
+**Fix.** Send a body that the route accepts:
+
+| Route | Body |
+| --- | --- |
+| `POST /jobs/{name}/start` | No body, or a JSON object with no field other than `params` |
+| `POST /dags/{name}/trigger` | No body, or a JSON object with no field other than `params`, `logicalDate`, and `requestId` |
+| `POST /dags/{name}/backfill` | A JSON object with `from` and `to`, and optionally `params` |
+
+The other routes that read a JSON body log the two `request body` lines in
+the same form.
+
+### A command reads a parameter and gets an empty value
+
+**Symptom.** A job or a task command reads `CRONSTABLE_PARAM_<NAME>` and the
+variable is unset. At load the daemon logs `the command reads
+CRONSTABLE_PARAM_<NAME>, and the workflow declares no parameter of that
+name`, or the same line for a job.
+
+**Cause.** The name after `CRONSTABLE_PARAM_` matches no parameter in the
+`params:` declaration of the command's job or workflow. The variable name is
+the parameter name in upper case, so `batch_size` reads as
+`CRONSTABLE_PARAM_BATCH_SIZE`.
+
+**Fix.** Correct the name in the command, or declare the parameter.
+
+### A Windows job or task runs part of a parameter value as a command
+
+**Symptom.** A job or a workflow task on Windows reads
+`%CRONSTABLE_PARAM_TARGET%`, and a value that holds `&`, `|`, or `>` runs a
+second command or writes a file. Or the command reads
+`!CRONSTABLE_PARAM_TARGET!` and receives that literal text. At load the
+daemon can log `cmd.exe replaces %CRONSTABLE_PARAM_TARGET% with the value
+before it parses the command, and param 'target' takes any string`.
+
+**Cause.** `cmd.exe` reads the text of an expanded `%VAR%` as command text,
+so those characters in a value act as command syntax. Double quotes around
+the reference do not protect against a value that holds a double quote.
+`cmd.exe` starts with delayed expansion off, so it does not expand `!VAR!`
+in a `command`.
+
+**Fix.** Read the variable from PowerShell, with `shell: powershell` and
+`$env:CRONSTABLE_PARAM_TARGET`, or from a script file that turns delayed
+expansion on:
+
+```bat
+@echo off
+setlocal EnableDelayedExpansion
+echo deploy !CRONSTABLE_PARAM_TARGET!
+```
+
+Constrain the parameter with `allowed` or `pattern` in its declaration as
+well. For a value that is the empty string, `%CRONSTABLE_PARAM_TARGET%` in a
+`command` stays as that literal text, because `cmd.exe` treats an empty
+variable as undefined.
+
 ## Concurrency and termination
 
 ### Overlapping runs, skipped runs, or a job killed mid-run
@@ -909,7 +1220,7 @@ shows a red **memory cap** chip on the run, the terminal dashboard shows
 OOM kill takes every process in the run's cgroup (`memory.oom.group`), and,
 where swap accounting is on, swap does not stretch the cap. On Windows the
 daemon ends the run's Job Object. The run fails whatever `failsWhen` says,
-and a `verify` check is skipped. The cap counts what the kernel charges to
+a DAG task's `skipExitCodes` do not apply, and a `verify` check is skipped. The cap counts what the kernel charges to
 the run, which is cgroup memory on Linux and commit charge on Windows. The
 **Resources** chart plots sampled RSS, so a run can hit the cap while its
 chart reads lower. The run record's `limits.peak_memory_bytes` holds the

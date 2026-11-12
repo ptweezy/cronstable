@@ -65,7 +65,7 @@ The web page's shortcut table applies verbatim to both frontends. Press
 | `/` | Focus the filter |
 | `j` / `↓`, `k` / `↑` | Select the next / previous job |
 | `Enter` | Open the selected job |
-| `r` / `x` | Run / cancel the selected job |
+| `r` / `x` | Run / cancel the selected job. For a job that declares [run parameters](Commands-and-Environment#params), `r` opens a row in the job's drawer that takes `name=value` pairs, and an empty row runs the job with its defaults. When the daemon refuses the start, the row stays open and shows the daemon's reasons under it until you edit the text. |
 | `p` | Pause or resume the selected job |
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
@@ -138,7 +138,32 @@ The TUI includes:
   identity-colored prefixes.
 - The **workflow drawer**: runs, an ASCII task graph, per-task states and
   attempts, **approval gates** (`a` approve / `R` reject), XCom
-  (cross-communication) values, task logs, trigger and backfill.
+  (cross-communication) values, task logs, trigger and backfill. In the
+  graph, the first edge into a task names the task's `triggerRule` when it is
+  not `all_success`, and its
+  [`when:`](Orchestration-and-DAGs#conditions-on-parameters-and-xcom-values) comparisons. A task with a condition and no upstream gets a
+  line of its own for them. A skipped task's row says why it was skipped.
+  For a
+  workflow that declares
+  [run parameters](Orchestration-and-DAGs#run-parameters), `t` opens an
+  input row that takes `name=value` pairs and lists the declared names with
+  their defaults. `Enter` on an empty row runs the workflow with the
+  defaults, and a quoted value can hold spaces. The backfill row takes the
+  same pairs after the dates, and the **Tasks** tab shows the values the
+  selected run stores. When the daemon refuses a trigger or a backfill, the
+  row stays open with its text. The line under the row shows the daemon's
+  reasons, such as `batch_size must be at least 1; ticket is required`,
+  until you edit the text. Each trigger carries a `requestId` that the
+  dashboard keeps until the daemon answers, for up to 10 minutes after the
+  trigger was last sent. The same trigger sent again within that time
+  starts one run. One backfill covers at most 100 scheduled
+  dates. For a longer range, the row stays open on the rest of the range,
+  and `Enter` continues. While another live host on the shared store runs a
+  build below the
+  [run engine level](Orchestration-and-DAGs#run-engine-levels) that a
+  workflow needs, the drawer shows the workflow's `fleetWarnings` lines,
+  each of which names a host to upgrade. The workflow list shows the first
+  line and a count of the rest.
 - The **cluster panel**, **fleet matrix** (jobs × nodes, failing-only
   filter), **node resources**, **activity heatmap** punchcard, and
   **upcoming runs**.

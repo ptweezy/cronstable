@@ -10,6 +10,7 @@ from cronstable.redact import (
     LINE_SCAN_LIMIT,
     REDACTED,
     _starts_mid_pem,
+    is_secret_name,
     redact_lines,
     redact_secrets,
 )
@@ -441,6 +442,52 @@ def test_url_userinfo_pattern_is_linear_not_quadratic():
     assert "s3cret" not in out and "user:" + REDACTED + "@db" in out
     out = redact_secrets("x redis://:SuperSecret123@cache:6379")
     assert "SuperSecret123" not in out
+
+
+def test_is_secret_name_reads_the_end_of_the_name():
+    for name in (
+        "password",
+        "db_password",
+        "API_KEY",
+        "apikey",
+        "PGPASSWORD",
+        "auth_token",
+        "client_secret",
+        "AWS_SECRET_ACCESS_KEY",
+        "private_key",
+        "rediscli_auth",
+        # the plural of a keyword holds secrets too
+        "passwords",
+        "DB_PASSWORDS",
+        "passwds",
+        "pwds",
+        "secrets",
+        "api_keys",
+        "apikeys",
+        "access-keys",
+        "secret_keys",
+        "auth_tokens",
+        "credentials",
+        "private_keys",
+    ):
+        assert is_secret_name(name), name
+    # a keyword earlier in the name describes the value
+    for name in (
+        "secret_name",
+        "token_count",
+        "password_policy",
+        "credential_provider",
+        "region",
+        # a name that ends with `tokens` alone usually counts them
+        "max_tokens",
+        "tokens",
+        "api_tokens",
+        # a further letter makes another word
+        "passwordss",
+        "secretsmanager",
+        "keys",
+    ):
+        assert not is_secret_name(name), name
 
 
 # ---------------------------------------------------------------------------

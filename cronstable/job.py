@@ -37,6 +37,7 @@ from cronstable.config import (
     _resolve_secret,
     schedule_object_to_crontab,
 )
+from cronstable.params import ENV_PREFIX as PARAM_ENV_PREFIX
 from cronstable.redact import redact_lines
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
@@ -106,6 +107,21 @@ def fixup_pyinstaller_env(env: dict[str, str]) -> None:
         del env[key]
 
 
+def drop_inherited_params(env: dict[str, str], owns_params: bool) -> None:
+    """Remove the run-parameter variables ``env`` inherited from the
+    daemon, for a run that has parameters of its own: a workflow task, or a
+    job that declares ``params``. Any other job's ``env`` is left as it is.
+
+    Such a run reads the parameters it stores, which the caller applies
+    afterward. Without this, a parameter the run does not store would read
+    as whatever the daemon's environment happened to hold.
+    """
+    if not owns_params:
+        return
+    for key in [k for k in env if k.startswith(PARAM_ENV_PREFIX)]:
+        del env[key]
+
+
 def pyinstaller_env_leaks() -> bool:
     """Whether spawns need an explicit env just for the PyInstaller scrub.
 
@@ -140,14 +156,9 @@ def loggable_spawn_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
-def is_cmd_shell(shell: str) -> bool:
-    """Whether ``shell`` names the Windows command processor.
-
-    Matched on the basename, so ``cmd``, ``cmd.exe`` and a full
-    ``C:\\Windows\\System32\\cmd.exe`` all resolve alike.
-    """
-    name = os.path.basename(shell.replace("\\", "/")).lower()
-    return name in ("cmd", "cmd.exe")
+#: Whether a ``shell:`` names the Windows command processor. It lives in
+#: :mod:`cronstable.platform`, where the configuration loader reads it too.
+is_cmd_shell = platform.is_cmd_shell
 
 
 def shell_spawn(
@@ -914,7 +925,14 @@ class SentryReporter(Reporter):
         for line in config["fingerprint"]:
             fingerprint.append(_compiled_template(line).render(tvars))
 
-        kwargs = {}
+        # The SDK client is process-wide and turns every error-level log
+        # record of the daemon into an event. The reporter keeps frame
+        # local variables (run parameter values, the child environment)
+        # and HTTP request bodies out of those events.
+        kwargs: dict[str, Any] = {
+            "include_local_variables": False,
+            "max_request_body_size": "never",
+        }
         if config.get("maxStringLength"):
             kwargs["max_value_length"] = config["maxStringLength"]
         if config.get("environment"):
@@ -2292,6 +2310,23 @@ class RunningJob:
         self.extra_env = extra_env or {}
         self.state_token = state_token
         self.run_id = run_id
+        # the run parameter values of a job that declares `params`, set by
+        # the launcher and recorded with the run; None for every other run
+        # (a DAG task's values live in its run document).
+        self.params: dict[str, Any] | None = None
+        # whether a manual start supplied those values. Such a run is one
+        # attempt outside the job's retry ladder: its failure arms no
+        # retry, its success or cancellation settles none, and it never
+        # counts as the run that supersedes a pending retry.
+        self.supplied_params = False
+        # the label of the token whose manual start supplied them; None for
+        # a start that no token authenticated
+        self.triggered_by: str | None = None
+        # whether this run has parameters of its own (see
+        # drop_inherited_params)
+        self.owns_params = dag_ref is not None or bool(
+            getattr(config, "params", None)
+        )
         self.proc: asyncio.subprocess.Process | None = None
         self.retcode: int | None = None
         # wall-clock instant this run started, for the web UI's run history;
@@ -2357,6 +2392,9 @@ class RunningJob:
         # `replaced` it is not reported or retried, but unlike `replaced` it is
         # recorded in the run history (shown as "cancelled" in the dashboard).
         self.cancelled = False
+        # exit codes with which the command skips this run: a DAG task's
+        # skipExitCodes, set by the DAG scheduler at launch. See `skipped`.
+        self.skip_exit_codes: tuple[int, ...] = ()
 
         statsd_config = self.config.statsd
         if statsd_config is not None:
@@ -2614,6 +2652,7 @@ class RunningJob:
         if custom_env or pyinstaller_env_leaks():
             env = dict(os.environ)
             fixup_pyinstaller_env(env)
+            drop_inherited_params(env, self.owns_params)
             for envvar in config.environment:
                 env[envvar["key"]] = envvar["value"]
             # The daemon-injected control-channel vars go last, so a job's own
@@ -2879,7 +2918,12 @@ class RunningJob:
             await self._settle()
             if self._terminated:
                 return  # cancelled while the limits settled
-        if self.failed:
+        if self.skipped:
+            self.verification = {
+                "outcome": "skipped",
+                "fail_reason": "command skipped the task",
+            }
+        elif self.failed:
             self.verification = {
                 "outcome": "skipped",
                 "fail_reason": "command failed",
@@ -2936,6 +2980,9 @@ class RunningJob:
             output=self.output,
             output_prefix="verify.",
         )
+        # the check reads the run's parameters and no others, like the
+        # command it follows
+        check.owns_params = self.owns_params
         self._verifier = check
         self.verification = {"outcome": "running"}
 
@@ -3088,11 +3135,31 @@ class RunningJob:
         return self.fail_reason is not None
 
     @property
+    def skipped(self) -> bool:
+        """Whether the command exited with one of ``skip_exit_codes``.
+
+        Only a command that started and exited by itself can skip its run.
+        A timeout, a cancel, a failed launch, a memory kill, and a refused
+        run never do.
+        """
+        record = self.limits_record
+        return (
+            bool(self.skip_exit_codes)
+            and self.retcode in self.skip_exit_codes
+            and not self._terminated
+            and not self.start_failed
+            and (record is None or record.failure is None)
+        )
+
+    @property
     def fail_reason(self) -> str | None:
         # A memory kill or a refused run fails whatever failsWhen says.
         record = self.limits_record
         if record is not None and record.failure is not None:
             return record.failure
+        if self.skip_exit_codes and self.skipped:
+            # a skip is decided ahead of failsWhen and is never a failure
+            return None
         if self.verification and self.verification["outcome"] == "failure":
             return "verification failed: {}".format(
                 self.verification.get("fail_reason") or "check failed"

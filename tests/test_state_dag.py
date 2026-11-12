@@ -13,7 +13,9 @@ argument everywhere).  Backend + cron wiring lives in test_state_dag_run.py.
 
 import asyncio
 import copy
+import dataclasses
 import json
+import logging
 import random
 import sys
 
@@ -65,7 +67,8 @@ class _Executor:
     """Drives a spec+body to a fixed point like the real advance loop.
 
     ``outcomes`` maps a task id (or ``id#i``) to ``True`` (success) / ``False``
-    (failure); ``xcom`` maps a task id to the list it "published" so a mapped
+    (failure) / ``"skip"`` (the command exited with one of its skip codes);
+    ``xcom`` maps a task id to the list it "published" so a mapped
     downstream can expand.  Approval gates and un-scripted tasks are left
     parked (the run stops making progress), which the test then inspects.
     """
@@ -106,14 +109,16 @@ class _Executor:
         if success is None:
             return body  # unscripted: leave running (e.g. approval/sensor)
         task = self.spec.by_id[intent.task_id]
+        skipped = success == "skip"
         body, _ = _apply(
             dag.mark_task_finished(
                 key,
                 success=bool(success),
-                exit_code=0 if success else 1,
+                exit_code=99 if skipped else 0 if success else 1,
                 fail_reason=None if success else "boom",
                 now=self.now,
                 task=task,
+                skipped=skipped,
             ),
             body,
         )
@@ -244,11 +249,76 @@ def test_validate_ok_linear():
             "is not a task",
             id="expand-from-task-not-a-task",
         ),
+        # a rule that counts upstream outcomes has none to count on a root
+        pytest.param(
+            (TaskSpec("alert", trigger_rule=dag.ALL_DONE_MIN_ONE_FAILED),),
+            "task 'alert': triggerRule all_done_min_one_failed counts "
+            "upstream outcomes, so the task needs a dependsOn entry",
+            id="min-one-failed-on-a-root",
+        ),
+        pytest.param(
+            (TaskSpec("j", trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS),),
+            "triggerRule none_failed_min_one_success counts upstream",
+            id="min-one-success-on-a-root",
+        ),
     ],
 )
 def test_validate_graph_rejects(tasks, match):
     spec = _spec(*tasks)
     with pytest.raises(dag.DagValidationError, match=match):
+        dag.validate_graph(spec)
+
+
+def test_upstream_first_moves_only_what_the_listing_has_out_of_order():
+    spec = _spec(
+        TaskSpec("a"), TaskSpec("b", depends_on=("a",)), TaskSpec("c")
+    )
+    # the walk follows a listing that already puts upstreams first
+    assert spec.upstream_first is spec.tasks
+    # an upstream listed after its dependent moves to just before it,
+    # behind its own upstreams, and every other task keeps its place
+    spec = _spec(
+        TaskSpec("x", depends_on=("r2",)),
+        TaskSpec("r1"),
+        TaskSpec("y", depends_on=("r2", "r1")),
+        TaskSpec("r2", depends_on=("r3",)),
+        TaskSpec("r3"),
+    )
+    dag.validate_graph(spec)
+    assert [t.id for t in spec.upstream_first] == ["r3", "r2", "x", "r1", "y"]
+    assert [t.id for t in spec.tasks] == ["x", "r1", "y", "r2", "r3"]
+    # a chain listed last task first is as deep as the DAG is long
+    chain = [TaskSpec("t0")] + [
+        TaskSpec("t{}".format(i), depends_on=("t{}".format(i - 1),))
+        for i in range(1, 5000)
+    ]
+    assert _spec(*reversed(chain)).upstream_first == tuple(chain)
+
+
+@pytest.mark.parametrize(
+    "tasks",
+    [
+        pytest.param((TaskSpec("a", depends_on=("ghost",)),), id="unknown"),
+        pytest.param((TaskSpec("a", depends_on=("a",)),), id="self"),
+        pytest.param(
+            (
+                TaskSpec("a", depends_on=("b",)),
+                TaskSpec("b", depends_on=("a",)),
+            ),
+            id="cycle",
+        ),
+        pytest.param(
+            (TaskSpec("b", depends_on=("a",)), TaskSpec("a"), TaskSpec("a")),
+            id="duplicate",
+        ),
+    ],
+)
+def test_upstream_first_leaves_a_bad_graph_to_validation(tasks):
+    # DagSpec.build orders the tasks before validate_graph has seen them, so
+    # it has to return for a graph that validation then refuses
+    spec = _spec(*tasks)
+    assert {t.id for t in spec.upstream_first} == {t.id for t in tasks}
+    with pytest.raises(dag.DagValidationError):
         dag.validate_graph(spec)
 
 
@@ -350,8 +420,6 @@ def test_cascade_settles_in_one_advance_in_any_declaration_order(
     body, result = _one_advance(spec, body)
     expected = dag.UPSTREAM_FAILED if ended == dag.FAILED else dag.SKIPPED
     assert [_state(body, "t%d" % i) for i in range(1, 8)] == [expected] * 7
-    # the pass counts the entries it ended, whatever the listing
-    assert result.ended == 7
     assert result.run_terminal
     assert result.launches == []
     # a skipped chain is a successful run; a failed one is not
@@ -377,35 +445,10 @@ def test_cascade_claims_an_all_done_task_listed_before_its_upstream():
     assert not result.run_terminal
 
 
-def test_upstream_first_order_is_built_once_for_a_spec(monkeypatch):
-    # The order is a function of the frozen spec, so every pass in which a
-    # task ends shares the one that the first such pass built.
-    tasks = _chain(6)
-    spec = _spec(*reversed(tasks))
-    built = []
-    real = dag._upstream_first
-
-    def counted(spec):
-        built.append(spec.name)
-        return real(spec)
-
-    monkeypatch.setattr(dag, "_upstream_first", counted)
-    for _ in range(3):
-        body = _body(spec)
-        body["tasks"]["t0"]["state"] = dag.FAILED
-        body, result = _one_advance(spec, body)
-        assert result.run_terminal
-    assert built == [spec.name]
-    assert [task.id for task in spec.upstream_first] == [
-        "t%d" % i for i in range(6)
-    ]
-    # a spec already listed upstream-first needs no other order
-    assert _spec(*tasks).upstream_first is None
-
-
-def test_cascade_keeps_declaration_order_among_claims():
-    # r1 and r2 are ready when the walk reaches them; `cleanup` becomes
-    # ready only once the cascade ends `b`, so its claim follows theirs.
+def test_cascade_claims_in_upstream_first_order():
+    # The pass visits `a` and `b` ahead of `cleanup`, which is listed before
+    # them, so `cleanup` is ready at its own visit and its claim comes
+    # before those of r1 and r2.
     spec = _spec(
         TaskSpec("cleanup", depends_on=("b",), trigger_rule=dag.ALL_DONE),
         TaskSpec("r1"),
@@ -416,7 +459,7 @@ def test_cascade_keeps_declaration_order_among_claims():
     body = _body(spec)
     body["tasks"]["a"]["state"] = dag.FAILED
     body, result = _one_advance(spec, body)
-    assert [li.taskkey for li in result.launches] == ["r1", "r2", "cleanup"]
+    assert [li.taskkey for li in result.launches] == ["cleanup", "r1", "r2"]
 
 
 def test_cascade_of_any_depth_keeps_declaration_order_among_claims():
@@ -440,9 +483,9 @@ def test_cascade_of_any_depth_keeps_declaration_order_among_claims():
 )
 def test_cascade_reaches_a_join_after_its_last_upstream(needs):
     # `join` waits on `ok`, a root that succeeded, and on `c`, two levels
-    # below the failed root.  The sweep reaches `join` after `c`, however
-    # many times `join` names `ok`, so the second walk claims `far`,
-    # listed first, ahead of `near`.
+    # below the failed root.  The pass reaches `join` after `c`, however
+    # many times `join` names `ok`, and claims `far`, listed first, ahead
+    # of `near`.
     spec = _spec(
         TaskSpec("far", depends_on=("join",), trigger_rule=dag.ALL_DONE),
         TaskSpec("near", depends_on=("b",), trigger_rule=dag.ALL_DONE),
@@ -460,27 +503,12 @@ def test_cascade_reaches_a_join_after_its_last_upstream(needs):
     assert [li.taskkey for li in result.launches] == ["far", "near"]
 
 
-def _spy_walks(monkeypatch):
-    """Record each declaration-order walk that an advance makes."""
-    real_walk = dag._walk_and_claim
-    walks = []
-
-    def spy(*args, **kwargs):
-        walks.append(len(walks))
-        return real_walk(*args, **kwargs)
-
-    monkeypatch.setattr(dag, "_walk_and_claim", spy)
-    return walks
-
-
 @pytest.mark.parametrize("ended", [dag.FAILED, dag.SKIPPED])
 @pytest.mark.parametrize("listing", ["reversed", "shuffled"])
-def test_cascade_of_any_depth_takes_two_walks(monkeypatch, ended, listing):
-    # Listed downstream-first, the chain lets a walk end one task only, so
-    # the sweep between the two walks ends the other 38.  Shuffled, neither
-    # the listing nor its reverse is upstream-first, and the sweep ends
-    # every task that the first walk left pending.
-    walks = _spy_walks(monkeypatch)
+def test_cascade_of_any_depth_settles_in_one_advance(ended, listing):
+    # Listed downstream-first, the chain has every task ahead of its
+    # upstream.  Shuffled, neither the listing nor its reverse is
+    # upstream-first.  One advance ends all 39 tasks below the root.
     tasks = _chain(40)
     if listing == "reversed":
         tasks.reverse()
@@ -490,9 +518,9 @@ def test_cascade_of_any_depth_takes_two_walks(monkeypatch, ended, listing):
     body = _body(spec)
     body["tasks"]["t0"]["state"] = ended
     body, result = _one_advance(spec, body)
-    assert result.ended == 39
+    expected = dag.UPSTREAM_FAILED if ended == dag.FAILED else dag.SKIPPED
+    assert [_state(body, "t%d" % i) for i in range(1, 40)] == [expected] * 39
     assert result.run_terminal
-    assert len(walks) == 2
 
 
 def test_cascade_through_a_mapped_task_listed_after_its_dependent():
@@ -532,12 +560,10 @@ def test_cascade_through_a_mapped_task_listed_after_its_dependent():
 @pytest.mark.parametrize(
     "items", [None, [1, 2]], ids=["placeholder", "instances"]
 )
-def test_cascade_reaches_a_mapped_task_between_the_two_walks(
-    monkeypatch, items
-):
-    # The first walk passes `work` while `check` is still pending and then
-    # ends `check`.  `work` is a placeholder while its items cannot be read
-    # and two instances once they can.  The sweep ends it in either shape.
+def test_cascade_reaches_a_mapped_task_listed_before_its_upstream(items):
+    # `work` is listed ahead of `check`, which this pass ends.  `work` is a
+    # placeholder while its items cannot be read and two instances once
+    # they can.  The pass ends it in either shape.
     spec = _spec(
         TaskSpec("sink", depends_on=("work",)),
         TaskSpec(
@@ -558,13 +584,11 @@ def test_cascade_reaches_a_mapped_task_between_the_two_walks(
         dag.plan_and_claim(spec, 1.0, "proc-A", "host-A", expansions), body
     )
     body["tasks"]["top"].update(state=dag.FAILED, proc=None, pid=None)
-    walks = _spy_walks(monkeypatch)
     body, result = _apply(
         dag.plan_and_claim(spec, 5.0, "proc-A", "host-A", expansions), body
     )
     assert _state(body, "sink") == dag.UPSTREAM_FAILED
     assert result.run_terminal
-    assert len(walks) == 2
 
 
 def test_cascade_from_a_sensor_timeout_listed_after_its_dependent():
@@ -600,7 +624,7 @@ def test_cascade_respects_the_claim_quota():
 
 
 @pytest.mark.parametrize("seed", range(12))
-def test_one_advance_is_independent_of_declaration_order(monkeypatch, seed):
+def test_one_advance_is_independent_of_declaration_order(seed):
     # A random graph below three ended roots, advanced once under the
     # upstream-first listing and under a shuffled one.  The quota is out
     # of reach, so both passes must leave identical task states.
@@ -621,18 +645,14 @@ def test_one_advance_is_independent_of_declaration_order(monkeypatch, seed):
         for i in range(3)
     }
     outcomes = []
-    walks = _spy_walks(monkeypatch)
     for listing in (tasks, shuffled):
         spec = _spec(*listing)
         dag.validate_graph(spec)
         body = _body(spec)
         for key, state in ended.items():
             body["tasks"][key]["state"] = state
-        walks.clear()
         body, result = _one_advance(spec, body)
         assert not result.deferred
-        # the sweep leaves nothing for a third walk to end
-        assert len(walks) <= 2
         outcomes.append(
             (
                 {key: entry["state"] for key, entry in body["tasks"].items()},
@@ -838,6 +858,133 @@ def test_fan_out_empty_list_resolves_success():
     assert body["mapped"]["work"]["items"] == []
     # collect still ran (empty map counts as success upstream)
     assert "collect" in ex.launched
+
+
+def _fan_out_beside(side, **work):
+    # `work` fans out over `gen` and has a second upstream, `side`
+    return _spec(
+        TaskSpec("gen"),
+        side,
+        TaskSpec(
+            "work",
+            depends_on=("gen", "side"),
+            expand=ExpandSpec(from_task="gen", key="items"),
+            **work,
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+
+
+@pytest.mark.parametrize("items", [[], ["x"]], ids=["empty", "one-item"])
+@pytest.mark.parametrize(
+    "case",
+    ["failed", "skip-code", "when", "rejected-gate", "nothing-to-handle"],
+)
+def test_fan_out_takes_its_trigger_rule_whatever_the_list_holds(case, items):
+    # the rule applies whatever the list holds: each instance of a list
+    # with items takes the verdict, and with no instance the placeholder
+    # takes it
+    below_a_skip = {"kind": "upstream", "detail": "upstream skipped: side"}
+    # each case: `side`, how its command ends (None when it runs none),
+    # `work`'s rule, the state `work` and `collect` end in, and the reason
+    # `work` records for a skip
+    side, outcome, rule, state, reason = {
+        "failed": (
+            TaskSpec("side"),
+            False,
+            dag.ALL_SUCCESS,
+            dag.UPSTREAM_FAILED,
+            None,
+        ),
+        "skip-code": (
+            TaskSpec("side", skip_exit_codes=(99,)),
+            "skip",
+            dag.ALL_SUCCESS,
+            dag.SKIPPED,
+            below_a_skip,
+        ),
+        "when": (
+            TaskSpec("side", when=(_p("mode", "equals", "full"),)),
+            None,
+            dag.ALL_SUCCESS,
+            dag.SKIPPED,
+            below_a_skip,
+        ),
+        "rejected-gate": (
+            TaskSpec("side", type=dag.APPROVAL, on_reject=dag.SKIPPED),
+            None,
+            dag.ALL_SUCCESS,
+            dag.SKIPPED,
+            below_a_skip,
+        ),
+        # a mapped failure handler beside an upstream that succeeded
+        "nothing-to-handle": (
+            TaskSpec("side"),
+            True,
+            dag.ALL_DONE_MIN_ONE_FAILED,
+            dag.SKIPPED,
+            {
+                "kind": "trigger_rule",
+                "detail": "all_done_min_one_failed: no upstream failed",
+            },
+        ),
+    }[case]
+    spec = _fan_out_beside(side, trigger_rule=rule)
+    ex = _Executor(
+        spec, outcomes={"gen": True, "side": outcome}, xcom={"gen": items}
+    )
+    body = ex.run(_when_body(spec, {"mode": "inc"}))
+    if side.type == dag.APPROVAL:
+        # nothing below the gate starts while it is undecided
+        assert ex.launched == ["gen"]
+        body, _ = _apply(
+            dag.apply_approval(
+                "side", approved=False, by="op", now=ex.now,
+                on_reject=dag.SKIPPED,
+            ),
+            body,
+        )
+        body = ex.run(body)
+    assert "collect" not in ex.launched
+    assert dag.is_terminal_run(body)
+    assert dag.effective_state(spec, body, "work") == state
+    assert _state(body, "collect") == state
+    if items:
+        assert _state(body, "work") == dag.EXPANDED
+        took = body["tasks"]["work#0"]
+    else:
+        assert "work" not in body["mapped"]
+        took = body["tasks"]["work"]
+    assert took["state"] == state and took.get("skipReason") == reason
+
+
+def test_fan_out_empty_list_waits_for_a_running_upstream():
+    spec = _fan_out_beside(TaskSpec("side"))
+    body, _ = _pass(spec, _body(spec), 1.0)
+    body = _done(body, spec, "gen")
+    offered = [("work", "gen", "items")]
+    assert dag.tasks_awaiting_expansion(spec, body) == offered
+    # `side` still runs, so the rule has no verdict yet: the empty list is
+    # not the task's outcome, and the driver reads it again on a later pass
+    body, res = _pass(spec, body, 6.0, expansions={"work": []})
+    assert _state(body, "work") == _state(body, "collect") == dag.PENDING
+    assert "work" not in body["mapped"]
+    assert not res.launches and not res.again
+    assert dag.tasks_awaiting_expansion(spec, body) == offered
+    # `side` succeeds, and a read the store could not answer is no list
+    met = _done(copy.deepcopy(body), spec, "side", now=7.0)
+    met, res = _pass(spec, met, 8.0, expansions={"work": None})
+    assert _state(met, "work") == dag.PENDING and not res.launches
+    # the pass that records the empty fan-out starts the task below it
+    met, res = _pass(spec, met, 9.0, expansions={"work": []})
+    assert met["mapped"]["work"]["items"] == []
+    assert [i.taskkey for i in res.launches] == ["collect"]
+    # had `side` failed, the placeholder ends as any task below a failure
+    failed = _done(copy.deepcopy(body), spec, "side", success=False, now=7.0)
+    failed, res = _pass(spec, failed, 8.0, expansions={"work": []})
+    assert _state(failed, "work") == dag.UPSTREAM_FAILED
+    assert _state(failed, "collect") == dag.UPSTREAM_FAILED
+    assert "work" not in failed["mapped"] and not res.launches
 
 
 def test_fan_out_one_instance_fails_fails_join():
@@ -1478,6 +1625,34 @@ def test_dag_cross_section_rejected(dags_yaml, state, match):
             "retainRuns must be >= 1",
             id="retain-runs-floor",
         ),
+        pytest.param(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+            "        skipExitCodes:\n          - 99\n          - 0\n",
+            "task 'a': skipExitCodes must be exit codes from 1 to 255, got 0",
+            id="skip-code-zero",
+        ),
+        pytest.param(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+            "        skipExitCodes:\n          - 256\n          - -1\n",
+            "from 1 to 255, got -1, 256",
+            id="skip-code-out-of-range",
+        ),
+        pytest.param(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: gate\n        type: approval\n"
+            "        skipExitCodes:\n          - 99\n",
+            "an approval gate runs no command",
+            id="skip-codes-on-a-gate",
+        ),
+        pytest.param(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+            "        triggerRule: one_failed\n",
+            "all_done_min_one_failed",
+            id="unknown-trigger-rule",
+        ),
     ],
 )
 def test_dag_config_rejected(dags_yaml, match):
@@ -2084,6 +2259,70 @@ def test_reconcile_and_plan_keeps_missing_or_terminal_body():
     assert dag.is_keep(new)
 
 
+# --------------------------------------------------------------------------
+# Run engine level: a build leaves a run above its own level untouched
+# --------------------------------------------------------------------------
+
+
+def test_new_run_body_records_engine_only_above_base():
+    spec = _spec(TaskSpec("a"))
+    assert spec.engine == dag.BASE_ENGINE_LEVEL
+    assert "engine" not in _body(spec)
+    needs_more = dataclasses.replace(spec, engine=dag.BASE_ENGINE_LEVEL + 1)
+    assert _body(needs_more)["engine"] == dag.BASE_ENGINE_LEVEL + 1
+
+
+@pytest.mark.parametrize(
+    "body, supported",
+    [
+        ({}, True),  # no key: the base level every build supports
+        ({"engine": dag.BASE_ENGINE_LEVEL}, True),
+        ({"engine": dag.ENGINE_LEVEL}, True),
+        ({"engine": dag.ENGINE_LEVEL + 1}, False),
+        # anything but an integer fails closed
+        ({"engine": None}, False),
+        ({"engine": "1"}, False),
+        ({"engine": 1.0}, False),
+        ({"engine": True}, False),
+    ],
+)
+def test_supports_run(body, supported):
+    assert dag.supports_run(body) is supported
+
+
+def test_transforms_keep_a_run_above_the_engine_level():
+    spec = _spec(TaskSpec("a", max_attempts=2), TaskSpec("b"))
+    body = _body(spec)
+    # "a" is a crashed foreign claim the reconcile half would recover and
+    # "b" is ready to claim: every transform has work to do on this body.
+    body["tasks"]["a"].update(
+        state=dag.RUNNING, proc="dead-proc", pid=999, host="h"
+    )
+    supported = copy.deepcopy(body)
+    body["engine"] = dag.ENGINE_LEVEL + 1
+    before = copy.deepcopy(body)
+
+    def dead(pid):
+        return False
+
+    new, res = dag.reconcile_and_plan(spec, 5.0, "me", "h", dead)(body)
+    assert dag.is_keep(new)
+    assert res.unsupported is True
+    assert res.reconciled == 0 and res.advance.launches == []
+    new, claimed = dag.plan_and_claim(spec, 5.0, "me", "h", {})(body)
+    assert dag.is_keep(new)
+    assert claimed.launches == [] and claimed.changed is False
+    new, changed = dag.reconcile_crashed(spec, 5.0, "me", "h", dead)(body)
+    assert dag.is_keep(new) and changed == 0
+    assert body == before  # nothing was mutated in place either
+
+    # the same body at a supported level is reconciled and claimed
+    new, res = dag.reconcile_and_plan(spec, 5.0, "me", "h", dead)(supported)
+    assert res.unsupported is False
+    assert res.reconciled == 1
+    assert {i.taskkey for i in res.advance.launches} == {"a", "b"}
+
+
 def test_reconcile_and_plan_flags_pending_expansion():
     # a mapped task awaiting its upstream list: the transform applies ONLY
     # the reconcile half and flags expansions_needed, so the driver runs the
@@ -2365,7 +2604,7 @@ def test_task_record_without_resources_field_still_parses():
 # --------------------------------------------------------------------------
 # Internal helper edge cases (pure functions driven against hand-built bodies)
 #
-# These exercise the low-level state-machine helpers -- _apply_expansions,
+# These exercise the low-level state-machine helpers -- _apply_expansion,
 # _propagate_placeholder, _advance_task, _is_quiescent and friends -- directly,
 # hitting the defensive/no-op branches the higher-level executor tests above
 # do not walk through.
@@ -2450,36 +2689,48 @@ def test_plan_and_claim_noop_on_none_and_terminal():
     assert result.launches == []
 
 
-# _apply_expansions: the three skip branches
+# _apply_expansion and its caller: the skip branches
 
 
-def test_apply_expansions_skip_branches():
+def test_apply_expansion_skip_branches():
     spec = _FANOUT_SPEC
     # (1) items is None -> unknown read, left for a later pass.
     body = _body(spec)
     body["tasks"]["gen"]["state"] = dag.SUCCESS
-    result = dag.AdvanceResult()
-    dag._apply_expansions(spec, body, {"work": None}, 1.0, result)
-    assert body["mapped"] == {}
-    assert result.changed is False
+    new, result = dag.plan_and_claim(spec, 1.0, "p", "h", {"work": None})(body)
+    assert dag.is_keep(new) and result.changed is False
 
-    # (2) target has no expand (or is unknown): nothing to materialise.
-    body = _body(spec)
-    body["tasks"]["gen"]["state"] = dag.SUCCESS
-    result = dag.AdvanceResult()
-    dag._apply_expansions(
-        spec, body, {"gen": [1, 2], "ghost": [1]}, 1.0, result
-    )
-    assert body["mapped"] == {}
-    assert result.changed is False
+    # (2) a list offered for a task that has no expand, or for an unknown
+    # id: the walk looks a list up by mapped task, so it expands nothing.
+    new, result = dag.plan_and_claim(
+        spec, 1.0, "p", "h", {"gen": [1, 2], "ghost": [1]}
+    )(body)
+    assert dag.is_keep(new) and result.changed is False
 
     # (3) upstream is not (yet) success under this fresh body: no fan-out.
     body = _body(spec)  # gen still pending
     result = dag.AdvanceResult()
-    dag._apply_expansions(spec, body, {"work": [1, 2]}, 1.0, result)
+    assert not dag._apply_expansion(
+        spec, body, spec.by_id["work"], [1, 2], 1.0, result
+    )
     assert body["mapped"] == {}
     assert "work#0" not in body["tasks"]
     assert result.changed is False
+
+    # (4) an empty list while the trigger rule has no "ready" verdict: no
+    # instance would take the verdict, so it records nothing until then.
+    spec = _fan_out_beside(TaskSpec("side"))
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    result = dag.AdvanceResult()
+    work = spec.by_id["work"]
+    assert not dag._apply_expansion(spec, body, work, [], 1.0, result)
+    assert body["mapped"] == {} and result.changed is False
+    assert _state(body, "work") == dag.PENDING
+    body["tasks"]["side"]["state"] = dag.SUCCESS
+    assert dag._apply_expansion(spec, body, work, [], 2.0, result)
+    assert body["mapped"]["work"] == {"items": [], "expandedAt": 2.0}
+    assert _state(body, "work") == dag.EXPANDED and result.changed is True
 
 
 # _instances_of: an un-expanded mapped task has no concrete instances
@@ -2639,6 +2890,26 @@ def test_maybe_terminalise_ignores_unmaterialised_mapped_task():
     dag._maybe_terminalise(spec, body, 5.0, result)
     assert body["state"] == dag.SUCCESS
     assert result.changed is True
+
+
+@pytest.mark.parametrize("side", [dag.FAILED, dag.RUNNING])
+def test_a_reload_added_mapped_task_records_its_empty_list(side):
+    # `work` has no entry in this run, so no placeholder can take its rule's
+    # verdict and nothing in the run reads its state: the pass records the
+    # empty list at once, whatever `side` did, and the driver stops reading
+    # it
+    spec = _fan_out_beside(TaskSpec("side"))
+    body = _body(spec)
+    del body["tasks"]["work"]
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["tasks"]["side"]["state"] = side
+    body["tasks"]["side"]["proc"] = "p" if side == dag.RUNNING else None
+    assert dag.tasks_awaiting_expansion(spec, body) == [
+        ("work", "gen", "items")
+    ]
+    body, _ = _pass(spec, body, 1.0, expansions={"work": []})
+    assert body["mapped"]["work"]["items"] == []
+    assert dag.tasks_awaiting_expansion(spec, body) == []
 
 
 # _fold_mapped_instances: the barrier and the terminaliser share one
@@ -3180,3 +3451,2445 @@ def test_expand_removed_by_reload_still_dispatches_and_terminalises():
     assert _state(body, "collect") == dag.SUCCESS
     # the placeholder itself is left as the fan-out marked it
     assert body["tasks"]["work"]["state"] == dag.EXPANDED
+
+
+# --------------------------------------------------------------------------
+# Branching: trigger rules, skip exit codes, and skip reasons
+# --------------------------------------------------------------------------
+
+_S, _F, _K, _U = dag.SUCCESS, dag.FAILED, dag.SKIPPED, dag.UPSTREAM_FAILED
+
+# rule -> the verdict for upstreams that (all succeeded, hold a skip and a
+# success, are all skipped, hold a failure)
+_RULE_VERDICTS = {
+    dag.ALL_SUCCESS: ("ready", "skip", "skip", "fail"),
+    dag.ALL_DONE: ("ready", "ready", "ready", "ready"),
+    dag.NONE_FAILED: ("ready", "ready", "ready", "fail"),
+    dag.NONE_FAILED_MIN_ONE_SUCCESS: ("ready", "ready", "skip", "fail"),
+    dag.ALL_DONE_MIN_ONE_FAILED: ("skip", "skip", "skip", "ready"),
+    # a rule string this build does not know reads as all_success
+    "a_rule_from_a_newer_build": ("ready", "skip", "skip", "fail"),
+}
+# upstream states for (u1, u2); None is an upstream with no entry in the run
+_UPSTREAM_COLUMNS = {
+    0: [(_S, _S), (_S, None), (None, None)],
+    1: [(_K, _S), (_S, _K)],
+    2: [(_K, _K), (_K, None)],
+    3: [(_F, _S), (_U, _S), (_F, _K), (_K, _U), (_F, None), (_F, _F)],
+}
+
+
+def _join_spec(rule, **kw):
+    return _spec(
+        TaskSpec("u1"),
+        TaskSpec("u2"),
+        TaskSpec("j", depends_on=("u1", "u2"), trigger_rule=rule, **kw),
+    )
+
+
+def _join_body(spec, states):
+    body = _body(spec)
+    for key, state in zip(("u1", "u2"), states):
+        if state is None:
+            del body["tasks"][key]
+        else:
+            body["tasks"][key]["state"] = state
+    return body
+
+
+@pytest.mark.parametrize("rule", list(_RULE_VERDICTS))
+@pytest.mark.parametrize("column", list(_UPSTREAM_COLUMNS))
+def test_trigger_rule_verdicts_over_plain_upstreams(rule, column):
+    spec = _join_spec(rule)
+    for states in _UPSTREAM_COLUMNS[column]:
+        body = _join_body(spec, states)
+        got = dag._deps_verdict(spec, body, spec.by_id["j"])
+        assert got == _RULE_VERDICTS[rule][column], states
+
+
+@pytest.mark.parametrize("rule", list(_RULE_VERDICTS))
+@pytest.mark.parametrize("live", [dag.PENDING, dag.RUNNING, dag.UP_FOR_RETRY])
+def test_every_trigger_rule_waits_for_a_live_upstream(rule, live):
+    spec = _join_spec(rule)
+    for other in (_S, _F, _K, _U):
+        body = _join_body(spec, (other, live))
+        assert dag._deps_verdict(spec, body, spec.by_id["j"]) == "wait"
+
+
+def test_trigger_rule_constants_cover_the_config_values():
+    # config.py spells the values out (it imports dag lazily), so the two
+    # lists are checked against each other here.
+    for rule in dag.TRIGGER_RULES:
+        cfg = _dagcfg(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: up\n        command: 'e'\n"
+            "      - id: a\n        command: 'e'\n"
+            "        dependsOn:\n          - up\n"
+            "        triggerRule: {}\n".format(rule)
+        )
+        assert cfg.dags[0].spec.by_id["a"].trigger_rule == rule
+        # the rules that only read upstream states also load on a root
+        root = (
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+            "        triggerRule: {}\n".format(rule)
+        )
+        if rule in dag._COUNTING_TRIGGER_RULES:
+            with pytest.raises(ConfigError, match="needs a dependsOn entry"):
+                _dagcfg(root)
+        else:
+            assert _dagcfg(root).dags[0].spec.by_id["a"].trigger_rule == rule
+    assert set(dag.TRIGGER_RULES) == set(_RULE_VERDICTS) - {
+        "a_rule_from_a_newer_build"
+    }
+
+
+def _fan_join(rule, instance_states, *, extra=None):
+    """gen -> work (mapped) -> j(rule); returns the verdict for ``j``.
+
+    ``instance_states`` is one state per ``work#i`` instance, or a single
+    state string for an un-expanded placeholder.  ``extra`` adds a plain
+    second upstream in that state.
+    """
+    deps = ("work",) if extra is None else ("work", "other")
+    tasks = [
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("other"),
+        TaskSpec("j", depends_on=deps, trigger_rule=rule),
+    ]
+    spec = _spec(*tasks)
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["tasks"]["other"]["state"] = extra or dag.SUCCESS
+    if isinstance(instance_states, str):
+        body["tasks"]["work"]["state"] = instance_states
+    else:
+        body["mapped"]["work"] = {
+            "items": list(range(len(instance_states))),
+            "expandedAt": 1.0,
+        }
+        body["tasks"]["work"]["state"] = dag.EXPANDED
+        for i, state in enumerate(instance_states):
+            entry = dag._new_task_entry(spec.by_id["work"], 1.0)
+            entry.pop("mapped")
+            entry.update(mapIndex=i, mapItem=i, state=state)
+            body["tasks"]["work#{}".format(i)] = entry
+    return dag._deps_verdict(spec, body, spec.by_id["j"])
+
+
+@pytest.mark.parametrize(
+    "instances, column",
+    [
+        pytest.param([_S, _S, _S], 0, id="all-instances-succeeded"),
+        pytest.param([], 0, id="empty-expansion-reads-success"),
+        pytest.param([_K, _K], 2, id="every-instance-skipped"),
+        pytest.param(_K, 2, id="placeholder-skipped-before-expanding"),
+        pytest.param([_S, _F, _K], 3, id="an-instance-failed"),
+        pytest.param(_U, 3, id="placeholder-upstream-failed"),
+    ],
+)
+@pytest.mark.parametrize("rule", list(_RULE_VERDICTS))
+def test_trigger_rule_verdicts_over_a_mapped_upstream(rule, instances, column):
+    assert _fan_join(rule, instances) == _RULE_VERDICTS[rule][column]
+
+
+def test_mapped_group_with_skipped_and_successful_instances():
+    # the group reads `skipped`, the "a skip and a success" column for every
+    # rule: one instance that succeeded is the success
+    # none_failed_min_one_success needs.
+    for rule, verdicts in _RULE_VERDICTS.items():
+        assert _fan_join(rule, [_S, _K, _K]) == verdicts[1], rule
+    # ...and while an instance is still going, every rule waits
+    for rule in _RULE_VERDICTS:
+        assert _fan_join(rule, [_S, _K, dag.RUNNING]) == "wait"
+    # a fully skipped group next to a plain upstream that succeeded
+    assert (
+        _fan_join(dag.NONE_FAILED_MIN_ONE_SUCCESS, [_K, _K], extra=_S)
+        == "ready"
+    )
+    # ...or next to a skipped one: nothing succeeded
+    assert (
+        _fan_join(dag.NONE_FAILED_MIN_ONE_SUCCESS, [_K, _K], extra=_K)
+        == "skip"
+    )
+    # a group that did not expand has no instance to count
+    assert _fan_join(dag.NONE_FAILED_MIN_ONE_SUCCESS, _K, extra=_K) == "skip"
+    assert _fan_join(dag.NONE_FAILED_MIN_ONE_SUCCESS, _K, extra=_S) == "ready"
+
+
+def _diamond(join_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS):
+    return _spec(
+        TaskSpec("extract"),
+        TaskSpec("full-load", depends_on=("extract",), skip_exit_codes=(99,)),
+        TaskSpec(
+            "incremental-load", depends_on=("extract",), skip_exit_codes=(99,)
+        ),
+        TaskSpec(
+            "publish",
+            depends_on=("full-load", "incremental-load"),
+            trigger_rule=join_rule,
+        ),
+        TaskSpec(
+            "alert",
+            depends_on=("full-load", "incremental-load", "publish"),
+            trigger_rule=dag.ALL_DONE_MIN_ONE_FAILED,
+        ),
+    )
+
+
+def _run_diamond(spec, **outcomes):
+    scripted = {"extract": True, "publish": True, "alert": True}
+    scripted.update({k.replace("_", "-"): v for k, v in outcomes.items()})
+    ex = _Executor(spec, outcomes=scripted)
+    body = ex.run(_body(spec))
+    states = {k: v["state"] for k, v in body["tasks"].items()}
+    return body, states, ex.launched
+
+
+@pytest.mark.parametrize(
+    "outcomes, publish, all_success_publish, alert, run",
+    [
+        pytest.param(
+            {"full_load": True, "incremental_load": "skip"},
+            _S, _K, _K, _S,
+            id="sunday",
+        ),
+        pytest.param(
+            {"full_load": "skip", "incremental_load": True},
+            _S, _K, _K, _S,
+            id="weekday",
+        ),
+        pytest.param(
+            {"full_load": False, "incremental_load": "skip"},
+            _U, _U, _S, _F,
+            id="the-full-load-fails",
+        ),
+        pytest.param(
+            {"full_load": "skip", "incremental_load": "skip"},
+            _K, _K, _K, _S,
+            id="both-guards-skip",
+        ),
+    ],
+)
+def test_branching_diamond(outcomes, publish, all_success_publish, alert, run):
+    body, states, launched = _run_diamond(_diamond(), **outcomes)
+    assert states["publish"] == publish
+    assert states["alert"] == alert
+    assert body["state"] == run
+    assert ("publish" in launched) == (publish == _S)
+    assert ("alert" in launched) == (alert == _S)
+    # the same graph with the default rule on the join: it skips whenever
+    # either branch does
+    body, states, launched = _run_diamond(_diamond(dag.ALL_SUCCESS), **outcomes)
+    assert states["publish"] == all_success_publish
+    assert "publish" not in launched
+    assert body["state"] == run
+
+
+def test_branching_diamond_publish_fails():
+    body, states, launched = _run_diamond(
+        _diamond(), full_load=True, incremental_load="skip", publish=False
+    )
+    assert states == {
+        "extract": _S,
+        "full-load": _S,
+        "incremental-load": _K,
+        "publish": _F,
+        "alert": _S,
+    }
+    # the handler ran and succeeded; the run is failed because a task failed
+    assert launched[-1] == "alert"
+    assert body["state"] == dag.FAILED
+
+
+def test_branching_diamond_records_why_each_task_skipped():
+    body, _, _ = _run_diamond(
+        _diamond(), full_load=True, incremental_load="skip"
+    )
+    tasks = body["tasks"]
+    assert tasks["incremental-load"]["skipReason"] == {
+        "kind": "exit_code",
+        "detail": "exit code 99",
+    }
+    assert tasks["incremental-load"]["exitCode"] == 99
+    assert tasks["alert"]["skipReason"] == {
+        "kind": "trigger_rule",
+        "detail": "all_done_min_one_failed: no upstream failed",
+    }
+    assert "skipReason" not in tasks["publish"]
+    assert "skipReason" not in tasks["full-load"]
+    body, _, _ = _run_diamond(
+        _diamond(), full_load="skip", incremental_load="skip"
+    )
+    assert body["tasks"]["publish"]["skipReason"] == {
+        "kind": "trigger_rule",
+        "detail": "none_failed_min_one_success: no upstream succeeded",
+    }
+    body, _, _ = _run_diamond(
+        _diamond(dag.ALL_SUCCESS), full_load="skip", incremental_load="skip"
+    )
+    assert body["tasks"]["publish"]["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: full-load, incremental-load",
+    }
+
+
+def test_a_skipped_branch_head_cascades_down_to_the_join():
+    # a branch longer than one task needs no extra keys: the head's skip
+    # cascades through its all_success successors, and the join's rule ends
+    # the cascade.
+    spec = _spec(
+        TaskSpec("guard-a", skip_exit_codes=(99,)),
+        TaskSpec("a1", depends_on=("guard-a",)),
+        TaskSpec("a2", depends_on=("a1",)),
+        TaskSpec("guard-b", skip_exit_codes=(99,)),
+        TaskSpec("b1", depends_on=("guard-b",)),
+        TaskSpec(
+            "join",
+            depends_on=("a2", "b1"),
+            trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+        ),
+    )
+    ex = _Executor(
+        spec,
+        outcomes={"guard-a": "skip", "guard-b": True, "b1": True, "join": True},
+    )
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.SUCCESS
+    assert _state(body, "a1") == _state(body, "a2") == dag.SKIPPED
+    assert body["tasks"]["a2"]["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: a1",
+    }
+    assert _state(body, "join") == dag.SUCCESS
+    assert "a1" not in ex.launched and "a2" not in ex.launched
+
+
+def test_skip_exit_code_completion_is_terminal_and_uses_no_attempt():
+    spec = _spec(TaskSpec("a", max_attempts=3, skip_exit_codes=(99,)))
+    task = spec.by_id["a"]
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    # attempt 0 fails: parked for a retry
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=False, exit_code=1, fail_reason="x", now=2.0,
+            task=task,
+        ),
+        body,
+    )
+    assert _state(body, "a") == dag.UP_FOR_RETRY
+    assert body["tasks"]["a"]["attempt"] == 1
+    body, res = _apply(dag.plan_and_claim(spec, 3.0, "p", "h", {}), body)
+    assert [i.attempt for i in res.launches] == [1]
+    # attempt 1 exits with the skip code: terminal, with attempts to spare
+    body, applied = _apply(
+        dag.mark_task_finished(
+            "a", success=False, exit_code=99, fail_reason="ignored", now=4.0,
+            task=task, skipped=True, resources={"cpu": 1},
+        ),
+        body,
+    )
+    assert applied is True
+    entry = body["tasks"]["a"]
+    assert entry["state"] == dag.SKIPPED
+    assert entry["attempt"] == 1
+    assert entry["exitCode"] == 99
+    assert entry["failReason"] is None
+    assert entry["finishedAt"] == 4.0
+    assert entry["proc"] is None and entry["pid"] is None
+    assert entry["resources"] == {"cpu": 1}
+    assert entry["skipReason"] == {"kind": "exit_code", "detail": "exit code 99"}
+    # nothing re-claims it, and the run ends successful
+    body, res = _apply(dag.plan_and_claim(spec, 5.0, "p", "h", {}), body)
+    assert res.launches == [] and res.run_terminal
+    assert body["state"] == dag.SUCCESS
+
+
+def test_mark_tasks_finished_applies_a_skip_beside_other_marks():
+    spec = _spec(
+        TaskSpec("a", skip_exit_codes=(99,)),
+        TaskSpec("b"),
+        TaskSpec("c", skip_exit_codes=(3,)),
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+
+    def mark(key, **kw):
+        base = {
+            "taskkey": key,
+            "success": True,
+            "exit_code": 0,
+            "fail_reason": None,
+            "task": spec.by_id[key],
+            "expected_proc": "p",
+            "expected_attempt": 0,
+            "expected_poke": None,
+        }
+        base.update(kw)
+        return base
+
+    marks = [
+        mark("a", success=False, exit_code=99, skipped=True),
+        mark("b"),
+        # a superseded claim's skip is fenced out like any stale completion
+        mark("c", success=False, exit_code=3, skipped=True, expected_proc="x"),
+    ]
+    body, applied = _apply(dag.mark_tasks_finished(marks, 2.0), body)
+    assert applied == ["a", "b"]
+    assert _state(body, "a") == dag.SKIPPED
+    assert body["tasks"]["a"]["skipReason"]["detail"] == "exit code 99"
+    assert _state(body, "b") == dag.SUCCESS
+    assert _state(body, "c") == dag.RUNNING
+    assert "skipReason" not in body["tasks"]["c"]
+
+
+def test_sensor_skips_on_a_skip_code_and_repokes_on_any_other():
+    spec = _spec(
+        TaskSpec("s", type=dag.SENSOR, poke_interval=5.0, skip_exit_codes=(99,)),
+        TaskSpec("after", depends_on=("s",)),
+    )
+    task = spec.by_id["s"]
+    body = _body(spec)
+    body, res = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert res.launches[0].is_sensor
+    # an unlisted nonzero exit: the condition is not met yet, poke again
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason="x", now=2.0,
+            task=task, expected_poke=0,
+        ),
+        body,
+    )
+    assert _state(body, "s") == dag.RUNNING
+    assert body["tasks"]["s"]["nextPokeAt"] == 7.0
+    body, res = _apply(dag.plan_and_claim(spec, 8.0, "p", "h", {}), body)
+    assert res.launches[0].poke_number == 1
+    # the next poke exits with the skip code: the sensor ends skipped
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=99, fail_reason="x", now=9.0,
+            task=task, expected_poke=1, skipped=True,
+        ),
+        body,
+    )
+    entry = body["tasks"]["s"]
+    assert entry["state"] == dag.SKIPPED
+    assert entry["pokeCount"] == 2
+    assert entry["exitCode"] == 99
+    assert entry["skipReason"] == {"kind": "exit_code", "detail": "exit code 99"}
+    # ...and its all_success downstream is skipped with it
+    body, res = _apply(dag.plan_and_claim(spec, 10.0, "p", "h", {}), body)
+    assert _state(body, "after") == dag.SKIPPED
+    assert body["state"] == dag.SUCCESS
+
+
+def test_approval_rejection_records_a_skip_reason_only_when_it_skips():
+    for on_reject, state in ((dag.SKIPPED, dag.SKIPPED), (dag.FAILED, dag.FAILED)):
+        spec = _spec(TaskSpec("gate", type=dag.APPROVAL, on_reject=on_reject))
+        body = _body(spec)
+        body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+        body, res = _apply(
+            dag.apply_approval(
+                "gate", approved=False, by="carol", now=2.0,
+                on_reject=on_reject,
+            ),
+            body,
+        )
+        assert res == {"ok": True, "state": state}
+        if state == dag.SKIPPED:
+            assert body["tasks"]["gate"]["skipReason"] == {
+                "kind": "approval",
+                "detail": "rejected by carol",
+            }
+        else:
+            assert "skipReason" not in body["tasks"]["gate"]
+
+
+def test_mapped_placeholder_and_instances_record_skip_reasons():
+    # 1. the expand source is skipped: the placeholder can never fan out
+    spec = _spec(
+        TaskSpec("gen", skip_exit_codes=(99,)),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+            trigger_rule=dag.ALL_DONE,
+        ),
+    )
+    body = _Executor(spec, outcomes={"gen": "skip"}).run(_body(spec))
+    assert body["tasks"]["work"]["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: gen",
+    }
+    assert body["state"] == dag.SUCCESS
+
+    # 2. the placeholder's own rule skips it: a mapped failure handler with
+    # nothing to handle
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec("side"),
+        TaskSpec(
+            "work",
+            depends_on=("gen", "side"),
+            expand=ExpandSpec(from_task="gen", key="items"),
+            trigger_rule=dag.ALL_DONE_MIN_ONE_FAILED,
+        ),
+    )
+    # the verdict resolves the placeholder, whether the driver's read
+    # failed (None) or returned an empty list
+    for items in (None, []):
+        body = _body(spec)
+        body["tasks"]["gen"]["state"] = dag.SUCCESS
+        body["tasks"]["side"]["state"] = dag.SUCCESS
+        body, _ = _apply(
+            dag.plan_and_claim(spec, 1.0, "p", "h", {"work": items}), body
+        )
+        assert body["tasks"]["work"]["state"] == dag.SKIPPED
+        assert body["tasks"]["work"]["skipReason"]["kind"] == "trigger_rule"
+        assert "work" not in body["mapped"]
+
+    # 3. instances that expanded before a second upstream skipped: each one
+    # records its own copy of the reason
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec("side", skip_exit_codes=(99,)),
+        TaskSpec(
+            "work",
+            depends_on=("gen", "side"),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["tasks"]["side"]["state"] = dag.RUNNING
+    body["tasks"]["side"]["proc"] = "p"
+    body, _ = _apply(
+        dag.plan_and_claim(spec, 1.0, "p", "h", {"work": ["x", "y"]}), body
+    )
+    assert _state(body, "work#0") == _state(body, "work#1") == dag.PENDING
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "side", success=False, exit_code=99, fail_reason=None, now=2.0,
+            task=spec.by_id["side"], skipped=True,
+        ),
+        body,
+    )
+    body, _ = _apply(dag.plan_and_claim(spec, 3.0, "p", "h", {}), body)
+    first, second = body["tasks"]["work#0"], body["tasks"]["work#1"]
+    assert first["state"] == second["state"] == dag.SKIPPED
+    assert first["skipReason"] == second["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: side",
+    }
+    assert first["skipReason"] is not second["skipReason"]
+    assert body["state"] == dag.SUCCESS
+
+
+def test_reload_changes_the_rule_of_a_pending_join_only():
+    # the live configuration decides a pending task, and a recorded outcome
+    # stands: the mid-run reload twin of
+    # test_reload_added_dependency_does_not_wedge_run.
+    def spec_with(rule):
+        return _spec(
+            TaskSpec("a", skip_exit_codes=(99,)),
+            TaskSpec("b"),
+            TaskSpec("j", depends_on=("a", "b"), trigger_rule=rule),
+            TaskSpec("k", depends_on=("a",), trigger_rule=rule),
+        )
+
+    old = spec_with(dag.ALL_SUCCESS)
+    body = _body(old)
+    body, _ = _apply(dag.plan_and_claim(old, 1.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=False, exit_code=99, fail_reason=None, now=2.0,
+            task=old.by_id["a"], skipped=True,
+        ),
+        body,
+    )
+    # under the old rule `k` (below the skipped task only) is skipped now;
+    # `j` still waits on `b`
+    body, _ = _apply(dag.plan_and_claim(old, 3.0, "p", "h", {}), body)
+    assert _state(body, "k") == dag.SKIPPED
+    assert _state(body, "j") == dag.PENDING
+    # the reload lands, then `b` finishes
+    new = spec_with(dag.NONE_FAILED)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "b", success=True, exit_code=0, fail_reason=None, now=4.0,
+            task=new.by_id["b"],
+        ),
+        body,
+    )
+    body, res = _apply(dag.plan_and_claim(new, 5.0, "p", "h", {}), body)
+    assert [i.taskkey for i in res.launches] == ["j"]  # the new rule decides
+    assert _state(body, "k") == dag.SKIPPED  # the recorded outcome stands
+    assert body["tasks"]["k"]["skipReason"]["kind"] == "upstream"
+
+
+@pytest.mark.parametrize("rule", list(_RULE_VERDICTS))
+def test_quiescence_is_the_same_under_every_trigger_rule(rule):
+    spec = _join_spec(rule)
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    # both upstreams in flight under our token, the join waiting: nothing
+    # a pass could change
+    assert _state(body, "j") == dag.PENDING
+    assert dag._is_quiescent(spec, body, 2.0, "p", None)
+    new, res = dag.plan_and_claim(spec, 2.0, "p", "h", {})(body)
+    assert dag.is_keep(new) and not res.changed
+    # one upstream still in flight: still quiescent
+    body["tasks"]["u1"].update(state=dag.SKIPPED, proc=None)
+    assert dag._is_quiescent(spec, body, 2.0, "p", None)
+    # every upstream terminal: the join resolves, so the pass must run
+    body["tasks"]["u2"].update(state=dag.SUCCESS, proc=None)
+    assert not dag._is_quiescent(spec, body, 2.0, "p", None)
+
+
+@pytest.mark.parametrize(
+    "task, level",
+    [
+        (TaskSpec("t"), dag.BASE_ENGINE_LEVEL),
+        (TaskSpec("t", trigger_rule=dag.ALL_DONE), dag.BASE_ENGINE_LEVEL),
+        (TaskSpec("t", trigger_rule=dag.NONE_FAILED), 2),
+        (TaskSpec("t", trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS), 2),
+        (TaskSpec("t", trigger_rule=dag.ALL_DONE_MIN_ONE_FAILED), 2),
+        (TaskSpec("t", skip_exit_codes=(99,)), 2),
+    ],
+)
+def test_a_branching_dag_needs_engine_level_two(task, level):
+    spec = _spec(TaskSpec("root"), task)
+    assert spec.engine == level
+    body = _body(spec)
+    assert body.get("engine", dag.BASE_ENGINE_LEVEL) == level
+    assert ("engine" in body) == (level > dag.BASE_ENGINE_LEVEL)
+    assert dag.supports_run(body)
+    assert dag.BRANCHING_PARAMS_ENGINE_LEVEL == 2 <= dag.ENGINE_LEVEL
+
+
+def test_skip_exit_codes_load_sorted_and_deduplicated():
+    cfg = _dagcfg(
+        "dags:\n  - name: d\n    tasks:\n"
+        "      - id: a\n        command: 'e'\n"
+        "        skipExitCodes:\n          - 99\n          - 3\n"
+        "          - 99\n"
+        "      - id: s\n        type: sensor\n        command: 'e'\n"
+        "        skipExitCodes:\n          - 75\n"
+        "      - id: b\n        command: 'e'\n"
+    )
+    spec = cfg.dags[0].spec
+    assert spec.by_id["a"].skip_exit_codes == (3, 99)
+    assert spec.by_id["s"].skip_exit_codes == (75,)
+    assert spec.by_id["b"].skip_exit_codes == ()
+    assert spec.engine == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    # a node key, so it never reaches the launch template
+    assert not hasattr(cfg.dags[0].task_templates["a"], "skipExitCodes")
+
+
+# --------------------------------------------------------------------------
+# The join lint: all_success tasks below upstreams with different skip sources
+# --------------------------------------------------------------------------
+
+
+def _gate(task_id, **kw):
+    return TaskSpec(task_id, type=dag.APPROVAL, on_reject=dag.SKIPPED, **kw)
+
+
+@pytest.mark.parametrize(
+    "tasks, joins",
+    [
+        pytest.param(
+            _diamond(dag.ALL_SUCCESS).tasks,
+            [("publish", ["full-load", "incremental-load"])],
+            id="the-diamond-with-the-default-rule",
+        ),
+        pytest.param(_diamond().tasks, [], id="the-diamond-with-a-join-rule"),
+        pytest.param(
+            (
+                TaskSpec("a"),
+                TaskSpec("b"),
+                TaskSpec("j", depends_on=("a", "b")),
+            ),
+            [],
+            id="nothing-can-skip",
+        ),
+        pytest.param(
+            (
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec("b"),
+                TaskSpec("j", depends_on=("guard", "b")),
+            ),
+            [],
+            id="one-guard-beside-a-plain-task",
+        ),
+        pytest.param(
+            (
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec("j", depends_on=("guard", "guard")),
+            ),
+            [],
+            id="a-repeated-dependency-is-one-upstream",
+        ),
+        pytest.param(
+            (
+                TaskSpec("ga", skip_exit_codes=(99,)),
+                TaskSpec("gb", skip_exit_codes=(99,)),
+                TaskSpec("j", depends_on=("ga", "ga", "gb")),
+            ),
+            [("j", ["ga", "gb"])],
+            id="a-repeated-dependency-is-named-once",
+        ),
+        pytest.param(
+            (
+                # the repeats sit above the joins: each join reads both
+                # guards' skips through x
+                TaskSpec("ga", skip_exit_codes=(99,)),
+                TaskSpec("gb", skip_exit_codes=(99,)),
+                TaskSpec("x", depends_on=("ga", "ga", "gb", "gb")),
+                TaskSpec("j", depends_on=("x", "ga")),
+                TaskSpec("j2", depends_on=("x", "gb")),
+            ),
+            [("x", ["ga", "gb"]), ("j", ["x", "ga"]), ("j2", ["x", "gb"])],
+            id="a-task-that-repeats-a-dependency-passes-its-skips-on",
+        ),
+        pytest.param(
+            (
+                # listed downstream-first: the result does not depend on
+                # the order tasks appear in
+                TaskSpec("j", depends_on=("a2", "b1")),
+                TaskSpec("a2", depends_on=("a1",)),
+                TaskSpec("a1", depends_on=("ga",)),
+                TaskSpec("b1", depends_on=("gb",)),
+                TaskSpec("ga", skip_exit_codes=(99,)),
+                TaskSpec("gb", skip_exit_codes=(99,)),
+            ),
+            [("j", ["a2", "b1"])],
+            id="a-skip-cascades-down-each-branch",
+        ),
+        pytest.param(
+            (
+                _gate("g1"),
+                _gate("g2"),
+                TaskSpec("j", depends_on=("g1", "g2")),
+            ),
+            [("j", ["g1", "g2"])],
+            id="two-gates-that-skip-on-reject",
+        ),
+        pytest.param(
+            (
+                # listed downstream-first: a branch reads its gate's sources
+                # whatever the order
+                TaskSpec("j", depends_on=("a", "b")),
+                TaskSpec("a", depends_on=("gate",)),
+                TaskSpec("b", depends_on=("gate",)),
+                _gate("gate"),
+            ),
+            [],
+            id="branches-below-one-gate-skip-together",
+        ),
+        pytest.param(
+            (
+                _gate("gate"),
+                TaskSpec("a", depends_on=("gate",)),
+                TaskSpec("j", depends_on=("gate", "a")),
+            ),
+            [],
+            id="a-gate-and-a-task-below-it-skip-together",
+        ),
+        pytest.param(
+            (
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec("a", depends_on=("guard",)),
+                TaskSpec("b", depends_on=("guard",)),
+                TaskSpec("j", depends_on=("a", "b")),
+            ),
+            [],
+            id="branches-below-one-guard-skip-together",
+        ),
+        pytest.param(
+            (
+                TaskSpec("wait", type=dag.SENSOR, skip_exit_codes=(75,)),
+                TaskSpec("a", depends_on=("wait",)),
+                TaskSpec("b", depends_on=("wait",)),
+                TaskSpec("j", depends_on=("a", "b")),
+            ),
+            [],
+            id="branches-below-one-sensor-skip-together",
+        ),
+        pytest.param(
+            (
+                _gate("gate"),
+                TaskSpec("a", depends_on=("gate",), skip_exit_codes=(99,)),
+                TaskSpec("b", depends_on=("gate",)),
+                TaskSpec("j", depends_on=("a", "b")),
+            ),
+            [("j", ["a", "b"])],
+            id="a-branch-that-also-skips-itself-is-reported",
+        ),
+        pytest.param(
+            (
+                _gate("g1"),
+                _gate("g2"),
+                TaskSpec("a", depends_on=("g1", "g2")),
+                TaskSpec("b", depends_on=("g1", "g2")),
+                TaskSpec("j", depends_on=("a", "b")),
+            ),
+            [("a", ["g1", "g2"]), ("b", ["g1", "g2"])],
+            id="tasks-below-the-same-two-gates-skip-together",
+        ),
+        pytest.param(
+            (
+                _gate("g1"),
+                _gate("g2", depends_on=("g1",)),
+                TaskSpec("a", depends_on=("g1", "g2")),
+                TaskSpec("j", depends_on=("g2", "a")),
+            ),
+            [("a", ["g1", "g2"])],
+            id="a-gate-below-a-gate-skips-with-the-task-below-both",
+        ),
+        pytest.param(
+            (
+                TaskSpec("work"),
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "handler",
+                    depends_on=("work",),
+                    trigger_rule=dag.ALL_DONE_MIN_ONE_FAILED,
+                ),
+                TaskSpec("j", depends_on=("guard", "handler")),
+            ),
+            [("j", ["guard", "handler"])],
+            id="a-failure-handler-can-always-skip",
+        ),
+        pytest.param(
+            (
+                TaskSpec("work"),
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "handler",
+                    depends_on=("work", "guard"),
+                    trigger_rule=dag.ALL_DONE_MIN_ONE_FAILED,
+                ),
+                TaskSpec("x", depends_on=("handler", "guard")),
+                TaskSpec("j", depends_on=("handler", "x")),
+            ),
+            [("x", ["handler", "guard"]), ("j", ["handler", "x"])],
+            id="a-failure-handler-skips-apart-from-its-upstreams",
+        ),
+        pytest.param(
+            (
+                # one guard beside them: either rule passing a skip on
+                # would give the join a second upstream that can skip
+                TaskSpec("ga", skip_exit_codes=(99,)),
+                TaskSpec("gb", skip_exit_codes=(99,)),
+                TaskSpec("gc", skip_exit_codes=(99,)),
+                TaskSpec("a", depends_on=("ga",), trigger_rule=dag.NONE_FAILED),
+                TaskSpec("b", depends_on=("gb",), trigger_rule=dag.ALL_DONE),
+                TaskSpec("j", depends_on=("a", "b", "gc")),
+            ),
+            [],
+            id="none-failed-and-all-done-stop-a-skip",
+        ),
+        pytest.param(
+            (
+                TaskSpec("ga", skip_exit_codes=(99,)),
+                TaskSpec("gb", skip_exit_codes=(99,)),
+                TaskSpec("plain"),
+                TaskSpec(
+                    "some",
+                    depends_on=("ga", "plain"),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+                TaskSpec(
+                    "every",
+                    depends_on=("ga", "gb"),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+                TaskSpec("j1", depends_on=("some", "gb")),
+                TaskSpec("j2", depends_on=("every", "gb")),
+            ),
+            [("j2", ["every", "gb"])],
+            id="min-one-success-skips-once-every-upstream-can",
+        ),
+        pytest.param(
+            (
+                TaskSpec("ga", skip_exit_codes=(99,)),
+                TaskSpec("gb", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "every",
+                    depends_on=("ga", "gb"),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+                TaskSpec("j", depends_on=("every", "ga")),
+            ),
+            [("j", ["every", "ga"])],
+            id="min-one-success-over-two-sources-is-a-source-itself",
+        ),
+        pytest.param(
+            (
+                # j's upstreams both skip with the gate, and j2 has one of
+                # them beside a second source
+                _gate("gate"),
+                TaskSpec("a", depends_on=("gate",)),
+                TaskSpec("b", depends_on=("gate",)),
+                TaskSpec(
+                    "some",
+                    depends_on=("a", "b"),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+                TaskSpec("j", depends_on=("some", "a")),
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec("j2", depends_on=("some", "guard")),
+            ),
+            [("j2", ["some", "guard"])],
+            id="min-one-success-below-one-source-skips-with-it",
+        ),
+        pytest.param(
+            (
+                TaskSpec("gen", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "work",
+                    depends_on=("gen",),
+                    expand=ExpandSpec(from_task="gen", key="items"),
+                ),
+                TaskSpec(
+                    "some",
+                    depends_on=("gen", "work"),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+                TaskSpec("j", depends_on=("work", "some")),
+            ),
+            [],
+            id="min-one-success-below-a-fan-out-skips-with-its-source",
+        ),
+        pytest.param(
+            (
+                # a group with a skipped instance reads skipped, and still
+                # counts as a success once another instance succeeded
+                TaskSpec("gen"),
+                TaskSpec(
+                    "work",
+                    depends_on=("gen",),
+                    expand=ExpandSpec(from_task="gen", key="items"),
+                    skip_exit_codes=(99,),
+                ),
+                TaskSpec(
+                    "some",
+                    depends_on=("work",),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+                TaskSpec("j", depends_on=("work", "some")),
+            ),
+            [("j", ["work", "some"])],
+            id="min-one-success-runs-below-a-fan-out-that-part-skipped",
+        ),
+        pytest.param(
+            (
+                TaskSpec("gen", skip_exit_codes=(99,)),
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "work",
+                    depends_on=("gen",),
+                    expand=ExpandSpec(from_task="gen", key="items"),
+                    trigger_rule=dag.ALL_DONE,
+                ),
+                TaskSpec("j", depends_on=("work", "guard")),
+            ),
+            [("j", ["work", "guard"])],
+            id="a-mapped-task-skips-with-its-expand-source",
+        ),
+        pytest.param(
+            (
+                TaskSpec("gen", skip_exit_codes=(99,)),
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "work",
+                    depends_on=("gen", "guard"),
+                    expand=ExpandSpec(from_task="gen", key="items"),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+                TaskSpec("after", depends_on=("gen",)),
+                TaskSpec("j", depends_on=("work", "after")),
+            ),
+            [],
+            id="a-mapped-task-skips-with-its-source-alone-under-a-join-rule",
+        ),
+        pytest.param(
+            (
+                TaskSpec("list", skip_exit_codes=(99,)),
+                TaskSpec("check", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "work",
+                    depends_on=("list", "check"),
+                    expand=ExpandSpec(from_task="list", key="items"),
+                ),
+                # `work` passes on the skip of `check` as well as that of
+                # its expand source, so it can skip apart from `after`
+                TaskSpec("after", depends_on=("list",)),
+                TaskSpec("j", depends_on=("work", "after")),
+            ),
+            [("work", ["list", "check"]), ("j", ["work", "after"])],
+            id="a-mapped-join-names-its-expand-source",
+        ),
+    ],
+)
+def test_skippable_joins(tasks, joins):
+    assert dag.skippable_joins(_spec(*tasks)) == joins
+
+
+def test_join_lint_warns_at_load_and_names_the_task(caplog):
+    diamond = (
+        "dags:\n  - name: nightly\n    tasks:\n"
+        "      - id: full\n        command: 'e'\n"
+        "        skipExitCodes:\n          - 99\n"
+        "      - id: incremental\n        command: 'e'\n"
+        "        skipExitCodes:\n          - 99\n"
+        "      - id: publish\n        command: 'e'\n"
+        "        dependsOn:\n          - full\n          - incremental\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        _xsect(diamond)
+    (record,) = [r for r in caplog.records if "can end skipped" in r.message]
+    text = record.getMessage()
+    assert "dag 'nightly': task 'publish'" in text
+    assert "(full, incremental)" in text
+    assert "so it is skipped when one of them is skipped and the rest" in text
+    assert "If they are alternative branches, set triggerRule: " in text
+    assert "none_failed_min_one_success" in text
+    # skipExitCodes puts the workflow at the level the advised rule needs
+    assert "run engine level" not in text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        _xsect(
+            diamond + "        triggerRule: none_failed_min_one_success\n"
+        )
+    assert not [r for r in caplog.records if "can end skipped" in r.message]
+
+
+_ONE_GATE = (
+    "dags:\n  - name: release\n    tasks:\n"
+    "      - id: gate\n        type: approval\n        onReject: skip\n"
+    "      - id: a\n        command: 'e'\n"
+    "        dependsOn:\n          - gate\n"
+    "      - id: b\n        command: 'e'\n"
+    "        dependsOn:\n          - gate\n"
+    "      - id: join\n        command: 'e'\n"
+    "        dependsOn:\n          - {}\n          - {}\n"
+)
+
+
+@pytest.mark.parametrize(
+    "join_deps", [("a", "b"), ("gate", "a")], ids=["diamond", "extra-edge"]
+)
+def test_join_lint_is_quiet_below_one_gate(caplog, join_deps):
+    cfg = _dagcfg(_ONE_GATE.format(*join_deps))
+    assert cfg.dags[0].spec.engine == dag.BASE_ENGINE_LEVEL
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        _validate_cross_sections(cfg)
+    assert not [r for r in caplog.records if "can end skipped" in r.message]
+
+
+def test_join_lint_names_the_engine_level_the_advised_rule_needs(caplog):
+    gates = (
+        "dags:\n  - name: release\n    tasks:\n"
+        "      - id: legal\n        type: approval\n        onReject: skip\n"
+        "      - id: security\n        type: approval\n"
+        "        onReject: skip\n"
+        "      - id: deploy\n        command: 'e'\n"
+        "        dependsOn:\n          - legal\n          - security\n"
+    )
+    cfg = _dagcfg(gates)
+    assert cfg.dags[0].spec.engine == dag.BASE_ENGINE_LEVEL
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        _validate_cross_sections(cfg)
+    (record,) = [r for r in caplog.records if "can end skipped" in r.message]
+    text = record.getMessage()
+    assert "(legal, security)" in text
+    assert "If they are alternative branches, set triggerRule: " in text
+    assert "That rule needs run engine level 2" in text
+    assert "upgrade every node" in text
+
+
+# --------------------------------------------------------------------------
+# when: conditions over parameters and XCom
+# --------------------------------------------------------------------------
+
+
+def _p(name, op, *values):
+    return dag.Condition(
+        source=dag.WHEN_PARAM, name=name, op=op, values=values
+    )
+
+
+def _x(task, key, op, *values):
+    return dag.Condition(
+        source=dag.WHEN_XCOM, name=task, key=key, op=op, values=values
+    )
+
+
+def _when_body(spec, params=None):
+    return dag.new_run_body(
+        dag="d",
+        run_key="rk",
+        run_id="rid",
+        logical_date=None,
+        kind="manual",
+        now=0.0,
+        spec=spec,
+        params=params,
+    )
+
+
+def _done(body, spec, key, success=True, now=5.0):
+    body, _ = _apply(
+        dag.mark_task_finished(
+            key,
+            success=success,
+            exit_code=0 if success else 1,
+            fail_reason=None if success else "boom",
+            now=now,
+            task=spec.by_id[key.partition("#")[0]],
+        ),
+        body,
+    )
+    return body
+
+
+def _pass(spec, body, now, conditions=None, expansions=None):
+    return _apply(
+        dag.plan_and_claim(
+            spec, now, "p", "h", expansions or {}, conditions
+        ),
+        body,
+    )
+
+
+def _combined(spec, body, now):
+    return _apply(
+        dag.reconcile_and_plan(spec, now, "p", "h", lambda pid: False), body
+    )
+
+
+@pytest.mark.parametrize(
+    "stored, cond, holds",
+    [
+        ("full", _p("v", "equals", "full"), True),
+        ("inc", _p("v", "equals", "full"), False),
+        ("inc", _p("v", "notEquals", "full"), True),
+        ("full", _p("v", "notEquals", "full"), False),
+        ("full", _p("v", "in", "full", "backfill"), True),
+        ("inc", _p("v", "in", "full", "backfill"), False),
+        ("inc", _p("v", "notIn", "full", "backfill"), True),
+        ("backfill", _p("v", "notIn", "full", "backfill"), False),
+        (5, _p("v", "equals", 5), True),
+        (5, _p("v", "notEquals", 5), False),
+        (5, _p("v", "in", 1, 2), False),
+        (2, _p("v", "notIn", 1, 2), False),
+        # a number stored as a float equals the integer it is
+        (5.0, _p("v", "equals", 5), True),
+        (2.5, _p("v", "in", 2.5, 3), True),
+        (True, _p("v", "equals", True), True),
+        (False, _p("v", "notEquals", True), True),
+        (False, _p("v", "in", True, False), True),
+        (True, _p("v", "notIn", True), False),
+        # a boolean equals only a boolean
+        (1, _p("v", "equals", True), False),
+        (True, _p("v", "equals", 1), False),
+        (0, _p("v", "notEquals", False), True),
+        (False, _p("v", "notIn", 0), True),
+        # and text never equals a number
+        ("5", _p("v", "equals", 5), False),
+    ],
+)
+def test_when_operators_over_each_parameter_type(stored, cond, holds):
+    spec = _spec(TaskSpec("t", when=(cond,)))
+    body = _when_body(spec, {"v": stored})
+    outcome = dag._when_outcome(spec, body, spec.by_id["t"], None)
+    if holds:
+        assert outcome is True
+    else:
+        assert isinstance(outcome, str)
+        assert outcome.startswith("param v {} ".format(cond.op))
+        assert outcome.endswith(
+            ": the value is {}".format(dag.env_text(stored))
+        )
+    body, res = _pass(spec, body, 1.0)
+    entry = body["tasks"]["t"]
+    if holds:
+        assert entry["state"] == dag.RUNNING and entry["whenMet"] is True
+        assert [i.taskkey for i in res.launches] == ["t"]
+    else:
+        assert entry["state"] == dag.SKIPPED and "whenMet" not in entry
+        assert entry["skipReason"] == {"kind": "condition", "detail": outcome}
+        assert not res.launches
+        assert entry["attempt"] == 0 and entry["startedAt"] is None
+
+
+@pytest.mark.parametrize("params", [None, {}, {"other": "x"}])
+def test_when_on_a_parameter_the_run_does_not_store(params):
+    # a run created before the parameter was declared
+    spec = _spec(
+        TaskSpec("eq", when=(_p("mode", "equals", "full"),)),
+        TaskSpec("isin", when=(_p("mode", "in", "full"),)),
+        TaskSpec("ne", when=(_p("mode", "notEquals", "full"),)),
+        TaskSpec("notin", when=(_p("mode", "notIn", "full"),)),
+    )
+    body, res = _pass(spec, _when_body(spec, params), 1.0)
+    assert sorted(i.taskkey for i in res.launches) == ["ne", "notin"]
+    for key in ("eq", "isin"):
+        assert _state(body, key) == dag.SKIPPED
+        assert body["tasks"][key]["skipReason"]["detail"].endswith(
+            ": the run has no such parameter"
+        )
+    assert body["tasks"]["eq"]["skipReason"]["detail"] == (
+        "param mode equals full: the run has no such parameter"
+    )
+
+
+def test_when_detail_names_the_first_failing_comparison_and_cuts_values():
+    long = "x" * 200
+    spec = _spec(
+        TaskSpec(
+            "t",
+            when=(
+                _p("a", "equals", "yes"),
+                _p("b", "in", "one", "two"),
+                _p("c", "equals", "never"),
+            ),
+        )
+    )
+    body, _ = _pass(spec, _when_body(spec, {"a": "yes", "b": long, "c": "z"}), 1.0)
+    assert body["tasks"]["t"]["skipReason"]["detail"] == (
+        "param b in one, two: the value is " + "x" * 80 + "..."
+    )
+    # every comparison has to hold
+    body, res = _pass(
+        spec, _when_body(spec, {"a": "yes", "b": "two", "c": "never"}), 1.0
+    )
+    assert [i.taskkey for i in res.launches] == ["t"]
+
+
+def _xcom_spec(*conds, rule=dag.ALL_SUCCESS):
+    return _spec(
+        TaskSpec("pub"),
+        TaskSpec("t", depends_on=("pub",), trigger_rule=rule, when=conds),
+    )
+
+
+def _published(spec, params=None):
+    # pub claimed and finished, t ready with its comparison unread
+    body, _ = _pass(spec, _when_body(spec, params), 1.0)
+    return _done(body, spec, "pub")
+
+
+@pytest.mark.parametrize(
+    "read, cond, detail",
+    [
+        ("12", _x("pub", "rows", "notIn", "0"), None),
+        ("0", _x("pub", "rows", "notIn", "0"), "the value is 0"),
+        ("full", _x("pub", "rows", "equals", "full"), None),
+        ("ful", _x("pub", "rows", "equals", "full"), "the value is ful"),
+        ("", _x("pub", "rows", "equals", ""), None),
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "equals", "x"),
+         "the key is not published"),
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "in", "x", "y"),
+         "the key is not published"),
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "notEquals", "x"), None),
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "notIn", "x"), None),
+        (dag.XCOM_TOO_LARGE, _x("pub", "rows", "equals", "x"),
+         "the value is over 4096 bytes"),
+        (dag.XCOM_TOO_LARGE, _x("pub", "rows", "notEquals", "x"), None),
+        (dag.XCOM_NOT_TEXT, _x("pub", "rows", "in", "x"),
+         "the value is not UTF-8 text"),
+        (dag.XCOM_GONE, _x("pub", "rows", "equals", "x"),
+         "the published value is no longer stored"),
+    ],
+)
+def test_when_over_an_xcom_value(read, cond, detail):
+    spec = _xcom_spec(cond)
+    body = _published(spec)
+    assert dag.tasks_awaiting_conditions(spec, body) == [("pub", "rows")]
+    body, res = _pass(spec, body, 6.0, {("pub", "rows"): read})
+    entry = body["tasks"]["t"]
+    if detail is None:
+        assert entry["state"] == dag.RUNNING and entry["whenMet"] is True
+        assert [i.taskkey for i in res.launches] == ["t"]
+    else:
+        assert entry["state"] == dag.SKIPPED
+        assert entry["skipReason"]["kind"] == dag.SKIP_CONDITION
+        assert entry["skipReason"]["detail"] == "{}: {}".format(
+            dag._condition_text(cond), detail
+        )
+        assert not res.launches
+    assert not res.again
+    assert dag.tasks_awaiting_conditions(spec, body) == []
+
+
+def test_when_xcom_detail_text():
+    cond = _x("extract", "row_count", "notIn", "0")
+    assert dag._condition_text(cond) == "xcom extract/row_count notIn 0"
+    assert dag._condition_text(_p("mode", "in", "a", True, 3)) == (
+        "param mode in a, true, 3"
+    )
+    assert dag._condition_text(_x("extract", "rows", "greaterThan", 0)) == (
+        "xcom extract/rows greaterThan 0"
+    )
+    assert dag._condition_text(_p("ratio", "lessThanOrEqual", 0.5)) == (
+        "param ratio lessThanOrEqual 0.5"
+    )
+
+
+_NOT_A_NUMBER = ", which is not a number"
+
+
+@pytest.mark.parametrize(
+    "stored, cond, detail",
+    [
+        (5, _p("v", "lessThan", 10), None),
+        (10, _p("v", "lessThan", 10), "the value is 10"),
+        (10, _p("v", "lessThanOrEqual", 10), None),
+        (11, _p("v", "lessThanOrEqual", 10), "the value is 11"),
+        (11, _p("v", "greaterThan", 10), None),
+        (10, _p("v", "greaterThan", 10), "the value is 10"),
+        (10, _p("v", "greaterThanOrEqual", 10), None),
+        (9, _p("v", "greaterThanOrEqual", 10), "the value is 9"),
+        # an integer and a float compare by value
+        (0.5, _p("v", "lessThan", 1), None),
+        (2, _p("v", "greaterThan", 1.5), None),
+        (-3, _p("v", "greaterThanOrEqual", -2.5), "the value is -3"),
+        # A reload can leave a run with a value of another type than the
+        # one the comparison was loaded for. Text that reads as a number
+        # compares as one, and no other value holds.
+        ("7", _p("v", "lessThan", 10), None),
+        ("abc", _p("v", "lessThan", 10), "the value is abc" + _NOT_A_NUMBER),
+        (True, _p("v", "lessThan", 5), "the value is true" + _NOT_A_NUMBER),
+        ("", _p("v", "lessThanOrEqual", 0), "the value is empty"),
+    ],
+)
+def test_ordering_operators_over_a_parameter(stored, cond, detail):
+    spec = _spec(TaskSpec("t", when=(cond,)))
+    body = _when_body(spec, {"v": stored})
+    outcome = dag._when_outcome(spec, body, spec.by_id["t"], None)
+    if detail is None:
+        assert outcome is True
+    else:
+        assert outcome == "{}: {}".format(dag._condition_text(cond), detail)
+    body, res = _pass(spec, body, 1.0)
+    entry = body["tasks"]["t"]
+    if detail is None:
+        assert entry["state"] == dag.RUNNING and entry["whenMet"] is True
+    else:
+        assert entry["state"] == dag.SKIPPED
+        assert entry["skipReason"] == {
+            "kind": dag.SKIP_CONDITION,
+            "detail": outcome,
+        }
+
+
+@pytest.mark.parametrize("op", sorted(dag.WHEN_ORDERING))
+def test_an_ordering_operator_fails_a_run_without_the_parameter(op):
+    spec = _spec(TaskSpec("t", when=(_p("v", op, 0),)))
+    body = _when_body(spec, {})
+    assert dag._when_outcome(spec, body, spec.by_id["t"], None) == (
+        "param v {} 0: the run has no such parameter".format(op)
+    )
+
+
+@pytest.mark.parametrize(
+    "read, cond, detail",
+    [
+        ("12", _x("pub", "rows", "greaterThan", 0), None),
+        ("0", _x("pub", "rows", "greaterThan", 0), "the value is 0"),
+        ("0", _x("pub", "rows", "lessThanOrEqual", 0), None),
+        # the text is read as a `number` value is: spaces, a fraction, and
+        # an exponent
+        (" 3.5 ", _x("pub", "rows", "lessThan", 4), None),
+        ("1e3", _x("pub", "rows", "greaterThanOrEqual", 1000), None),
+        ("-2", _x("pub", "rows", "greaterThanOrEqual", -1),
+         "the value is -2"),
+        # text that is no finite number holds for no operator
+        ("many", _x("pub", "rows", "greaterThan", 0),
+         "the value is many" + _NOT_A_NUMBER),
+        ("1e999", _x("pub", "rows", "greaterThan", 0),
+         "the value is 1e999" + _NOT_A_NUMBER),
+        ("nan", _x("pub", "rows", "lessThan", 0),
+         "the value is nan" + _NOT_A_NUMBER),
+        ("", _x("pub", "rows", "lessThan", 1), "the value is empty"),
+        # and neither does a source with no value
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "greaterThan", 0),
+         "the key is not published"),
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "lessThan", 0),
+         "the key is not published"),
+        (dag.XCOM_TOO_LARGE, _x("pub", "rows", "lessThanOrEqual", 0),
+         "the value is over 4096 bytes"),
+        (dag.XCOM_NOT_TEXT, _x("pub", "rows", "greaterThanOrEqual", 0),
+         "the value is not UTF-8 text"),
+    ],
+)
+def test_ordering_operators_over_an_xcom_value(read, cond, detail):
+    spec = _xcom_spec(cond)
+    body = _published(spec)
+    assert dag.tasks_awaiting_conditions(spec, body) == [("pub", "rows")]
+    body, res = _pass(spec, body, 6.0, {("pub", "rows"): read})
+    entry = body["tasks"]["t"]
+    if detail is None:
+        assert entry["state"] == dag.RUNNING and entry["whenMet"] is True
+        assert [i.taskkey for i in res.launches] == ["t"]
+    else:
+        assert entry["state"] == dag.SKIPPED
+        assert entry["skipReason"] == {
+            "kind": dag.SKIP_CONDITION,
+            "detail": "{}: {}".format(dag._condition_text(cond), detail),
+        }
+        assert not res.launches
+    assert dag.tasks_awaiting_conditions(spec, body) == []
+
+
+def test_an_ordering_operator_needs_the_same_engine_level_as_the_others():
+    for op in dag.WHEN_ORDERING:
+        spec = _spec(TaskSpec("t", when=(_p("v", op, 1),)))
+        assert spec.engine == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert dag.WHEN_OPERATORS[4:] == tuple(dag.WHEN_ORDERING)
+
+
+def test_combined_transform_hands_an_xcom_comparison_to_the_driver():
+    spec = _xcom_spec(_x("pub", "rows", "equals", "go"))
+    body = _when_body(spec)
+    body, res = _combined(spec, body, 1.0)
+    # nothing to read while the publisher has not run: one RMW, as before
+    assert not res.conditions_needed and res.advance is not None
+    assert [i.taskkey for i in res.advance.launches] == ["pub"]
+    body = _done(body, spec, "pub")
+    before = copy.deepcopy(body)
+    new, res = dag.reconcile_and_plan(
+        spec, 6.0, "p", "h", lambda pid: False
+    )(body)
+    # the claim half did not run, and nothing was reconciled: the document
+    # is kept and the driver reads the value
+    assert dag.is_keep(new) and body == before
+    assert res.conditions_needed and not res.expansions_needed
+    assert res.advance is None
+    body, res = _pass(spec, body, 7.0, {("pub", "rows"): "go"})
+    assert [i.taskkey for i in res.launches] == ["t"]
+    # decided: the next advance is one RMW again
+    body, res = _combined(spec, body, 8.0)
+    assert not res.conditions_needed
+
+
+def test_an_unanswered_xcom_read_leaves_the_task_pending():
+    spec = _xcom_spec(_x("pub", "rows", "equals", "go"))
+    body = _published(spec)
+    for conditions in (None, {}, {("pub", "rows"): None}):
+        new, res = dag.plan_and_claim(
+            spec, 6.0, "p", "h", {}, conditions
+        )(body)
+        # never guessed: nothing is written, and the pass asks for another
+        assert dag.is_keep(new) and not res.changed and not res.launches
+        assert res.again
+        assert _state(body, "t") == dag.PENDING
+        assert "whenMet" not in body["tasks"]["t"]
+    # the next pass reads it
+    body, res = _pass(spec, body, 7.0, {("pub", "rows"): "go"})
+    assert [i.taskkey for i in res.launches] == ["t"] and not res.again
+
+
+def test_a_parameter_comparison_that_fails_needs_no_xcom_read():
+    spec = _xcom_spec(
+        _x("pub", "rows", "equals", "go"), _p("mode", "equals", "full")
+    )
+    body = _published(spec, {"mode": "inc"})
+    assert dag.tasks_awaiting_conditions(spec, body) == []
+    body, res = _combined(spec, body, 6.0)
+    assert not res.conditions_needed
+    assert body["tasks"]["t"]["skipReason"]["detail"] == (
+        "param mode equals full: the value is inc"
+    )
+    # with the parameter met, the XCom value is what is left to read
+    body = _published(spec, {"mode": "full"})
+    assert dag.tasks_awaiting_conditions(spec, body) == [("pub", "rows")]
+
+
+def test_xcom_pairs_are_read_once_each():
+    spec = _spec(
+        TaskSpec("pub"),
+        TaskSpec("other"),
+        TaskSpec(
+            "t1",
+            depends_on=("pub", "other"),
+            when=(
+                _x("pub", "k", "equals", "a"),
+                _x("other", "k", "notEquals", "b"),
+                _x("pub", "k", "notEquals", "z"),
+            ),
+        ),
+        TaskSpec("t2", depends_on=("pub",), when=(_x("pub", "k", "in", "a"),)),
+    )
+    body, _ = _pass(spec, _when_body(spec), 1.0)
+    body = _done(body, spec, "pub")
+    # t1 still waits for `other`, so only t2 contributes
+    assert dag.tasks_awaiting_conditions(spec, body) == [("pub", "k")]
+    body = _done(body, spec, "other")
+    assert dag.tasks_awaiting_conditions(spec, body) == [
+        ("pub", "k"),
+        ("other", "k"),
+    ]
+    body, res = _pass(
+        spec, body, 6.0, {("pub", "k"): "a", ("other", "k"): "c"}
+    )
+    assert sorted(i.taskkey for i in res.launches) == ["t1", "t2"]
+
+
+def test_a_failed_upstream_wins_over_an_unmet_condition():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("b", depends_on=("a",), when=(_p("mode", "equals", "full"),)),
+    )
+    body, _ = _pass(spec, _when_body(spec, {"mode": "inc"}), 1.0)
+    body = _done(body, spec, "a", success=False)
+    body, _ = _pass(spec, body, 6.0)
+    entry = body["tasks"]["b"]
+    # the trigger rule is read first, so the condition is never consulted
+    assert entry["state"] == dag.UPSTREAM_FAILED
+    assert "skipReason" not in entry and "whenMet" not in entry
+    assert body["state"] == dag.FAILED
+
+
+def test_a_skipped_upstream_wins_over_a_met_condition():
+    spec = _spec(
+        TaskSpec("a", when=(_p("mode", "equals", "full"),)),
+        TaskSpec("b", depends_on=("a",), when=(_p("mode", "equals", "inc"),)),
+    )
+    body, res = _pass(spec, _when_body(spec, {"mode": "inc"}), 1.0)
+    assert not res.launches and body["state"] == dag.SUCCESS
+    assert body["tasks"]["a"]["skipReason"]["kind"] == dag.SKIP_CONDITION
+    assert body["tasks"]["b"]["skipReason"] == {
+        "kind": "upstream",
+        "detail": "upstream skipped: a",
+    }
+
+
+def test_when_met_is_recorded_once_and_survives_a_reload():
+    old = _spec(
+        TaskSpec(
+            "a",
+            max_attempts=2,
+            when=(_p("mode", "equals", "full"),),
+        ),
+        TaskSpec("b", depends_on=("a",), when=(_p("mode", "equals", "full"),)),
+    )
+    body, res = _pass(old, _when_body(old, {"mode": "full"}), 1.0)
+    assert [i.taskkey for i in res.launches] == ["a"]
+    assert body["tasks"]["a"]["whenMet"] is True
+    body = _done(body, old, "a", success=False)
+    assert _state(body, "a") == dag.UP_FOR_RETRY
+    # a reload changes both conditions to ones the run does not meet
+    new = _spec(
+        TaskSpec(
+            "a",
+            max_attempts=2,
+            when=(_p("mode", "equals", "inc"),),
+        ),
+        TaskSpec("b", depends_on=("a",), when=(_p("mode", "equals", "inc"),)),
+    )
+    body, res = _pass(new, body, 10.0)
+    # the retry keeps the recorded decision
+    assert [i.taskkey for i in res.launches] == ["a"]
+    assert _state(body, "a") == dag.RUNNING
+    body = _done(body, new, "a", now=11.0)
+    body, res = _pass(new, body, 12.0)
+    # a task with no recorded result reads the condition as it is now
+    assert not res.launches
+    assert body["tasks"]["b"]["skipReason"] == {
+        "kind": "condition",
+        "detail": "param mode equals inc: the value is full",
+    }
+    assert body["state"] == dag.SUCCESS
+
+
+def test_a_released_claim_keeps_when_met():
+    spec = _spec(TaskSpec("a", when=(_p("mode", "equals", "full"),)))
+    body, _ = _pass(spec, _when_body(spec, {"mode": "full"}), 1.0)
+    body, released = _apply(
+        dag.release_lost_claims(spec, [("a", "p", 0, 0)], 2.0), body
+    )
+    assert released == ["a"] and _state(body, "a") == dag.PENDING
+    assert body["tasks"]["a"]["whenMet"] is True
+    changed = _spec(TaskSpec("a", when=(_p("mode", "equals", "inc"),)))
+    body, res = _pass(changed, body, 3.0)
+    assert [i.taskkey for i in res.launches] == ["a"]
+
+
+def test_a_deferred_claim_keeps_when_met_and_a_skip_never_waits(monkeypatch):
+    monkeypatch.setattr(dag, "MAX_CLAIMS_PER_PASS", 1)
+    met = (_p("mode", "equals", "full"),)
+    unmet = (_p("mode", "equals", "inc"),)
+    spec = _spec(
+        TaskSpec("first", when=met),
+        TaskSpec("second", when=met),
+        TaskSpec("never", when=unmet),
+        TaskSpec("gate", type=dag.APPROVAL, when=unmet),
+    )
+    body, res = _pass(spec, _when_body(spec, {"mode": "full"}), 1.0)
+    assert [i.taskkey for i in res.launches] == ["first"] and res.deferred
+    # the quota was spent before these three were reached: the skip and the
+    # recorded result did not wait for it
+    assert _state(body, "second") == dag.PENDING
+    assert body["tasks"]["second"]["whenMet"] is True
+    assert _state(body, "never") == dag.SKIPPED
+    assert _state(body, "gate") == dag.SKIPPED
+    # a reload now flips the condition: the deferred task still launches
+    flipped = _spec(
+        TaskSpec("first", when=met),
+        TaskSpec("second", when=unmet),
+        TaskSpec("never", when=unmet),
+        TaskSpec("gate", type=dag.APPROVAL, when=unmet),
+    )
+    body, res = _pass(flipped, body, 2.0)
+    assert [i.taskkey for i in res.launches] == ["second"]
+
+
+def test_when_skips_a_gate_without_parking_it():
+    spec = _spec(
+        TaskSpec("gate", type=dag.APPROVAL, when=(_p("go", "equals", True),)),
+        TaskSpec("after", depends_on=("gate",)),
+    )
+    body, res = _pass(spec, _when_body(spec, {"go": False}), 1.0)
+    gate = body["tasks"]["gate"]
+    assert gate["state"] == dag.SKIPPED and "awaitingApproval" not in gate
+    assert gate["approval"] is None and gate["startedAt"] is None
+    assert gate["skipReason"]["kind"] == dag.SKIP_CONDITION
+    assert _state(body, "after") == dag.SKIPPED and body["state"] == dag.SUCCESS
+    # a met condition parks the gate as usual
+    body, res = _pass(spec, _when_body(spec, {"go": True}), 1.0)
+    gate = body["tasks"]["gate"]
+    assert gate["awaitingApproval"] is True and gate["whenMet"] is True
+    assert not res.launches
+
+
+def test_when_is_read_once_before_a_sensor_first_pokes():
+    spec = _spec(
+        TaskSpec(
+            "wait",
+            type=dag.SENSOR,
+            poke_interval=10.0,
+            when=(_p("go", "equals", True),),
+        )
+    )
+    body, res = _pass(spec, _when_body(spec, {"go": False}), 1.0)
+    entry = body["tasks"]["wait"]
+    assert entry["state"] == dag.SKIPPED and not res.launches
+    assert entry["pokeCount"] == 0 and "firstPokeAt" not in entry
+    # met: the sensor pokes, and later pokes do not read the condition
+    body, res = _pass(spec, _when_body(spec, {"go": True}), 1.0)
+    assert [i.is_sensor for i in res.launches] == [True]
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "wait", success=False, exit_code=1, fail_reason=None, now=2.0,
+            task=spec.by_id["wait"],
+        ),
+        body,
+    )
+    assert _state(body, "wait") == dag.RUNNING  # idle between pokes
+    flipped = _spec(
+        TaskSpec(
+            "wait",
+            type=dag.SENSOR,
+            poke_interval=10.0,
+            when=(_p("go", "equals", False),),
+        )
+    )
+    body, res = _pass(flipped, body, 50.0)
+    assert [i.poke_number for i in res.launches] == [1]
+
+
+def _mapped_when(*conds):
+    return _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+            when=conds,
+        ),
+        TaskSpec("collect", depends_on=("work",), trigger_rule=dag.NONE_FAILED),
+    )
+
+
+def test_when_skips_a_mapped_placeholder_before_it_expands():
+    spec = _mapped_when(_p("mode", "equals", "full"))
+    body, _ = _pass(spec, _when_body(spec, {"mode": "inc"}), 1.0)
+    body = _done(body, spec, "gen")
+    # no list is read for a fan-out a condition may still skip
+    assert dag.tasks_awaiting_expansion(spec, body) == []
+    # and a list read from a stale snapshot expands nothing
+    body, res = _pass(spec, body, 6.0, expansions={"work": ["a", "b"]})
+    work = body["tasks"]["work"]
+    assert work["state"] == dag.SKIPPED
+    assert work["skipReason"] == {
+        "kind": "condition",
+        "detail": "param mode equals full: the value is inc",
+    }
+    assert "work" not in body["mapped"]
+    assert not [k for k in body["tasks"] if k.startswith("work#")]
+    assert [i.taskkey for i in res.launches] == ["collect"]
+
+
+def test_a_met_condition_lets_a_mapped_task_expand_on_the_next_pass():
+    spec = _mapped_when(_p("mode", "equals", "full"))
+    body, _ = _pass(spec, _when_body(spec, {"mode": "full"}), 1.0)
+    body = _done(body, spec, "gen")
+    body, res = _combined(spec, body, 6.0)
+    # decided on the placeholder, in the one RMW; the driver advances again
+    assert not res.expansions_needed and res.advance.again
+    work = body["tasks"]["work"]
+    assert work["state"] == dag.PENDING and work["whenMet"] is True
+    assert dag.tasks_awaiting_expansion(spec, body) == [
+        ("work", "gen", "items")
+    ]
+    new, res = dag.reconcile_and_plan(
+        spec, 7.0, "p", "h", lambda pid: False
+    )(body)
+    assert res.expansions_needed and dag.is_keep(new)
+    # a reload that flips the condition cannot undo the recorded result,
+    # and an instance has no condition of its own to read
+    flipped = _mapped_when(_p("mode", "equals", "inc"))
+    body, res = _pass(flipped, body, 8.0, expansions={"work": ["a", "b"]})
+    assert sorted(i.taskkey for i in res.launches) == ["work#0", "work#1"]
+    assert _state(body, "work") == dag.EXPANDED
+    assert "whenMet" not in body["tasks"]["work#0"]
+    assert not res.again
+
+
+def test_a_mapped_placeholder_reads_an_xcom_comparison():
+    spec = _mapped_when(_x("gen", "go", "equals", "yes"))
+    body, _ = _pass(spec, _when_body(spec), 1.0)
+    body = _done(body, spec, "gen")
+    assert dag.tasks_awaiting_conditions(spec, body) == [("gen", "go")]
+    assert dag.tasks_awaiting_expansion(spec, body) == []
+    met, res = _pass(spec, body, 6.0, {("gen", "go"): "yes"})
+    assert met["tasks"]["work"]["whenMet"] is True and res.again
+    unmet, res = _pass(spec, body, 6.0, {("gen", "go"): "no"})
+    assert _state(unmet, "work") == dag.SKIPPED and not res.again
+    assert unmet["tasks"]["work"]["skipReason"]["detail"] == (
+        "xcom gen/go equals yes: the value is no"
+    )
+
+
+def _early_resolved():
+    # `work` fans out over `src` and also depends on `pub`. When `src` fails,
+    # the placeholder resolves at once, while `pub` still runs.
+    return _spec(
+        TaskSpec("src"),
+        TaskSpec("pub"),
+        TaskSpec(
+            "work",
+            depends_on=("src", "pub"),
+            expand=ExpandSpec(from_task="src", key="items"),
+        ),
+        TaskSpec(
+            "after",
+            depends_on=("work",),
+            trigger_rule=dag.ALL_DONE,
+            when=(_x("pub", "go", "equals", "yes"),),
+        ),
+    )
+
+
+def test_an_xcom_comparison_waits_for_its_publisher_to_finish():
+    spec = _early_resolved()
+    body, _ = _pass(spec, _when_body(spec), 1.0)
+    body = _done(body, spec, "src", success=False)
+    body, res = _pass(spec, body, 6.0)
+    assert _state(body, "work") == dag.UPSTREAM_FAILED
+    assert _state(body, "pub") == dag.RUNNING
+    # `after` is ready by its rule, and its publisher is not final yet
+    assert dag._deps_verdict(spec, body, spec.by_id["after"]) == "ready"
+    assert _state(body, "after") == dag.PENDING
+    assert dag.tasks_awaiting_conditions(spec, body) == []
+    assert not res.again
+    # even a value read too early is not used
+    new, res = dag.plan_and_claim(
+        spec, 7.0, "p", "h", {}, {("pub", "go"): "yes"}
+    )(body)
+    assert dag.is_keep(new) and not res.again
+    body = _done(body, spec, "pub", now=8.0)
+    assert dag.tasks_awaiting_conditions(spec, body) == [("pub", "go")]
+    body, res = _pass(spec, body, 9.0, {("pub", "go"): "yes"})
+    assert [i.taskkey for i in res.launches] == ["after"]
+
+
+def test_quiescence_with_a_task_waiting_on_an_xcom_comparison():
+    # a wrong "quiescent" answer would wedge the run, so each shape in which
+    # a conditional task still has something to do reads as "act"
+    spec = _xcom_spec(_x("pub", "rows", "equals", "go"))
+    body, _ = _pass(spec, _when_body(spec), 1.0)
+    # the publisher is in flight under our token and `t` waits on it
+    assert dag._is_quiescent(spec, body, 2.0, "p", None)
+    body = _done(body, spec, "pub")
+    # ready with an unread comparison
+    assert not dag._is_quiescent(spec, body, 6.0, "p", None)
+    assert not dag._is_quiescent(spec, body, 6.0, "p", {})
+    # ready by its rule while its publisher still runs
+    spec = _early_resolved()
+    body, _ = _pass(spec, _when_body(spec), 1.0)
+    body = _done(body, spec, "src", success=False)
+    body, _ = _pass(spec, body, 6.0)
+    assert _state(body, "after") == dag.PENDING
+    assert not dag._is_quiescent(spec, body, 7.0, "p", None)
+    # a mapped placeholder whose condition is undecided
+    spec = _mapped_when(_p("mode", "equals", "full"))
+    body, _ = _pass(spec, _when_body(spec, {"mode": "full"}), 1.0)
+    body = _done(body, spec, "gen")
+    assert not dag._is_quiescent(spec, body, 6.0, "p", None)
+
+
+def test_a_task_that_becomes_ready_inside_a_pass_asks_for_another():
+    # `guard` is skipped by this pass, which is what makes `t` ready: the
+    # driver read nothing for it, and nothing else would wake the run
+    spec = _spec(
+        TaskSpec("pub"),
+        TaskSpec("guard", depends_on=("pub",), when=(_p("m", "equals", "x"),)),
+        TaskSpec(
+            "t",
+            depends_on=("pub", "guard"),
+            trigger_rule=dag.NONE_FAILED,
+            when=(_x("pub", "k", "equals", "go"),),
+        ),
+    )
+    body, _ = _pass(spec, _when_body(spec, {"m": "y"}), 1.0)
+    body = _done(body, spec, "pub")
+    assert dag.tasks_awaiting_conditions(spec, body) == []
+    body, res = _combined(spec, body, 6.0)
+    assert res.advance is not None and res.advance.again
+    assert _state(body, "guard") == dag.SKIPPED
+    assert _state(body, "t") == dag.PENDING
+    body, res = _combined(spec, body, 7.0)
+    assert res.conditions_needed
+    body, res = _pass(spec, body, 8.0, {("pub", "k"): "go"})
+    assert [i.taskkey for i in res.launches] == ["t"] and not res.again
+
+
+def test_an_empty_fan_out_expands_in_the_pass_that_settles_its_rule():
+    # `b` ends upstream_failed inside the pass that holds the empty list,
+    # which is what makes the all_done `work` ready: the pass records the
+    # list at `work`'s own visit, so nothing waits for another pass
+    spec = _spec(
+        TaskSpec("x"),
+        TaskSpec("b", depends_on=("x",)),
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen", "b"),
+            expand=ExpandSpec(from_task="gen", key="items"),
+            trigger_rule=dag.ALL_DONE,
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    body, _ = _pass(spec, _body(spec), 1.0)
+    body = _done(body, spec, "x", success=False)
+    body = _done(body, spec, "gen")
+    body, res = _pass(spec, body, 6.0, expansions={"work": []})
+    assert _state(body, "b") == dag.UPSTREAM_FAILED
+    assert body["mapped"]["work"]["items"] == []
+    assert [i.taskkey for i in res.launches] == ["collect"]
+    assert not res.again
+
+
+def _gated_chain(*listing):
+    # its condition skips `gate` under mode=inc
+    tasks = {
+        "gate": TaskSpec("gate", when=(_p("mode", "equals", "full"),)),
+        "mid": TaskSpec("mid", depends_on=("gate",)),
+        "last": TaskSpec("last", depends_on=("mid",)),
+        "cleanup": TaskSpec(
+            "cleanup", depends_on=("gate",), trigger_rule=dag.ALL_DONE
+        ),
+    }
+    return _spec(*(tasks[task_id] for task_id in listing))
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        ("gate", "mid", "last"),
+        ("last", "mid", "gate"),
+        ("mid", "last", "gate"),
+    ],
+)
+def test_one_pass_settles_a_skipped_chain_however_it_is_listed(listing):
+    # nothing runs, so no completion would force another pass: a skip that
+    # stopped at a task listed before its upstream would wait out the run's
+    # idle floor at each level
+    spec = _gated_chain(*listing)
+    body, res = _combined(spec, _when_body(spec, {"mode": "inc"}), 1.0)
+    assert body["state"] == dag.SUCCESS and res.advance.run_terminal
+    assert {k: _state(body, k) for k in listing} == dict.fromkeys(
+        listing, dag.SKIPPED
+    )
+    assert not res.advance.again and not res.advance.launches
+    # the spec keeps the order the configuration lists the tasks in
+    assert [t.id for t in spec.tasks] == list(listing)
+
+
+@pytest.mark.parametrize("listing", [("gate", "cleanup"), ("cleanup", "gate")])
+def test_a_task_listed_above_its_skipped_upstream_starts_in_the_same_pass(
+    listing,
+):
+    spec = _gated_chain(*listing)
+    body, res = _combined(spec, _when_body(spec, {"mode": "inc"}), 1.0)
+    assert _state(body, "gate") == dag.SKIPPED
+    assert [i.taskkey for i in res.advance.launches] == ["cleanup"]
+
+
+def test_a_failure_reaches_a_chain_listed_last_task_first_in_one_pass():
+    spec = _spec(
+        TaskSpec("c", depends_on=("b",)),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec("a"),
+    )
+    body, _ = _pass(spec, _body(spec), 1.0)
+    body = _done(body, spec, "a", success=False)
+    body, _ = _pass(spec, body, 6.0)
+    assert _state(body, "b") == _state(body, "c") == dag.UPSTREAM_FAILED
+    assert body["state"] == dag.FAILED
+
+
+def test_a_join_listed_above_an_xcom_conditional_task_settles_in_one_pass():
+    spec = _spec(
+        TaskSpec("tail", depends_on=("join",), trigger_rule=dag.ALL_DONE),
+        TaskSpec("join", depends_on=("t",)),
+        TaskSpec(
+            "t", depends_on=("pub",), when=(_x("pub", "k", "equals", "go"),)
+        ),
+        TaskSpec("pub"),
+    )
+    dag.validate_graph(spec)
+    body, _ = _pass(spec, _when_body(spec), 1.0)
+    body = _done(body, spec, "pub")
+    body, res = _combined(spec, body, 6.0)
+    assert res.conditions_needed
+    # the pass that brings the value for `t`'s comparison skips `t` and
+    # then `join`
+    body, res = _pass(spec, body, 7.0, {("pub", "k"): "stop"})
+    assert _state(body, "t") == _state(body, "join") == dag.SKIPPED
+    assert [i.taskkey for i in res.launches] == ["tail"] and not res.again
+
+
+def _shuffled_dag(rng):
+    """A random valid workflow, listed in a random order."""
+    ids = ["t{}".format(i) for i in range(rng.randint(3, 7))]
+    tasks, mapped = [], set()
+    for i, task_id in enumerate(ids):
+        deps = tuple(rng.sample(ids[:i], k=rng.randint(0, min(3, i))))
+        sources = [dep for dep in deps if dep not in mapped]
+        expand = None
+        if sources and rng.random() < 0.4:
+            expand = ExpandSpec(rng.choice(sources), "items")
+            mapped.add(task_id)
+        tasks.append(
+            TaskSpec(
+                task_id,
+                depends_on=deps,
+                trigger_rule=rng.choice(dag.TRIGGER_RULES)
+                if deps
+                else dag.ALL_SUCCESS,
+                expand=expand,
+                skip_exit_codes=(99,) if rng.random() < 0.3 else (),
+                when=(_p("mode", "equals", rng.choice(["inc", "full"])),)
+                if rng.random() < 0.3
+                else (),
+            )
+        )
+    rng.shuffle(tasks)
+    spec = _spec(*tasks)
+    dag.validate_graph(spec)
+    return spec
+
+
+def _advance(spec, lists, body, now):
+    """One driver advance: the combined transform, then the list reads and
+    the claim transform when a fan-out awaits them."""
+    body, res = _combined(spec, body, now)
+    if res.advance is not None:
+        return body, res.advance
+    expansions = {
+        task_id: lists[source]
+        for task_id, source, _ in dag.tasks_awaiting_expansion(spec, body)
+    }
+    return _pass(spec, body, now, expansions=expansions)
+
+
+def test_a_pass_that_asks_for_no_other_leaves_a_second_nothing_to_do():
+    # Between completions only the idle floor wakes a run, so a pass has to
+    # finish its own work: each skip, failure, and fan-out it decides
+    # reaches the tasks below in the same pass, however they are listed.
+    for seed in range(200):
+        rng = random.Random(seed)
+        spec = _shuffled_dag(rng)
+        lists = {t.id: rng.choice([[], ["a"], ["a", "b"]]) for t in spec.tasks}
+        body = _when_body(spec, {"mode": "inc"})
+        running, now = [], 1.0
+        for _ in range(100):
+            now += 1.0
+            body, res = _advance(spec, lists, body, now)
+            running += [intent.taskkey for intent in res.launches]
+            if dag.is_terminal_run(body):
+                break
+            if res.again or res.deferred:
+                continue
+            assert _advance(spec, lists, body, now)[0] == body, seed
+            assert running, seed  # a live run always has a task in flight
+            # one completion, then the advance it forces
+            key = running.pop(rng.randrange(len(running)))
+            task = spec.by_id[key.partition("#")[0]]
+            outcome = rng.choice(["ok", "ok", "fail", "skip"])
+            skipped = outcome == "skip" and bool(task.skip_exit_codes)
+            body, _ = _apply(
+                dag.mark_task_finished(
+                    key,
+                    success=outcome == "ok",
+                    exit_code=99 if skipped else int(outcome != "ok"),
+                    fail_reason=None,
+                    now=now,
+                    task=task,
+                    skipped=skipped,
+                ),
+                body,
+            )
+        assert dag.is_terminal_run(body), seed
+
+
+def test_an_xcom_source_a_reload_added_reads_as_no_value():
+    old = _spec(TaskSpec("a"), TaskSpec("t", depends_on=("a",)))
+    body, _ = _pass(old, _when_body(old), 1.0)
+    # the reload adds `late` and a comparison that reads it; this run has no
+    # entry for `late`, so it never runs here and has published nothing
+    def reloaded(op):
+        return _spec(
+            TaskSpec("a"),
+            TaskSpec("late", depends_on=("a",)),
+            TaskSpec(
+                "t",
+                depends_on=("a", "late"),
+                when=(_x("late", "k", op, "go"),),
+            ),
+        )
+
+    body = _done(body, old, "a")
+    spec = reloaded("equals")
+    assert dag.tasks_awaiting_conditions(spec, body) == []
+    skipped, res = _combined(spec, body, 6.0)
+    assert not res.conditions_needed
+    assert skipped["tasks"]["t"]["skipReason"]["detail"] == (
+        "xcom late/k equals go: the task is not in this run"
+    )
+    assert skipped["state"] == dag.SUCCESS
+    ran, res = _combined(reloaded("notEquals"), body, 6.0)
+    assert [i.taskkey for i in res.advance.launches] == ["t"]
+
+
+@pytest.mark.parametrize(
+    "tasks, level",
+    [
+        ((TaskSpec("t", when=(_p("m", "equals", "x"),)),), 2),
+        ((TaskSpec("t"),), dag.BASE_ENGINE_LEVEL),
+        (
+            (
+                TaskSpec("t", skip_exit_codes=(9,)),
+                TaskSpec("u", when=(_p("m", "equals", "x"),)),
+            ),
+            2,
+        ),
+    ],
+)
+def test_a_dag_with_when_needs_engine_level_two(tasks, level):
+    spec = _spec(*tasks)
+    assert spec.engine == level
+    body = _when_body(spec, {"m": "x"})
+    assert body.get("engine", dag.BASE_ENGINE_LEVEL) == level
+    assert dag.supports_run(body)
+    # the level a skip code, a join rule, and a declaration need too
+    assert dag.BRANCHING_PARAMS_ENGINE_LEVEL == 2 == dag.ENGINE_LEVEL
+    # a build one level below leaves the run alone
+    body["engine"] = dag.ENGINE_LEVEL + 1
+    assert not dag.supports_run(body)
+
+
+def test_conditional_tasks_are_the_ones_that_read_xcom():
+    spec = _spec(
+        TaskSpec("pub"),
+        TaskSpec("p", when=(_p("m", "equals", "x"),)),
+        TaskSpec("x", depends_on=("pub",), when=(_x("pub", "k", "in", "a"),)),
+        TaskSpec("plain"),
+    )
+    assert [t.id for t in spec.conditional_tasks] == ["x"]
+    assert _spec(TaskSpec("plain")).conditional_tasks == ()
+
+
+@pytest.mark.parametrize(
+    "tasks, joins",
+    [
+        pytest.param(
+            (
+                TaskSpec("full", when=(_p("m", "equals", "full"),)),
+                TaskSpec("inc", when=(_p("m", "notEquals", "full"),)),
+                TaskSpec("publish", depends_on=("full", "inc")),
+            ),
+            [("publish", ["full", "inc"])],
+            id="two-conditional-branches",
+        ),
+        pytest.param(
+            (
+                TaskSpec("full", when=(_p("m", "equals", "full"),)),
+                TaskSpec("inc"),
+                TaskSpec("publish", depends_on=("full", "inc")),
+            ),
+            [],
+            id="one-conditional-branch",
+        ),
+        pytest.param(
+            (
+                TaskSpec("check", when=(_p("m", "equals", "full"),)),
+                TaskSpec("a", depends_on=("check",)),
+                TaskSpec("b", depends_on=("check",)),
+                TaskSpec("publish", depends_on=("a", "b")),
+            ),
+            [],
+            id="branches-below-one-conditional-task",
+        ),
+        pytest.param(
+            (
+                TaskSpec("full", when=(_p("m", "equals", "full"),)),
+                TaskSpec("guard", skip_exit_codes=(99,)),
+                TaskSpec(
+                    "publish",
+                    depends_on=("full", "guard"),
+                    trigger_rule=dag.NONE_FAILED_MIN_ONE_SUCCESS,
+                ),
+            ),
+            [],
+            id="a-join-rule-keeps-the-lint-quiet",
+        ),
+    ],
+)
+def test_skippable_joins_count_a_conditional_upstream(tasks, joins):
+    assert dag.skippable_joins(_spec(*tasks)) == joins
+
+
+def test_validate_graph_checks_an_xcom_source():
+    def graph(source, **kw):
+        return _spec(
+            TaskSpec("gen"),
+            TaskSpec("mid", depends_on=("gen",)),
+            TaskSpec(
+                "fan",
+                depends_on=("gen",),
+                expand=ExpandSpec(from_task="gen", key="items"),
+            ),
+            TaskSpec("side"),
+            TaskSpec(
+                "t",
+                depends_on=("mid", "fan"),
+                when=(_x(source, "k", "equals", "v"),),
+                **kw,
+            ),
+        )
+
+    # a direct upstream and one reached through another task are both fine
+    dag.validate_graph(graph("mid"))
+    dag.validate_graph(graph("gen"))
+    for source, text in (
+        ("side", "is not upstream of this task"),
+        ("t", "is not upstream of this task"),
+        ("ghost", "is not a task"),
+        ("fan", "is mapped"),
+    ):
+        with pytest.raises(dag.DagValidationError) as err:
+            dag.validate_graph(graph(source))
+        assert "task 't': when: xcom task {!r}".format(source) in str(err.value)
+        assert text in str(err.value)
+
+
+_WHEN_YAML = (
+    "dags:\n  - name: d\n    params:\n"
+    "      - name: mode\n        default: inc\n"
+    "        allowed:\n          - inc\n          - full\n"
+    "      - name: count\n        type: integer\n        default: 1\n"
+    "        minimum: 0\n"
+    "      - name: ratio\n        type: number\n        default: 0.5\n"
+    "      - name: dry\n        type: boolean\n        default: false\n"
+    "    tasks:\n"
+    "      - id: a\n        command: 'e'\n"
+    "      - id: fan\n        command: 'e'\n"
+    "        dependsOn:\n          - a\n"
+    "        expand:\n          fromTask: a\n          key: items\n"
+    "      - id: side\n        command: 'e'\n"
+    "      - id: b\n        command: 'e'\n"
+    "        dependsOn:\n          - fan\n"
+    "        when:\n"
+)
+
+
+def _when_entry(*lines):
+    # one `when:` entry: the first line carries the dash
+    out = "          - {}\n".format(lines[0])
+    for line in lines[1:]:
+        out += "            {}\n".format(line)
+    return out
+
+
+@pytest.mark.parametrize(
+    "entries, message",
+    [
+        pytest.param(
+            _when_entry("equals: full"),
+            "when entry 1: names exactly one source",
+            id="no-source",
+        ),
+        pytest.param(
+            _when_entry(
+                "param: mode", "xcom:", "  task: a", "  key: k", "equals: full"
+            ),
+            "when entry 1: names exactly one source",
+            id="two-sources",
+        ),
+        pytest.param(
+            _when_entry("param: mode"),
+            "when entry 1: names exactly one operator",
+            id="no-operator",
+        ),
+        pytest.param(
+            _when_entry("param: mode", "equals: full", "notEquals: inc"),
+            "when entry 1: names exactly one operator",
+            id="two-operators",
+        ),
+        pytest.param(
+            _when_entry("param: mode", "equals: full")
+            + _when_entry("param: nope", "equals: x"),
+            "when entry 2: param 'nope' is not a parameter this workflow "
+            "declares",
+            id="undeclared-param",
+        ),
+        pytest.param(
+            _when_entry("param: mode", "equals: ful"),
+            "param 'mode': value 'ful' must be one of: inc, full, so the "
+            "parameter never holds it",
+            id="a-value-outside-allowed",
+        ),
+        pytest.param(
+            _when_entry("param: count", "in:", "  - '1'", "  - many"),
+            "param 'count': value 'many' must be an integer",
+            id="not-the-declared-type",
+        ),
+        pytest.param(
+            _when_entry("param: count", "notEquals: '-1'"),
+            "param 'count': value '-1' must be at least 0",
+            id="a-value-below-the-minimum",
+        ),
+        pytest.param(
+            _when_entry("param: dry", "equals: maybe"),
+            "param 'dry': value 'maybe' must be true or false",
+            id="not-a-boolean",
+        ),
+        pytest.param(
+            _when_entry("xcom:", "  task: side", "  key: k", "equals: v"),
+            "task 'b': when: xcom task 'side' is not upstream of this task",
+            id="xcom-task-not-upstream",
+        ),
+        pytest.param(
+            _when_entry("xcom:", "  task: ghost", "  key: k", "equals: v"),
+            "task 'b': when: xcom task 'ghost' is not a task",
+            id="xcom-task-unknown",
+        ),
+        pytest.param(
+            _when_entry("xcom:", "  task: fan", "  key: k", "equals: v"),
+            "task 'b': when: xcom task 'fan' is mapped",
+            id="xcom-task-mapped",
+        ),
+        pytest.param(
+            _when_entry(
+                "xcom:", "  task: a", "  key: k", "equals: " + "v" * 4097
+            ),
+            "an XCom comparison value is at most 4096 bytes",
+            id="xcom-value-too-large",
+        ),
+        pytest.param(
+            _when_entry("xcom:", "  task: a", "  key: ''", "equals: v"),
+            "`xcom` needs a `task` and a `key`",
+            id="xcom-empty-key",
+        ),
+        pytest.param(
+            _when_entry("param: mode", "lessThan: '3'"),
+            "when entry 1: `lessThan` compares numbers, and param 'mode' "
+            "has the type string",
+            id="ordering-a-string-param",
+        ),
+        pytest.param(
+            _when_entry("param: dry", "greaterThanOrEqual: '0'"),
+            "`greaterThanOrEqual` compares numbers, and param 'dry' has "
+            "the type boolean",
+            id="ordering-a-boolean-param",
+        ),
+        pytest.param(
+            _when_entry("param: count", "greaterThan: many"),
+            "when entry 1: `greaterThan` value 'many' must be a number",
+            id="ordering-value-not-a-number",
+        ),
+        pytest.param(
+            _when_entry("xcom:", "  task: a", "  key: k", "lessThan: ''"),
+            "`lessThan` value '' must be a number",
+            id="ordering-xcom-value-not-a-number",
+        ),
+        pytest.param(
+            _when_entry("param: ratio", "lessThanOrEqual: 1e999"),
+            "`lessThanOrEqual` value '1e999' must be a finite number",
+            id="ordering-value-not-finite",
+        ),
+        pytest.param(
+            _when_entry("param: count", "lessThan: '3'", "greaterThan: '1'"),
+            "when entry 1: names exactly one operator: `equals`, "
+            "`notEquals`, `in`, `notIn`, `lessThan`, `lessThanOrEqual`, "
+            "`greaterThan`, or `greaterThanOrEqual`",
+            id="two-ordering-operators",
+        ),
+        pytest.param(
+            _when_entry("param: nope", "lessThan: '3'"),
+            "param 'nope' is not a parameter this workflow declares",
+            id="ordering-an-undeclared-param",
+        ),
+    ],
+)
+def test_when_load_rejections(entries, message):
+    with pytest.raises(ConfigError) as err:
+        _dagcfg(_WHEN_YAML + entries)
+    text = str(err.value)
+    assert text.startswith("dag 'd': ") and message in text
+
+
+def test_when_refuses_an_empty_list_and_an_unknown_key():
+    from cronstable.config import _dag_condition
+
+    with pytest.raises(ValueError, match="`in` needs at least one value"):
+        _dag_condition({"param": "mode", "in": []}, {})
+    # strictyaml refuses a key the schema does not have
+    with pytest.raises(ConfigError):
+        _dagcfg(_WHEN_YAML + _when_entry("param: mode", "matches: f.*"))
+
+
+def test_when_is_a_node_key_that_defaults_cannot_set():
+    with pytest.raises(ConfigError):
+        _dagcfg(
+            "defaults:\n  when:\n    - param: mode\n      equals: full\n"
+            + _WHEN_YAML
+            + _when_entry("param: mode", "equals: full")
+        )
+
+
+def test_when_loads_typed_and_exports_in_the_configuration_shape():
+    cfg = _dagcfg(
+        _WHEN_YAML
+        + _when_entry("param: mode", "equals: full")
+        + _when_entry("param: count", "in:", "  - '2'", "  - '1'", "  - '2'")
+        + _when_entry("param: ratio", "notEquals: '2'")
+        + _when_entry("param: dry", "notIn:", "  - 'yes'")
+        + _when_entry(
+            "xcom:", "  task: a", "  key: rows", "notIn:", "  - '0'",
+            "  - ''", "  - '0'",
+        )
+        + "        skipExitCodes:\n          - 99\n"
+        + "      - id: gate\n        type: approval\n"
+        + "        when:\n"
+        + _when_entry("param: dry", "equals: 'false'")
+    )
+    spec = cfg.dags[0].spec
+    when = spec.by_id["b"].when
+    assert when == (
+        _p("mode", "equals", "full"),
+        _p("count", "in", 2, 1),
+        _p("ratio", "notEquals", 2),
+        _p("dry", "notIn", True),
+        _x("a", "rows", "notIn", "0", ""),
+    )
+    assert [type(v) for v in when[1].values] == [int, int]
+    assert when[3].values[0] is True
+    assert spec.by_id["gate"].when == (_p("dry", "equals", False),)
+    assert spec.engine == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert [t.id for t in spec.conditional_tasks] == ["b"]
+    assert dag.when_export(when) == [
+        {"param": "mode", "equals": "full"},
+        {"param": "count", "in": [2, 1]},
+        {"param": "ratio", "notEquals": 2},
+        {"param": "dry", "notIn": [True]},
+        {"xcom": {"task": "a", "key": "rows"}, "notIn": ["0", ""]},
+    ]
+    json.dumps(dag.when_export(when))  # serves as JSON
+    # a node key, so it never reaches the launch template
+    assert not hasattr(cfg.dags[0].task_templates["b"], "when")
+
+
+def test_ordering_operators_load_one_number_for_either_source():
+    cfg = _dagcfg(
+        _WHEN_YAML
+        + _when_entry("param: count", "greaterThan: '0'")
+        # a threshold is a number whatever the parameter's type, and it is
+        # free of the parameter's own bounds
+        + _when_entry("param: count", "lessThan: '2.5'")
+        + _when_entry("param: count", "greaterThanOrEqual: '-1'")
+        # a whole number takes its integer form, as a stored value does
+        + _when_entry("param: ratio", "lessThanOrEqual: '1.0'")
+        + _when_entry(
+            "xcom:", "  task: a", "  key: rows", "greaterThan: ' 1e2 '"
+        )
+        + _when_entry(
+            "xcom:", "  task: a", "  key: rows", "lessThan: '0.25'"
+        )
+    )
+    spec = cfg.dags[0].spec
+    when = spec.by_id["b"].when
+    assert when == (
+        _p("count", "greaterThan", 0),
+        _p("count", "lessThan", 2.5),
+        _p("count", "greaterThanOrEqual", -1),
+        _p("ratio", "lessThanOrEqual", 1),
+        _x("a", "rows", "greaterThan", 100),
+        _x("a", "rows", "lessThan", 0.25),
+    )
+    assert [type(cond.values[0]) for cond in when] == [
+        int, float, int, int, int, float,
+    ]
+    assert spec.engine == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    # an XCom source is read before the claim, whichever operator reads it
+    assert [t.id for t in spec.conditional_tasks] == ["b"]
+    assert dag.when_export(when) == [
+        {"param": "count", "greaterThan": 0},
+        {"param": "count", "lessThan": 2.5},
+        {"param": "count", "greaterThanOrEqual": -1},
+        {"param": "ratio", "lessThanOrEqual": 1},
+        {"xcom": {"task": "a", "key": "rows"}, "greaterThan": 100},
+        {"xcom": {"task": "a", "key": "rows"}, "lessThan": 0.25},
+    ]
+    json.dumps(dag.when_export(when))
+
+
+def test_the_join_lint_names_a_join_below_two_conditional_branches(caplog):
+    text = (
+        "dags:\n  - name: nightly\n    params:\n"
+        "      - name: mode\n        default: inc\n"
+        "    tasks:\n"
+        "      - id: full\n        command: 'e'\n"
+        "        when:\n          - param: mode\n            equals: full\n"
+        "      - id: incremental\n        command: 'e'\n"
+        "        when:\n          - param: mode\n            notEquals: full\n"
+        "      - id: publish\n        command: 'e'\n"
+        "        dependsOn:\n          - full\n          - incremental\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        _xsect(text)
+    (record,) = [r for r in caplog.records if "can end skipped" in r.message]
+    assert "(full, incremental)" in record.getMessage()

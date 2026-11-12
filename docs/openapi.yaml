@@ -410,18 +410,56 @@ paths:
       tags: [jobs]
       summary: Run a job now
       operationId: startJob
+      description: >-
+        The body is optional. `params` supplies values for the run parameters
+        the job declares, and a request without it starts the run with the
+        declared defaults. A body that is not a JSON object, and any other
+        key in one, is refused with `400`. Supplying a non-empty `params` map
+        needs the `params` scope in addition to `control`. A `200` means a
+        run started, or, with `pending: true`, that the run starts when
+        another node yields the job's cluster concurrency slot. A
+        `concurrencyPolicy` that admits no new run answers `409`.
       x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/JobName"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                params: { $ref: "#/components/schemas/DagRunParams" }
       responses:
         "200":
-          description: Launched.
+          description: >-
+            Launched, or accepted to launch when another node yields the
+            job's cluster concurrency slot (`pending`).
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   started: { type: string }
+                  params:
+                    allOf:
+                      - $ref: "#/components/schemas/DagRunParams"
+                    description: >-
+                      The values the run takes, with defaults applied.
+                      Present for a job that declares parameters.
+                  pending:
+                    type: boolean
+                    description: >-
+                      Present, and `true`, when nothing runs yet. Under
+                      `concurrencyPolicy: Replace` with
+                      `concurrencyScope: cluster`, another node holds the
+                      job's slot. This node asks it to yield, and the run
+                      starts when the slot frees. A newer launch of the job
+                      takes its place, and this node skips the run if the
+                      holder keeps the slot for twice `slotTtlSeconds` or
+                      if a reload leaves the job with a `params`
+                      declaration that the values in `params` do not fit.
                 required: [started]
         "202":
           description: Accepted into a resource pool queue.
@@ -434,29 +472,55 @@ paths:
                   queued: { type: string }
                   queueId: { type: string }
                   pool: { type: string }
+                  params:
+                    allOf:
+                      - $ref: "#/components/schemas/DagRunParams"
+                    description: >-
+                      The values the run takes, with defaults applied.
+                      Present for a job that declares parameters.
+        "400":
+          description: >-
+            The request starts nothing. The body is not a JSON object, it
+            holds an unknown field, or its parameters are refused: `params`
+            is not an object, a name the job does not declare, a wrong type,
+            or a failed constraint. For refused parameters the error
+            envelope adds `paramErrors`.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/ParamErrors"
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403":
+          description: >-
+            The token lacks `control`, or the body holds a non-empty `params`
+            map and the token lacks `params`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >-
-            The job is disabled; concurrencyPolicy Forbid starts nothing
-            because an instance is still running, or, under
-            concurrencyScope cluster, because another node holds the job's
-            slot; or its resource pool refuses the run: the pool queue is
-            full, the pool is draining before a capacity change, or pool
-            state requires reliable exclusive locks (JSON error envelope
-            with the reason).
+            The request starts nothing, and the JSON error envelope gives the
+            reason. The job is disabled, or `concurrencyPolicy: Forbid` admits
+            no new run because an instance is still running or, under
+            `concurrencyScope: cluster`, because another node holds the job's
+            slot. The job's resource pool can also refuse the run: the pool
+            queue is full, the pool is draining before a capacity change, or
+            pool state requires reliable exclusive locks.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: >-
-            Pool state is unavailable for a job in a resource pool: the
-            configured store has not started, a store operation fails with
-            an I/O error or takes longer than 5 seconds, or a pool document
-            cannot be read. Also answered when the store that holds a
-            concurrencyScope cluster job's slot does not answer within 10
-            seconds and onStoreUnavailable is fail-closed.
+            The request starts nothing. Pool state is unavailable for a job
+            in a resource pool: the configured store has not started, a
+            store operation fails with an I/O error or takes longer than 5
+            seconds, or the daemon can't read a pool document. For a job
+            outside a pool, the state store that holds the job's cluster
+            concurrency slot doesn't answer within 10 seconds and
+            `onStoreUnavailable` is `fail-closed`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -671,12 +735,41 @@ paths:
       tags: [dags]
       summary: Trigger a manual DAG run
       operationId: triggerDag
+      description: >-
+        Starts a run. Every body field is optional, and a request with no
+        body starts a run with the declared parameter defaults. Supplying a
+        non-empty `params` map needs the `params` scope in addition to
+        `control`.
       x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/DagName"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                params: { $ref: "#/components/schemas/DagRunParams" }
+                logicalDate:
+                  type: string
+                  format: date-time
+                  description: >-
+                    The logical date the run records, stored in UTC. A run
+                    with no logical date records `null`.
+                requestId:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                  description: >-
+                    Makes the request repeatable. The run key is derived from
+                    this value, so a repeated request returns the first run
+                    with `created: false` while that run is retained.
       responses:
         "200":
-          description: The created run.
+          description: >-
+            The run. `created` says whether this request created it.
           content:
             application/json:
               schema:
@@ -687,9 +780,45 @@ paths:
                     type: string
                     description: Same as `dag` (the generic subject key).
                   runKey: { type: string }
+                  created:
+                    type: boolean
+                    description: >-
+                      False when `requestId` named a run that an earlier
+                      request created.
+                  params:
+                    allOf:
+                      - $ref: "#/components/schemas/DagRunParams"
+                    description: >-
+                      The values the run stores, with defaults applied.
+                      Present for a DAG that declares parameters.
+                required: [dag, name, runKey, created]
+        "400":
+          description: >-
+            Invalid JSON, an unknown body field, an unusable `logicalDate`
+            or `requestId`, or refused parameters. Refused parameters add
+            `paramErrors` to the error envelope, and no run is created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/ParamErrors"
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403":
+          description: >-
+            The token lacks `control`, or the body holds a non-empty `params`
+            map and the token lacks `params`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >-
+            `requestId` names a run that has other parameters or another
+            logical date.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "500":
           description: The run could not be durably recorded.
           content:
@@ -701,6 +830,11 @@ paths:
       tags: [dags]
       summary: Backfill a DAG across a range
       operationId: backfillDag
+      description: >-
+        Creates a run for each scheduled date in the range that has none.
+        `params` applies to the runs this request creates, and a date that
+        already has a run keeps that run's values. Supplying a non-empty
+        `params` map needs the `params` scope in addition to `control`.
       x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/DagName"
@@ -713,7 +847,9 @@ paths:
               properties:
                 from: { type: string, format: date-time }
                 to: { type: string, format: date-time }
+                params: { $ref: "#/components/schemas/DagRunParams" }
               required: [from, to]
+              additionalProperties: false
       responses:
         "200":
           description: The backfill result.
@@ -726,21 +862,55 @@ paths:
                   created:
                     type: integer
                     description: >-
-                      The number of scheduled instants in the range (at most
-                      100) that have a run in the store when the request
-                      returns, including runs that already existed before the
-                      request.
+                      Runs this request created. One request covers at most
+                      100 scheduled instants in the range, counting the ones
+                      in `existing`.
+                  existing:
+                    type: integer
+                    description: >-
+                      Scheduled dates in the range that already had a run.
+                      Those runs are unchanged.
+                  runKeys:
+                    type: array
+                    items: { type: string }
+                    description: Run keys of the created runs.
+                  existingRunKeys:
+                    type: array
+                    items: { type: string }
+                    description: Run keys of the runs that already existed.
+                  truncated:
+                    type: boolean
+                    description: >-
+                      True when the request reached its limit of 100
+                      scheduled instants before the end of the range.
+                  nextFrom:
+                    type: string
+                    format: date-time
+                    description: >-
+                      The first scheduled instant the request did not reach,
+                      in UTC. Present only when `truncated` is true. Send it
+                      as `from` with the same `to` to continue.
         "400":
           description: >-
-            A bad range or an unknown/unscheduled DAG (every refused backfill
-            is 400 with a `reason`; this route never returns 404). While the
-            configured state store has not started, these requests answer
-            503 instead.
+            A bad range, an unknown/unscheduled DAG, an unknown body field,
+            or refused parameters (every refused backfill is 400 with a
+            `reason`; this route never returns 404). Refused parameters add `paramErrors`, and no run is
+            created. While the configured state store has not started, these
+            requests answer 503 instead.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/ParamErrors"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            The token lacks `control`, or the body holds a non-empty `params`
+            map and the token lacks `params`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
         "503":
           description: >-
             Backfill state is unavailable
@@ -1694,6 +1864,13 @@ paths:
       tags: [dags]
       summary: Preview or execute selective recovery
       operationId: recoverDagRun
+      description: >-
+        Previews a recovery, or executes a reviewed one with `dryRun: false`
+        and the preview's `planToken`. Executing a plan whose `params`
+        differ from the declared defaults needs the `params` scope in
+        addition to `control`. The preview needs `control` alone. So does
+        repeating a request that the daemon already accepted, which returns
+        the existing run.
       x-required-scope: control
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }
@@ -1715,7 +1892,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403":
+          description: >-
+            The token lacks `control`, or the request executes a plan whose
+            `params` differ from the declared defaults and the token lacks
+            `params`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "409":
           description: >-
             The workflow or the run is not found
@@ -1748,6 +1932,13 @@ paths:
       tags: [dags]
       summary: Preview or recover failed logical dates
       operationId: recoverDagDates
+      description: >-
+        Previews recovery of the failed dates in a range, or executes a
+        reviewed batch with `dryRun: false` and the preview's `planToken`.
+        Executing a batch in which a plan's `params` differ from the
+        declared defaults needs the `params` scope in addition to `control`,
+        including a resubmitted batch that is already complete. A refused
+        request creates no run. The preview needs `control` alone.
       x-required-scope: control
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }
@@ -1775,7 +1966,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403":
+          description: >-
+            The token lacks `control`, or the request executes a batch in
+            which a plan's `params` differ from the declared defaults and
+            the token lacks `params`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "409":
           description: >-
             The workflow is absent from the configuration
@@ -1822,8 +2020,11 @@ components:
         token is 401. Tokens may be *scoped*: the scalar `web.authToken` grants
         all scopes, while each `web.authTokens` entry lists some of `view`
         (every read-only GET, and every /mcp method), `control` (the
-        mutating POSTs) and `approve` (the DAG decision route); `control` and
-        `approve` each imply `view`. A recognized token
+        mutating POSTs), `approve` (the DAG decision route) and `params`
+        (choosing run parameter values on a job start, a DAG trigger, or a
+        DAG backfill, or reusing chosen values in a DAG recovery, each of
+        which also needs `control`); `control`, `approve` and `params` each
+        imply `view`. A recognized token
         that lacks the scope an operation requires is 403, not 401. The
         required scope defaults to `view` for GET/HEAD and `control` for other
         methods; operations that need another carry an `x-required-scope`
@@ -2047,13 +2248,14 @@ components:
             # the client recognizes; capability checks look for the known
             # values only.
             description: >-
-              Token scope. Known values: view, control, approve. The list
+              Token scope. Known values: view, control, approve, params.
+              The list
               is open: a newer daemon may send a scope that is not on it,
               and clients must keep decoding and simply not recognize the
               unknown scope.
             anyOf:
               - type: string
-                enum: [view, control, approve]
+                enum: [view, control, approve, params]
               - type: string
         allScopes: { type: boolean }
         pairLinkBase:
@@ -2220,6 +2422,13 @@ components:
       type: object
       description: One job's full state (an entry of `GET /jobs`, or `GET /jobs/{name}`).
       properties:
+        params:
+          type: array
+          description: >-
+            The run parameters the job declares, in declaration order.
+            Present only on a job that declares them. A client sends `params`
+            on a start only when this key is present.
+          items: { $ref: "#/components/schemas/DagParam" }
         pool: { $ref: "#/components/schemas/JobPool" }
         verification: { $ref: "#/components/schemas/VerificationStatus" }
         name: { type: string }
@@ -2624,6 +2833,23 @@ components:
             The task instance keys that the recovery keeps from the source
             run, sorted.
           items: { type: string }
+        preservedSkipped:
+          type: object
+          description: >-
+            The preserved tasks that stay `skipped`, keyed by task instance
+            key. Each value is the `skipReason` that the source run recorded
+            for the task, or null when it recorded none. Present only when a
+            preserved task is `skipped`.
+          additionalProperties:
+            type: object
+            nullable: true
+            properties:
+              kind:
+                type: string
+                description: >-
+                  An open string. Known values are `exit_code`, `upstream`,
+                  `trigger_rule`, `approval`, and `condition`.
+              detail: { type: string }
         resetMappings:
           type: array
           description: >-
@@ -2658,6 +2884,12 @@ components:
           description: >-
             Whether the two revisions differ. Executing such a plan needs
             `allowConfigChange`.
+        params:
+          allOf:
+            - $ref: "#/components/schemas/DagRunParams"
+          description: >-
+            The source run's parameter values, which the recovery run
+            reuses. Present on a plan of a DAG that declares parameters.
         planToken:
           type: string
           description: >-
@@ -2752,6 +2984,12 @@ components:
       type: object
       description: One finished run.
       properties:
+        params:
+          allOf:
+            - $ref: "#/components/schemas/DagRunParams"
+          description: >-
+            The run parameter values the run took. Present on a run of a job
+            that declares parameters.
         verification: { $ref: "#/components/schemas/VerificationResult" }
         outcome:
           # Open enum (enum + bare string under anyOf): generated clients keep
@@ -2785,8 +3023,29 @@ components:
           type: string
           format: date-time
           description: >-
-            The same instant as `finished_at`. Present on every row except a
-            `skipped` one, so a pause never moves the last-ran watermark.
+            The same instant as `finished_at`. Absent on a `skipped` row, so
+            a pause never moves the last-ran watermark. Also absent on the
+            row of a manual start that supplied run parameter values, which
+            carries `suppliedRanAt` in its place.
+        suppliedParams:
+          type: boolean
+          description: >-
+            Present and true on the row of a manual start that supplied run
+            parameter values. That run stays outside the job's retry
+            sequence.
+        suppliedRanAt:
+          type: string
+          format: date-time
+          description: >-
+            The same instant as `finished_at`. Present only on a row that
+            carries `suppliedParams`.
+        triggeredBy:
+          type: string
+          description: >-
+            The label of the token whose manual start supplied the run
+            parameter values. Present only on a row that carries
+            `suppliedParams`, and absent when no token authenticated the
+            start.
       additionalProperties: true
 
     RunResources:
@@ -3012,8 +3271,143 @@ components:
                   `all_done_min_one_failed`.
               retries: { type: integer }
               mapped: { type: boolean }
+              skipExitCodes:
+                type: array
+                items: { type: integer }
+                description: >-
+                  Exit codes with which the task's command ends the task
+                  `skipped`. Present only on a task that sets them.
+              when:
+                type: array
+                description: >-
+                  The comparisons that all have to hold for the task to run.
+                  Present only on a task that sets them.
+                items: { $ref: "#/components/schemas/DagCondition" }
             additionalProperties: true
+        params:
+          type: array
+          description: >-
+            The run parameters the DAG declares, in declaration order.
+            Present only on a DAG that declares them. A client sends `params`
+            on a trigger or a backfill only when this key is present.
+          items: { $ref: "#/components/schemas/DagParam" }
+        fleetWarnings:
+          type: array
+          items: { type: string }
+          description: >-
+            Present while another live host on the shared store runs a build
+            below the run engine level this DAG needs. Each entry names one
+            host.
       additionalProperties: true
+
+    DagParam:
+      type: object
+      description: >-
+        One declared run parameter of a DAG or a job. A constraint key is
+        present only when the declaration sets it. A job's parameter always
+        has a `default`.
+      properties:
+        name: { type: string }
+        type:
+          type: string
+          description: >-
+            An open string. Known values are `string`, `integer`, `number`,
+            and `boolean`.
+        default:
+          description: >-
+            The value a run stores when the caller supplies none, in the
+            declared type. Absent on a required parameter.
+        required:
+          type: boolean
+          description: >-
+            Present and true when the caller has to supply the value.
+        allowed:
+          type: array
+          description: The complete list of accepted values.
+          items: {}
+        minimum: { type: number }
+        maximum: { type: number }
+        pattern:
+          type: string
+          description: >-
+            A regular expression in Python syntax that the whole value has
+            to match.
+        maxLength: { type: integer }
+        description: { type: string }
+      required: [name, type]
+      additionalProperties: true
+
+    DagCondition:
+      type: object
+      description: >-
+        One `when` comparison of a task, in the shape the configuration
+        writes it. It carries one source, `param` or `xcom`, and one
+        operator: `equals`, `notEquals`, `in`, `notIn`, `lessThan`,
+        `lessThanOrEqual`, `greaterThan`, or `greaterThanOrEqual`. A
+        comparison on a parameter carries values in the parameter's declared
+        type. A comparison on an XCom value carries strings. The last four
+        operators carry one number for either source.
+      properties:
+        param:
+          type: string
+          description: The name of a run parameter the DAG declares.
+        xcom:
+          type: object
+          description: A value that an upstream task published.
+          properties:
+            task: { type: string }
+            key: { type: string }
+        equals:
+          description: Holds when the source equals this value.
+        notEquals:
+          description: Holds when the source does not equal this value.
+        in:
+          type: array
+          description: Holds when the source equals one of these values.
+          items: {}
+        notIn:
+          type: array
+          description: Holds when the source equals none of these values.
+          items: {}
+        lessThan:
+          type: number
+          description: >-
+            Holds when the source is a number below this one. An XCom value
+            is text and is read as a number.
+        lessThanOrEqual:
+          type: number
+          description: Holds when the source is a number at or below this one.
+        greaterThan:
+          type: number
+          description: Holds when the source is a number above this one.
+        greaterThanOrEqual:
+          type: number
+          description: Holds when the source is a number at or above this one.
+      additionalProperties: true
+
+    DagRunParams:
+      type: object
+      description: >-
+        Run parameter values keyed by declared name. Each value has the
+        declared JSON type: a string, an integer, a number, or a boolean.
+        Nothing is coerced.
+      additionalProperties:
+        oneOf:
+          - type: string
+          - type: number
+          - type: boolean
+
+    ParamErrors:
+      type: object
+      description: >-
+        What the error envelope adds when a request's `params` are refused.
+      properties:
+        paramErrors:
+          type: object
+          description: >-
+            The reason for each refused parameter, keyed by name. Each value
+            continues the name, for example `must be at most 10000`.
+          additionalProperties: { type: string }
 
     DagRunSummary:
       type: object
@@ -3136,8 +3530,9 @@ components:
           type: string
           nullable: true
           description: >-
-            The scheduled instant the run covers, as an ISO 8601 string.
-            Null on a manual run.
+            The instant the run covers, as an ISO 8601 string: the scheduled
+            time, or the `logicalDate` from the trigger request. Null on a
+            manual run triggered without one.
         kind:
           type: string
           description: >-
@@ -3162,6 +3557,24 @@ components:
             The digest of the DAG's launch configuration when the run was
             created. A recovery plan reads a document without one as a
             changed configuration.
+        engine:
+          type: integer
+          description: >-
+            The run engine level the DAG needed when the run was created.
+            Absent at level 1.
+        params:
+          allOf:
+            - $ref: "#/components/schemas/DagRunParams"
+          description: >-
+            The parameter values the run stores, written when the run is
+            created and never changed. Present on a run of a DAG that
+            declares parameters.
+        triggeredBy:
+          type: string
+          description: >-
+            The label of the token that asked for the run through a trigger
+            or a backfill. Absent on a scheduled run and when no token
+            authenticated the request.
         mapped:
           type: object
           description: >-
@@ -3228,6 +3641,19 @@ components:
                 description: When the task ended, in epoch seconds.
               exitCode: { type: integer, nullable: true }
               failReason: { type: string, nullable: true }
+              skipReason:
+                type: object
+                description: >-
+                  Why a `skipped` entry was skipped. Absent on an entry in
+                  any other state.
+                properties:
+                  kind:
+                    type: string
+                    description: >-
+                      An open string. Known values are `exit_code`,
+                      `upstream`, `trigger_rule`, `approval`, and
+                      `condition`.
+                  detail: { type: string }
               resources: { $ref: "#/components/schemas/RunResources" }
               updatedAt:
                 type: number
@@ -3302,6 +3728,11 @@ components:
                 description: >-
                   The source run's key, on an entry that a recovery run kept
                   from its source.
+              whenMet:
+                type: boolean
+                description: >-
+                  Present and true once the task's `when` comparisons held.
+                  The result is recorded once and is not read again.
             additionalProperties: true
       additionalProperties: true
 

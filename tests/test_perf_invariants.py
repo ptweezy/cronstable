@@ -1519,7 +1519,7 @@ async def test_chain_task_costs_three_document_rewrites(dag_cron, monkeypatch):
     launched = _dagstate_stub_launches(monkeypatch, cron)
     counts = _dagstate_count_writes(monkeypatch, cron.state_backend)
 
-    run_key = await sched.trigger_run("chain")
+    run_key = (await sched.trigger("chain"))["runKey"]
     await _drain_pending(cron)
     assert counts == {"mutations": 4, "rewrites": 3, "leases": 1}, (
         "starting a run must cost four document mutations (three of them "
@@ -1639,7 +1639,7 @@ async def test_failure_cascade_ends_a_reversed_chain_in_one_advance(
     sched = cron._dag
     launched = _dagstate_stub_launches(monkeypatch, cron)
     counts = _dagstate_count_writes(monkeypatch, cron.state_backend)
-    run_key = await sched.trigger_run("reversed")
+    run_key = (await sched.trigger("reversed"))["runKey"]
     (running,) = launched
     del launched[:]
     assert running.dag_ref.task_id == "t0"

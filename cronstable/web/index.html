@@ -894,6 +894,17 @@
   .modal input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
+  /* ---------- run-parameters modal ---------- */
+  .paramfields { display: grid; gap: 12px; max-height: 56vh; overflow: auto; padding: 2px; }
+  .paramfield label { display: block; font-size: 12px; margin-bottom: 4px; }
+  .paramfield select {
+    width: 100%; padding: 8px 10px; border-radius: var(--radius); border: 1px solid var(--border2);
+    background: var(--bg2); color: var(--fg);
+  }
+  .paramfield .phint { color: var(--fg-dim); font-size: 11px; margin-top: 3px; overflow-wrap: anywhere; }
+  .paramfield .perr, #paramError { color: var(--fail); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+  .paramfield .perr:empty, #paramError:empty { display: none; }
+
   /* ---------- pair-a-device modal ---------- */
   /* the QR itself is deliberately theme-independent: dark modules on a
      light tile scan reliably whatever the dashboard theme */
@@ -916,6 +927,7 @@
   }
   .toast .g { font-weight: 700; }
   .toast.ok .g { color: var(--ok); } .toast.err .g { color: var(--fail); } .toast.info .g { color: var(--accent); }
+  .toast.warn .g { color: var(--pending); }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
   @media (max-width: 820px) {
@@ -1444,6 +1456,10 @@
     border: 1px solid color-mix(in srgb, var(--fail) 35%, var(--border)); }
   .ha-chip.cap-off { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
     border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border)); }
+  /* a workflow with live hosts below the run engine level it needs */
+  .ha-chip.fleet { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border)); }
+  .drawer-head .meta.fleetwarn { color: var(--pending); flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
   .drawer-head .meta .ha-chip { margin-left: 0; font-size: 11px; }
   .runtable td .ha-chip { margin: 0 6px 0 0; }
 
@@ -1545,6 +1561,7 @@
   .daggraph .edge { stroke: var(--border2); stroke-width: 1.4; fill: none; }
   .daggraph .node { cursor: pointer; }
   .daggraph .node rect { stroke-width: 1.5; }
+  .daggraph .node .when { fill: var(--panel); stroke-width: 1.5; }
   .daggraph .node:hover rect { filter: brightness(1.25); }
 
   /* XCom viewer */
@@ -1843,12 +1860,15 @@
       </button>
     </div>
     <div class="meta" id="dgMeta"></div>
-    <div id="dgBackfill" style="display:none; margin-top:8px; gap:6px; align-items:center;" class="approw">
+    <div class="meta" id="dgParams" style="display:none"></div>
+    <div class="meta fleetwarn" id="dgFleet" role="status" style="display:none"></div>
+    <div id="dgBackfill" style="display:none; margin-top:8px; gap:6px; align-items:center; flex-wrap:wrap;" class="approw">
       <span class="faint">backfill</span>
       <input type="text" id="dgBfFrom" placeholder="from ISO (2026-07-01T00:00:00)" style="width:220px" autocomplete="off" spellcheck="false">
       <input type="text" id="dgBfTo" placeholder="to ISO" style="width:220px" autocomplete="off" spellcheck="false">
       <button class="btn primary" id="dgBfGo">run backfill</button>
       <label class="toggle"><input type="checkbox" id="dgBfFailed"> Failed dates only</label>
+      <span class="faint" id="dgBfNote" role="status" style="flex-basis:100%"></span>
     </div>
     <section id="dgRecoveryResults" style="display:none; margin-top:12px" aria-live="polite"></section>
     <section id="dgRecovery" style="display:none; margin-top:12px" aria-live="polite"></section>
@@ -2017,6 +2037,24 @@
       <button class="btn" id="pairCopy" style="margin-right:auto">Copy</button>
       <button class="btn primary" id="pairClose">Close</button>
     </div>
+  </div>
+</div>
+
+<!-- run-parameters modal: the trigger and the backfill of a workflow that
+     declares params. BEFORE the token modal for the reason the pair modal
+     gives: its submit is where a stale token 401s. -->
+<div class="overlay" id="paramWrap">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="paramTitle" aria-describedby="paramMsg">
+    <h3 id="paramTitle">Run workflow</h3>
+    <p id="paramMsg"></p>
+    <form id="paramForm" autocomplete="off">
+      <div class="paramfields" id="paramFields"></div>
+      <div id="paramError" role="alert"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="paramCancel">Cancel</button>
+        <button type="submit" class="btn primary" id="paramGo">Run</button>
+      </div>
+    </form>
   </div>
 </div>
 
@@ -5460,6 +5498,8 @@ var qrcode = function() {
     seenFirst: false,
     connected: true,
     auth: null,                // /whoami payload; null until the probe resolves (scope-aware chrome)
+    paramForm: null,           // the open run-parameters dialog: { dag, decl, backfill }
+    triggerRequest: null,      // the trigger the server has not answered: { key, id, at } (see triggerRequestId)
     clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
     clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     nodeLimits: null,          // /node `limits`: the caps this host can apply; null until known
@@ -5523,6 +5563,8 @@ var qrcode = function() {
   }
   const canControl = () => canScope("control");
   const canApprove = () => canScope("approve");
+  // choosing run parameter values; without it a run uses the declared defaults
+  const canParams = () => canScope("params");
   // A public-view instance: no token stored, and the daemon answered the
   // credential-less /whoami with a restricted anonymous grant.
   function publicView() {
@@ -8281,21 +8323,45 @@ var qrcode = function() {
     state.seenFirst = true;
   }
 
-  async function runJob(name) {
+  // Start a job. One that declares `params` opens the parameter dialog
+  // first, for a token that may choose values. `defaults` skips the dialog
+  // and starts the run with the declared defaults, which is what a bulk
+  // action wants.
+  async function runJob(name, defaults) {
+    if (!defaults && jobParamDecl(name).length && canParams()) { openParamForm(name, null, true); return; }
+    await postJobStart(name, null);
+  }
+  // POST the start. Resolves true on success, null after a failure it has
+  // already reported, and the error body of a 400 or 403 when `fromForm` is
+  // set, for the dialog to show under its fields.
+  async function postJobStart(name, params, fromForm) {
     try {
-      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/start", { method: "POST" });
+      const opts = { method: "POST" };
+      if (params) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify({ params: params }); }
+      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/start", opts);
       if (res.ok) {
-        toast("ok", (res.status === 202 ? "Queued " : "▶ started ") + name);
+        const r = (await res.json().catch(() => ({}))) || {};
+        // A 200 that carries `pending` starts nothing yet: the run waits
+        // for another node to yield the job's cluster slot.
+        const waiting = res.status === 200 && r.pending === true;
+        const doubt = paramsUnconfirmed(params, r);
+        if (doubt) toast("warn", (res.status === 202 ? "Queued " : waiting ? "Accepted " : "▶ started ") + name + ", but " + doubt);
+        else if (waiting) toast("info", name + " starts when another node yields its cluster slot");
+        else toast("ok", (res.status === 202 ? "Queued " : "▶ started ") + name);
         if (res.status === 202) loadPools();
-        if (res.status !== 202 && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
+        if (res.status !== 202 && !waiting && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
         setTimeout(loadJobs, 300);
-      } else if (res.status === 409 || res.status === 503) {
+        return true;
+      }
+      if (fromForm && (res.status === 400 || res.status === 403)) return await errorBody(res);
+      if (res.status === 409 || res.status === 503) {
         // the daemon's reason: a disabled job, a run that Forbid holds
         // back, a pool or cluster slot that refuses it
         const error = await res.json().catch(() => ({}));
         toast("err", error.error || "could not start (HTTP " + res.status + ")");
       } else { toast("err", "could not start (HTTP " + res.status + ")"); }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "could not start " + name); }
+    return null;
   }
   async function cancelJob(name) {
     try {
@@ -8324,7 +8390,7 @@ var qrcode = function() {
   function runAllFailing() {
     const failing = state.jobs.filter((j) => health(j).key === "fail" && j.enabled);
     if (!failing.length) { toast("info", "no failing jobs"); return; }
-    failing.forEach((j) => runJob(j.name));
+    failing.forEach((j) => runJob(j.name, true));
     toast("info", "restarting " + failing.length + " failing job" + (failing.length > 1 ? "s" : ""));
   }
 
@@ -8676,7 +8742,10 @@ var qrcode = function() {
         "<td>" + fmtDuration(r.duration) + "</td>" +
         (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
                   "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
-        '<td class="reason">' + limitsChips(r.limits, r.verification && r.verification.limits) + esc(r.fail_reason || r.skip_reason || "") + verificationDetail(r.verification) + "</td>" +
+        '<td class="reason">' + limitsChips(r.limits, r.verification && r.verification.limits) + esc(r.fail_reason || r.skip_reason || "") + verificationDetail(r.verification) +
+          (r.params ? ' <span class="faint runparams" title="' + escAttr(paramsText(r.params)) + '">' + esc(truncStr(paramsText(r.params), 60)) + "</span>" : "") +
+          // a manual start that supplied values: the label of its token
+          (r.triggeredBy ? ' <span class="faint">by ' + esc(truncStr(r.triggeredBy, 40)) + "</span>" : "") + "</td>" +
       "</tr>";
     }
     const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th>' +
@@ -10137,7 +10206,11 @@ var qrcode = function() {
         renderedBase = w.pairLinkBase;
         renderPairQr(pairLink(payload, renderedBase));
       }
-      if (w.authenticated === true && w.allScopes === true) $("pairWarn").style.display = "";
+      // A token that passes every route's check is full access, with or
+      // without `params`, which adds only the choice of run parameter values.
+      const held = Array.isArray(w.scopes) ? w.scopes : [];
+      const everyRoute = ["view", "control", "approve"].every((s) => held.includes(s));
+      if (w.authenticated === true && (w.allScopes === true || everyRoute)) $("pairWarn").style.display = "";
     }).catch(() => {});
   }
   function closePair() { if (closeOverlay("pairWrap")) pairSeq++; }
@@ -10176,12 +10249,14 @@ var qrcode = function() {
     updateAuthBtn(); closeModal(); loadWhoami(); loadJobs();
   }
 
+  // A "warn" toast reports an action that went through with a caveat. It
+  // holds a full sentence, so it stays longer than the others.
   function toast(kind, msg) {
     const e = el("div", "toast " + kind);
-    const g = kind === "ok" ? "✓" : kind === "err" ? "✕" : "›";
+    const g = kind === "ok" ? "✓" : kind === "err" ? "✕" : kind === "warn" ? "!" : "›";
     e.innerHTML = '<span class="g">' + g + '</span><span>' + esc(msg) + "</span>";
     $("toasts").appendChild(e);
-    setTimeout(() => { e.style.opacity = "0"; e.style.transition = "opacity .3s"; setTimeout(() => e.remove(), 300); }, 3000);
+    setTimeout(() => { e.style.opacity = "0"; e.style.transition = "opacity .3s"; setTimeout(() => e.remove(), 300); }, kind === "warn" ? 9000 : 3000);
   }
   function copyText(text, what) {
     const done = () => toast("ok", "copied " + (what || "text"));
@@ -10248,7 +10323,7 @@ var qrcode = function() {
   function anyOverlayOpen() {
     return state.palette.open || state.timeline.open || state.mitigate.open || state.sandbox.open || state.tail.open ||
       !!(state.dagDrawer && state.dagDrawer.dag) ||
-      ["settingsWrap", "helpWrap", "modalWrap", "pairWrap"].some((id) => $(id).classList.contains("open"));
+      ["settingsWrap", "helpWrap", "modalWrap", "pairWrap", "paramWrap"].some((id) => $(id).classList.contains("open"));
   }
   // ---- focus management (trap + restore) for modal surfaces ----
   function focusables(c) {
@@ -10259,6 +10334,7 @@ var qrcode = function() {
   // topmost open surface, in stacking order
   function activeSurface() {
     if ($("modalWrap").classList.contains("open")) return $("modalWrap");
+    if ($("paramWrap").classList.contains("open")) return $("paramWrap");
     if ($("settingsWrap").classList.contains("open")) return $("settingsWrap");
     if ($("helpWrap").classList.contains("open")) return $("helpWrap");
     if ($("pairWrap").classList.contains("open")) return $("pairWrap");
@@ -10388,6 +10464,7 @@ var qrcode = function() {
     if (e.key === "Escape") {
       if ($("colsMenu").classList.contains("open")) return toggleColsMenu(false);
       if ($("modalWrap").classList.contains("open")) return closeModal();
+      if ($("paramWrap").classList.contains("open")) return closeParamForm();
       if ($("settingsWrap").classList.contains("open")) return closeSettings();
       if ($("helpWrap").classList.contains("open")) return closeHelp();
       if ($("pairWrap").classList.contains("open")) return closePair();
@@ -10472,6 +10549,42 @@ var qrcode = function() {
       "</span>" + esc(DST_LABEL[s] || s || "?") + "</span>";
   }
   function truncStr(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+  // a task's triggerRule as a short badge label; the default rule gets none.
+  // A rule this page does not know shows under its own name.
+  const RULE_LABEL = {
+    all_done: "all done", none_failed: "none failed",
+    none_failed_min_one_success: "1+ success", all_done_min_one_failed: "1+ failed",
+  };
+  function ruleLabel(spec) {
+    const rule = spec && spec.triggerRule;
+    return !rule || rule === "all_success" ? "" : (RULE_LABEL[rule] || rule.replace(/_/g, " "));
+  }
+  // a task's when: comparisons as one phrase, in the words the configuration
+  // uses: "param mode equals full; xcom extract/row_count notIn 0"
+  const WHEN_OPS = ["equals", "notEquals", "in", "notIn", "lessThan", "lessThanOrEqual", "greaterThan", "greaterThanOrEqual"];
+  function whenText(spec) {
+    return ((spec && spec.when) || []).map((c) => {
+      const src = c.xcom ? "xcom " + c.xcom.task + "/" + c.xcom.key : "param " + c.param;
+      const op = WHEN_OPS.find((k) => c[k] !== undefined) || "";
+      const want = c[op];
+      return src + " " + op + " " + (Array.isArray(want) ? want.join(", ") : String(want));
+    }).join("; ");
+  }
+  // why a task entry is skipped, from its skipReason ({kind, detail})
+  function skipReasonText(reason) {
+    if (!reason || !reason.detail) return "";
+    return reason.kind === "exit_code" ? "skipped itself, " + reason.detail : String(reason.detail);
+  }
+  // the reused tasks a recovery leaves skipped, each with its recorded reason
+  function recoverySkipsHtml(plan) {
+    const skips = plan.preservedSkipped || {};
+    const keys = Object.keys(skips).sort();
+    if (!keys.length) return "";
+    return '<p class="recskips">Stays skipped: ' + keys.map((k) => {
+      const why = skipReasonText(skips[k]);
+      return esc(k) + (why ? ' <span class="faint">(' + esc(why) + ")</span>" : "");
+    }).join(", ") + "</p>";
+  }
 
   // epoch-second time helpers (DAG timestamps are float epoch seconds; only
   // logicalDate is ISO). Reuse the ISO formatters via a conversion.
@@ -10573,7 +10686,7 @@ var qrcode = function() {
     const sig = JSON.stringify(dags.map((d) => [
       d.name, d.enabled, d.schedule, (d.tasks || []).length, d.totalRuns,
       d.latestRun && d.latestRun.state, d.latestRun && d.latestRun.updatedAt,
-      d.runCounts, state.dagDrawer.dag, canControl(),
+      d.runCounts, state.dagDrawer.dag, canControl(), d.fleetWarnings,
     ]));
     if (sig === state.dags.sig) return;
     state.dags.sig = sig;
@@ -10596,7 +10709,7 @@ var qrcode = function() {
       const rowCls = (state.dagDrawer.dag === d.name ? "active" : "") + (d.enabled ? "" : " muted");
       return '<tr data-dag="' + escAttr(d.name) + '" class="' + rowCls + '">' +
         "<td>" + status + "</td>" +
-        '<td><div class="dagname">' + esc(d.name) + (d.enabled ? "" : " (disabled)") + "</div>" +
+        '<td><div class="dagname">' + esc(d.name) + (d.enabled ? "" : " (disabled)") + fleetChip(d) + "</div>" +
         '<div class="dagmeta">' + esc(tasks.length + " task" + (tasks.length === 1 ? "" : "s") + (kindStr && kindStr !== tasks.length + "" ? " · " + kindStr : "")) + mapped + "</div></td>" +
         "<td>" + sched + "</td>" +
         '<td class="muted">' + esc(kindStr || tasks.length) + "</td>" +
@@ -10611,6 +10724,18 @@ var qrcode = function() {
         '<button class="btn" data-dagopen="' + escAttr(d.name) + '">Open</button>' +
         "</div></td></tr>";
     }).join("");
+  }
+  // `fleetWarnings` (GET /dags): one line for each live host on the shared
+  // store whose build is below the run engine level the workflow needs.
+  function fleetWarnings(d) {
+    return Array.isArray(d && d.fleetWarnings) ? d.fleetWarnings.filter((w) => typeof w === "string" && w) : [];
+  }
+  // the card's chip: how many hosts, with every line in its tooltip
+  function fleetChip(d) {
+    const warns = fleetWarnings(d);
+    if (!warns.length) return "";
+    return '<span class="ha-chip fleet" title="' + escAttr(warns.join("\n")) + '">⚠ ' +
+      warns.length + (warns.length === 1 ? " host needs" : " hosts need") + " an upgrade</span>";
   }
   // a compact stacked bar of a dag's run outcomes (success/failed/running)
   function dagHistBar(counts, total) {
@@ -10638,6 +10763,7 @@ var qrcode = function() {
     $("dagScrim").classList.add("open");
     $("dgName").textContent = dag;
     $("dgBackfill").style.display = "none";
+    $("dgBfNote").textContent = "";
     renderDagDrawerHead();
     renderDagCard();
     switchDagTab(tab || (runKey ? "tasks" : "runs"));
@@ -10682,7 +10808,15 @@ var qrcode = function() {
     if (run) {
       bits.push('<span class="kbadge">' + esc(run.kind || "?") + "</span>");
       if (run.createdAt) bits.push('<span>started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b></span>");
+      if (run.triggeredBy) bits.push("<span>by <b>" + esc(truncStr(run.triggeredBy, 40)) + "</b></span>");
     }
+    // the values the run stores; its tasks read exactly these
+    const runParams = run && run.params && typeof run.params === "object" ? Object.entries(run.params) : [];
+    $("dgParams").style.display = runParams.length ? "" : "none";
+    $("dgParams").innerHTML = runParams.length
+      ? '<span class="faint">parameters</span>' + runParams.map(([k, v]) =>
+          '<span title="' + escAttr(k + " = " + paramText(v)) + '">' + esc(k) + " <b>" + esc(truncStr(paramText(v), 48)) + "</b></span>").join("")
+      : "";
     if (run && run.recovery) {
       const recovery = run.recovery;
       bits.push('<a href="#" data-source-run="' + escAttr(recovery.sourceRunKey) + '">Source run</a>');
@@ -10691,6 +10825,10 @@ var qrcode = function() {
       if (recovery.error) bits.push('<span role="alert" class="fail">' + esc(recovery.error) + '</span>');
     }
     $("dgMeta").innerHTML = bits.join("");
+    // every line in full: each names a host to upgrade
+    const warns = fleetWarnings(d);
+    $("dgFleet").style.display = warns.length ? "" : "none";
+    $("dgFleet").innerHTML = warns.map((w) => "<span>⚠ " + esc(w) + "</span>").join("");
     renderRecoveryResults();
   }
   function switchDagTab(tab) {
@@ -10881,6 +11019,9 @@ var qrcode = function() {
       bits.push('<span class="' + (recon ? "recon" : "faint") + '" title="' + escAttr(e.failReason) + '">' +
         (recon ? "⚠ " : "") + esc(truncStr(e.failReason, 48)) + "</span>");
     }
+    // a rejected gate already says who rejected it, in the approval bit above
+    const skipWhy = e.skipReason && e.skipReason.kind !== "approval" ? skipReasonText(e.skipReason) : "";
+    if (skipWhy) bits.push('<span class="faint skipwhy" title="' + escAttr(skipWhy) + '">' + esc(truncStr(skipWhy, 56)) + "</span>");
     // sampled CPU/peak-RSS, present only when the task ran with monitorResources
     if (e.resources) {
       bits.push('<span class="faint nowrap" title="' +
@@ -10909,8 +11050,15 @@ var qrcode = function() {
     const tcls = opts.inst ? "inst" : "";
     const typeBadge = (!opts.inst && spec && spec.type && spec.type !== "task")
       ? ' <span class="kbadge">' + esc(spec.type) + "</span>" : "";
+    const rule = opts.inst ? "" : ruleLabel(spec);
+    const ruleBadge = rule
+      ? ' <span class="kbadge rulebadge" title="' + escAttr("triggerRule: " + spec.triggerRule) + '">' + esc(rule) + "</span>" : "";
+    // the task runs only when its comparisons hold; the tooltip lists them
+    const when = opts.inst ? "" : whenText(spec);
+    const whenBadge = when
+      ? ' <span class="kbadge whenbadge" title="' + escAttr("when: " + when) + '">when</span>' : "";
     return '<tr class="' + (opts.isGroup ? "fanhead" : "") + '">' +
-      '<td class="' + tcls + '">' + label + typeBadge + "</td>" +
+      '<td class="' + tcls + '">' + label + typeBadge + ruleBadge + whenBadge + "</td>" +
       "<td>" + dstCell(st) + "</td>" +
       '<td class="muted">' + esc(attempt) + "</td>" +
       "<td>" + exit + "</td>" +
@@ -11007,11 +11155,26 @@ var qrcode = function() {
       const fill = st ? "color-mix(in srgb, var(--" + v + ") 22%, var(--panel))" : "var(--panel)";
       const stroke = "var(--" + v + ")";
       const glyph = st ? dstGlyph(st) : (t.type === "approval" ? "?" : t.type === "sensor" ? "⏲" : "·");
-      svg += '<g class="node" data-gtask="' + escAttr(t.id) + '"><title>' + escAttr(t.id + (st ? " · " + st : "") + (t.type !== "task" ? " (" + t.type + ")" : "")) + "</title>";
+      const rule = ruleLabel(t);
+      const when = whenText(t);
+      const skipWhy = run && st === "skipped" ? skipReasonText(((run.tasks || {})[t.id] || {}).skipReason) : "";
+      svg += '<g class="node" data-gtask="' + escAttr(t.id) + '"><title>' + escAttr(t.id + (st ? " · " + st : "") + (skipWhy ? " (" + skipWhy + ")" : "") +
+        (t.type !== "task" ? " (" + t.type + ")" : "") + (rule ? " · triggerRule: " + t.triggerRule : "") +
+        ((t.skipExitCodes || []).length ? " · skips on exit " + t.skipExitCodes.join(", ") : "") +
+        (when ? " · when: " + when : "")) + "</title>";
       svg += '<rect x="' + p.x + '" y="' + p.y + '" width="' + L.NW + '" height="' + L.NH + '" rx="3" style="fill:' + fill + ';stroke:' + stroke + '"/>';
       svg += '<text x="' + (p.x + 8) + '" y="' + (p.y + L.NH / 2 + 3.5) + '">' + esc(glyph + " " + truncStr(t.id, 17)) + "</text>";
       if (t.type !== "task") svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + 10) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">' + esc(t.type) + "</text>";
       if (t.mapped) svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + L.NH - 4) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">fan-out</text>';
+      // the rule badge takes the corner the type and fan-out labels leave
+      // free: a mapped task is always a plain task, so one always is
+      if (rule) svg += '<text class="rule" x="' + (p.x + L.NW - 6) + '" y="' + (t.type !== "task" ? p.y + L.NH - 4 : p.y + 10) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">' + esc(rule) + "</text>";
+      // a decision diamond where the edges enter a task that has when:
+      if (when) {
+        const cy = p.y + L.NH / 2;
+        svg += '<path class="when" d="M' + (p.x - 5) + " " + cy + " L" + p.x + " " + (cy - 5) + " L" + (p.x + 5) + " " + cy +
+          " L" + p.x + " " + (cy + 5) + 'Z" style="stroke:' + stroke + '"/>';
+      }
       svg += "</g>";
     });
     holder.innerHTML = svg + "</svg>";
@@ -11136,17 +11299,235 @@ var qrcode = function() {
       else toast("err", "decision failed (HTTP " + res.status + ")");
     } catch (e) { if (e.message !== "unauthorized") toast("err", "decision failed"); }
   }
+  // ---- run parameters ----
+  // A workflow's `params` declaration (GET /dags) drives one dialog, shared
+  // by the trigger and the backfill. A token without the `params` scope
+  // never sees it: its runs use the declared defaults, as the daemon
+  // enforces.
+  function dagParamDecl(name) {
+    const d = state.dags.byName[name];
+    return (d && d.params) || [];
+  }
+  // a job's declaration (GET /jobs), which opens the same dialog from Run
+  function jobParamDecl(name) {
+    const j = (state.byName || {})[name];
+    return (j && j.params) || [];
+  }
+  // a run's stored values as "name = value" text
+  function paramsText(params) {
+    return Object.entries(params || {}).map(([k, v]) => k + " = " + paramText(v)).join(", ");
+  }
+  // a value as a task reads it: text as it is, anything else as JSON text
+  function paramText(v) { return typeof v === "string" ? v : JSON.stringify(v); }
+  function recoveryParamsHtml(plan) {
+    const entries = Object.entries(plan.params || {});
+    if (!entries.length) return "";
+    return "<p>Parameters: " + esc(entries.map(([k, v]) => k + " = " + paramText(v)).join(", ")) + "</p>";
+  }
+  function paramFieldHtml(p, i) {
+    const id = "paramF" + i;
+    const def = p.required ? null : p.default;
+    let control;
+    if (p.type === "boolean") {
+      control = '<input type="checkbox" id="' + id + '"' + (def === true ? " checked" : "") + ">";
+    } else if (p.allowed && p.allowed.length) {
+      // An allowed "" is labeled (empty), so the operator can tell it from
+      // `choose…`. Both options have the value "", so paramFieldValue
+      // distinguishes them by position.
+      control = '<select id="' + id + '">' + (p.required ? '<option value="">choose…</option>' : "") +
+        p.allowed.map((v) => '<option value="' + escAttr(paramText(v)) + '"' + (!p.required && v === def ? " selected" : "") + ">" + esc(v === "" ? "(empty)" : paramText(v)) + "</option>").join("") +
+        "</select>";
+    } else {
+      control = '<input type="text" id="' + id + '" value="' + escAttr(def == null ? "" : paramText(def)) + '"' +
+        (p.type === "string" ? "" : ' inputmode="' + (p.type === "integer" ? "numeric" : "decimal") + '"') +
+        (p.maxLength ? ' maxlength="' + escAttr(p.maxLength) + '"' : "") + ' autocomplete="off" spellcheck="false">';
+    }
+    const hints = [];
+    if (p.description) hints.push(p.description);
+    if (p.minimum != null && p.maximum != null) hints.push(p.minimum + " to " + p.maximum);
+    else if (p.minimum != null) hints.push("at least " + p.minimum);
+    else if (p.maximum != null) hints.push("at most " + p.maximum);
+    if (p.pattern) hints.push("matches " + p.pattern);
+    return '<div class="paramfield" data-param="' + escAttr(p.name) + '">' +
+      '<label for="' + id + '"><b>' + esc(p.name) + '</b> <span class="faint">' + esc(p.type) + (p.required ? " · required" : "") + "</span></label>" +
+      control +
+      (hints.length ? '<div class="phint">' + esc(hints.join(" · ")) + "</div>" : "") +
+      '<div class="perr" role="alert"></div></div>';
+  }
+  // The value a field holds, in the declared JSON type: the daemon coerces
+  // nothing. `undefined` leaves the parameter out, so the daemon applies the
+  // default or reports it as required. Throws the reason to show under the
+  // field.
+  function paramFieldValue(p, i) {
+    const f = $("paramF" + i);
+    if (p.type === "boolean") return f.checked;
+    if (p.type === "string") {
+      // "" can be an allowed value. Only the `choose…` option, which
+      // paramFieldHtml puts first in a required list, leaves the parameter
+      // out.
+      if (p.allowed && p.allowed.length) return p.required && f.selectedIndex === 0 ? undefined : f.value;
+      // an empty required text box is a value the caller has not supplied
+      return f.value === "" && p.required ? undefined : f.value;
+    }
+    const t = f.value.trim();
+    if (t === "") return undefined;
+    const n = Number(t);
+    if (p.type === "integer") {
+      if (!/^[+-]?\d+$/.test(t) || !Number.isSafeInteger(n)) throw new Error("must be an integer");
+      return n;
+    }
+    if (!/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(t) || !Number.isFinite(n)) throw new Error("must be a number");
+    return n;
+  }
+  // `job` is true when `name` is a job, started through POST /jobs/{name}/start
+  function openParamForm(name, backfill, job) {
+    if (!openOverlay("paramWrap")) return;
+    const decl = job ? jobParamDecl(name) : dagParamDecl(name);
+    state.paramForm = { dag: name, decl: decl, backfill: backfill || null, job: !!job };
+    $("paramTitle").textContent = (backfill ? "Backfill " : "Run ") + name;
+    $("paramMsg").textContent = backfill
+      ? "These values apply to the runs this backfill creates. A date that already has a run keeps its values."
+      : job
+        ? "The run records these values, and its command reads them. Everyone who can view this job sees them."
+        : "The run stores these values, and its tasks read them. Everyone who can view this workflow sees them.";
+    $("paramFields").innerHTML = decl.map(paramFieldHtml).join("");
+    $("paramError").textContent = "";
+    $("paramGo").textContent = backfill ? "Run backfill" : "Run";
+    $("paramGo").disabled = false;
+    focusFirst($("paramWrap"));
+  }
+  function closeParamForm() { if (closeOverlay("paramWrap")) state.paramForm = null; }
+  // Each reason goes under its field. A name with no field (the declaration
+  // changed since the last poll) joins the summary line.
+  function showParamErrors(errors, message) {
+    const rest = [];
+    const rows = [...document.querySelectorAll("#paramFields .paramfield")];
+    rows.forEach((r) => { r.querySelector(".perr").textContent = ""; });
+    for (const [name, why] of Object.entries(errors || {})) {
+      const row = rows.find((r) => r.getAttribute("data-param") === name);
+      if (row) row.querySelector(".perr").textContent = name + " " + why;
+      else rest.push(name + " " + why);
+    }
+    $("paramError").textContent = [message].concat(rest).filter(Boolean).join(" · ");
+  }
+  // Sends required parameters and values that differ from the declared
+  // defaults, so an unchanged dialog starts the same run as a click without
+  // the dialog. Defaults come from the latest poll, so a field left at a
+  // default that a reload replaced is still sent.
+  async function submitParamForm() {
+    const form = state.paramForm;
+    if (!form) return;
+    const latest = new Map((form.job ? jobParamDecl(form.dag) : dagParamDecl(form.dag)).map((p) => [p.name, p]));
+    const chosen = {}, errors = {};
+    form.decl.forEach((p, i) => {
+      try {
+        const v = paramFieldValue(p, i);
+        const d = latest.get(p.name) || p;
+        if (v !== undefined && (d.required || v !== d.default)) chosen[p.name] = v;
+      } catch (e) { errors[p.name] = e.message; }
+    });
+    if (Object.keys(errors).length) { showParamErrors(errors, ""); return; }
+    const params = Object.keys(chosen).length ? chosen : null;
+    $("paramGo").disabled = true;
+    const result = form.job
+      ? await postJobStart(form.dag, params, true)
+      : form.backfill
+        ? await postBackfill(form.dag, form.backfill.from, form.backfill.to, params)
+        : await postTrigger(form.dag, params);
+    if (state.paramForm !== form) return;
+    $("paramGo").disabled = false;
+    if (result === true) closeParamForm();
+    else if (result && result.more) {
+      // A backfill that stopped at the server's limit. The dialog stays
+      // open with its values, and Run continues from the next date.
+      form.backfill.from = result.more;
+      showParamErrors({}, "");
+      $("paramMsg").textContent = "The server stopped at its limit for one backfill. Run again to continue from " + result.more + " with these values.";
+    }
+    else if (result) showParamErrors(result.paramErrors, result.error);
+  }
+  // Why a response fails to confirm the values a request chose, or "" when
+  // it confirms them. A server that takes the values echoes the run's whole
+  // map as `params`. One that ignores the request body sends no map, and
+  // its run takes the defaults.
+  function paramsUnconfirmed(sent, body) {
+    const names = Object.keys(sent || {});
+    if (!names.length) return "";
+    const echoed = body && body.params;
+    if (!echoed || typeof echoed !== "object") return "the server did not confirm the values, so the run may use the defaults";
+    const differing = names.filter((n) => !Object.prototype.hasOwnProperty.call(echoed, n) || echoed[n] !== sent[n]).sort();
+    return differing.length ? "the run stores other values for " + differing.join(", ") : "";
+  }
+  // A trigger's requestId. The server derives the run key from it, so a
+  // trigger sent again with the same ID returns the first run. A trigger
+  // keeps its ID until the server answers it. It takes a new ID once
+  // TRIGGER_REQUEST_HOLD_MS have passed since it was last sent, and so does
+  // a trigger of another workflow or with other values.
+  const TRIGGER_REQUEST_HOLD_MS = 10 * 60 * 1000;
+  function triggerRequestId(name, params) {
+    const key = JSON.stringify([name, params || {}]);
+    const held = state.triggerRequest;
+    // wall clock, so the time a suspended machine sleeps counts
+    const now = Date.now();
+    let id = held && held.key === key && now - held.at <= TRIGGER_REQUEST_HOLD_MS ? held.id : "";
+    if (!id) {
+      const bytes = new Uint8Array(16);
+      // crypto.randomUUID needs a secure context, and this page is often
+      // served over plain HTTP
+      if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+      else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+      id = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    state.triggerRequest = { key: key, id: id, at: now };
+    return id;
+  }
+  // An error response as { error, paramErrors }. 4xx bodies are the uniform
+  // JSON envelope; the raw-text fallback keeps an older daemon's plain body.
+  async function errorBody(res) {
+    const t = await res.text().catch(() => "");
+    try { const j = JSON.parse(t); if (j && typeof j === "object" && j.error) return j; } catch (_) {}
+    return { error: t || "HTTP " + res.status };
+  }
+  function errorBodyText(body) {
+    const errs = Object.entries(body.paramErrors || {}).map(([n, w]) => n + " " + w);
+    return body.error + (errs.length ? ": " + errs.join("; ") : "");
+  }
   async function dagTrigger(name) {
+    if (dagParamDecl(name).length && canParams()) { openParamForm(name); return; }
+    const result = await postTrigger(name, null);
+    if (result && result !== true) toast("err", "trigger: " + errorBodyText(result));
+  }
+  // POST the trigger. Resolves true on success, null after a failure it has
+  // already reported, and the error body for a refusal the caller shows.
+  async function postTrigger(name, params) {
     try {
-      const res = await apiFetch("/dags/" + encodeURIComponent(name) + "/trigger", { method: "POST" });
+      const body = { requestId: triggerRequestId(name, params) };
+      if (params) body.params = params;
+      const res = await apiFetch("/dags/" + encodeURIComponent(name) + "/trigger",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      // the server answered: the next trigger is a new request
+      if (res.status < 500) state.triggerRequest = null;
       if (res.ok) {
-        let rk = null; try { rk = (await res.json()).runKey; } catch (_) {}
-        toast("ok", "▶ triggered " + name);
+        const r = (await res.json().catch(() => ({}))) || {};
+        const rk = r.runKey || null;
+        const doubt = paramsUnconfirmed(params, r);
+        if (doubt) toast("warn", "▶ triggered " + name + ", but " + doubt);
+        // the run that an unanswered trigger created
+        else if (r.created === false) toast("info", name + " run " + rk + " was already started by this trigger");
+        else toast("ok", "▶ triggered " + name);
         loadDags();
         if (state.dagDrawer.dag === name) { setTimeout(() => { loadDagRuns(); if (rk) selectDagRun(rk, true); }, 300); }
-      } else if (res.status === 404) toast("err", "no such dag");
-      else toast("err", "trigger failed (HTTP " + res.status + ")");
-    } catch (e) { if (e.message !== "unauthorized") toast("err", "trigger failed"); }
+        return true;
+      }
+      if (res.status === 404) { toast("err", "no such dag"); return null; }
+      if (res.status === 400 || res.status === 403 || res.status === 409) return await errorBody(res);
+      toast("err", "trigger failed (HTTP " + res.status + ")");
+    } catch (e) {
+      // the server may have the request; the held requestId makes the same
+      // trigger return that run
+      if (e.message !== "unauthorized") toast("warn", "trigger got no answer; trigger " + name + " again with the same values within " + TRIGGER_REQUEST_HOLD_MS / 60000 + " minutes, and the run starts only once");
+    }
+    return null;
   }
   async function dagBackfill() {
     const dag = state.dagDrawer.dag;
@@ -11156,22 +11537,39 @@ var qrcode = function() {
       await previewRecovery("/dags/" + encodeURIComponent(dag) + "/recover", { from, to });
       return;
     }
+    if (dagParamDecl(dag).length && canParams()) { openParamForm(dag, { from: from, to: to }); return; }
+    const result = await postBackfill(dag, from, to, null);
+    if (result && result !== true && !result.more) toast("err", "backfill: " + errorBodyText(result));
+  }
+  // POST the backfill; resolves like postTrigger. A backfill that the
+  // server cut short at its limit resolves { more }, the date the next one
+  // starts from, and leaves the row open on the rest of the range.
+  async function postBackfill(dag, from, to, params) {
     try {
+      const body = { from: from, to: to };
+      if (params) body.params = params;
       const res = await apiFetch("/dags/" + encodeURIComponent(dag) + "/backfill",
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: from, to: to }) });
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (res.ok) {
-        let created = null; try { created = (await res.json()).created; } catch (_) {}
-        toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + ")" : ""));
-        $("dgBackfill").style.display = "none";
+        let r = {}; try { r = (await res.json()) || {}; } catch (_) {}
+        const created = r.created;
+        const queued = "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + (r.existing ? ", " + r.existing + " already existed" : "") + ")" : "");
         setTimeout(loadDagRuns, 300);
-      } else {
-        // 4xx bodies are the uniform JSON envelope {"error": msg}; keep the
-        // raw-text fallback so an older daemon's plain body still shows
-        const t = await res.text().catch(() => "");
-        let msg = t; try { msg = JSON.parse(t).error || t; } catch (_) {}
-        toast("err", "backfill: " + (msg || "HTTP " + res.status));
+        if (r.truncated === true && typeof r.nextFrom === "string") {
+          $("dgBfFrom").value = r.nextFrom;
+          $("dgBfNote").textContent = "The server stopped at its limit for one backfill. Run it again to continue from " + r.nextFrom + ".";
+          $("dgBackfill").style.display = "flex";
+          toast("warn", queued + ". The range holds more dates: run the backfill again to continue from " + r.nextFrom);
+          return { more: r.nextFrom };
+        }
+        toast("ok", queued);
+        $("dgBfNote").textContent = "";
+        $("dgBackfill").style.display = "none";
+        return true;
       }
+      return await errorBody(res);
     } catch (e) { if (e.message !== "unauthorized") toast("err", "backfill failed"); }
+    return null;
   }
 
   function verificationDetail(result) {
@@ -11273,7 +11671,7 @@ var qrcode = function() {
       const preserved = plans.reduce((n, p) => n + p.preserved.length, 0);
       $("dgRecovery").style.display = "";
       $("dgRecovery").innerHTML = '<div class="card" style="padding:16px"><h3>Review recovery</h3><p>' + tasks + ' tasks will run; ' + preserved + ' task results will be reused across ' + plans.length + (plans.length === 1 ? ' run.</p>' : ' runs.</p>') +
-        plans.map(p => '<details><summary>' + esc(p.sourceRunKey) + '</summary><p>Run: ' + esc(p.tasks.join(", ")) + '</p><p>Reuse: ' + esc(p.preserved.join(", ") || "none") + '</p><p>Configuration: <code>' + esc(p.configurationRevision) + '</code></p><p>Artifacts: ' + esc(p.artifacts.map(a => a.name).join(", ") || "none") + '</p></details>').join("") +
+        plans.map(p => '<details><summary>' + esc(p.sourceRunKey) + '</summary><p>Run: ' + esc(p.tasks.join(", ")) + '</p><p>Reuse: ' + esc(p.preserved.join(", ") || "none") + '</p>' + recoverySkipsHtml(p) + recoveryParamsHtml(p) + '<p>Configuration: <code>' + esc(p.configurationRevision) + '</code></p><p>Artifacts: ' + esc(p.artifacts.map(a => a.name).join(", ") || "none") + '</p></details>').join("") +
         (changed ? '<p><label><input type="checkbox" id="dgRecoveryConfig"> Use the current configuration, which differs from the source run.</label></p>' : '') +
         '<p class="faint">Recovery preserves the source run. Selected commands run again and may repeat external side effects.</p>' +
         '<button class="btn primary" id="dgRecoveryGo"' + (!tasks ? " disabled" : "") + '>Start recovery</button> <button class="btn" id="dgRecoveryDismiss">Dismiss</button></div>';
@@ -11834,6 +12232,11 @@ var qrcode = function() {
     // that held it before. The field consumes Enter so that the browser
     // does not go on to activate that control with the same key press.
     $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("tokenSave").click(); } });
+
+    // run parameters
+    $("paramForm").addEventListener("submit", (e) => { e.preventDefault(); submitParamForm(); });
+    $("paramCancel").addEventListener("click", closeParamForm);
+    $("paramWrap").addEventListener("click", (e) => { if (e.target === $("paramWrap")) closeParamForm(); });
 
     // pair a device
     $("openPair").addEventListener("click", () => { closeSettings(); openPair(); });

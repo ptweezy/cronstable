@@ -42,6 +42,7 @@ import math
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -57,6 +58,7 @@ from typing import (
 )
 
 from cronstable import _cliargs
+from cronstable import params as run_params
 from cronstable.badge import badge_addressable, badge_markdown
 from cronstable.cronexpr import LOCAL_ZONE, CronTab
 from cronstable.croninfo import (
@@ -113,6 +115,10 @@ HEAT_MAX_JOBS = 80
 
 #: The boot self-test replays after this long, like the web page's.
 BOOT_EVERY_S = 12 * 3600
+
+#: A trigger that got no answer keeps its ``requestId`` for this long after
+#: it was last sent, like the web page's.
+TRIGGER_REQUEST_HOLD_S = 10 * 60
 
 #: Status glyphs, identical to the web dashboard's GLYPH map, with a
 #: plain-ASCII fallback for terminals/fonts that lack them (--ascii).
@@ -1303,6 +1309,42 @@ def pad_to(text: str, width: int) -> str:
         text = truncate(text, width)
         w = text_width(text)
     return text + " " * (width - w)
+
+
+def input_tail(text: str, room: int) -> str:
+    """``text`` as an input row shows it in ``room`` cells: whole when it
+    fits, else its end behind an ellipsis, so the cursor stays in view."""
+    if text_width(text) <= room:
+        return text
+    start = len(text)
+    used = 1  # the ellipsis
+    while start and used + char_width(text[start - 1]) <= room:
+        start -= 1
+        used += char_width(text[start])
+    return _ELLIPSIS + text[start:]
+
+
+def wrap_cells(text: str, width: int) -> list[str]:
+    """Plain ``text`` as lines of at most ``width`` cells, broken at
+    spaces. A word wider than a line is split."""
+    lines: list[str] = []
+    line = ""
+    for word in text.split():
+        joined = "%s %s" % (line, word) if line else word
+        if text_width(joined) <= width:
+            line = joined
+            continue
+        if line:
+            lines.append(line)
+        while text_width(word) > width:
+            # a character wider than the line still takes a line
+            head = truncate(word, width, "") or word[:1]
+            lines.append(head)
+            word = word[len(head) :]
+        line = word
+    if line:
+        lines.append(line)
+    return lines
 
 
 #: Flattened-string memo for :func:`oneline`.  The schedule and command
@@ -3354,14 +3396,88 @@ INPUT_HOMES = {
     "sandbox": "sandbox",
     "token": "token",
     "backfill": "dag",
+    "params": "dag",
+    "jobparams": "drawer",
 }
+
+#: The drawers' input rows and their labels. A row that takes parameters
+#: lists the declared ones on the line under it.
+INPUT_ROW_LABELS = {
+    "backfill": "backfill FROM..TO: ",
+    "params": "run with: ",
+    "jobparams": "run with: ",
+}
+
+#: An input row keeps at most this many cells of a refusal, because it wraps
+#: the kept text on every frame.
+REFUSAL_MAX = 2000
 
 
 #: payload types of the per-frame memo slots (see App.__init__)
 _TimelineEntry = tuple[str, str | None, str, Any, str, Any]
 _PaletteRow = tuple[str, str, Callable[[], Any]]
 _FleetMatrix = tuple[list[dict[str, Any]], int, int, int, list[str]]
-_DagGraphLayer = tuple[int, list[str], list[tuple[str, list[str]]]]
+# (depth, task keys, [(task key, its dependencies, its note)]); the note is
+# the task's trigger rule ("" for the default all_success) and its `when:`
+# comparisons.
+_DagGraphLayer = tuple[int, list[str], list[tuple[str, list[str], str]]]
+
+#: the `when:` operators, in the order the daemon exports them
+_WHEN_OPERATORS = (
+    "equals",
+    "notEquals",
+    "in",
+    "notIn",
+    "lessThan",
+    "lessThanOrEqual",
+    "greaterThan",
+    "greaterThanOrEqual",
+)
+
+
+def when_text(when: Any) -> str:
+    """A task's ``when:`` comparisons as one phrase, from ``GET /dags``.
+
+    Matches the dashboard's ``whenText``. The phrase is one line, because an
+    XCom comparison value can hold a line break.
+    """
+    parts = []
+    for cond in when if isinstance(when, list) else ():
+        if not isinstance(cond, dict):
+            continue
+        xcom = cond.get("xcom")
+        if isinstance(xcom, dict):
+            source = "xcom %s/%s" % (xcom.get("task", ""), xcom.get("key", ""))
+        else:
+            source = "param %s" % cond.get("param", "")
+        op = next((op for op in _WHEN_OPERATORS if op in cond), "")
+        wanted = cond.get(op)
+        values = wanted if isinstance(wanted, list) else [wanted]
+        parts.append(
+            "%s %s %s"
+            % (
+                source,
+                op,
+                ", ".join(
+                    v if isinstance(v, str) else json.dumps(v) for v in values
+                ),
+            )
+        )
+    return " ".join("; ".join(parts).split())
+
+
+def skip_reason_text(reason: Any) -> str:
+    """Why a workflow task is skipped, from its ``skipReason``.
+
+    Matches the dashboard's ``skipReasonText``. A rejected gate returns ""
+    here: its row already says the gate was rejected.
+    """
+    if not isinstance(reason, dict) or reason.get("kind") == "approval":
+        return ""
+    detail = str(reason.get("detail") or "")
+    if detail and reason.get("kind") == "exit_code":
+        return "skipped itself, " + detail
+    return detail
 
 
 class App:
@@ -3419,6 +3535,9 @@ class App:
         self.cluster: dict[str, Any] | None = None
         self.fleet: dict[str, Any] | None = None
         self.dags: list[dict[str, Any]] = []
+        # the trigger the daemon has not answered: (workflow, values as
+        # JSON, requestId, time last sent); see _trigger_request_id
+        self._trigger_request: tuple[str, str, str, float] | None = None
         self.state_data: dict[str, Any] | None = None
         self.node: dict[str, Any] | None = None
         self.connected = False
@@ -3447,6 +3566,9 @@ class App:
         self.booting = False
         self.focus: str | None = None
         self.inputs: dict[str, str] = dict.fromkeys(INPUT_HOMES, "")
+        # why an input row's last commit failed, as (input, toast kind,
+        # text): the row shows it until an edit
+        self.refusal: tuple[str, str, str] | None = None
         self.quit = False
         self._start_job = start_job
         self._boot_override = boot
@@ -3667,6 +3789,24 @@ class App:
         # toasts embed job names and server error strings; flatten and
         # strip escapes so API-derived text cannot reach the tty raw
         self.toasts.append((kind, oneline(message), time.monotonic() + 3.0))
+        self.mark()
+
+    def _refused(
+        self, row: str | None, kind: str, payload: Any, action: str
+    ) -> None:
+        """Report a failed ``action``. The toast leads with the daemon's
+        reasons from ``payload``, which keeps them inside the toast's cut.
+        Input ``row`` shows them on the line under it."""
+        reasons = _refusal_reasons(payload)
+        self.toast(kind, "%s (%s)" % (reasons, action) if reasons else action)
+        if row is not None:
+            self.refuse_input(row, kind, reasons or action)
+
+    def refuse_input(self, name: str, kind: str, text: str) -> None:
+        """Show ``text`` on the line under input row ``name``: why its
+        commit failed."""
+        # flattened and stripped of escapes, as a toast is, then cut
+        self.refusal = (name, kind, truncate(oneline(text), REFUSAL_MAX))
         self.mark()
 
     def top_overlay(self) -> str | None:
@@ -4703,6 +4843,153 @@ def _quote(text: str) -> str:
     return quote(text, safe="")
 
 
+def parse_param_words(words: list[str], declared: Any) -> dict[str, Any]:
+    """``name=value`` words as a ``params`` request map.
+
+    Each value is converted to the type the workflow declares for the name,
+    because the API takes typed JSON and coerces nothing. Raises
+    :class:`ValueError` with the text to show for a word that is not
+    ``name=value``, a name the workflow does not declare, and a value that
+    is not of the declared type.
+    """
+    kinds = {
+        str(p.get("name")): str(p.get("type", run_params.STRING))
+        for p in declared or []
+        if isinstance(p, dict)
+    }
+    out: dict[str, Any] = {}
+    for word in words:
+        name, sep, value = word.partition("=")
+        if not sep or not name:
+            raise ValueError("%s is not name=value" % word)
+        kind = kinds.get(name)
+        if kind is None:
+            raise ValueError("%s %s" % (name, run_params.UNDECLARED))
+        try:
+            out[name] = run_params.parse_text(kind, value)
+        except ValueError as exc:
+            raise ValueError("%s %s" % (name, exc)) from exc
+    return out
+
+
+def split_words(text: str) -> list[str]:
+    """An input row's text as words. A quoted value can hold spaces, and
+    a backslash is an ordinary character, so a Windows path survives.
+    Raises :class:`ValueError` for an unclosed quote."""
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    try:
+        return list(lexer)
+    except ValueError as exc:
+        raise ValueError("unclosed quote") from exc
+
+
+def param_hint(declared: Any) -> str:
+    """The declared parameters on one line, for the input row's hint:
+    ``name=default`` for each, ``name=?`` for a required one, and the
+    choices after a name that has ``allowed`` values."""
+    bits = []
+    for p in declared or []:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name", "?"))
+        if p.get("required"):
+            bit = name + "=?"
+        else:
+            bit = "%s=%s" % (name, run_params.env_text(p.get("default")))
+        allowed = p.get("allowed")
+        if isinstance(allowed, list) and allowed:
+            bit += " (%s)" % "|".join(run_params.env_text(v) for v in allowed)
+        bits.append(bit)
+    return "  ".join(bits)
+
+
+def _refusal_reasons(payload: Any) -> str:
+    """Why the daemon refused an action, from its error envelope: the
+    reason per refused parameter, or else the envelope's own reason."""
+    if not isinstance(payload, dict):
+        return ""
+    errors = payload.get("paramErrors")
+    if isinstance(errors, dict) and errors:
+        return "; ".join(
+            "%s %s" % (name, why) for name, why in sorted(errors.items())
+        )
+    return str(payload.get("error") or "")
+
+
+def _backfill_counts(payload: Any) -> str:
+    """The backfill toast's count suffix, the same text the page shows."""
+    created = payload.get("created") if isinstance(payload, dict) else None
+    if not isinstance(created, int) or isinstance(created, bool):
+        return ""
+    text = " (%d run%s" % (created, "" if created == 1 else "s")
+    existing = payload.get("existing")
+    if isinstance(existing, int) and existing > 0:
+        text += ", %d already existed" % existing
+    return text + ")"
+
+
+def _backfill_next(payload: Any) -> str | None:
+    """Where a backfill that the daemon cut short continues: the
+    response's ``nextFrom``, or ``None`` for a backfill that covered its
+    range."""
+    if not isinstance(payload, dict) or payload.get("truncated") is not True:
+        return None
+    following = payload.get("nextFrom")
+    return oneline(following) if isinstance(following, str) else None
+
+
+def fleet_warnings(dag: Any) -> list[str]:
+    """The ``fleetWarnings`` that ``GET /dags`` lists for a workflow, one
+    line for each live host below the run engine level it needs."""
+    listed = dag.get("fleetWarnings") if isinstance(dag, dict) else None
+    if not isinstance(listed, list):
+        return []
+    # flattened and stripped of escapes: each line holds a host's name
+    lines = (oneline(text) for text in listed if isinstance(text, str))
+    return [line for line in lines if line]
+
+
+def _same_param(sent: Any, stored: Any) -> bool:
+    """Whether the daemon's echo holds the value the client sent. A number
+    equals a number of the same value, and a boolean only a boolean."""
+    if isinstance(sent, bool) or isinstance(stored, bool):
+        return sent is stored
+    if isinstance(sent, (int, float)) and isinstance(stored, (int, float)):
+        return sent == stored
+    return type(sent) is type(stored) and bool(sent == stored)
+
+
+def params_unconfirmed(sent: dict[str, Any] | None, payload: Any) -> str:
+    """Why a response fails to confirm the values a request chose, or
+    ``""`` when it confirms them.
+
+    A daemon that takes the values echoes the run's whole map as
+    ``params``. A response without the map came from a daemon that ignored
+    the request body, so the run took the defaults.
+    """
+    if not sent:
+        return ""
+    echoed = payload.get("params") if isinstance(payload, dict) else None
+    if not isinstance(echoed, dict):
+        return (
+            "the daemon did not confirm the values, so the run may use "
+            "the defaults"
+        )
+    differing = sorted(
+        name
+        for name, value in sent.items()
+        if name not in echoed or not _same_param(value, echoed[name])
+    )
+    if not differing:
+        return ""
+    return "the run stores other values for %s" % ", ".join(
+        oneline(name) for name in differing
+    )
+
+
 # ===================================================================
 #  the application: actions
 # ===================================================================
@@ -4712,34 +4999,122 @@ class AppActions(App):
     bottom of the file is the concrete class the CLI instantiates."""
 
     # ---- job actions (instant + toast, exactly like the page) -------
-    async def run_job(self, name: str) -> None:
+    async def run_job(
+        self,
+        name: str,
+        params: dict[str, Any] | None = None,
+        row: str | None = None,
+    ) -> bool:
+        """POST the start; ``params`` are sent only when given. Returns
+        whether the daemon accepted it: the job started, was queued, or
+        waits for its cluster slot. On a failure, input ``row`` shows why."""
+        path = "/jobs/%s/start" % _quote(name)
         try:
-            status, body = await self.api.post("/jobs/%s/start" % _quote(name))
+            if params:
+                status, payload = await self.api.post(
+                    path, body={"params": params}
+                )
+            else:
+                status, payload = await self.api.post(path)
         except Unauthorized:
             self.open("token")
             self.focus = "token"
-            return
+            return False
         except TimeoutError:
-            self.toast("fail", "start %s: no answer from the daemon" % name)
-            return
+            self._refused(
+                row, "fail", None, "start %s: no answer from the daemon" % name
+            )
+            return False
         except Exception as exc:  # noqa: BLE001 - toast + carry on
-            self.toast("fail", "start %s: %s" % (name, exc))
-            return
-        # the daemon's reason: a disabled job, a run that Forbid holds back
-        reason = body.get("error") if isinstance(body, dict) else None
+            self._refused(row, "fail", None, "start %s: %s" % (name, exc))
+            return False
         if status in (200, 202):
-            self.toast(
-                "ok", ("queued %s" if status == 202 else "▶ started %s") % name
-            )
+            if isinstance(payload, dict) and payload.get("pending") is True:
+                # the daemon accepted the start, and nothing runs yet:
+                # the run waits for another node to yield the job's
+                # cluster slot
+                self.toast(
+                    "info",
+                    "%s starts when another node yields its cluster slot"
+                    % name,
+                )
+            else:
+                self._toast_started(
+                    ("queued %s" if status == 202 else "▶ started %s") % name,
+                    params,
+                    payload,
+                )
             self.refresh_now()
-        elif status == 409:
-            self.toast("warn", reason or "%s is disabled" % name)
+            return True
+        if status == 409:
+            # a disabled job, or a concurrencyPolicy that admitted no run:
+            # the daemon's reason says which
+            self._refused(row, "warn", payload, "%s did not start" % name)
         elif status == 404:
-            self.toast("fail", "no such job: %s" % name)
+            self._refused(row, "fail", None, "no such job: %s" % name)
         else:
-            self.toast(
-                "fail", "start %s: %s" % (name, reason or "HTTP %d" % status)
+            self._refused(
+                row, "fail", payload, "start %s: HTTP %d" % (name, status)
             )
+        return False
+
+    def _toast_started(
+        self,
+        text: str,
+        params: dict[str, Any] | None,
+        payload: Any,
+        kind: str = "ok",
+    ) -> None:
+        """The toast for a start the daemon accepted. It warns when the
+        response does not confirm the ``params`` the request chose."""
+        doubt = params_unconfirmed(params, payload)
+        if doubt:
+            self.toast("warn", "%s, but %s" % (text, doubt))
+        else:
+            self.toast(kind, text)
+
+    def job_params_declared(self, name: str | None) -> list[Any]:
+        """The ``params`` declaration ``GET /jobs`` lists for ``name``."""
+        declared = (self.by_name.get(name or "") or {}).get("params")
+        return declared if isinstance(declared, list) else []
+
+    async def run_job_or_prompt(self, name: str) -> None:
+        """Start ``name``, or open its parameter row when it declares
+        parameters. An empty row then starts it with the defaults."""
+        if not self.job_params_declared(name):
+            await self.run_job(name)
+            return
+        if self.drawer_job != name or not self.is_open("drawer"):
+            self.open_drawer(name)
+        elif self.top_overlay() != "drawer":
+            self.open("drawer")  # beneath another overlay: raise the row
+        self.inputs["jobparams"] = ""
+        self.refusal = None
+        self.focus = "jobparams"
+        self.mark()
+
+    async def run_job_from_input(self, text: str) -> None:
+        """The job parameter row's commit. A refused row stays focused with
+        its text, so the operator corrects it in place."""
+        name = self.drawer_job
+        if not name:
+            self.focus = None
+            return
+        try:
+            params = parse_param_words(
+                split_words(text), self.job_params_declared(name)
+            )
+        except ValueError as exc:
+            self.toast("warn", "params: %s" % exc)
+            self.refuse_input("jobparams", "warn", str(exc))
+            return
+        if (
+            await self.run_job(name, params, row="jobparams")
+            or self.focus != "jobparams"
+        ):
+            self.inputs["jobparams"] = ""
+            if self.focus == "jobparams":
+                self.focus = None
 
     async def cancel_job(self, name: str) -> None:
         try:
@@ -5068,23 +5443,143 @@ class AppActions(App):
         self.term.invalidate()
         self.mark()
 
-    async def dag_trigger(self, name: str) -> None:
+    def dag_params_declared(self, name: str | None) -> list[Any]:
+        """The ``params`` declaration ``GET /dags`` lists for ``name``."""
+        for entry in self.dags:
+            if str(entry.get("name", "")) == name:
+                declared = entry.get("params")
+                return declared if isinstance(declared, list) else []
+        return []
+
+    def _trigger_request_id(
+        self, name: str, params: dict[str, Any] | None
+    ) -> str:
+        """The ``requestId`` for a trigger of ``name`` with ``params``.
+
+        A trigger keeps its ID until the daemon answers it, so the same
+        trigger sent again after a timeout names the same run. It takes a
+        new ID once :data:`TRIGGER_REQUEST_HOLD_S` have passed since it was
+        last sent, and so does a trigger of another workflow or with other
+        values.
+        """
+        key = (name, json.dumps(params or {}, sort_keys=True))
+        # wall clock, so the time a suspended machine sleeps counts
+        now = time.time()
+        held = self._trigger_request
+        if (
+            held is None
+            or held[:2] != key
+            or now - held[3] > TRIGGER_REQUEST_HOLD_S
+        ):
+            request_id = os.urandom(16).hex()
+        else:
+            request_id = held[2]
+        self._trigger_request = (*key, request_id, now)
+        return request_id
+
+    async def dag_trigger_or_prompt(self, name: str) -> None:
+        """Trigger ``name``, or open its parameter row when it declares
+        parameters. An empty row then runs it with the defaults."""
+        if not self.dag_params_declared(name):
+            await self.dag_trigger(name)
+            return
+        if self.dag_name != name or not self.is_open("dag"):
+            self.open_dag(name)
+        elif self.top_overlay() != "dag":
+            self.open("dag")  # beneath another overlay: raise the row
+        self.inputs["params"] = ""
+        self.refusal = None
+        self.focus = "params"
+        self.mark()
+
+    async def dag_trigger(
+        self,
+        name: str,
+        params: dict[str, Any] | None = None,
+        row: str | None = None,
+    ) -> bool:
+        """POST the trigger; ``params`` are sent only when given. Returns
+        whether the daemon answered with the run. On a failure, input
+        ``row`` shows why.
+
+        Every trigger carries a ``requestId`` (see
+        :meth:`_trigger_request_id`), so one sent again after no answer
+        gets the run that the first one created.
+        """
+        path = "/dags/%s/trigger" % _quote(name)
+        body: dict[str, Any] = {
+            "requestId": self._trigger_request_id(name, params)
+        }
+        if params:
+            body["params"] = params
         try:
-            status, payload = await self.api.post(
-                "/dags/%s/trigger" % _quote(name)
-            )
+            status, payload = await self.api.post(path, body=body)
         except Unauthorized:
             self.open("token")
             self.focus = "token"
-            return
+            return False
+        except TimeoutError:
+            # the daemon may have the request; the held requestId makes a
+            # repeat of this trigger return that run
+            self._refused(
+                row,
+                "fail",
+                None,
+                "trigger %s: no answer from the daemon; send the same "
+                "trigger again within %d minutes, and the run starts only "
+                "once" % (name, TRIGGER_REQUEST_HOLD_S // 60),
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
-            self.toast("fail", "trigger %s: %s" % (name, exc))
-            return
+            self._refused(row, "fail", None, "trigger %s: %s" % (name, exc))
+            return False
+        if status < 500:
+            # the daemon answered: the next trigger is a new request
+            self._trigger_request = None
         if status == 200 and isinstance(payload, dict):
-            self.toast("ok", "▶ %s run %s" % (name, payload.get("runKey", "")))
+            run_key = oneline(payload.get("runKey", ""))
+            if payload.get("created") is False:
+                # the run that an unanswered trigger created
+                self._toast_started(
+                    "%s run %s was already started by this trigger"
+                    % (name, run_key),
+                    params,
+                    payload,
+                    "info",
+                )
+            else:
+                self._toast_started(
+                    "▶ %s run %s" % (name, run_key), params, payload
+                )
             self._spawn(self._load_dag_runs())
-        else:
-            self.toast("fail", "trigger %s: HTTP %d" % (name, status))
+            return True
+        self._refused(
+            row, "fail", payload, "trigger %s: HTTP %d" % (name, status)
+        )
+        return False
+
+    async def dag_trigger_from_input(self, text: str) -> None:
+        """The parameter row's commit. A refused row stays focused with its
+        text, so the operator corrects it in place."""
+        name = self.dag_name
+        if not name:
+            self.focus = None
+            return
+        try:
+            params = parse_param_words(
+                split_words(text), self.dag_params_declared(name)
+            )
+        except ValueError as exc:
+            self.toast("warn", "params: %s" % exc)
+            self.refuse_input("params", "warn", str(exc))
+            return
+        if (
+            await self.dag_trigger(name, params, row="params")
+            or self.focus != "params"
+        ):
+            self.inputs["params"] = ""
+            if self.focus == "params":
+                self.focus = None
 
     async def dag_decision(self, task_key: str, decision: str) -> None:
         if not self.dag_name or not self.dag_run_key:
@@ -5112,34 +5607,87 @@ class AppActions(App):
         else:
             self.toast("fail", "%s: HTTP %d" % (decision, status))
 
-    async def dag_backfill(self, spec: str) -> None:
-        """``from..to`` ISO dates from the backfill input row."""
+    async def dag_backfill(self, spec: str) -> bool:
+        """``from..to`` ISO dates from the backfill input row, and after
+        them any ``name=value`` run parameters. Returns whether the daemon
+        queued the whole range. On a failure, the row shows why. When the
+        daemon stops at its limit for one backfill, the row holds the rest
+        of the range."""
         if not self.dag_name:
-            return
-        parts = [p.strip() for p in re.split(r"\.\.| ", spec) if p.strip()]
+            return False
+        try:
+            words = split_words(spec)
+            params = parse_param_words(
+                [w for w in words if "=" in w],
+                self.dag_params_declared(self.dag_name),
+            )
+        except ValueError as exc:
+            self.toast("warn", "backfill: %s" % exc)
+            self.refuse_input("backfill", "warn", str(exc))
+            return False
+        dates = " ".join(w for w in words if "=" not in w)
+        parts = [p.strip() for p in re.split(r"\.\.| ", dates) if p.strip()]
         if len(parts) != 2:
-            self.toast("warn", "backfill wants: FROM..TO (ISO dates)")
-            return
+            wants = "backfill wants: FROM..TO (ISO dates)"
+            self.toast("warn", wants)
+            self.refuse_input("backfill", "warn", wants)
+            return False
+        body: dict[str, Any] = {"from": parts[0], "to": parts[1]}
+        if params:
+            body["params"] = params
         try:
             status, payload = await self.api.post(
-                "/dags/%s/backfill" % _quote(self.dag_name),
-                body={"from": parts[0], "to": parts[1]},
+                "/dags/%s/backfill" % _quote(self.dag_name), body=body
             )
         except Unauthorized:
             self.open("token")
             self.focus = "token"
-            return
+            return False
+        except TimeoutError:
+            self._refused(
+                "backfill", "fail", None, "backfill: no answer from the daemon"
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
-            self.toast("fail", "backfill: %s" % exc)
-            return
+            self._refused("backfill", "fail", None, "backfill: %s" % exc)
+            return False
         if status == 200:
-            self.toast("ok", "▶ backfill queued")
             self._spawn(self._load_dag_runs())
-        else:
-            detail = ""
-            if isinstance(payload, dict) and payload.get("error"):
-                detail = " — %s" % payload["error"]
-            self.toast("fail", "backfill: HTTP %d%s" % (status, detail))
+            queued = "▶ backfill queued" + _backfill_counts(payload)
+            following = _backfill_next(payload)
+            if following is None:
+                self.toast("ok", queued)
+                return True
+            # the daemon stopped at its limit: the row stays open on the
+            # rest of the range, with the same values
+            rest = [following + ".." + parts[1]]
+            rest += [shlex.quote(w) for w in words if "=" in w]
+            self.inputs["backfill"] = " ".join(rest)
+            more = (
+                "the daemon stopped at its limit for one backfill; press "
+                "enter to continue from %s" % following
+            )
+            self.toast("warn", "%s; %s" % (queued, more))
+            self.refuse_input("backfill", "warn", more)
+            return False
+        self._refused(
+            "backfill", "fail", payload, "backfill: HTTP %d" % status
+        )
+        return False
+
+    async def dag_backfill_from_input(self, text: str) -> None:
+        """The backfill row's commit. An empty row closes. A refused row
+        stays focused with its text, so the operator corrects it in place,
+        and so does a row that holds the rest of a range the daemon cut
+        short."""
+        if (
+            not (text and self.dag_name)
+            or await self.dag_backfill(text)
+            or self.focus != "backfill"
+        ):
+            self.inputs["backfill"] = ""
+            if self.focus == "backfill":
+                self.focus = None
 
     def save_log(self) -> None:
         """The Logs tab's download button: write the buffer to a file."""
@@ -5322,10 +5870,10 @@ class AppPalette(AppActions):
         return out
 
     def _act_trigger_dag(self, name: str) -> None:
-        self._spawn(self.dag_trigger(name))
+        self._spawn(self.dag_trigger_or_prompt(name))
 
     def _act_run_job(self, name: str) -> None:
-        self._spawn(self.run_job(name))
+        self._spawn(self.run_job_or_prompt(name))
 
     def _act_cancel_job(self, name: str) -> None:
         self._spawn(self.cancel_job(name))
@@ -5671,6 +6219,7 @@ class AppKeys(AppPalette):
 
     async def _input_commit(self, name: str) -> None:
         value = self.inputs[name].strip()
+        self.refusal = None  # a commit sets its own
         if name == "filter":
             self.focus = None
         elif name == "token":
@@ -5702,11 +6251,11 @@ class AppKeys(AppPalette):
         elif name == "sandbox":
             self.focus = None  # results render live; Enter just settles
         elif name == "backfill":
-            spec = value
-            self.inputs["backfill"] = ""
-            self.focus = None
-            if spec:
-                await self.dag_backfill(spec)
+            await self.dag_backfill_from_input(value)
+        elif name == "params":
+            await self.dag_trigger_from_input(value)
+        elif name == "jobparams":
+            await self.run_job_from_input(value)
 
     def _match_job(self, query: str) -> str | None:
         if query in self.by_name:
@@ -5725,6 +6274,8 @@ class AppKeys(AppPalette):
         if buf is None:
             return
         self.inputs[name] = buf
+        if buf != before and self.refusal and self.refusal[0] == name:
+            self.refusal = None  # it was for the text before this edit
         if name == "filter":
             self.filter_text = buf
             if self._filter_hold:
@@ -5765,7 +6316,7 @@ class AppKeys(AppPalette):
         elif key == "r":
             job = self.selected_job()
             if job and job.get("enabled") and not job.get("running"):
-                await self.run_job(job["name"])
+                await self.run_job_or_prompt(job["name"])
         elif key == "x":
             job = self.selected_job()
             if job and job.get("running"):
@@ -5937,7 +6488,9 @@ class AppKeys(AppPalette):
         elif key == "t":
             if self.dags:
                 idx = min(self.dags_sel, len(self.dags) - 1)
-                await self.dag_trigger(str(self.dags[idx].get("name", "")))
+                await self.dag_trigger_or_prompt(
+                    str(self.dags[idx].get("name", ""))
+                )
         elif key == "r":
             self._spawn(self._load_dags())
 
@@ -6056,7 +6609,7 @@ class AppKeys(AppPalette):
         elif key == "pgup":
             self.panel_scroll = max(0, self.panel_scroll - 10)
         elif key == "r" and self.drawer_job:
-            await self.run_job(self.drawer_job)
+            await self.run_job_or_prompt(self.drawer_job)
         elif key == "x" and self.drawer_job:
             await self.cancel_job(self.drawer_job)
 
@@ -6096,7 +6649,7 @@ class AppKeys(AppPalette):
         elif key == "d":
             self.save_log()
         elif key == "r" and self.drawer_job:
-            await self.run_job(self.drawer_job)
+            await self.run_job_or_prompt(self.drawer_job)
         elif key == "x" and self.drawer_job:
             await self.cancel_job(self.drawer_job)
 
@@ -6220,9 +6773,10 @@ class AppKeys(AppPalette):
                 self._spawn(self._load_dag_xcom())
             return
         if key == "t" and self.dag_name:
-            await self.dag_trigger(self.dag_name)
+            await self.dag_trigger_or_prompt(self.dag_name)
             return
         if key == "b":
+            self.refusal = None
             self.focus = "backfill"
             return
         if self.dag_tab == "runs":
@@ -7519,6 +8073,16 @@ class AppOverlays(AppRender):
                     bg="sel" if selected else None,
                 )
             )
+            warnings = fleet_warnings(dag)
+            if warnings:
+                # the first host, and how many more the drawer lists
+                more = len(warnings) - 1
+                note = warnings[0] + (" (+%d more)" % more if more else "")
+                body.append(
+                    paint.style(
+                        "   ⚠ " + truncate(note, max(0, width - 7)), "warn"
+                    )
+                )
         if not self.dags:
             body.append(paint.style("  no workflows configured", "dim"))
         return panel_frame(
@@ -8431,6 +8995,37 @@ class AppDrawers(AppOverlays):
             )
         return " " + "".join(spans) + paint.style("  ←/→ switch", "dim")
 
+    def _input_rows(
+        self, paint: Painter, name: str, declared: Any, width: int, lines: int
+    ) -> list[str]:
+        """Input row ``name`` and the lines under it: why its last commit
+        failed, or else the ``declared`` parameters."""
+        label = INPUT_ROW_LABELS[name]
+        room = max(1, width - 4)
+        rows = [
+            " "
+            + paint.style(label, "dim")
+            + paint.style(
+                input_tail(self.inputs[name], max(1, room - len(label))) + "▌",
+                "bright",
+            )
+        ]
+        refusal = self.refusal
+        if refusal is not None and refusal[0] == name:
+            # wrapped, and cut past a quarter of the panel's height
+            held = wrap_cells(refusal[2], room)
+            limit = max(1, lines // 4)
+            if len(held) > limit:
+                held[limit - 1 :] = [
+                    truncate(" ".join(held[limit - 1 :]), room)
+                ]
+            rows += [" " + paint.style(line, refusal[1]) for line in held]
+        elif declared:
+            rows.append(
+                " " + paint.style(truncate(param_hint(declared), room), "dim")
+            )
+        return rows
+
     # ---- the job drawer ---------------------------------------------
     def render_drawer_panel(
         self, paint: Painter, width: int, lines: int
@@ -8471,6 +9066,10 @@ class AppDrawers(AppOverlays):
                     % (paint.glyph("paused", ascii_mode), " · ".join(bits)),
                     "warn",
                 )
+            )
+        if self.focus == "jobparams":
+            rows += self._input_rows(
+                paint, "jobparams", job.get("params"), width, lines
             )
         rows += [
             self._tabs_row(paint, self.DRAWER_TABS, self.drawer_tab),
@@ -8857,6 +9456,9 @@ class AppDrawers(AppOverlays):
             resources = run.get("resources") or {}
             if resources.get("cpu_total_seconds") is not None:
                 detail += " · %.1fs cpu" % resources["cpu_total_seconds"]
+            if run.get("triggeredBy"):
+                # the label of the token whose manual start chose values
+                detail += " · by %s" % oneline(run["triggeredBy"])
             run_rows.append(
                 " "
                 + paint.style(paint.glyph(key, ascii_mode), color)
@@ -9158,13 +9760,23 @@ class AppDrawers(AppOverlays):
             self._tabs_row(paint, self.DAG_TABS, self.dag_tab),
             paint.hline(width - 2),
         ]
-        if self.focus == "backfill":
-            rows.insert(
-                2,
-                " "
-                + paint.style("backfill FROM..TO: ", "dim")
-                + paint.style(self.inputs["backfill"] + "▌", "bright"),
+        if self.focus in ("backfill", "params"):
+            rows[2:2] = self._input_rows(
+                paint, self.focus, dag.get("params"), width, lines
             )
+        # under the title: each live host below the run engine level the
+        # workflow needs, wrapped and cut past a quarter of the height
+        held = [
+            line
+            for text in fleet_warnings(dag)
+            for line in wrap_cells("⚠ " + text, max(1, width - 4))
+        ]
+        limit = max(1, lines // 4)
+        if len(held) > limit:
+            held[limit - 1 :] = [
+                truncate(" ".join(held[limit - 1 :]), max(1, width - 4))
+            ]
+        rows[1:1] = [" " + paint.style(line, "warn") for line in held]
         body_lines = lines - len(rows) - 1
         if self.dag_tab == "runs":
             rows.extend(self._dag_runs_tab(paint, width, body_lines))
@@ -9279,11 +9891,18 @@ class AppDrawers(AppOverlays):
         for level in sorted(layers):
             names = sorted(layers[level])
             # A wide root layer can skip all its empty edge lists on paint.
-            incoming = [
-                (name, dependencies[name])
-                for name in names
-                if dependencies[name]
-            ]
+            incoming = []
+            for name in names:
+                when = by_key[name].get("when")
+                if when:
+                    when = when_text(when)
+                if not dependencies[name] and not when:
+                    continue
+                rule = str(by_key[name].get("triggerRule") or "")
+                note = "" if rule == "all_success" else rule
+                if when:
+                    note += (" · " if note else "") + "when " + when
+                incoming.append((name, dependencies[name], note))
             layout.append((level, names, incoming))
         self._dag_graph_memo = (tasks, layout)
         return layout
@@ -9345,18 +9964,34 @@ class AppDrawers(AppOverlays):
                 spans.append(paint.style(" ", "fg"))
                 used += text_width(label) + 1
             rows.append(cut_to_width("".join(spans), content_width))
-            for name, deps in incoming:
+            for name, deps, note in incoming:
+                # the task's first edge carries its trigger rule and its
+                # `when:` comparisons; a root task has no edge, so its
+                # comparisons get a row of their own
+                note = " · " + note if note else ""
+                if not deps:
+                    if len(rows) >= body_lines:
+                        return rows
+                    rows.append(
+                        cut_to_width(
+                            paint.style("     " + name + note, "dim"),
+                            content_width,
+                        )
+                    )
+                    continue
                 for dep in deps:
                     if len(rows) >= body_lines:
                         return rows
                     rows.append(
                         cut_to_width(
                             paint.style(
-                                "     %s %s %s" % (dep, arrow, name), "dim"
+                                "     %s %s %s%s" % (dep, arrow, name, note),
+                                "dim",
                             ),
                             content_width,
                         )
                     )
+                    note = ""
         return rows
 
     def _dag_tasks_tab(
@@ -9371,7 +10006,15 @@ class AppDrawers(AppOverlays):
                 )
             )
             return rows
-        rows.append(paint.style(" run %s" % self.dag_run_key, "dim"))
+        head = " run %s" % self.dag_run_key
+        stored = (self.dag_run or {}).get("params")
+        if isinstance(stored, dict) and stored:
+            # the values the run stores, which its tasks read
+            head += " · " + "  ".join(
+                "%s=%s" % (name, run_params.env_text(value))
+                for name, value in stored.items()
+            )
+        rows.append(paint.style(truncate(head, max(1, width - 2)), "dim"))
         self.dag_sel = min(self.dag_sel, max(0, len(tasks) - 1))
         start = scroll_window(len(tasks), body_lines - 1, self.dag_sel, 0)
         for idx, task in enumerate(tasks[start : start + body_lines - 1]):
@@ -9389,6 +10032,9 @@ class AppDrawers(AppOverlays):
             extra = ""
             if attempts:
                 extra += " · try %s" % attempts
+            skip_why = skip_reason_text(task.get("skipReason"))
+            if skip_why:
+                extra += " · " + skip_why
             if awaiting:
                 extra += "  ► a approve · R reject"
             rows.append(

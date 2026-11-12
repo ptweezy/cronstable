@@ -17,7 +17,7 @@ import types
 import jsonschema
 import pytest
 
-from cronstable import _json
+from cronstable import _json, dagrun
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
 from cronstable.cron import (
@@ -816,16 +816,39 @@ async def test_run_job_success_and_confirm_gate(monkeypatch):
     h = _handler()
     launched = []
 
-    async def fake_start(name):
-        launched.append(name)
+    async def fake_start(name, params=None, scopes=None, triggered_by=None):
+        launched.append((name, triggered_by))
+        return {"queued": None, "params": None}
 
-    monkeypatch.setattr(h._cron, "start_job_by_name", fake_start)
+    monkeypatch.setattr(h._cron, "start_job", fake_start)
     result = await _call(h, "cron_run_job", {"name": "hello"})
     assert result["isError"] is True  # confirm missing
     assert launched == []
     result = await _call(h, "cron_run_job", {"name": "hello", "confirm": True})
     assert result["structuredContent"] == {"started": "hello"}
-    assert launched == ["hello"]
+    # a call that no token authenticates is attributed to the server
+    assert launched == [("hello", "mcp")]
+
+
+async def test_run_job_reports_a_start_that_waits_for_its_cluster_slot(
+    monkeypatch,
+):
+    h = _handler()
+
+    async def fake_start(name, params=None, scopes=None, triggered_by=None):
+        return {"queued": None, "params": {"region": "us"}, "pending": True}
+
+    monkeypatch.setattr(h._cron, "start_job", fake_start)
+    result = await _call(h, "cron_run_job", {"name": "hello", "confirm": True})
+    assert result["structuredContent"] == {
+        "started": "hello",
+        "params": {"region": "us"},
+        "pending": True,
+    }
+    assert result["content"][0]["text"] == (
+        "job 'hello' starts when another node yields its cluster "
+        "concurrency slot"
+    )
 
 
 async def test_run_job_disabled_surfaces_api_action_error():
@@ -1482,7 +1505,7 @@ async def test_dag_tools_full_flow(tmp_path):
         await _teardown(cron)
 
 
-async def test_backfill_tool_dry_run_default_and_real(tmp_path):
+async def test_backfill_tool_dry_run_default_and_real(tmp_path, monkeypatch):
     h, cron = await _state_handler(tmp_path)
     try:
         result = await _call(
@@ -1516,6 +1539,38 @@ async def test_backfill_tool_dry_run_default_and_real(tmp_path):
         )
         assert result["structuredContent"]["ok"] is True
         assert result["structuredContent"]["created"] == 2
+        assert result["structuredContent"]["existing"] == 0
+        assert len(result["structuredContent"]["runKeys"]) == 2
+        assert "2 created, 0 already existed" in result["content"][0]["text"]
+
+        # the same range again creates nothing and says so
+        result = await _call(
+            h,
+            "cron_backfill_dag",
+            {**args, "dry_run": False, "confirm": True},
+        )
+        assert result["structuredContent"]["created"] == 0
+        assert result["structuredContent"]["existing"] == 2
+        assert result["structuredContent"]["truncated"] is False
+        text = result["content"][0]["text"]
+        assert text.endswith("0 created, 2 already existed")
+
+        # a call that stops at its limit says where the next one starts
+        monkeypatch.setattr(dagrun, "DAG_MAX_CATCHUP", 1)
+        result = await _call(
+            h,
+            "cron_backfill_dag",
+            {**args, "dry_run": False, "confirm": True},
+        )
+        body = result["structuredContent"]
+        assert (body["existing"], body["truncated"]) == (1, True)
+        assert body["nextFrom"] == "2026-01-01T01:00:00+00:00"
+        assert result["content"][0]["text"].endswith(
+            "0 created, 1 already existed. The call stopped at its limit "
+            "of scheduled times; call again with "
+            "from=2026-01-01T01:00:00+00:00 to continue"
+        )
+        monkeypatch.undo()
 
         # an unparseable range surfaces the engine's reason as a tool error
         result = await _call(
@@ -1561,7 +1616,8 @@ async def test_backfill_tool_reports_unavailable_state(tmp_path, monkeypatch):
             assert text == "backfill state is unavailable"
         # with the store back, the same call creates the runs
         result = await _call(h, "cron_backfill_dag", execute)
-        assert result["structuredContent"] == {"ok": True, "created": 2}
+        done = result["structuredContent"]
+        assert (done["ok"], done["created"], done["existing"]) == (True, 2, 0)
     finally:
         await _teardown(cron)
 
@@ -2321,3 +2377,355 @@ async def test_why_no_run_and_listing_results_conform():
     await _call(h, "cron_pause_job", {"name": "hello", "confirm": True})
     await _call(h, "cron_list_jobs")
     await _call(h, "cron_get_status", {"limit": 1})
+
+
+# ---------------------------------------------------------------------------
+# run parameters on the trigger and backfill tools
+# ---------------------------------------------------------------------------
+
+_PARAM_DAGS = (
+    "dags:\n  - name: deploy\n    params:\n"
+    "      - name: target\n        default: staging\n        allowed:\n"
+    "          - staging\n          - prod\n"
+    "      - name: ticket\n        required: true\n"
+    "    tasks:\n      - id: a\n        command: 'x'\n"
+    "  - name: nightly\n    schedule: '0 * * * *'\n    params:\n"
+    "      - name: limit\n        type: integer\n        default: 10\n"
+    "    tasks:\n      - id: a\n        command: 'x'\n"
+)
+
+
+async def _param_handler(tmp_path):
+    cron = await _make_state_cron(tmp_path, _PARAM_DAGS)
+    cron.web_config = {}
+    cfg = _build_mcp_config(
+        {"enabled": True, "readOnly": False, "toolsets": _ALL_TOOLSETS}
+    )
+    return MCPHandler(cron, cfg), cron
+
+
+async def test_trigger_tool_takes_params(tmp_path):
+    h, cron = await _param_handler(tmp_path)
+    try:
+        # the listing carries the declaration an agent builds its values from
+        result = await _call(h, "cron_list_dags")
+        declared = {
+            d["name"]: d.get("params")
+            for d in result["structuredContent"]["dags"]
+        }
+        assert [p["name"] for p in declared["deploy"]] == ["target", "ticket"]
+
+        args = {
+            "dag": "deploy",
+            "params": {"ticket": "OPS-1", "target": "prod"},
+            "request_id": "agent-turn-7",
+            "confirm": True,
+        }
+        result = await _call(h, "cron_trigger_dag", args)
+        body = result["structuredContent"]
+        assert body["created"] is True
+        assert body["params"] == {"target": "prod", "ticket": "OPS-1"}
+        assert "triggered dag 'deploy'" in result["content"][0]["text"]
+        doc = await cron._dag.get_run("deploy", body["runKey"])
+        assert doc["params"] == body["params"]
+        # with no token in play the audit label is the surface
+        assert doc["triggeredBy"] == "mcp"
+
+        # the same request_id returns the first run
+        again = await _call(h, "cron_trigger_dag", args)
+        assert again["structuredContent"]["created"] is False
+        assert again["structuredContent"]["runKey"] == body["runKey"]
+        assert "already has run" in again["content"][0]["text"]
+        # and with other values it is refused
+        clash = await _call(
+            h,
+            "cron_trigger_dag",
+            {**args, "params": {"ticket": "OPS-2"}},
+        )
+        assert clash["isError"] is True
+        assert "different parameters" in clash["content"][0]["text"]
+
+        # refused values name each parameter, so the model can correct them
+        result = await _call(
+            h,
+            "cron_trigger_dag",
+            {"dag": "deploy", "params": {"target": "qa"}, "confirm": True},
+        )
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        assert "invalid parameters for workflow 'deploy'" in text
+        assert "target must be one of: staging, prod" in text
+        assert "ticket is required" in text
+
+        for bad in (
+            {"params": ["a"]},
+            {"logical_date": 5},
+            {"logical_date": "soon", "params": {"ticket": "OPS-1"}},
+            {"request_id": ""},
+        ):
+            result = await _call(
+                h, "cron_trigger_dag", {"dag": "deploy", "confirm": True, **bad}
+            )
+            assert result["isError"] is True, bad
+        # confirm still gates everything else
+        result = await _call(
+            h, "cron_trigger_dag", {"dag": "deploy", "params": {"x": 1}}
+        )
+        assert "confirm=true" in result["content"][0]["text"]
+        assert len(await cron._dag.list_runs("deploy")) == 1
+    finally:
+        await _teardown(cron)
+
+
+async def test_backfill_tool_takes_params(tmp_path):
+    h, cron = await _param_handler(tmp_path)
+    try:
+        args = {
+            "dag": "nightly",
+            "from": "2026-01-01T00:00:00+00:00",
+            "to": "2026-01-01T01:30:00+00:00",
+            "params": {"limit": 3},
+        }
+        # the dry run reports the values the runs would store
+        result = await _call(h, "cron_backfill_dag", args)
+        assert result["structuredContent"]["dryRun"] is True
+        assert result["structuredContent"]["params"] == {"limit": 3}
+        # and refuses what a real run would refuse
+        result = await _call(
+            h, "cron_backfill_dag", {**args, "params": {"limit": "three"}}
+        )
+        assert result["isError"] is True
+        assert "limit must be an integer" in result["content"][0]["text"]
+        assert await cron._dag.list_runs("nightly") == []
+
+        result = await _call(
+            h, "cron_backfill_dag", {**args, "dry_run": False, "confirm": True}
+        )
+        assert result["structuredContent"]["created"] == 2
+        for key in result["structuredContent"]["runKeys"]:
+            doc = await cron._dag.get_run("nightly", key)
+            assert doc["params"] == {"limit": 3}
+            assert doc["triggeredBy"] == "mcp"
+    finally:
+        await _teardown(cron)
+
+
+async def test_params_need_the_params_scope_over_mcp(tmp_path):
+    # the REST twins refuse a non-empty params map from a token without the
+    # scope; the tools apply the same check and name the scope
+    h, cron = await _param_handler(tmp_path)
+    try:
+        trigger = {
+            "dag": "nightly",
+            "params": {"limit": 3},
+            "confirm": True,
+        }
+        backfill = {
+            "dag": "nightly",
+            "from": "2026-01-01T00:00:00+00:00",
+            "to": "2026-01-01T01:30:00+00:00",
+            "params": {"limit": 3},
+            "dry_run": False,
+            "confirm": True,
+        }
+        token = _as_caller(frozenset({"view", "control"}), label="ci")
+        try:
+            for tool, args in (
+                ("cron_trigger_dag", trigger),
+                ("cron_backfill_dag", backfill),
+            ):
+                result = await _call(h, tool, args)
+                assert result["isError"] is True, tool
+                assert "'params' scope" in result["content"][0]["text"]
+            assert await cron._dag.list_runs("nightly") == []
+            # the defaults stay open to `control`
+            result = await _call(
+                h, "cron_trigger_dag", {"dag": "nightly", "confirm": True}
+            )
+            assert result["structuredContent"]["params"] == {"limit": 10}
+            result = await _call(
+                h,
+                "cron_trigger_dag",
+                {"dag": "nightly", "params": {}, "confirm": True},
+            )
+            assert result["structuredContent"]["created"] is True
+        finally:
+            mcp_mod._caller.reset(token)
+        token = _as_caller(
+            frozenset({"view", "control", "params"}), label="ops"
+        )
+        try:
+            result = await _call(h, "cron_trigger_dag", trigger)
+            body = result["structuredContent"]
+            assert body["params"] == {"limit": 3}
+            doc = await cron._dag.get_run("nightly", body["runKey"])
+            # the run names the token that supplied the values
+            assert doc["triggeredBy"] == "ops"
+        finally:
+            mcp_mod._caller.reset(token)
+    finally:
+        await _teardown(cron)
+
+
+async def test_recovering_chosen_values_needs_the_params_scope_over_mcp(
+    tmp_path,
+):
+    # the REST twins refuse to execute a recovery that reuses chosen values
+    # for a token without the scope; the tool applies the same check
+    h, cron = await _param_handler(tmp_path)
+    try:
+        _set_cmd(cron, "nightly", "a", [_PY, "-c", "raise SystemExit(3)"])
+        day = "2026-01-02T00:00:00+00:00"
+        made = await cron._dag.trigger(
+            "nightly", params={"limit": 3}, logical_date=day
+        )
+        source = await _drive(cron, "nightly", made["runKey"])
+        assert source["state"] == "failed"
+        before = await cron._dag.list_runs("nightly")
+        by_key = {"dag": "nightly", "run_key": made["runKey"]}
+        by_date = {"dag": "nightly", "from": day, "to": day}
+        reviewed = []
+        token = _as_caller(frozenset({"view", "control"}), label="ci")
+        try:
+            for args in (by_key, by_date):
+                # the preview stays a `control` tool
+                result = await _call(h, "cron_preview_recovery", args)
+                plan = result["structuredContent"]
+                shown = plan.get("plans") or [plan]
+                assert shown[0]["params"] == {"limit": 3}
+                reviewed.append(
+                    {**args, "plan_token": plan["planToken"], "confirm": True}
+                )
+                result = await _call(h, "cron_recover_dag", reviewed[-1])
+                assert result["isError"] is True, args
+                assert "'params' scope" in result["content"][0]["text"]
+            assert await cron._dag.list_runs("nightly") == before
+        finally:
+            mcp_mod._caller.reset(token)
+        token = _as_caller(
+            frozenset({"view", "control", "params"}), label="ops"
+        )
+        try:
+            # the same reviewed call runs for a token that holds both
+            result = await _call(h, "cron_recover_dag", reviewed[0])
+            assert result["structuredContent"]["created"] is True
+            assert result["structuredContent"]["params"] == {"limit": 3}
+        finally:
+            mcp_mod._caller.reset(token)
+    finally:
+        await _teardown(cron)
+
+
+# ---------------------------------------------------------------------------
+# run parameters on cron_run_job
+# ---------------------------------------------------------------------------
+
+
+def _job_param_handler():
+    cron = Cron(
+        None,
+        config_yaml=(
+            "jobs:\n  - name: report\n    command: 'x'\n"
+            "    schedule: '0 0 1 1 *'\n    params:\n"
+            "      - name: region\n        default: eu\n        allowed:\n"
+            "          - eu\n          - us\n"
+            "      - name: rows\n        type: integer\n        default: 100\n"
+            "  - name: plain\n    command: 'x'\n    schedule: '0 0 1 1 *'\n"
+        ),
+    )
+    cron.web_config = {}
+    for job in cron.cron_jobs.values():
+        job.command = [sys.executable, "-c", "pass"]
+    cfg = _build_mcp_config(
+        {"enabled": True, "readOnly": False, "toolsets": _ALL_TOOLSETS}
+    )
+    return MCPHandler(cron, cfg), cron
+
+
+async def _reap_jobs(cron):
+    for jobs in list(cron.running_jobs.values()):
+        for running in list(jobs):
+            await running.wait()
+            await cron._handle_finished_job(running)
+
+
+async def test_run_job_tool_takes_params():
+    h, cron = _job_param_handler()
+    # the listing carries the declaration an agent builds its values from
+    listed = await _call(h, "cron_list_jobs")
+    declared = {
+        j["name"]: j.get("params") for j in listed["structuredContent"]["jobs"]
+    }
+    assert [p["name"] for p in declared["report"]] == ["region", "rows"]
+    assert declared["plain"] is None
+    result = await _call(
+        h,
+        "cron_run_job",
+        {"name": "report", "params": {"region": "us"}, "confirm": True},
+    )
+    assert result["structuredContent"] == {
+        "started": "report",
+        "params": {"region": "us", "rows": 100},
+    }
+    (running,) = cron.running_jobs["report"]
+    assert running.params == {"region": "us", "rows": 100}
+    await _reap_jobs(cron)
+    # without params the run takes the defaults, and the result says which
+    result = await _call(h, "cron_run_job", {"name": "report", "confirm": True})
+    assert result["structuredContent"]["params"] == {
+        "region": "eu",
+        "rows": 100,
+    }
+    await _reap_jobs(cron)
+    # refused values start nothing, and the text names each one
+    result = await _call(
+        h,
+        "cron_run_job",
+        {"name": "report", "params": {"rows": "5", "x": 1}, "confirm": True},
+    )
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "invalid parameters for job 'report': rows must be an integer; "
+        "x is not a declared parameter"
+    )
+    result = await _call(
+        h, "cron_run_job", {"name": "report", "params": [1], "confirm": True}
+    )
+    assert result["isError"] is True
+    result = await _call(
+        h, "cron_run_job", {"name": "plain", "params": {"a": 1}, "confirm": True}
+    )
+    assert result["isError"] is True
+    assert "declares no parameters" in result["content"][0]["text"]
+    assert not cron.running_jobs.get("report")
+    assert not cron.running_jobs.get("plain")
+    # a job that declares none answers with no values
+    result = await _call(h, "cron_run_job", {"name": "plain", "confirm": True})
+    assert result["structuredContent"] == {"started": "plain"}
+    await _reap_jobs(cron)
+
+
+async def test_run_job_params_need_the_params_scope_over_mcp():
+    h, cron = _job_param_handler()
+    args = {"name": "report", "params": {"region": "us"}, "confirm": True}
+    token = _as_caller(frozenset({"view", "control"}), label="ci")
+    try:
+        result = await _call(h, "cron_run_job", args)
+        assert result["isError"] is True
+        assert "'params' scope" in result["content"][0]["text"]
+        assert not cron.running_jobs.get("report")
+        # the defaults stay open to `control`
+        result = await _call(
+            h, "cron_run_job", {"name": "report", "confirm": True}
+        )
+        assert result["structuredContent"]["started"] == "report"
+        await _reap_jobs(cron)
+    finally:
+        mcp_mod._caller.reset(token)
+    token = _as_caller(frozenset({"view", "control", "params"}), label="ops")
+    try:
+        result = await _call(h, "cron_run_job", args)
+        assert result["structuredContent"]["params"]["region"] == "us"
+        await _reap_jobs(cron)
+    finally:
+        mcp_mod._caller.reset(token)

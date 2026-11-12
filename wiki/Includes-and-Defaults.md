@@ -120,8 +120,9 @@ run-scoped `secrets`, or reporter (`onFailure`/`onSuccess`/…) block covers DAG
 tasks too, with the task's own value winning on any key it sets. Approval gates
 ignore an inherited `resourceLimits`, because they run no process.
 
-The DAG-node fields that shape the graph (`dependsOn`, `triggerRule`, `retries`,
-`expand`, `onReject`, the poke settings) are graph structure, not launch config,
+The DAG-node fields that shape the graph (`dependsOn`, `triggerRule`,
+`skipExitCodes`, `when`, `retries`, `expand`, `onReject`, the poke settings)
+are graph structure, not launch config,
 and are never touched by `defaults:`. The DAG's synthetic schedule-trigger job
 runs a placeholder `true` on every tick and deliberately stays on the built-in
 defaults, so a global reporter fires per DAG **run**, not on every tick.

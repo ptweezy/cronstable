@@ -27,6 +27,8 @@ coordinate across a fleet. DAGs use the existing job runner and state store:
 [XCom: passing data between tasks](#xcom-passing-data-between-tasks) ·
 [Fan-out: dynamic mapping](#fan-out-dynamic-mapping) ·
 [Sensors](#sensors) · [Approval gates](#approval-gates) ·
+[Conditional branching](#conditional-branching) ·
+[Run parameters](#run-parameters) ·
 [Scheduling, catch-up, and backfill](#scheduling-catch-up-and-backfill) ·
 [Crash-resume and the fleet](#crash-resume-and-the-fleet) ·
 [Retention and GC](#retention-and-gc) ·
@@ -65,12 +67,24 @@ with `dependsOn:`, a list of upstream task ids. The graph must be **acyclic**
 and every dependency must resolve. A cycle or a dangling edge is a
 configuration error at load, never a run that stops responding at runtime.
 
-A task's `triggerRule` governs its readiness:
+A task's `triggerRule` governs its readiness. Every rule waits until each
+upstream reaches a terminal state, then reads those states:
 
-| `triggerRule` | the task runs when… |
-| --- | --- |
-| `all_success` (default) | every upstream succeeded (an upstream failure makes it `upstream_failed`, and an upstream skip cascades a `skipped`) |
-| `all_done` | every upstream reached a terminal state, regardless of outcome |
+| `triggerRule` | The task runs when… | Otherwise |
+| --- | --- | --- |
+| `all_success` (default) | every upstream succeeded | an upstream failure makes it `upstream_failed`, and an upstream skip cascades a `skipped` |
+| `all_done` | every upstream is terminal, whatever the outcome | it always runs |
+| `none_failed` | no upstream failed | an upstream failure makes it `upstream_failed` |
+| `none_failed_min_one_success` | no upstream failed and at least one succeeded | an upstream failure makes it `upstream_failed`, and it is `skipped` when every upstream was skipped |
+| `all_done_min_one_failed` | at least one upstream failed | it is `skipped` |
+
+`none_failed_min_one_success` and `all_done_min_one_failed` count upstream
+outcomes, so a task that uses either needs at least one `dependsOn` entry. A
+task with one of these rules and no `dependsOn` is a configuration error at
+load.
+
+[Conditional branching](#conditional-branching) shows the last three rules
+in use.
 
 Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
@@ -92,8 +106,9 @@ accept a `report` block only, because a task's retries come from the node's
 ignored for tasks).
 
 Only the **launch** fields inherit. The DAG-node fields that shape the graph
-(`dependsOn`, `triggerRule`, `retries`, `retryDelaySeconds`, `expand`,
-`onReject`, the poke settings) are never touched by a `defaults:` block.
+(`dependsOn`, `triggerRule`, `skipExitCodes`, `when`, `retries`,
+`retryDelaySeconds`, `expand`, `onReject`, the poke settings) are never
+touched by a `defaults:` block.
 
 The DAG's own schedule frame is separate too: the synthetic trigger job that
 fires the DAG on schedule stays on the built-in defaults, so a global
@@ -126,14 +141,27 @@ Each task instance moves through:
 ```text
 pending ─▶ running ─▶ success
                    ├▶ up_for_retry ─▶ running (after retryDelaySeconds)
-                   └▶ failed              (retries exhausted)
-pending ─▶ upstream_failed   (an upstream failed, all_success)
-pending ─▶ skipped           (an upstream was skipped, all_success)
+                   ├▶ failed              (retries exhausted)
+                   └▶ skipped             (the command exited with a skipExitCodes code)
+pending ─▶ upstream_failed   (the trigger rule fails on an upstream failure)
+pending ─▶ skipped           (the trigger rule skips on these upstream states)
+pending ─▶ skipped           (a when comparison does not hold)
 ```
 
 A dag_run is `success` after every task is terminal and none failed. It is
 `failed` if any task ended `failed` or `upstream_failed`. `skipped` is not a
 failure.
+
+A `skipped` task entry records why in `skipReason`, an object with a `kind`
+and a `detail` string:
+
+| `kind` | The task was skipped because… | Example `detail` |
+| --- | --- | --- |
+| `exit_code` | its command exited with one of its `skipExitCodes` | `exit code 99` |
+| `upstream` | an upstream was skipped and its rule is `all_success` | `upstream skipped: full-load` |
+| `trigger_rule` | its rule skips on the states its upstreams reached | `all_done_min_one_failed: no upstream failed` |
+| `approval` | its gate was rejected with `onReject: skip` | `rejected by alice` |
+| `condition` | one of its `when` comparisons did not hold | `param mode equals full: the value is incremental` |
 
 ## XCom: passing data between tasks
 
@@ -156,8 +184,16 @@ cronstable xcom list                                            # keys in this r
 Outputs are content-addressed and versioned (newest wins by key). The daemon
 injects the run's identity so the CLI needs no arguments beyond the key:
 `CRONSTABLE_DAG_NAME`, `CRONSTABLE_DAG_RUN_ID`, `CRONSTABLE_DAG_RUN_KEY`,
-`CRONSTABLE_DAG_TASK`, `CRONSTABLE_DAG_TASKKEY`, `CRONSTABLE_DAG_MAP_INDEX`, `CRONSTABLE_DAG_MAP_ITEM`,
-`CRONSTABLE_DAG_XCOM_SCOPE`.
+`CRONSTABLE_DAG_LOGICAL_DATE`, `CRONSTABLE_DAG_TASK`,
+`CRONSTABLE_DAG_TASKKEY`, `CRONSTABLE_DAG_MAP_INDEX`,
+`CRONSTABLE_DAG_MAP_ITEM`, `CRONSTABLE_DAG_XCOM_SCOPE`.
+
+`CRONSTABLE_DAG_LOGICAL_DATE` holds the run's logical date, the scheduled
+time that the run stands for, as an ISO 8601 instant in UTC such as
+`2026-01-04T02:00:00+00:00`. A backfill run, a catch-up run, and a
+[recovery](Workflow-Recovery) run can start days after that time, so a
+command that depends on the date reads it from this variable. A manual run
+that names no `logicalDate` has none, and the variable is the empty string.
 
 ## Fan-out: dynamic mapping
 
@@ -179,8 +215,14 @@ XCom list (Airflow's `.expand()`):
 When `list-work` succeeds, the scheduler reads its `items` list and materializes
 `process#0`, `process#1`, `process#2`, each with its own state, retries, and
 XCom, and its item in `$CRONSTABLE_DAG_MAP_ITEM`. A downstream task that
-lists `process` in `dependsOn` waits for **all** the mapped instances (fan-in). An
-empty list resolves the mapped task to `success` immediately.
+lists `process` in `dependsOn` waits for **all** the mapped instances (fan-in).
+
+An empty list creates no instances, so the mapped task follows its
+`triggerRule` as a single task does. It waits for every upstream. Where the
+[trigger rule table](#tasks-and-dependencies) says a task runs, the mapped
+task resolves to `success`, and otherwise it ends `skipped` or
+`upstream_failed`. In this example, `process` has one upstream, so an empty
+list resolves it to `success` as soon as `list-work` succeeds.
 
 The expanded item set is recorded **once** in the dag_run and never recomputed,
 so a crash-resumed run reconstructs the identical set of mapped instances
@@ -260,12 +302,552 @@ curl -X POST .../dags/nightly-etl/runs/<run_key>/tasks/publish-gate/decision \
 `approve` succeeds the gate and the graph proceeds. `reject` fails it (or, with
 `onReject: skip`, marks it `skipped`, cascading `skipped` to its `all_success`
 downstream). The decision (`by`, timestamp) is recorded durably.
+[Conditional branching](#conditional-branching) covers the trigger rules that
+let a downstream task run after a skipped gate.
 
 You can be paged when a gate begins waiting: configure the
 [`notify:` block](Reporting#daemon-event-notifications-notify) with the
 `approval_waiting` event. The daemon then fires a reporter (webhook, mail, …)
 the first time each gate parks awaiting a decision. A whole DAG run reaching
 `failed` similarly fires the `dag_failure` event.
+
+## Conditional branching
+
+A workflow branches when a task ends `skipped` and a later task joins the
+branches with a trigger rule. A task is skipped on purpose in one of two
+ways. Its command can exit with a code listed in `skipExitCodes`. Or a
+[`when:` condition](#conditions-on-parameters-and-xcom-values) can fail to
+hold, and then the command never starts.
+
+A task skips itself by exiting with a code listed in its `skipExitCodes`.
+The list has no default, so a command that exits `99` fails unless the task
+lists `99`. Each code is from `1` to `255`.
+
+Pick a code that only the command's own skip decision returns. A shell or a
+failing program exits with `1` or `2` for an ordinary error, `126` for a
+file that it cannot run, and `127` for a command that it cannot find. With
+one of those codes in the list, a broken command ends the task `skipped`.
+At load and under `--validate-config`, cronstable logs a warning for each
+task that lists one, and the configuration still loads:
+
+```text
+dag 'nightly-load': task 'full-load': skipExitCodes holds 1, 127. A shell or a failing program exits with 1 or 2 for an ordinary error, 126 for a file it cannot run, and 127 for a command it cannot find, so a broken command would end the task skipped. Use a code that only the command's own skip decision returns, such as 99
+```
+
+```yaml
+state:
+  path: /var/lib/cronstable/state
+dags:
+  - name: nightly-load
+    schedule: "0 2 * * *"
+    tasks:
+      - id: extract
+        command: ./extract.sh
+      - id: full-load
+        dependsOn:
+          - extract
+        command: |
+          day=$(date -u -d "${CRONSTABLE_DAG_LOGICAL_DATE:-now}" +%u)
+          [ "$day" = 7 ] || exit 99
+          ./load.sh --full
+        skipExitCodes:
+          - 99
+      - id: incremental-load
+        dependsOn:
+          - extract
+        command: |
+          day=$(date -u -d "${CRONSTABLE_DAG_LOGICAL_DATE:-now}" +%u)
+          [ "$day" != 7 ] || exit 99
+          ./load.sh --incremental
+        skipExitCodes:
+          - 99
+      - id: publish
+        dependsOn:
+          - full-load
+          - incremental-load
+        triggerRule: none_failed_min_one_success
+        command: ./publish.sh
+      - id: alert
+        dependsOn:
+          - full-load
+          - incremental-load
+          - publish
+        triggerRule: all_done_min_one_failed
+        command: ./page-oncall.sh
+```
+
+On Sunday the full load runs and the incremental load skips itself. On every
+other day the two swap. Each load reads the weekday from
+[`CRONSTABLE_DAG_LOGICAL_DATE`](#xcom-passing-data-between-tasks), so a
+backfill, a catch-up run, or a recovery run takes the branch of the date it
+stands for. The schedule runs in UTC, so `date -u` reads the weekday in UTC.
+`date -d` is the GNU form, and `:-now` covers a manual run that names no
+`logicalDate`. `publish` joins the branches, and `alert` is a failure
+handler:
+
+| Case | `full-load` | `incremental-load` | `publish` | `alert` | Run |
+| --- | --- | --- | --- | --- | --- |
+| Sunday | `success` | `skipped` | `success` | `skipped` | `success` |
+| Another day | `skipped` | `success` | `success` | `skipped` | `success` |
+| Sunday, the full load fails | `failed` | `skipped` | `upstream_failed` | `success` | `failed` |
+| Both loads skip | `skipped` | `skipped` | `skipped` | `skipped` | `success` |
+| `publish` fails | `success` | `skipped` | `failed` | `success` | `failed` |
+
+Choosing the join's rule:
+
+- `none_failed_min_one_success` runs the join after the branch that ran, and
+  skips it when every branch skipped. Use it for a join below alternative
+  branches.
+- `none_failed` also runs the join when every branch skipped.
+- `all_success`, the default, skips the join when one branch skips and no
+  branch fails. At load, cronstable logs a warning that names an
+  `all_success` task with two or more upstreams that can end `skipped`. It
+  omits the warning when it detects that those upstreams only ever skip
+  together, as two tasks below one `onReject: skip` gate do.
+
+A branch longer than one task needs no extra keys. A skipped task cascades
+`skipped` to its `all_success` successors, and the join's rule ends the
+cascade.
+
+A failure handler uses `all_done_min_one_failed`. It waits for every
+upstream to finish, runs when at least one of them failed, and is `skipped`
+otherwise. The run verdict keeps its rule: in the third and fifth rows the
+handler succeeds and the run is still `failed`, because a task failed. The
+`dag_failure` event fires for it, and
+[recovery](Workflow-Recovery) can retry the failed task.
+
+How a skip interacts with the rest of a task:
+
+- The skip is decided ahead of `failsWhen`. A command that exits with a
+  listed code ends the task `skipped`, whatever `failsWhen` says.
+- Only a command that started and exited by itself can skip. A run stopped by
+  `executionTimeout` or a cancel is never a skip, and neither is a run that
+  goes over its [memory cap](Resource-Limits#memory) or that
+  `resourceLimits.required` refuses. On Windows, a memory-cap kill exits with
+  code `1`, and the task fails even when `1` is listed.
+- A skip runs no `verify` step and fires neither `onFailure` nor `onSuccess`.
+- A skip is terminal and uses no attempt. A task that failed twice and then
+  exits with a listed code ends `skipped`.
+- For a sensor, exit `0` means the condition is met, a listed code ends the
+  sensor `skipped`, and any other code pokes again.
+- An approval gate runs no command, so `skipExitCodes` on a gate is a
+  configuration error.
+- In a fan-out, each mapped instance decides for itself. A group with skipped
+  instances and no failed one reads `skipped`. For
+  `none_failed_min_one_success`, such a group counts as a success when at
+  least one of its instances succeeded.
+
+A reload applies to a run in progress the way it does for every node field:
+
+- A changed `triggerRule` applies to tasks that are still `pending`.
+- Changed `skipExitCodes` apply to instances launched after the reload. An
+  instance that is running keeps the codes it launched with.
+- A changed `when:` applies to tasks whose condition has no recorded result.
+  A task entry that carries `whenMet` keeps its decision.
+- A task that is already `skipped` stays `skipped`.
+
+A workflow that sets `skipExitCodes`, or a rule other than `all_success` and
+`all_done`, needs run engine level 2. On a store that several nodes share,
+upgrade every node before a configuration uses these keys (see
+[run engine levels](#run-engine-levels)).
+
+### Conditions on parameters and XCom values
+
+A task with `when:` runs only when every comparison in the list holds. The
+scheduler reads the comparisons when the task becomes ready. If one does not
+hold, the task ends `skipped` and its command never starts.
+
+```yaml
+state:
+  path: /var/lib/cronstable/state
+dags:
+  - name: nightly-load
+    params:
+      - name: mode
+        default: incremental
+        allowed:
+          - incremental
+          - full
+    tasks:
+      - id: extract
+        command: ./extract.sh
+      - id: full-load
+        dependsOn:
+          - extract
+        when:
+          - param: mode
+            equals: full
+        command: ./load.sh --full
+      - id: incremental-load
+        dependsOn:
+          - extract
+        when:
+          - param: mode
+            notEquals: full
+          - xcom:
+              task: extract
+              key: row_count
+            notIn:
+              - "0"
+        command: ./load.sh --incremental
+      - id: publish
+        dependsOn:
+          - full-load
+          - incremental-load
+        triggerRule: none_failed_min_one_success
+        command: ./publish.sh
+```
+
+A run started with `mode` set to `full` runs `full-load` and skips
+`incremental-load`. A run with the default `mode` skips `full-load`. It runs
+`incremental-load` unless `extract` published `0` as its `row_count`, and in
+that case `publish` is skipped too, because no branch ran.
+
+Each entry names one source and one operator:
+
+| Key | Meaning |
+| --- | --- |
+| `param` | The name of a [run parameter](#run-parameters) the workflow declares. |
+| `xcom` | A map with `task` and `key`: the value that task published with `cronstable xcom push --key KEY`. |
+| `equals`, `notEquals` | One value to compare the source with. |
+| `in`, `notIn` | A list of values. `in` holds when the source equals one of them, and `notIn` holds when it equals none of them. |
+| `lessThan`, `lessThanOrEqual`, `greaterThan`, `greaterThanOrEqual` | One number. The comparison holds when the source is a number below it, at or below it, above it, or at or above it. |
+
+A numeric comparison branches on a count. This task runs only when
+`extract` published a `row_count` above zero:
+
+```yaml
+      - id: load
+        dependsOn:
+          - extract
+        when:
+          - xcom:
+              task: extract
+              key: row_count
+            greaterThan: 0
+        command: ./load.sh
+```
+
+What a comparison reads:
+
+- A parameter comparison reads the value the run stores, in the parameter's
+  declared type. Write each comparison value the way you write the
+  parameter's `default`. A boolean equals only a boolean, so `true` does not
+  equal `1`.
+- An XCom comparison reads the published bytes as UTF-8 text, with one
+  trailing newline removed. `xcom.task` is a task upstream of this one, and
+  it cannot be a mapped task, because a mapped task publishes one value per
+  instance. Each comparison value is text of at most 4096 bytes, so quote a
+  value such as `"0"`. Under `cmd.exe`, the command
+  `echo full | cronstable xcom push --key mode` publishes `full` followed by
+  a space, which does not equal `full`. Publish from PowerShell, or write
+  `echo full| cronstable xcom push --key mode`.
+- `lessThan`, `lessThanOrEqual`, `greaterThan`, and `greaterThanOrEqual`
+  compare numbers. On a parameter, they apply to an `integer` or a `number`,
+  and another type is a configuration error. On an XCom source, they read
+  the published text as a number, so `12`, `3.5`, and `1e3` all compare, and
+  spaces around the number are ignored. The comparison value is any finite
+  number: the parameter's `minimum`, `maximum`, and `allowed` do not apply
+  to it.
+- A source with no value fails `equals` and `in`, and passes `notEquals` and
+  `notIn`. It fails each of the four numeric operators, and so does XCom
+  text that is not a number, such as `none`. An XCom source has no value
+  when the task did not publish the key, when the published value is larger
+  than 4096 bytes, and when it is not UTF-8 text. A parameter has no value
+  in a run that was created before the workflow declared it.
+
+The loader checks every entry. A comparison value that the parameter can
+never hold is a configuration error, so a misspelled value such as
+`equals: ful` fails the load when the parameter's `allowed` list is
+`incremental` and `full`.
+
+How a condition is decided:
+
+- The trigger rule is read first. A task below a failed upstream ends
+  `upstream_failed`, whatever its condition says.
+- An unmet condition uses no attempt and takes no
+  [pool](Resource-Pools) slot. It runs no `verify` step and fires neither
+  `onFailure` nor `onSuccess`. The task's `skipReason` has the kind
+  `condition` and names the comparison, for example
+  `param mode equals full: the value is incremental` or
+  `xcom extract/row_count greaterThan 0: the value is 0`.
+- A met condition is recorded on the task entry as `whenMet` and is not read
+  again, so a retry keeps the decision.
+- An XCom value is read once the task that published it has finished. If the
+  store cannot answer, the task stays `pending` and the read is retried
+  after five seconds.
+- On a sensor, the condition is read once, before the first poke. On an
+  approval gate, an unmet condition skips the gate and nobody is asked to
+  decide.
+- On a mapped task, the condition is read once for the whole fan-out, before
+  it expands. An unmet condition creates no instances.
+- A task can set both `when:` and `skipExitCodes`. The condition decides
+  whether the command starts, and a command that starts can still skip
+  itself.
+
+A workflow that uses `when:` needs run engine level 2 (see
+[run engine levels](#run-engine-levels)).
+
+## Run parameters
+
+A workflow declares the values that can differ from run to run under
+`params:`. A caller supplies values when it starts a run, cronstable checks
+them against the declaration, and every task of the run reads the same
+values.
+
+```yaml
+state:
+  path: /var/lib/cronstable/state
+dags:
+  - name: deploy
+    params:
+      - name: target
+        type: string
+        default: staging
+        allowed:
+          - staging
+          - prod
+        description: Environment to deploy to
+      - name: batch_size
+        type: integer
+        default: 500
+        minimum: 1
+        maximum: 10000
+      - name: ticket
+        type: string
+        required: true
+        pattern: "OPS-[0-9]+"
+        maxLength: 32
+    tasks:
+      - id: release
+        command: ./release.sh "$CRONSTABLE_PARAM_TARGET" "$CRONSTABLE_PARAM_BATCH_SIZE"
+```
+
+### Declaring parameters
+
+| Key | Meaning |
+| --- | --- |
+| `name` | Required. Starts with a letter and holds at most 64 letters, digits, and underscores. Names are unique within the workflow, ignoring case. |
+| `type` | `string` (the default), `integer`, `number`, or `boolean`. |
+| `default` | The value a run stores when the caller supplies none. It has to pass the parameter's own constraints. |
+| `required` | `true` means the caller supplies the value on every run. A required parameter takes no `default`, and a workflow with a `schedule` cannot have one. |
+| `allowed` | The complete list of accepted values, for a `string`, an `integer`, or a `number`. |
+| `minimum`, `maximum` | Inclusive bounds for an `integer` or a `number`. |
+| `pattern` | A regular expression in Python syntax that the whole string has to match. The daemon evaluates it for each supplied value, so keep it free of nested repetition such as `(a+)+` (see [pattern cost](#pattern-cost)). |
+| `maxLength` | The longest accepted string, in characters, from 1 to 4096. |
+| `description` | Text that the dashboard shows under the field. |
+
+Every parameter sets either `default` or `required: true`, so every run of a
+workflow stores the same parameter names. A fault in the declaration is a
+configuration error at load.
+
+The limits:
+
+- A workflow declares at most 32 parameters.
+- A string is at most 4096 bytes of UTF-8 and holds no control character
+  and no Unicode line or paragraph separator.
+- An integer is from -9007199254740991 to 9007199254740991, the range a JSON
+  client reads exactly. A number is finite.
+- The values of one run are at most 16 KiB as JSON.
+
+#### Pattern cost
+
+A `pattern` that holds a repeat inside an unbounded repeat, with nothing
+required between them, can take time that grows exponentially with the
+length of a value that it refuses. `([a-z0-9]+-?)+` is such a pattern,
+because its `-` is optional. So is `([0-9]{1,3}\.?)+`, whose inner repeat
+has an upper bound. The daemon schedules nothing while it checks a value.
+It checks `maxLength` first, and that limit bounds the cost only when it is
+short, such as 16, because each further character multiplies the time.
+
+At load and under `--validate-config`, cronstable logs a warning for each
+job or workflow parameter that has such a pattern, and the configuration
+still loads:
+
+```text
+dag 'deploy': param 'slug': the pattern holds a repeat inside an unbounded repeat with nothing required between them, as (a+)+ does. Checking a value that does not match can take time that grows exponentially with the length of the value, and the daemon schedules nothing until the check ends. Require a character between the repeats, or make the inner repeat possessive, as in (a++)+
+```
+
+cronstable omits the warning for a parameter whose `maxLength` is 16 or
+less, unless its pattern also holds an alternative (`|`) or a third repeat.
+
+Either rewrite removes the exponential growth:
+
+| Rewrite | Example |
+| --- | --- |
+| Require a separator between the repeats | `[a-z0-9]+(-[a-z0-9]+)*` |
+| Make the inner repeat possessive | `(?:[a-z0-9]++-?)+` |
+
+The warning covers this one shape. A pattern can be slow in ways that it
+does not detect, such as a repeat over alternatives that overlap, as in
+`(a|aa)+`.
+
+### Supplying values
+
+Send the values as a `params` object when you start a run:
+
+```bash
+curl -X POST http://127.0.0.1:8080/dags/deploy/trigger \
+     -H "Authorization: Bearer $TOKEN" \
+     -d '{"params": {"target": "prod", "ticket": "OPS-4412"}}'
+```
+
+- Each value has the declared JSON type. Nothing is coerced, so `"500"` is
+  refused for an integer. A form converts its text before it sends.
+- A name the workflow does not declare is refused, and a workflow with no
+  `params:` accepts no values.
+- A refused request creates no run. It answers `400` with the reason for
+  each parameter under [`paramErrors`](HTTP-API#post-dagsnametrigger).
+- A parameter the caller leaves out takes its `default`.
+- A scheduled run and a catch-up run store the defaults.
+- A [backfill](#scheduling-catch-up-and-backfill) takes the same `params`
+  object and applies it to the runs it creates. A date that already has a
+  run keeps that run's values, and the response lists those dates under
+  `existingRunKeys`.
+- To run a date that already has a run with other values, trigger a manual
+  run with `logicalDate` and `params`. It gets its own run key, and the
+  scheduled run stays as it is.
+- `requestId` makes a trigger repeatable. The run key is derived from it, so
+  a repeated request returns the first run with `created: false`. The repeat
+  is compared with the stored values after defaults are applied, so it
+  answers `409` when a reload changed a default in between. The web
+  dashboard and the terminal dashboard send a `requestId` with every
+  trigger. They keep it until the daemon answers, for up to 10 minutes after
+  the trigger was last sent, so a trigger that you send again within that
+  time starts one run.
+
+The [web dashboard](Web-Dashboard#dag-orchestration) opens a form for a workflow
+that declares parameters, the [terminal dashboard](Terminal-Dashboard) takes
+`name=value` pairs, and the [MCP](MCP) tools `cron_trigger_dag` and
+`cron_backfill_dag` take a `params` argument.
+
+With [scoped tokens](HTTP-API#scoped-tokens-webauthtokens), supplying values
+needs the `params` scope in addition to `control`. A token that holds
+`control` alone starts runs with the declared defaults. Use `allowed` for
+every parameter that selects a target, because the declaration bounds what
+any caller can choose.
+
+### Reading values in a task
+
+Each parameter reaches every task of the run as an environment variable
+named `CRONSTABLE_PARAM_` plus the parameter name in upper case:
+
+| Declared type | Variable text |
+| --- | --- |
+| `string` | The text |
+| `integer`, `number` | The JSON text, such as `500` or `0.5` |
+| `boolean` | `true` or `false` |
+
+A `number` has one stored form. A whole value is stored as an integer, so a
+request that sends `5.0` and one that sends `5` both store `5`, and the
+variable reads `5`. A `default` and an `allowed` value follow the same rule.
+
+The variables are applied after the task's own `environment:`, so a
+task-level variable of the same name loses. A task receives the parameters
+its run stores and no others: a `CRONSTABLE_PARAM_*` variable in the
+daemon's own environment is not passed on.
+
+`cronstable param` reads the same values over the
+[loopback endpoint](Durable-State#job-facing-state):
+
+```bash
+cronstable param get target     # prints one value; exits 4 for an unknown name
+cronstable param list           # prints the parameter names
+cronstable param dump           # prints every value as one JSON object
+```
+
+cronstable never substitutes a value into the command text. Quote the
+variable in a POSIX shell (`"$CRONSTABLE_PARAM_TARGET"`), which does not
+parse an expanded variable again.
+
+`cmd.exe`, the default shell of a Windows task, reads the text of an
+expanded `%CRONSTABLE_PARAM_TARGET%` as command text. A `&`, `|`, or `>` in
+the value is command syntax there, so a value of the form
+`staging & <command>` runs that command. Double quotes around the reference
+do not protect against a value that holds a double quote. `cmd.exe` starts
+with delayed expansion off, so `!CRONSTABLE_PARAM_TARGET!` in a `command`
+stays as that literal text. A Windows task reads a parameter in one of
+these ways:
+
+- From PowerShell, which does not parse the value again:
+
+  ```yaml
+        - id: release
+          shell: powershell
+          command: Write-Output deploy $env:CRONSTABLE_PARAM_TARGET
+  ```
+
+- From a script file that turns delayed expansion on:
+
+  ```bat
+  @echo off
+  setlocal EnableDelayedExpansion
+  echo deploy !CRONSTABLE_PARAM_TARGET!
+  ```
+
+Constrain each value with `allowed` or `pattern` in the declaration as
+well. `cmd.exe` treats a variable whose value is the empty string as
+undefined, so for an empty value `%CRONSTABLE_PARAM_TARGET%` in a `command`
+stays as that literal text.
+
+At load and under `--validate-config`, cronstable logs a warning for two
+kinds of reference in a job or task `command`, and the configuration still
+loads:
+
+- The command names `CRONSTABLE_PARAM_<NAME>` for a name that its job or
+  workflow does not declare. That variable is unset when the command runs.
+- `cmd.exe` parses the command, the command holds
+  `%CRONSTABLE_PARAM_<NAME>%`, and the parameter is a `string` with no
+  `allowed` list and no `pattern`. `cmd.exe` parses a string `command`
+  under the Windows default shell or `shell: cmd`, and a `command` list
+  whose first item is `cmd` or `cmd.exe`.
+
+```text
+dag 'deploy': task 'release': the command reads CRONSTABLE_PARAM_TRAGET, and the workflow declares no parameter of that name, so the variable is unset when the command runs
+dag 'deploy': task 'release': cmd.exe replaces %CRONSTABLE_PARAM_TARGET% with the value before it parses the command, and param 'target' takes any string. A value that holds &, |, <, >, or a double quote runs as part of the command line. Give the parameter an allowed list or a pattern, or read the variable from PowerShell or a script file
+```
+
+### What a run stores
+
+- The run document holds the checked values under `params`, written when the
+  run is created. Nothing changes them afterward. A reload that changes the
+  declaration leaves every existing run with the values it has. A run that
+  was created before a parameter was declared has no variable for it, so
+  let in-flight runs finish before a task command starts to read a new
+  parameter.
+- A run that a trigger or a backfill request created records the label of
+  the requesting token under `triggeredBy`.
+- [Recovery](Workflow-Recovery#run-parameters) reuses the source run's
+  values.
+- The daemon log names the parameters a request supplied and never prints a
+  value. The built-in report templates carry no parameters. A custom report
+  template that renders the task's `environment` includes the
+  `CRONSTABLE_PARAM_*` variables.
+- With the [Sentry reporter](Reporting#sentry-reporter) in use, the
+  daemon's error-level log records also go to Sentry as events. An event
+  carries its traceback without the local variables of the stack frames,
+  and it carries no HTTP request body, so neither brings a parameter value
+  to Sentry.
+
+A run's parameter values are visible to every reader with the `view` scope,
+to MCP clients, and in state backups. Keep a secret in the task's
+[`secrets:`](Durable-State#run-scoped-secrets) block. When a run needs a
+different credential, pass the secret's name as a parameter and let the task
+resolve it.
+
+A parameter name that reads as a secret is a configuration error. That is a
+name that ends with one of these words, in any letter case and with or
+without the underscore: `password`, `passwd`, `pwd`, `secret`, `token`,
+`credential`, `api_key`, `access_key`, `secret_key`, `auth_token`,
+`private_key`, or `rediscli_auth`. The plural of a word counts too, as in
+`passwords`, `api_keys`, and `credentials`. The one plural that loads is
+`tokens`, because a name such as `max_tokens` counts tokens, although
+`auth_tokens` is still refused. A name that only starts with or contains
+one of the words, such as `secret_name` or `password_policy`, describes its
+value and loads.
+
+A workflow that declares `params:` needs run engine level 2 (see
+[run engine levels](#run-engine-levels)).
 
 ## Scheduling, catch-up, and backfill
 
@@ -280,6 +862,13 @@ A scheduled DAG follows the
 [catch-up discipline](Durable-State#missed-run-catch-up): `onMissed`
 (`skip` / `run-once` / `run-all`) and `startingDeadlineSeconds` bound how many
 missed logical dates a restart replays, capped like a job's catch-up.
+
+Catch-up counts the missed dates from the latest logical date among the runs
+the schedule created, which are its scheduled runs and its catch-up runs. A
+manual run, a backfill, and a recovery leave that reference point where it is,
+whatever logical date they carry. [Retention](#retention-and-gc) always keeps
+the run that holds it. A DAG with no scheduled or catch-up run has no
+reference point, so it schedules forward.
 
 `catchupJitterSeconds` spreads the replays, with the same checkpointed
 at-least-once resume the job engine has. The owed watermark goes into a
@@ -297,6 +886,15 @@ curl -X POST .../dags/nightly-etl/backfill \
      -d '{"from": "2026-01-01T00:00:00+00:00", "to": "2026-01-07T00:00:00+00:00"}'
 ```
 
+The response counts the runs the request created (`created`, `runKeys`)
+separately from the dates that already had a run (`existing`,
+`existingRunKeys`). A run that already exists is left as it is, whatever its
+state. One request covers at most 100 scheduled dates. When the range holds
+more, the response has `truncated: true` and `nextFrom`, the first date the
+request did not reach. Send `nextFrom` as `from` with the same `to` to
+continue. For a workflow that declares [run parameters](#run-parameters),
+the request also takes a `params` object.
+
 While the state store cannot answer, the request answers `503` with
 `backfill state is unavailable`. The runs written before a fault stay, and
 the same request creates the rest. See
@@ -312,6 +910,11 @@ launch twice (crash recovery is at-least-once; see the delivery contract
 below). The claim that flips a task `pending → running` is a single
 atomic compare-and-set on the run document, a correctness backstop underneath
 the lease.
+
+A pass that reads XCom values, for a mapped task's list or a `when:`
+comparison, checks the lease again before it claims. So does a pass that
+prepares a [recovery run](Workflow-Recovery). An owner whose lease ran out
+during those reads starts no task in that pass.
 
 The owner also keeps an in-memory record of every task instance it claimed
 and queued for launch. If a store write lands after the owner's timeout
@@ -344,12 +947,75 @@ exactly-once: a task whose process outlives a crashed daemon may run again on
 resume. A task that must be exactly-once should guard its side effect with an
 [idempotency key](Durable-State#idempotency-keys).
 
+### Run engine levels
+
+During an upgrade, the nodes on a shared store run different cronstable
+versions. Each build supports workflow features up to a numbered run engine
+level. The current level is 2. A workflow needs the highest level any of its
+features needs.
+
+| Level | A workflow needs it when… |
+| --- | --- |
+| 1 | always |
+| 2 | a task sets `skipExitCodes`, [`when:`](#conditions-on-parameters-and-xcom-values), or a `triggerRule` other than `all_success` and `all_done`, or the workflow declares [`params:`](#run-parameters) |
+
+- A run document records the level its DAG needed at creation in an `engine`
+  field. A document with no `engine` field is at level 1.
+- A node adopts and advances only runs at or below its own level. It leaves
+  the document of a higher run unchanged, releases any advance lease it holds
+  on the run, and logs one warning. The run stays `running` until a node at
+  its level adopts it.
+- A node refuses to [recover](Workflow-Recovery) a run above its level.
+- Each node records its level as `dagEngine` in its
+  [manifest](Durable-State#garbage-collection-and-manifests). A manifest with
+  no `dagEngine` is at level 1, and so is a host that has no manifest. A build
+  at level 1 advances any run under the rules it knows.
+- When another live host is below the level a loaded DAG needs, the node logs
+  a warning that names the host, and the DAG's entry in `GET /dags` lists the
+  same text under `fleetWarnings`. The
+  [web dashboard](Web-Dashboard#dag-orchestration) and the
+  [terminal dashboard](Terminal-Dashboard#features) show those lines on the
+  workflow. A host counts as live for 12 hours after its newest sign of life
+  on the store: a manifest, or a task that it started in a run of a DAG the
+  node loads.
+- A build at level 1 refuses a configuration that uses a level 2 feature. It
+  keeps running the DAGs that it loaded earlier and records no manifest until
+  it loads a configuration again. Once its last manifest is 12 hours old, only
+  the tasks that it starts keep it in `fleetWarnings`: if it starts no task
+  for 12 hours, it leaves the list, and it returns after it starts its next
+  task.
+- When a host leaves the list of a DAG that still needs the level, the node
+  logs `dag <dag>: host <host> leaves the fleet warning: <reason>`. The reason
+  is either that the host's manifest advertises a high enough level, or that
+  the node finds no manifest or task start from the host in the last 12 hours.
+
+Upgrade every node on a shared store before a configuration uses a feature
+that needs a higher level.
+
+Installing an older build needs the reverse order. A build at level 1 does
+not read the `engine` field, so it adopts a run that records `engine: 2` and
+advances it under the rules it knows. It reads no `when:` condition and
+sets no `CRONSTABLE_PARAM_*` variable, so a task that a condition would
+skip runs, and a command reads its parameters as unset. Before you install
+an older build on any node of the store:
+
+1. Remove the level 2 keys from the configuration on every node. New runs
+   then record no `engine` field. A run in progress follows the changed
+   configuration for its remaining tasks, as after any
+   [reload](#conditional-branching).
+2. Wait until every run whose document records `engine: 2` has finished.
+   [`GET /dags/{name}/runs/{run_key}`](HTTP-API#get-dagsnamerunsrun_key)
+   shows the field.
+
 ## Retention and GC
 
 A dag_run document is durable and, while its DAG is configured, is **not**
 swept by the record garbage collector (GC). Instead each DAG keeps its newest
 `retainRuns` **terminal** runs (default 50) and prunes the rest, along with
-their XCom, on a periodic DAG-owned pass.
+their XCom, on a periodic DAG-owned pass. The pass always keeps the scheduled
+or catch-up run with the latest logical date, because
+[catch-up](#scheduling-catch-up-and-backfill) counts missed dates from it.
+That run can add one terminal run beyond `retainRuns`.
 
 Each node runs the pass hourly and at daemon start. It deletes runs in
 batches of up to 32, each run under its own lease, and keeps a run that a
@@ -395,7 +1061,8 @@ Over the [HTTP control API](HTTP-API#dag-endpoints):
 - `GET /dags`: the configured DAGs and their tasks
 - `GET /dags/{name}/runs`: recent runs and their per-task state counts
 - `GET /dags/{name}/runs/{run_key}`: one run's full document
-- `POST /dags/{name}/trigger`: start a manual run now
+- `POST /dags/{name}/trigger`: start a manual run now, with
+  [run parameters](#run-parameters) when the workflow declares them
 - `POST /dags/{name}/backfill`: replay a date range
 - `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision`: approve/reject a gate
 

@@ -28,6 +28,11 @@ PAIR_LINK_FALLBACK = "https://relay.cronstable.com/pair"
 #: ID as ``instance``.
 INSTANCE_HEADER = "Cronstable-Instance"
 
+#: The scopes a route can require. A token that holds them passes every
+#: route's check, with or without ``params``, which adds only the choice of
+#: run parameter values.
+ROUTE_SCOPES = ("view", "control", "approve")
+
 # The characters that http.client refuses in a host.
 _UNSAFE_HOST = re.compile(r"[\x00-\x20\x7f]")
 # Path characters that RFC 3986 allows as written, and "%" so that an
@@ -299,6 +304,7 @@ def notes(whoami: Any) -> list[tuple[str, str]]:
     ``GET /whoami`` reply.
     """
     who = whoami if isinstance(whoami, dict) else {}
+    scopes = who.get("scopes")
     out = []
     if who.get("authenticated") is not True:
         out.append(
@@ -308,7 +314,9 @@ def notes(whoami: Any) -> list[tuple[str, str]]:
                 "carries none and the app connects without one.",
             )
         )
-    elif who.get("allScopes") is True:
+    elif who.get("allScopes") is True or (
+        isinstance(scopes, list) and all(s in scopes for s in ROUTE_SCOPES)
+    ):
         out.append(
             (
                 "full-access token",
@@ -317,7 +325,6 @@ def notes(whoami: Any) -> list[tuple[str, str]]:
                 "web.authTokens.",
             )
         )
-    scopes = who.get("scopes")
     if isinstance(scopes, list) and "control" not in scopes:
         out.append(
             (

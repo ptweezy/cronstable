@@ -23,8 +23,10 @@ job API context. `command` accepts a shell string or an argument list.
 The verifier must exit with code zero. A nonzero exit, timeout, or launch
 failure fails the whole run, triggers its failure reporters, and follows its
 retry policy. Retrying runs the command and verifier again. A failed or
-canceled main command skips verification. The verifier's timeout is
-separate from `executionTimeout`.
+canceled main command skips verification, and so does a workflow task whose
+command exits with one of its
+[`skipExitCodes`](Orchestration-and-DAGs#conditional-branching). The
+verifier's timeout is separate from `executionTimeout`.
 
 The timeout covers both the verifier process and its output streams. If the
 verifier exits but a child process still holds its stdout or stderr open at

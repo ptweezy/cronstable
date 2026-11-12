@@ -8,7 +8,7 @@ from tests._helpers import _state_cfg, start_state
 from tests.conftest import Req
 from tests.test_pools import POOL_OUTAGES, break_pool_state, make
 from tests.test_recovery import _RANGE, _failed_dates, failed_flow
-from tests.test_state_dag_run import _BACKFILL, _BACKFILL_RANGE
+from tests.test_state_dag_run import _BACKFILL, _BACKFILL_RANGE, _start_web
 from tests.test_web_scopes import _ScopedReq, _bearer, _run, _table
 from cronstable.cron import Cron
 from cronstable.config import _build_mcp_config
@@ -533,10 +533,12 @@ async def test_backfill_answers_503_when_a_run_cannot_be_written(
     assert logged == [warning, warning]
     assert await backend.list_document_keys("dagrun/bf") == list(written)
     assert len(written) == 1
-    done = {"ok": True, "created": 5}
-    assert json.loads((await _backfill(cron)).body) == done
+    # the run written before the fault counts as existing
+    done = json.loads((await _backfill(cron)).body)
+    assert (done["ok"], done["created"], done["existing"]) == (True, 4, 1)
     result = await _backfill_tool(cron, **_EXECUTE)
-    assert result["structuredContent"] == done
+    done = result["structuredContent"]
+    assert (done["ok"], done["created"], done["existing"]) == (True, 0, 5)
     assert len(await backend.list_document_keys("dagrun/bf")) == 5
 
 
@@ -568,7 +570,81 @@ async def test_backfill_refusals_answer_400(dag_cron, monkeypatch):
     assert await cron.state_backend.list_document_keys("dagrun/bf") == []
     response = await _backfill(cron)
     assert response.status == 200
-    assert json.loads(response.body) == {"ok": True, "created": 5}
+    done = json.loads(response.body)
+    assert (done["ok"], done["created"], done["existing"]) == (True, 5, 0)
+
+
+async def test_refused_workflow_bodies_are_logged(dag_cron, caplog):
+    # A trigger or a backfill whose body the route refuses creates no run
+    # and logs one warning, which names the request and the reason the
+    # caller got. The line holds field names and no value.
+    import aiohttp
+
+    cron = await dag_cron(_BACKFILL)
+    base = await _start_web(cron)
+    window = dict(zip(("from", "to"), _BACKFILL_RANGE, strict=True))
+    refused = [
+        (
+            "/dags/bf/trigger",
+            {"json": {"ref": "zz-9", "params": {}}},
+            'unknown trigger field "ref"; the body accepts params, '
+            "logicalDate, requestId",
+        ),
+        (
+            "/dags/bf/trigger",
+            {"data": b"ref=zz-9"},
+            "request body is not valid JSON",
+        ),
+        (
+            "/dags/bf/backfill",
+            {"json": {**window, "dryRun": True, "by": "zz-9"}},
+            'unknown backfill field "by", "dryRun"; the body accepts from, '
+            "to, params",
+        ),
+        (
+            # a misspelled `from` is named, ahead of the check of the dates
+            "/dags/bf/backfill",
+            {"json": {"form": window["from"], "to": window["to"]}},
+            'unknown backfill field "form"; the body accepts from, to, '
+            "params",
+        ),
+        (
+            "/dags/bf/backfill",
+            {"json": [window, "zz-9"]},
+            "request body must be a JSON object",
+        ),
+    ]
+    # a body of known fields that lacks a date, and one of whitespace, which
+    # counts as no body, answer 400 with no warning
+    undated = [{"json": {"from": window["from"]}}, {"data": b" \n"}]
+    try:
+        async with aiohttp.ClientSession() as session:
+            with caplog.at_level("WARNING", logger="cronstable"):
+                for path, sent, reason in refused:
+                    async with session.post(base + path, **sent) as response:
+                        assert response.status == 400
+                        assert (await response.json())["error"] == reason
+                for sent in undated:
+                    async with session.post(
+                        base + "/dags/bf/backfill", **sent
+                    ) as response:
+                        assert response.status == 400
+                        assert (await response.json())["error"] == (
+                            "backfill needs string `from` and `to` ISO dates"
+                        )
+    finally:
+        await cron.start_stop_web_app(None)
+    logged = [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.getMessage().startswith("web: refused")
+    ]
+    assert logged == [
+        ("WARNING", 'web: refused POST "{}": {}'.format(path, reason))
+        for path, _sent, reason in refused
+    ]
+    assert "zz-9" not in caplog.text
+    assert await cron.state_backend.list_document_keys("dagrun/bf") == []
 
 
 async def test_stateless_daemon_answers_backfill_requests_400():
