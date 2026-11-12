@@ -1761,7 +1761,12 @@ class DagScheduler:
         for intent in result.launches:
             try:
                 stamp = await self._launch_task(
-                    dagcfg, ref, run_id, intent, body.get("params")
+                    dagcfg,
+                    ref,
+                    run_id,
+                    intent,
+                    body.get("params"),
+                    body.get("logicalDate"),
                 )
             except Exception:  # noqa: BLE001 - fail just this task, keep going
                 logger.exception(
@@ -2303,6 +2308,7 @@ class DagScheduler:
         run_id: str,
         intent,
         params: dict[str, Any] | None = None,
+        logical_date: Any = None,
     ) -> tuple[str, str, int | None, int | None] | None:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
@@ -2362,7 +2368,7 @@ class DagScheduler:
                 return None
         try:
             token, env = await self._prepare_task_run(
-                dagcfg, run_id, ref[1], intent, template, params
+                dagcfg, run_id, ref[1], intent, template, params, logical_date
             )
         except BaseException:
             await self._cron._pools.finish(
@@ -2467,6 +2473,7 @@ class DagScheduler:
         intent,
         template,
         params: dict[str, Any] | None = None,
+        logical_date: Any = None,
     ) -> tuple[str | None, dict[str, str]]:
         """Register the task run with the loopback API; return its env.
 
@@ -2479,7 +2486,9 @@ class DagScheduler:
 
         ``params`` is the run document's stored parameter map. Each entry
         becomes a ``CRONSTABLE_PARAM_*`` variable, and the loopback API
-        serves the map to ``cronstable param``.
+        serves the map to ``cronstable param``. ``logical_date`` is the run
+        document's ``logicalDate``, exported as it is stored. A run with
+        none exports the empty string.
         """
         if not isinstance(params, dict):
             params = {}
@@ -2488,6 +2497,9 @@ class DagScheduler:
             dag.ENV_DAG_NAME: dagcfg.name,
             dag.ENV_DAG_RUN_ID: run_id,
             dag.ENV_DAG_RUN_KEY: run_key,
+            dag.ENV_DAG_LOGICAL_DATE: (
+                logical_date if isinstance(logical_date, str) else ""
+            ),
             dag.ENV_DAG_TASK: intent.task_id,
             dag.ENV_DAG_TASKKEY: intent.taskkey,
             dag.ENV_DAG_MAP_INDEX: (
@@ -3652,7 +3664,10 @@ class DagScheduler:
 
         The result counts the runs this call created (``created``,
         ``runKeys``) apart from the instants that already had a run
-        (``existing``, ``existingRunKeys``).  Without a state backend the
+        (``existing``, ``existingRunKeys``).  ``truncated`` is true when
+        the bound ended the call before the range did, and ``nextFrom`` is
+        then the first instant the call left, in UTC, for the ``from`` of
+        the call that continues.  Without a state backend the
         request raises :class:`BackfillUnavailable`, so an unwritable store
         never reads as a range of existing runs.  A store fault on a run
         raises, after a warning that names the run's instant and the cause.
@@ -3731,13 +3746,19 @@ class DagScheduler:
                 ", ".join(sorted(params)),
                 "" if triggered_by is None else " by " + triggered_by,
             )
-        return {
+        result: dict[str, Any] = {
             "ok": True,
             "created": len(created),
             "existing": len(existing),
             "runKeys": created,
             "existingRunKeys": existing,
+            # the loop ended with an instant of the range still unvisited
+            "truncated": nxt is not None and nxt <= end,
         }
+        if result["truncated"]:
+            assert nxt is not None
+            result["nextFrom"] = nxt.astimezone(datetime.UTC).isoformat()
+        return result
 
     async def _check_fleet(self, now: float) -> None:
         """Warn about live peers below the engine level a loaded dag needs.

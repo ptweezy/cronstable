@@ -73,6 +73,16 @@ IS_WINDOWS = sys.platform == "win32"
 DEFAULT_SHELL = "" if IS_WINDOWS else "/bin/sh"
 
 
+def is_cmd_shell(shell: str) -> bool:
+    """Whether ``shell`` names the Windows command processor.
+
+    Matched on the basename, so ``cmd``, ``cmd.exe`` and a full
+    ``C:\\Windows\\System32\\cmd.exe`` all resolve alike.
+    """
+    name = os.path.basename(shell.replace("\\", "/")).lower()
+    return name in ("cmd", "cmd.exe")
+
+
 # --- Default config location (the ``-c`` default) -------------------------
 #: File names a configuration directory can be loaded from, kept in step
 #: with the filter in :func:`cronstable.config._config_dir_entries` (YAML by

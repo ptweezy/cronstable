@@ -585,7 +585,7 @@ async def test_gateway_uses_real_unmodified_daemon_listener(monkeypatch):
     cron = Cron(None, config_yaml=CONFIG)
     started = []
 
-    async def start(name, params=None, scopes=None):
+    async def start(name, params=None, scopes=None, triggered_by=None):
         started.append(name)
         return {"queued": None, "params": None}
 

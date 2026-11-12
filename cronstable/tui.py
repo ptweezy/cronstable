@@ -3419,7 +3419,16 @@ _FleetMatrix = tuple[list[dict[str, Any]], int, int, int, list[str]]
 _DagGraphLayer = tuple[int, list[str], list[tuple[str, list[str], str]]]
 
 #: the `when:` operators, in the order the daemon exports them
-_WHEN_OPERATORS = ("equals", "notEquals", "in", "notIn")
+_WHEN_OPERATORS = (
+    "equals",
+    "notEquals",
+    "in",
+    "notIn",
+    "lessThan",
+    "lessThanOrEqual",
+    "greaterThan",
+    "greaterThanOrEqual",
+)
 
 
 def when_text(when: Any) -> str:
@@ -3522,6 +3531,9 @@ class App:
         self.cluster: dict[str, Any] | None = None
         self.fleet: dict[str, Any] | None = None
         self.dags: list[dict[str, Any]] = []
+        # the trigger the daemon has not answered: (workflow, values as
+        # JSON, requestId); see _trigger_request_id
+        self._trigger_request: tuple[str, str, str] | None = None
         self.state_data: dict[str, Any] | None = None
         self.node: dict[str, Any] | None = None
         self.connected = False
@@ -4915,6 +4927,65 @@ def _backfill_counts(payload: Any) -> str:
     return text + ")"
 
 
+def _backfill_next(payload: Any) -> str | None:
+    """Where a backfill that the daemon cut short continues: the
+    response's ``nextFrom``, or ``None`` for a backfill that covered its
+    range."""
+    if not isinstance(payload, dict) or payload.get("truncated") is not True:
+        return None
+    following = payload.get("nextFrom")
+    return oneline(following) if isinstance(following, str) else None
+
+
+def fleet_warnings(dag: Any) -> list[str]:
+    """The ``fleetWarnings`` that ``GET /dags`` lists for a workflow, one
+    line for each live host below the run engine level it needs."""
+    listed = dag.get("fleetWarnings") if isinstance(dag, dict) else None
+    if not isinstance(listed, list):
+        return []
+    # flattened and stripped of escapes: each line holds a host's name
+    lines = (oneline(text) for text in listed if isinstance(text, str))
+    return [line for line in lines if line]
+
+
+def _same_param(sent: Any, stored: Any) -> bool:
+    """Whether the daemon's echo holds the value the client sent. A number
+    equals a number of the same value, and a boolean only a boolean."""
+    if isinstance(sent, bool) or isinstance(stored, bool):
+        return sent is stored
+    if isinstance(sent, (int, float)) and isinstance(stored, (int, float)):
+        return sent == stored
+    return type(sent) is type(stored) and bool(sent == stored)
+
+
+def params_unconfirmed(sent: dict[str, Any] | None, payload: Any) -> str:
+    """Why a response fails to confirm the values a request chose, or
+    ``""`` when it confirms them.
+
+    A daemon that takes the values echoes the run's whole map as
+    ``params``. A response without the map came from a daemon that ignored
+    the request body, so the run took the defaults.
+    """
+    if not sent:
+        return ""
+    echoed = payload.get("params") if isinstance(payload, dict) else None
+    if not isinstance(echoed, dict):
+        return (
+            "the daemon did not confirm the values, so the run may use "
+            "the defaults"
+        )
+    differing = sorted(
+        name
+        for name, value in sent.items()
+        if name not in echoed or not _same_param(value, echoed[name])
+    )
+    if not differing:
+        return ""
+    return "the run stores other values for %s" % ", ".join(
+        oneline(name) for name in differing
+    )
+
+
 # ===================================================================
 #  the application: actions
 # ===================================================================
@@ -4964,9 +5035,10 @@ class AppActions(App):
                     % name,
                 )
             else:
-                self.toast(
-                    "ok",
+                self._toast_started(
                     ("queued %s" if status == 202 else "▶ started %s") % name,
+                    params,
+                    payload,
                 )
             self.refresh_now()
             return True
@@ -4981,6 +5053,21 @@ class AppActions(App):
                 row, "fail", payload, "start %s: HTTP %d" % (name, status)
             )
         return False
+
+    def _toast_started(
+        self,
+        text: str,
+        params: dict[str, Any] | None,
+        payload: Any,
+        kind: str = "ok",
+    ) -> None:
+        """The toast for a start the daemon accepted. It warns when the
+        response does not confirm the ``params`` the request chose."""
+        doubt = params_unconfirmed(params, payload)
+        if doubt:
+            self.toast("warn", "%s, but %s" % (text, doubt))
+        else:
+            self.toast(kind, text)
 
     def job_params_declared(self, name: str | None) -> list[Any]:
         """The ``params`` declaration ``GET /jobs`` lists for ``name``."""
@@ -5360,6 +5447,21 @@ class AppActions(App):
                 return declared if isinstance(declared, list) else []
         return []
 
+    def _trigger_request_id(
+        self, name: str, params: dict[str, Any] | None
+    ) -> str:
+        """The ``requestId`` for a trigger of ``name`` with ``params``.
+
+        A trigger keeps its ID until the daemon answers it, so the same
+        trigger sent again after a timeout names the same run. A trigger
+        of another workflow or with other values takes a new ID.
+        """
+        key = (name, json.dumps(params or {}, sort_keys=True))
+        held = self._trigger_request
+        if held is None or held[:2] != key:
+            held = self._trigger_request = (*key, os.urandom(16).hex())
+        return held[2]
+
     async def dag_trigger_or_prompt(self, name: str) -> None:
         """Trigger ``name``, or open its parameter row when it declares
         parameters. An empty row then runs it with the defaults."""
@@ -5382,34 +5484,57 @@ class AppActions(App):
         row: str | None = None,
     ) -> bool:
         """POST the trigger; ``params`` are sent only when given. Returns
-        whether the run was created. On a failure, input ``row`` shows why."""
+        whether the daemon answered with the run. On a failure, input
+        ``row`` shows why.
+
+        Every trigger carries a ``requestId`` (see
+        :meth:`_trigger_request_id`), so one sent again after no answer
+        gets the run that the first one created.
+        """
         path = "/dags/%s/trigger" % _quote(name)
+        body: dict[str, Any] = {
+            "requestId": self._trigger_request_id(name, params)
+        }
+        if params:
+            body["params"] = params
         try:
-            if params:
-                status, payload = await self.api.post(
-                    path, body={"params": params}
-                )
-            else:
-                status, payload = await self.api.post(path)
+            status, payload = await self.api.post(path, body=body)
         except Unauthorized:
             self.open("token")
             self.focus = "token"
             return False
         except TimeoutError:
-            # the daemon may have the request, so a retry can add a second run
+            # the daemon may have the request; the held requestId makes a
+            # repeat of this trigger return that run
             self._refused(
                 row,
                 "fail",
                 None,
-                "trigger %s: no answer from the daemon; the run may still"
-                " have started" % name,
+                "trigger %s: no answer from the daemon; send the same "
+                "trigger again, and the run starts only once" % name,
             )
             return False
         except Exception as exc:  # noqa: BLE001
             self._refused(row, "fail", None, "trigger %s: %s" % (name, exc))
             return False
+        if status < 500:
+            # the daemon answered: the next trigger is a new request
+            self._trigger_request = None
         if status == 200 and isinstance(payload, dict):
-            self.toast("ok", "▶ %s run %s" % (name, payload.get("runKey", "")))
+            run_key = oneline(payload.get("runKey", ""))
+            if payload.get("created") is False:
+                # the run that an unanswered trigger created
+                self._toast_started(
+                    "%s run %s was already started by this trigger"
+                    % (name, run_key),
+                    params,
+                    payload,
+                    "info",
+                )
+            else:
+                self._toast_started(
+                    "▶ %s run %s" % (name, run_key), params, payload
+                )
             self._spawn(self._load_dag_runs())
             return True
         self._refused(
@@ -5469,7 +5594,9 @@ class AppActions(App):
     async def dag_backfill(self, spec: str) -> bool:
         """``from..to`` ISO dates from the backfill input row, and after
         them any ``name=value`` run parameters. Returns whether the daemon
-        queued the backfill. On a failure, the row shows why."""
+        queued the whole range. On a failure, the row shows why. When the
+        daemon stops at its limit for one backfill, the row holds the rest
+        of the range."""
         if not self.dag_name:
             return False
         try:
@@ -5509,17 +5636,34 @@ class AppActions(App):
             self._refused("backfill", "fail", None, "backfill: %s" % exc)
             return False
         if status == 200:
-            self.toast("ok", "▶ backfill queued" + _backfill_counts(payload))
             self._spawn(self._load_dag_runs())
-            return True
+            queued = "▶ backfill queued" + _backfill_counts(payload)
+            following = _backfill_next(payload)
+            if following is None:
+                self.toast("ok", queued)
+                return True
+            # the daemon stopped at its limit: the row stays open on the
+            # rest of the range, with the same values
+            rest = [following + ".." + parts[1]]
+            rest += [shlex.quote(w) for w in words if "=" in w]
+            self.inputs["backfill"] = " ".join(rest)
+            more = (
+                "the daemon stopped at its limit for one backfill; press "
+                "enter to continue from %s" % following
+            )
+            self.toast("warn", "%s; %s" % (queued, more))
+            self.refuse_input("backfill", "warn", more)
+            return False
         self._refused(
             "backfill", "fail", payload, "backfill: HTTP %d" % status
         )
         return False
 
     async def dag_backfill_from_input(self, text: str) -> None:
-        """The backfill row's commit. An empty row closes, and a refused row
-        stays focused with its text, so the operator corrects it in place."""
+        """The backfill row's commit. An empty row closes. A refused row
+        stays focused with its text, so the operator corrects it in place,
+        and so does a row that holds the rest of a range the daemon cut
+        short."""
         if (
             not (text and self.dag_name)
             or await self.dag_backfill(text)
@@ -7913,6 +8057,16 @@ class AppOverlays(AppRender):
                     bg="sel" if selected else None,
                 )
             )
+            warnings = fleet_warnings(dag)
+            if warnings:
+                # the first host, and how many more the drawer lists
+                more = len(warnings) - 1
+                note = warnings[0] + (" (+%d more)" % more if more else "")
+                body.append(
+                    paint.style(
+                        "   ⚠ " + truncate(note, max(0, width - 7)), "warn"
+                    )
+                )
         if not self.dags:
             body.append(paint.style("  no workflows configured", "dim"))
         return panel_frame(
@@ -9286,6 +9440,9 @@ class AppDrawers(AppOverlays):
             resources = run.get("resources") or {}
             if resources.get("cpu_total_seconds") is not None:
                 detail += " · %.1fs cpu" % resources["cpu_total_seconds"]
+            if run.get("triggeredBy"):
+                # the label of the token whose manual start chose values
+                detail += " · by %s" % oneline(run["triggeredBy"])
             run_rows.append(
                 " "
                 + paint.style(paint.glyph(key, ascii_mode), color)
@@ -9591,6 +9748,19 @@ class AppDrawers(AppOverlays):
             rows[2:2] = self._input_rows(
                 paint, self.focus, dag.get("params"), width, lines
             )
+        # under the title: each live host below the run engine level the
+        # workflow needs, wrapped and cut past a quarter of the height
+        held = [
+            line
+            for text in fleet_warnings(dag)
+            for line in wrap_cells("⚠ " + text, max(1, width - 4))
+        ]
+        limit = max(1, lines // 4)
+        if len(held) > limit:
+            held[limit - 1 :] = [
+                truncate(" ".join(held[limit - 1 :]), max(1, width - 4))
+            ]
+        rows[1:1] = [" " + paint.style(line, "warn") for line in held]
         body_lines = lines - len(rows) - 1
         if self.dag_tab == "runs":
             rows.extend(self._dag_runs_tab(paint, width, body_lines))

@@ -63,8 +63,8 @@ The preview lists them under `params`.
 
 - The declaration is part of the configuration revision. When it changed
   after the source run was created, execution requires
-  `allowConfigChange: true`. A parameter's `description` stays out of the
-  revision.
+  `allowConfigChange: true`. A parameter's `description` and the order of
+  the parameters stay out of the revision.
 - The source's values have to fit the current declaration as a complete map.
   The request answers `409` and names each parameter when a stored value
   fails a constraint, when the declaration has a parameter the source lacks,

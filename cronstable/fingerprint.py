@@ -405,12 +405,16 @@ def canonical_job(
     if job.params:
         # The declaration decides which values a run can take, so replicas
         # that disagree on it must show as drift, and a pool entry queued
-        # under another declaration is cancelled. A description is display
-        # text and stays out, as it does in a workflow's recovery revision.
-        out["params"] = [
-            {k: v for k, v in asdict(spec).items() if k != "description"}
-            for spec in job.params
-        ]
+        # under another declaration is cancelled. A description and the
+        # order of the parameters are display only and stay out, as they
+        # do in a workflow's recovery revision.
+        out["params"] = sorted(
+            (
+                {k: v for k, v in asdict(spec).items() if k != "description"}
+                for spec in job.params
+            ),
+            key=lambda entry: entry["name"],
+        )
     return out
 
 

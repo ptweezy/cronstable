@@ -1169,6 +1169,10 @@ _dag_task_schema_dict.update(
                     Opt("notEquals"): Str(),
                     Opt("in"): Seq(Str()),
                     Opt("notIn"): Seq(Str()),
+                    Opt("lessThan"): Str(),
+                    Opt("lessThanOrEqual"): Str(),
+                    Opt("greaterThan"): Str(),
+                    Opt("greaterThanOrEqual"): Str(),
                 }
             )
         ),
@@ -2702,6 +2706,29 @@ _DAG_TASK_NODE_KEYS = frozenset(
 )
 
 
+def _dag_threshold(op: str, text: str) -> int | float:
+    """The number an ordering ``when:`` operator compares its source with.
+
+    ``text`` is read as a ``number`` parameter's value is, and takes the
+    same stored form. Raises :class:`ValueError` for text that is not a
+    finite number. The compared parameter's ``minimum``, ``maximum``, and
+    ``allowed`` do not apply, because a threshold bounds the parameter's
+    values and need not be one of them.
+    """
+    from cronstable import params as run_params
+
+    number = run_params.ParamSpec(name=op, type=run_params.NUMBER)
+    try:
+        value = run_params.parse_text(run_params.NUMBER, text)
+    except ValueError as ex:
+        raise ValueError("`{}` value {!r} {}".format(op, text, ex)) from ex
+    refused = run_params.check_value(number, value)
+    if refused is not None:
+        raise ValueError("`{}` value {!r} {}".format(op, text, refused))
+    threshold: int | float = run_params.stored_form(number, value)
+    return threshold
+
+
 def _dag_condition(raw: dict[str, Any], declared: dict[str, Any]) -> Any:
     """One ``when:`` entry as a ``cronstable.dag.Condition``.
 
@@ -2709,7 +2736,9 @@ def _dag_condition(raw: dict[str, Any], declared: dict[str, Any]) -> Any:
     ``declared`` maps each parameter name of the workflow to its
     ``ParamSpec``. A parameter's comparison values are converted to its type
     and checked like a supplied value, so a value the parameter can never
-    hold fails the load.
+    hold fails the load. The value of an ordering operator, such as
+    ``lessThan``, is a number for either source, and the parameter it
+    compares is an ``integer`` or a ``number``.
     """
     from cronstable import dag
     from cronstable import params as run_params
@@ -2720,17 +2749,30 @@ def _dag_condition(raw: dict[str, Any], declared: dict[str, Any]) -> Any:
     operators = [key for key in dag.WHEN_OPERATORS if key in raw]
     if len(operators) != 1:
         raise ValueError(
-            "names exactly one operator: `equals`, `notEquals`, `in`, or "
-            "`notIn`"
+            "names exactly one operator: {}, or `{}`".format(
+                ", ".join("`{}`".format(o) for o in dag.WHEN_OPERATORS[:-1]),
+                dag.WHEN_OPERATORS[-1],
+            )
         )
     op = operators[0]
     texts = raw[op] if isinstance(raw[op], list) else [raw[op]]
     if not texts:
         raise ValueError("`{}` needs at least one value".format(op))
+    threshold = None
+    if op in dag.WHEN_ORDERING:
+        threshold = _dag_threshold(op, texts[0])
     if sources[0] == dag.WHEN_XCOM:
         xcom = raw["xcom"]
         if not xcom["task"] or not xcom["key"]:
             raise ValueError("`xcom` needs a `task` and a `key`")
+        if threshold is not None:
+            return dag.Condition(
+                source=dag.WHEN_XCOM,
+                name=xcom["task"],
+                key=xcom["key"],
+                op=op,
+                values=(threshold,),
+            )
         for text in texts:
             if len(text.encode("utf-8")) > dag.MAX_CONDITION_XCOM_BYTES:
                 raise ValueError(
@@ -2750,6 +2792,16 @@ def _dag_condition(raw: dict[str, Any], declared: dict[str, Any]) -> Any:
     if spec is None:
         raise ValueError(
             "param {!r} is not a parameter this workflow declares".format(name)
+        )
+    if threshold is not None:
+        if spec.type not in (run_params.INTEGER, run_params.NUMBER):
+            raise ValueError(
+                "`{}` compares numbers, and param {!r} has the type {}".format(
+                    op, name, spec.type
+                )
+            )
+        return dag.Condition(
+            source=dag.WHEN_PARAM, name=name, op=op, values=(threshold,)
         )
     values: list[Any] = []
     for text in texts:
@@ -5617,6 +5669,8 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _warn_if_resource_limits_unsupported(config)
     _warn_if_mail_login_unencrypted(config)
     _warn_if_param_pattern_nests_repeats(config)
+    _warn_if_param_references_misfire(config)
+    _warn_if_skip_exit_codes_hide_failures(config)
 
 
 def capped_jobs(
@@ -5737,6 +5791,135 @@ def _warn_if_param_pattern_nests_repeats(config: CronstableConfig) -> None:
                 kind,
                 name,
                 spec.name,
+            )
+
+
+#: A parameter variable as a command names it, in any shell's syntax. The
+#: group is the part after the prefix.
+_PARAM_REFERENCE = re.compile(r"CRONSTABLE_PARAM_([A-Za-z0-9_]+)")
+#: The same variable in the form that cmd.exe replaces with its value before
+#: it parses the command line. cmd.exe ignores case in a variable name.
+_CMD_PARAM_REFERENCE = re.compile(r"(?i)%CRONSTABLE_PARAM_([A-Za-z0-9_]+)%")
+
+
+def _reaches_cmd(job: JobConfig, windows: bool) -> bool:
+    """Whether cmd.exe parses ``job``'s command: a string command under the
+    Windows default shell or ``shell: cmd``, or an argument list that
+    starts with cmd.exe."""
+    command = job.command
+    if isinstance(command, list):
+        return bool(command) and platform.is_cmd_shell(str(command[0]))
+    return windows and (not job.shell or platform.is_cmd_shell(job.shell))
+
+
+def _warn_if_param_references_misfire(
+    config: CronstableConfig, windows: bool | None = None
+) -> None:
+    """Warn for a command that reads a run parameter in a way that goes
+    wrong at run time.
+
+    Two checks, each once per load for each command and parameter:
+
+    * The command names a ``CRONSTABLE_PARAM_*`` variable for a parameter
+      that its job or DAG does not declare, so the variable is unset.
+    * cmd.exe parses the command, the command holds
+      ``%CRONSTABLE_PARAM_<NAME>%``, and the parameter is a string with no
+      ``allowed`` and no ``pattern``. cmd.exe replaces the reference with
+      the value before it parses the line, so the value can add commands.
+
+    ``windows`` says whether this host runs string commands through cmd.exe
+    by default. It defaults to :data:`cronstable.platform.IS_WINDOWS`.
+    """
+    if windows is None:
+        windows = platform.IS_WINDOWS
+    commands: list[tuple[str, str, JobConfig, tuple[Any, ...]]] = [
+        ("job {!r}".format(job.name), "the job", job, job.params)
+        for job in config.jobs
+    ]
+    for d in config.dags:
+        commands += [
+            (
+                "dag {!r}: task {!r}".format(d.name, task.id),
+                "the workflow",
+                task.job_template,
+                d.spec.params,
+            )
+            for task in d.tasks
+            if task.type != "approval"  # a gate runs no command
+        ]
+    for subject, owner, job, specs in commands:
+        command = job.command
+        text = " ".join(command) if isinstance(command, list) else command
+        if "CRONSTABLE_PARAM_" not in text:
+            continue
+        declared = {spec.name.upper(): spec for spec in specs}
+        for name in sorted(
+            {
+                found
+                for found in _PARAM_REFERENCE.findall(text)
+                if found.upper() not in declared
+            }
+        ):
+            logger.warning(
+                "%s: the command reads CRONSTABLE_PARAM_%s, and %s declares "
+                "no parameter of that name, so the variable is unset when "
+                "the command runs",
+                subject,
+                name,
+                owner,
+            )
+        if not _reaches_cmd(job, windows):
+            continue
+        for name in sorted(
+            {found.upper() for found in _CMD_PARAM_REFERENCE.findall(text)}
+        ):
+            spec = declared.get(name)
+            if (
+                spec is None
+                or spec.type != "string"
+                or spec.allowed
+                or spec.pattern is not None
+            ):
+                continue
+            logger.warning(
+                "%s: cmd.exe replaces %%CRONSTABLE_PARAM_%s%% with the "
+                "value before it parses the command, and param %r takes "
+                "any string. A value that holds &, |, <, >, or a double "
+                "quote runs as part of the command line. Give the "
+                "parameter an allowed list or a pattern, or read the "
+                "variable from PowerShell or a script file",
+                subject,
+                name,
+                spec.name,
+            )
+
+
+#: Exit codes that a shell or a failing program returns without the command
+#: choosing them: 1 and 2 for an ordinary error, 126 for a file that cannot
+#: run, and 127 for a command that is not found.
+_AMBIGUOUS_SKIP_CODES = frozenset({1, 2, 126, 127})
+
+
+def _warn_if_skip_exit_codes_hide_failures(config: CronstableConfig) -> None:
+    """Warn for each DAG task whose ``skipExitCodes`` holds a code that an
+    ordinary failure also produces, once per load per task."""
+    for d in config.dags:
+        for task in d.tasks:
+            codes = sorted(
+                _AMBIGUOUS_SKIP_CODES.intersection(task.spec.skip_exit_codes)
+            )
+            if not codes:
+                continue
+            logger.warning(
+                "dag %r: task %r: skipExitCodes holds %s. A shell or a "
+                "failing program exits with 1 or 2 for an ordinary error, "
+                "126 for a file it cannot run, and 127 for a command it "
+                "cannot find, so a broken command would end the task "
+                "skipped. Use a code that only the command's own skip "
+                "decision returns, such as 99",
+                d.name,
+                task.id,
+                ", ".join(map(str, codes)),
             )
 
 

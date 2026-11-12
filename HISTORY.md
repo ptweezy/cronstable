@@ -13,17 +13,33 @@
   repeat inside an unbounded repeat with nothing required between them, as
   `(a+)+` does. Checking a value against such a pattern can take time that
   grows exponentially with the length of the value.
+- At load, the daemon logs a warning for a command that reads a
+  `CRONSTABLE_PARAM_*` variable its job or workflow does not declare, for a
+  `cmd.exe` command that holds `%CRONSTABLE_PARAM_<NAME>%` for a string
+  parameter with no `allowed` list and no `pattern`, and for a task whose
+  `skipExitCodes` holds `1`, `2`, `126`, or `127`.
+- The run of a manual job start that supplies values records the label of
+  the requesting token as `triggeredBy`, and the daemon logs the parameter
+  names and the label.
 - A workflow branches on skipped tasks. A task ends `skipped` when its
   command exits with a code in its `skipExitCodes`, or before it starts
   when a `when:` comparison on a run parameter or an XCom value does not
-  hold. The trigger rules `none_failed`, `none_failed_min_one_success`, and
+  hold. A comparison tests equality, as `equals` and `in` do, or compares
+  numbers, as `lessThan` and `greaterThan` do. The trigger rules
+  `none_failed`, `none_failed_min_one_success`, and
   `all_done_min_one_failed` join branches and run failure handlers, and a
   skipped task records why in `skipReason`.
+- A workflow task reads its run's logical date, in UTC, from
+  `CRONSTABLE_DAG_LOGICAL_DATE`. A command that branches on that date takes
+  the same branch in a backfill, a catch-up run, and a recovery run.
 - A workflow that uses `params:`, `when:`, `skipExitCodes`, or one of those
   trigger rules needs run engine level 2, and its runs record `engine: 2`.
   An earlier release refuses such a configuration, and it advances a level 2
   run under the rules it knows. On a store that several nodes share, upgrade
   every node before a configuration uses one of the keys.
+- The web dashboard and the terminal dashboard show a workflow's
+  `fleetWarnings`: each live host on the shared store that runs a build
+  below the run engine level the workflow needs.
 - `POST /jobs/{name}/start` and `POST /dags/{name}/trigger` answer `400` for
   a body that is not a JSON object or that holds a field the route does not
   take, and `POST /dags/{name}/backfill` answers `400` for a field in
@@ -33,6 +49,13 @@
 - A backfill's `created` counts the runs that the request created, and
   `existing` counts the dates that already had a run. `runKeys` and
   `existingRunKeys` list them, so a repeated backfill answers `created: 0`.
+- A backfill of a range that holds more than 100 scheduled dates answers
+  `truncated: true` and `nextFrom`, the `from` of the request that
+  continues. The dashboards keep the backfill open on the rest of the range.
+- The web dashboard and the terminal dashboard send a `requestId` with each
+  workflow trigger, so sending a trigger again after a timeout starts one
+  run. Both warn when the daemon's answer does not confirm the values that a
+  start or a trigger chose.
 - Backfill and failed-dates recovery read `from` and `to` as RFC 3339 dates
   or date-times, such as `2026-01-05` or `2026-01-05T02:00:00+00:00`, on
   every Python version. They refuse the ISO 8601 basic and week forms, such

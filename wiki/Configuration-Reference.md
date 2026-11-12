@@ -474,7 +474,8 @@ Per-task keys:
 | `onReject` | `fail` / `skip` | `fail` | Approval gate: what a rejection does. |
 
 Each `when` entry sets one source (`param` or `xcom`) and one operator
-(`equals`, `notEquals`, `in`, or `notIn`):
+(`equals`, `notEquals`, `in`, `notIn`, `lessThan`, `lessThanOrEqual`,
+`greaterThan`, or `greaterThanOrEqual`):
 
 | Key | Type | Description |
 | --- | --- | --- |
@@ -484,11 +485,17 @@ Each `when` entry sets one source (`param` or `xcom`) and one operator
 | `notEquals` | `Str` | Holds when the source does not equal the value. |
 | `in` | `Seq(Str)` | Holds when the source equals one of the values. |
 | `notIn` | `Seq(Str)` | Holds when the source equals none of the values. |
+| `lessThan` | `Str` | Holds when the source is a number below the value, which is a number. A `param` source has the type `integer` or `number`, and an `xcom` source is read as a number. |
+| `lessThanOrEqual` | `Str` | Holds when the source is a number at or below the value. |
+| `greaterThan` | `Str` | Holds when the source is a number above the value. |
+| `greaterThanOrEqual` | `Str` | Holds when the source is a number at or above the value. |
 
 A comparison value is written as text. For `param`, cronstable converts the
 text to the parameter's declared type and checks it against the parameter's
 constraints. For `xcom`, the text is compared as it is and holds at most
-4096 bytes.
+4096 bytes. The value of `lessThan`, `lessThanOrEqual`, `greaterThan`, or
+`greaterThanOrEqual` is a finite number for either source, and the
+parameter's constraints do not apply to it.
 
 Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,

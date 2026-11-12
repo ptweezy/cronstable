@@ -19,6 +19,7 @@ import asyncio
 import datetime
 import json
 import math
+import re
 import sys
 import time
 from typing import Any, Optional
@@ -3540,11 +3541,12 @@ async def test_dag_action_error_and_status_paths(tmp_path):
     app.api.post = _raise_boom
     await app.dag_trigger("d")
     assert any("trigger" in m for m in _msgs(app))
-    # a timeout is named, with a warning that the run may have started
+    # a timeout is named, and says that the same trigger is safe to repeat
     app.api.post = _raise_timeout
     await app.dag_trigger("d")
     assert _msgs(app)[-1] == (
-        "trigger d: no answer from the daemon; the run may still have started"
+        "trigger d: no answer from the daemon; send the same trigger again,"
+        " and the run starts only once"
     )
     app.api.post = _post_status(500)
     await app.dag_trigger("d")
@@ -3616,6 +3618,80 @@ async def test_dag_backfill_toast_reports_created_and_existing(tmp_path):
     assert "▶ backfill queued (2 runs, 1 already existed)" in _msgs(app)
     await asyncio.sleep(0)
     assert refreshed == [1]
+
+
+@pytest.mark.parametrize(
+    "payload, following",
+    [
+        ({"truncated": True, "nextFrom": "2026-01-05T00:00:00+00:00"},
+         "2026-01-05T00:00:00+00:00"),
+        ({"truncated": False}, None),
+        # an older daemon sends neither key
+        ({"created": 3}, None),
+        ({"truncated": True}, None),
+        ({"truncated": "yes", "nextFrom": "2026-01-05"}, None),
+        ("not json", None),
+    ],
+)
+def test_backfill_next(payload, following):
+    assert tui._backfill_next(payload) == following
+
+
+async def test_a_truncated_backfill_keeps_the_row_on_the_rest(tmp_path):
+    app = _param_app(tmp_path)
+    app.dags = [{"name": "d", "params": _DECLARED}]
+    app.open_dag("d")
+    posted = []
+    answers = [
+        {
+            "created": 100,
+            "existing": 0,
+            "truncated": True,
+            "nextFrom": "2026-01-05T04:00:00+00:00",
+        },
+        {"created": 20, "existing": 0, "truncated": False},
+    ]
+
+    async def post(path, body=None):
+        posted.append(body)
+        return 200, answers[len(posted) - 1]
+
+    app.api.post = post
+    await app.handle_key("b")
+    await _press(app, "2026-01-01..2026-01-06 ticket='OPS 1' batch_size=7")
+    await app.handle_key("enter")
+    # the row stays open on the rest of the range, with the same values
+    assert app.focus == "backfill"
+    assert app.inputs["backfill"] == (
+        "2026-01-05T04:00:00+00:00..2026-01-06 'ticket=OPS 1' batch_size=7"
+    )
+    more = (
+        "the daemon stopped at its limit for one backfill; press enter to"
+        " continue from 2026-01-05T04:00:00+00:00"
+    )
+    assert app.toasts[-1][:2] == (
+        "warn",
+        "▶ backfill queued (100 runs); " + more,
+    )
+    assert app.refusal == ("backfill", "warn", more)
+    # enter sends the rest, and a whole range closes the row
+    await app.handle_key("enter")
+    assert posted == [
+        {
+            "from": "2026-01-01",
+            "to": "2026-01-06",
+            "params": {"ticket": "OPS 1", "batch_size": 7},
+        },
+        {
+            "from": "2026-01-05T04:00:00+00:00",
+            "to": "2026-01-06",
+            "params": {"ticket": "OPS 1", "batch_size": 7},
+        },
+    ]
+    assert app.focus is None and app.inputs["backfill"] == ""
+    assert app.toasts[-1][:2] == ("ok", "▶ backfill queued (20 runs)")
+    app.close("dag")
+    await asyncio.sleep(0.05)
 
 
 async def test_save_log_success_and_oserror(tmp_path, monkeypatch):
@@ -4346,6 +4422,73 @@ def test_render_dags_index_variants(tmp_path):
     ]
     body = _txt(app.render_dags(paint, 110, 30))
     assert "pipeline" in body and "0 * * * *" in body
+    assert "⚠" not in body
+
+
+_NODE_A = (
+    "host node-a runs a build at run engine level 1 and this workflow needs"
+    " level 2; upgrade cronstable on that host"
+)
+_NODE_B = _NODE_A.replace("node-a", "node-b")
+
+
+def test_fleet_warnings_reads_the_dag_entry():
+    assert tui.fleet_warnings({"fleetWarnings": [_NODE_A]}) == [_NODE_A]
+    # control characters and escapes never reach the frame
+    assert tui.fleet_warnings(
+        {"fleetWarnings": ["host \x1b[31mred\x1b[0m\nruns", "", 7]}
+    ) == ["host red runs"]
+    for entry in ({}, {"fleetWarnings": None}, {"fleetWarnings": "x"}, None):
+        assert tui.fleet_warnings(entry) == []
+
+
+def test_the_workflow_list_names_a_host_that_needs_an_upgrade(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dags = [
+        {"name": "deploy", "tasks": [], "fleetWarnings": [_NODE_A, _NODE_B]},
+        {"name": "plain", "tasks": [], "fleetWarnings": [_NODE_A]},
+        {"name": "quiet", "tasks": []},
+    ]
+    rows = [strip_ansi(row) for row in app.render_dags(paint, 110, 30)]
+    lines = [row for row in rows if "⚠" in row]
+    # one line under each workflow that has warnings: the first host, cut
+    # to the panel, and how many more the drawer lists
+    assert len(lines) == 2
+    assert "⚠ host node-a runs a build at run engine level 1" in lines[0]
+    assert "upgrade cronstable" not in lines[0]
+    assert rows.index(lines[0]) == 1 + next(
+        i for i, row in enumerate(rows) if "⧉ deploy" in row
+    )
+    # at a width that holds the whole line, the count follows it
+    app.dags = [{"name": "d", "fleetWarnings": ["a b", "c", "d"]}]
+    assert "⚠ a b (+2 more)" in _txt(app.render_dags(paint, 110, 30))
+
+
+def test_the_workflow_drawer_lists_every_fleet_warning(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dag_name = "deploy"
+    app.dags = [{"name": "deploy", "fleetWarnings": [_NODE_A, _NODE_B]}]
+
+    def held():
+        """The rows between the title and the tabs."""
+        rows = [strip_ansi(r) for r in app.render_dag_panel(paint, 70, 24)]
+        tabs = next(i for i, row in enumerate(rows) if "xcom" in row)
+        return rows[1:tabs]
+
+    # every line in full, wrapped to the panel
+    assert held()[0].startswith(" ⚠ host node-a runs a build")
+    assert " ".join(row.strip() for row in held()) == (
+        "⚠ " + _NODE_A + " ⚠ " + _NODE_B
+    )
+    assert all(len(row) <= 67 for row in held())
+    # past a quarter of the panel's height the rest is cut to one line
+    app.dags[0]["fleetWarnings"] = [_NODE_A] * 9
+    assert len(held()) == 6 and held()[-1].endswith("…")
+    # a workflow with none keeps its rows
+    app.dags = [{"name": "deploy"}]
+    assert held() == []
 
 
 def test_render_mitigate_overflow_and_running(tmp_path):
@@ -4452,6 +4595,9 @@ def test_drawer_history_variants(tmp_path):
                 "outcome": "success",
                 "started_at": _iso_ago(60),
                 "duration": 1.0,
+                "params": {"region": "us"},
+                "suppliedParams": True,
+                "triggeredBy": "release\x1b[2J",
             },
             {
                 "outcome": "skipped",
@@ -4464,6 +4610,8 @@ def test_drawer_history_variants(tmp_path):
     }
     body = _txt(app._drawer_history(paint, 90, 24))
     assert "peak rss" in body and "exit 7" in body and "cpu" in body
+    # a start that supplied values names its token, on that run alone
+    assert body.count(" · by ") == 1 and " · by release\n" in body
     # a pause-skipped slot names its reason, stamped with its due time
     stamp = datetime.datetime.fromisoformat(due).astimezone()
     skipped = next(line for line in body.splitlines() if "skipped" in line)
@@ -5585,6 +5733,17 @@ def test_dag_graph_names_a_task_s_when_comparisons(tmp_path):
         (
             [{"param": "a", "equals": "1"}, {"param": "b", "notEquals": "2"}],
             "param a equals 1; param b notEquals 2",
+        ),
+        # an ordering comparison carries one number
+        ([{"param": "n", "lessThan": 10}], "param n lessThan 10"),
+        ([{"param": "n", "lessThanOrEqual": 0.5}], "param n lessThanOrEqual 0.5"),
+        (
+            [{"xcom": {"task": "a", "key": "rows"}, "greaterThan": 0}],
+            "xcom a/rows greaterThan 0",
+        ),
+        (
+            [{"param": "n", "greaterThanOrEqual": -1}],
+            "param n greaterThanOrEqual -1",
         ),
         # an XCom comparison value can hold a line break: the phrase is
         # one line
@@ -7309,13 +7468,16 @@ async def test_dag_trigger_opens_the_parameter_row(tmp_path):
     posted = []
 
     async def post(path, body=None):
+        # every trigger carries a requestId of its own
+        body = dict(body)
+        assert re.fullmatch("[0-9a-f]{32}", body.pop("requestId"))
         posted.append((path, body))
-        return 200, {"runKey": "manual-1"}
+        return 200, {"runKey": "manual-1", "params": body.get("params")}
 
     app.api.post = post
-    # a workflow that declares nothing triggers at once, with no body
+    # a workflow that declares nothing triggers at once, with no values
     await app.dag_trigger_or_prompt("plain")
-    assert posted == [("/dags/plain/trigger", None)]
+    assert posted == [("/dags/plain/trigger", {})]
     assert app.focus is None
     # a declaration opens the workflow and focuses the row instead
     await app.dag_trigger_or_prompt("d")
@@ -7338,12 +7500,145 @@ async def test_dag_trigger_opens_the_parameter_row(tmp_path):
         {"params": {"ticket": "OPS-1", "batch_size": 20, "dry": True}},
     )
     assert app.focus is None and app.inputs["params"] == ""
-    # an empty row runs with the defaults: no body
+    # an empty row runs with the defaults: no values
     await app.handle_key("t")
     assert app.focus == "params"
     await app.handle_key("enter")
-    assert posted[-1] == ("/dags/d/trigger", None)
+    assert posted[-1] == ("/dags/d/trigger", {})
     app.close("dag")
+    await asyncio.sleep(0.05)
+
+
+async def test_a_trigger_keeps_its_request_id_until_the_daemon_answers(
+    tmp_path,
+):
+    app = _param_app(tmp_path)
+    app.dags = [{"name": "d", "params": _DECLARED}, {"name": "other"}]
+    sent = []
+    answer = [_raise_timeout]
+
+    async def post(path, body=None):
+        sent.append((path, body["requestId"], body.get("params")))
+        return await answer[0]()
+
+    def ids():
+        return [request_id for _path, request_id, _params in sent]
+
+    app.api.post = post
+    values = {"ticket": "OPS-1"}
+    # no answer: the daemon may have the request, so the ID is kept
+    assert not await app.dag_trigger("d", values)
+    assert not await app.dag_trigger("d", dict(values))
+    assert ids()[0] == ids()[1]
+    # a 5xx comes from a daemon or a proxy that may have passed it on
+    answer[0] = _post_status(502, "bad gateway")
+    assert not await app.dag_trigger("d", values)
+    assert ids()[2] == ids()[0]
+    # other values, and another workflow, are other requests
+    assert not await app.dag_trigger("d", {"ticket": "OPS-2"})
+    assert not await app.dag_trigger("other")
+    assert len(set(ids())) == 3
+    # the repeat that gets through returns the first request's run
+    answer[0] = _raise_timeout
+    assert not await app.dag_trigger("d", values)
+    answer[0] = _post_status(
+        200, {"runKey": "manual-9", "created": False, "params": values}
+    )
+    app.toasts = []
+    assert await app.dag_trigger("d", values)
+    assert ids()[-1] == ids()[-2]
+    assert app.toasts[-1][:2] == (
+        "info",
+        "d run manual-9 was already started by this trigger",
+    )
+    # the daemon answered, so the next trigger is a new request
+    answer[0] = _post_status(200, {"runKey": "manual-10", "params": values})
+    assert await app.dag_trigger("d", values)
+    assert ids()[-1] != ids()[-2]
+    assert app.toasts[-1][:2] == ("ok", "▶ d run manual-10")
+    # a refusal is an answer too
+    answer[0] = _post_status(400, {"error": "no"})
+    assert not await app.dag_trigger("d", values)
+    assert not await app.dag_trigger("d", values)
+    assert ids()[-1] != ids()[-2]
+    await asyncio.sleep(0.05)
+
+
+_UNCONFIRMED = (
+    "the daemon did not confirm the values, so the run may use the defaults"
+)
+_OTHER_VALUES = "the run stores other values for "
+
+
+@pytest.mark.parametrize(
+    "sent, payload, doubt",
+    [
+        # the daemon echoes the whole map, defaults included
+        ({"rows": 5}, {"params": {"rows": 5, "region": "eu"}}, ""),
+        # a number equals a number of the same value
+        ({"ratio": 5.0}, {"params": {"ratio": 5}}, ""),
+        ({"ratio": 5}, {"params": {"ratio": 5.0}}, ""),
+        # nothing was chosen, so there is nothing to confirm
+        (None, {}, ""),
+        ({}, "not json", ""),
+        # a daemon that ignores the body sends no map
+        ({"rows": 5}, {"runKey": "manual-1"}, _UNCONFIRMED),
+        ({"rows": 5}, "ok", _UNCONFIRMED),
+        # the names, sorted, and never a value
+        (
+            {"rows": 5, "dry": True, "region": "us"},
+            {"params": {"rows": 6, "dry": 1, "region": "us"}},
+            _OTHER_VALUES + "dry, rows",
+        ),
+        ({"dry": False}, {"params": {"dry": 0}}, _OTHER_VALUES + "dry"),
+        ({"rows": 5}, {"params": {"rows": "5"}}, _OTHER_VALUES + "rows"),
+        ({"rows": 5}, {"params": {}}, _OTHER_VALUES + "rows"),
+    ],
+)
+def test_params_unconfirmed(sent, payload, doubt):
+    assert tui.params_unconfirmed(sent, payload) == doubt
+
+
+async def test_a_start_that_does_not_confirm_its_values_warns(tmp_path):
+    app = _param_app(tmp_path)
+    job = _job("report", outcome="success")
+    app.jobs, app.by_name = [job], {"report": job}
+    unconfirmed = _UNCONFIRMED
+    # a daemon that ignores the body starts the run with the defaults
+    app.api.post = _post_status(200, {"started": "report"})
+    assert await app.run_job("report", {"rows": 5})
+    assert app.toasts[-1][:2] == (
+        "warn",
+        "▶ started report, but " + unconfirmed,
+    )
+    app.api.post = _post_status(202, {"queued": "report"})
+    assert await app.run_job("report", {"rows": 5})
+    assert app.toasts[-1][:2] == ("warn", "queued report, but " + unconfirmed)
+    # one that takes them echoes the map
+    app.api.post = _post_status(
+        200, {"started": "report", "params": {"rows": 5, "region": "eu"}}
+    )
+    assert await app.run_job("report", {"rows": 5})
+    assert app.toasts[-1][:2] == ("ok", "▶ started report")
+    # a start with no values has nothing to confirm
+    app.api.post = _post_status(200, {"started": "report"})
+    assert await app.run_job("report")
+    assert app.toasts[-1][:2] == ("ok", "▶ started report")
+    # a workflow trigger reads the echo the same way
+    app.api.post = _post_status(200, {"runKey": "manual-1"})
+    assert await app.dag_trigger("d", {"ticket": "OPS-1"})
+    assert app.toasts[-1][:2] == (
+        "warn",
+        "▶ d run manual-1, but " + unconfirmed,
+    )
+    app.api.post = _post_status(
+        200, {"runKey": "manual-2", "params": {"ticket": "OPS-2"}}
+    )
+    assert await app.dag_trigger("d", {"ticket": "OPS-1"})
+    assert app.toasts[-1][:2] == (
+        "warn",
+        "▶ d run manual-2, but the run stores other values for ticket",
+    )
     await asyncio.sleep(0.05)
 
 
@@ -7705,8 +8000,8 @@ async def test_each_input_row_shows_why_its_commit_failed(tmp_path, cols):
     await app.handle_key("enter")
     app.toasts = []
     assert (
-        "run with: ▌ trigger deploy: no answer from the daemon; the run may"
-        " still have started ─"
+        "run with: ▌ trigger deploy: no answer from the daemon; send the"
+        " same trigger again, and the run starts only once ─"
     ) in _drawer_text(app)
     # the row closes with its drawer and opens again with the hint
     await app.handle_key("esc")

@@ -16,6 +16,7 @@ the dashboard displays. Tests check these behaviors:
 """
 
 import json
+import re
 
 import pytest
 
@@ -71,10 +72,29 @@ def _wait_task_state(page, task, label):
 
 
 def _posts(page):
+    """Each POST the page sent, as its path and the values of its body.
+
+    Every trigger carries a ``requestId`` of its own, which
+    :func:`_request_ids` reads. It is left out here, so a trigger that
+    chose no values reads as ``None``.
+    """
+    posts = []
+    for r in page.faults.requests:
+        if r["method"] != "POST":
+            continue
+        body = json.loads(r["body"]) if r["body"] else None
+        if r["path"].endswith("/trigger"):
+            assert re.fullmatch("[0-9a-f]{32}", body.pop("requestId"))
+            body = body or None
+        posts.append((r["path"], body))
+    return posts
+
+
+def _request_ids(page, path):
+    """The ``requestId`` of each trigger the page sent to ``path``."""
     return [
-        (r["path"], json.loads(r["body"]) if r["body"] else None)
-        for r in page.faults.requests
-        if r["method"] == "POST"
+        json.loads(r["body"])["requestId"]
+        for r in page.faults.sent("POST", path)
     ]
 
 
@@ -557,8 +577,113 @@ def test_trigger_failures_are_reported(browser, tmp_path):
                 page.faults.clear(r"/dags/plain/trigger")
             page.faults.abort(r"/dags/plain/trigger")
             _click(page, '#dagRows [data-dagtrigger="plain"]')
-            e2e.wait_toast(page, "trigger failed")
+            assert "warn" in e2e.wait_toast(
+                page,
+                "trigger got no answer; trigger plain again with the same "
+                "values, and the run starts only once",
+            )
         assert daemon.api("GET", "/dags/plain/runs")[1]["runs"] == []
+
+
+def test_a_trigger_sent_again_after_no_answer_starts_one_run(
+    browser, tmp_path
+):
+    path = "/dags/plain/trigger"
+    button = '#dagRows [data-dagtrigger="plain"]'
+    dags = [e2e.diamond_dag("plain", gate=False)]
+    with e2e.Daemon(tmp_path, dags=dags) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            page.faults.record()
+            page.wait_for_selector(button)
+            # the answer to the first trigger never reaches the page
+            page.faults.abort(path, times=1)
+            _click(page, button)
+            assert "warn" in e2e.wait_toast(page, "trigger got no answer")
+            (lost,) = _request_ids(page, path)
+            # the daemon had the request, and created its run
+            first = daemon.api("POST", path, body={"requestId": lost})[1]
+            assert first["created"] is True
+            # the same trigger again carries the same ID and gets that run
+            _click(page, button)
+            assert "info" in e2e.wait_toast(
+                page,
+                "plain run {} was already started by this trigger".format(
+                    first["runKey"]
+                ),
+            )
+            assert _request_ids(page, path) == [lost, lost]
+            assert len(daemon.api("GET", "/dags/plain/runs")[1]["runs"]) == 1
+            # the daemon answered, so the next trigger is a new request
+            _click(page, button)
+            assert "ok" in e2e.wait_toast(page, "▶ triggered plain")
+            assert _request_ids(page, path)[-1] != lost
+        assert len(daemon.api("GET", "/dags/plain/runs")[1]["runs"]) == 2
+
+
+def _with_fleet_warnings(warnings):
+    """A ``GET /dags`` rewrite that lists ``warnings`` on every workflow."""
+
+    def rewrite(dags):
+        for entry in dags:
+            entry["fleetWarnings"] = warnings
+        return dags
+
+    return rewrite
+
+
+_NODE_A = (
+    "host node-a runs a build at run engine level 1 and this workflow needs "
+    "level 2; upgrade cronstable on that host"
+)
+
+
+def test_the_card_and_the_drawer_show_fleet_warnings(browser, tmp_path):
+    # the daemon lists a live host below the level a workflow needs; a
+    # host name comes from the shared store, so the page shows it as text
+    hostile = (
+        'host x"\'><img src=x data-xss=1 onerror="window.__xss=1"> runs a '
+        "build at run engine level 1"
+    )
+    dags = [e2e.diamond_dag("plain", gate=False)]
+    with e2e.Daemon(tmp_path, dags=dags) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            row = '#dagRows tr[data-dag="plain"]'
+            page.wait_for_selector(row)
+            assert page.query_selector(row + " .ha-chip.fleet") is None
+            page.faults.rewrite(
+                r"/dags", _with_fleet_warnings([_NODE_A, hostile])
+            )
+            # the next poll brings the warnings
+            chip = row + " .ha-chip.fleet"
+            page.wait_for_selector(chip)
+            assert page.inner_text(chip) == "⚠ 2 hosts need an upgrade"
+            assert page.get_attribute(chip, "title") == (
+                _NODE_A + "\n" + hostile
+            )
+            # the drawer lists every line in full
+            _open_dag(page, "plain")
+            page.wait_for_function(
+                "document.getElementById('dgFleet').style.display !== 'none'"
+            )
+            assert page.evaluate(
+                "[...document.querySelectorAll('#dgFleet span')]"
+                ".map((s) => s.textContent)"
+            ) == ["⚠ " + _NODE_A, "⚠ " + hostile]
+            assert page.evaluate("window.__xss") is None
+            assert page.query_selector("[data-xss]") is None
+            # one host reads in the singular, and no host clears both
+            page.faults.clear(r"/dags")
+            page.faults.rewrite(r"/dags", _with_fleet_warnings([_NODE_A]))
+            page.wait_for_function(
+                "(s) => document.querySelector(s).textContent === "
+                "'⚠ 1 host needs an upgrade'",
+                arg=chip,
+            )
+            page.faults.clear(r"/dags")
+            page.wait_for_function(
+                "(s) => !document.querySelector(s)", arg=chip
+            )
+            assert not page.is_visible("#dgFleet")
 
 
 def test_backfill_creates_real_runs(browser, tmp_path):
@@ -1278,7 +1403,8 @@ def test_an_unchanged_param_form_sends_no_values(browser, tmp_path):
             page.wait_for_selector('#dagRows [data-dagtrigger="scale"]')
             _click(page, '#dagRows [data-dagtrigger="scale"]')
             page.wait_for_selector("#paramWrap.open")
-            # JSON.parse reads the default 1.0 as 1, and "1.0" equals it
+            # the declared default 1.0 has the stored form 1, and a typed
+            # "1.0" equals it
             assert page.input_value("#paramF0") == "1"
             page.fill("#paramF0", "1.0")
             page.click("#paramGo")
@@ -1302,9 +1428,11 @@ def test_an_unchanged_param_form_sends_no_values(browser, tmp_path):
         assert len(runs) == 2
         for run in runs:
             stored = daemon.dag_run("scale", run["runKey"])["params"]
-            # the declared 1.0, which a control-only token can recover
-            assert stored == {"ratio": 1.0, "label": "base"}
-            assert type(stored["ratio"]) is float
+            # the declared default, which a control-only token can recover.
+            # A whole number is stored as an integer, the form the page
+            # shows and a client sends back.
+            assert stored == {"ratio": 1, "label": "base"}
+            assert type(stored["ratio"]) is int
 
 
 def test_backfill_sends_the_form_values(browser, tmp_path):
@@ -1339,6 +1467,154 @@ def test_backfill_sends_the_form_values(browser, tmp_path):
             "dry": False,
             "note": "none",
         }
+
+
+# What the daemon answers when a range holds more dates than one backfill
+# covers. The tests serve it in place of creating 100 runs.
+_NEXT_FROM = "2025-12-30T00:00:00+00:00"
+_TRUNCATED = {
+    "ok": True,
+    "created": 100,
+    "existing": 0,
+    "runKeys": [],
+    "existingRunKeys": [],
+    "truncated": True,
+    "nextFrom": _NEXT_FROM,
+}
+_BACKFILL = "/dags/nightly/backfill"
+
+
+def test_a_truncated_backfill_leaves_the_form_on_the_rest(browser, tmp_path):
+    nightly = e2e.diamond_dag("nightly", gate=False)
+    nightly["schedule"] = "0 0 1 1 *"
+    with e2e.Daemon(tmp_path, dags=[nightly]) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            page.faults.record()
+            _open_dag(page, "nightly")
+            page.click("#dgBackfillBtn")
+            page.fill("#dgBfFrom", "2000-01-01")
+            page.fill("#dgBfTo", "2026-01-02")
+            page.faults.json(_BACKFILL, _TRUNCATED, method="POST")
+            page.click("#dgBfGo")
+            assert "warn" in e2e.wait_toast(
+                page,
+                "▦ backfill queued (100 runs). The range holds more dates: "
+                "run the backfill again to continue from " + _NEXT_FROM,
+            )
+            # the form stays open, with From on the first date not reached
+            assert page.is_visible("#dgBackfill")
+            assert page.input_value("#dgBfFrom") == _NEXT_FROM
+            assert page.inner_text("#dgBfNote") == (
+                "The server stopped at its limit for one backfill. Run it "
+                "again to continue from " + _NEXT_FROM + "."
+            )
+            # the same button sends the rest, and a whole range closes it
+            page.faults.clear(_BACKFILL)
+            page.click("#dgBfGo")
+            assert "ok" in e2e.wait_toast(page, "▦ backfill queued (1 run)")
+            assert _posts(page)[-1] == (
+                _BACKFILL,
+                {"from": _NEXT_FROM, "to": "2026-01-02"},
+            )
+            page.wait_for_function(
+                "document.getElementById('dgBackfill').style.display === "
+                "'none'"
+            )
+            assert page.text_content("#dgBfNote") == ""
+        runs = daemon.api("GET", "/dags/nightly/runs")[1]["runs"]
+        assert [r["logicalDate"] for r in runs] == [
+            "2026-01-01T00:00:00+00:00"
+        ]
+
+
+def test_a_truncated_backfill_keeps_the_form_values(browser, tmp_path):
+    nightly = _param_dag("nightly", schedule="0 0 1 1 *")
+    with e2e.Daemon(tmp_path, dags=[nightly]) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            page.faults.record()
+            _open_dag(page, "nightly")
+            page.click("#dgBackfillBtn")
+            page.fill("#dgBfFrom", "2000-01-01")
+            page.fill("#dgBfTo", "2026-01-02")
+            page.click("#dgBfGo")
+            page.wait_for_selector("#paramWrap.open")
+            page.select_option("#paramF0", "prod")
+            page.faults.json(_BACKFILL, _TRUNCATED, method="POST")
+            page.click("#paramGo")
+            e2e.wait_toast(page, "The range holds more dates")
+            # the dialog stays open with its values, and says what Run does
+            assert page.is_visible("#paramWrap .modal")
+            assert page.input_value("#paramF0") == "prod"
+            assert page.inner_text("#paramMsg") == (
+                "The server stopped at its limit for one backfill. Run "
+                "again to continue from " + _NEXT_FROM + " with these values."
+            )
+            page.faults.clear(_BACKFILL)
+            page.click("#paramGo")
+            assert "ok" in e2e.wait_toast(page, "▦ backfill queued (1 run)")
+            _param_form_closed(page)
+            assert _posts(page)[-1] == (
+                _BACKFILL,
+                {
+                    "from": _NEXT_FROM,
+                    "to": "2026-01-02",
+                    "params": {"target": "prod"},
+                },
+            )
+        run = daemon.api("GET", "/dags/nightly/runs")[1]["runs"][0]
+        assert daemon.dag_run("nightly", run["runKey"])["params"]["target"] == (
+            "prod"
+        )
+
+
+def _without_params(body):
+    """A start or trigger answer as a daemon that ignores the body sends
+    it: with no ``params`` map."""
+    body.pop("params", None)
+    return body
+
+
+def _with_other_target(body):
+    body["params"]["target"] = "staging"
+    return body
+
+
+def test_a_trigger_that_does_not_confirm_its_values_warns(browser, tmp_path):
+    trigger = '#dagRows [data-dagtrigger="deploy"]'
+    path = r"/dags/deploy/trigger"
+
+    def run_with_prod(page):
+        _click(page, trigger)
+        page.wait_for_selector("#paramWrap.open")
+        page.select_option("#paramF0", "prod")
+        page.click("#paramGo")
+
+    with e2e.Daemon(tmp_path, dags=[_param_dag()]) as daemon:
+        with e2e.open_page(browser, daemon.url) as page:
+            page.wait_for_selector(trigger)
+            # a daemon that takes the values echoes them: no warning
+            run_with_prod(page)
+            assert "ok" in e2e.wait_toast(page, "▶ triggered deploy")
+            _param_form_closed(page)
+            # one that ignores the body starts the run with the defaults
+            page.faults.rewrite(path, _without_params)
+            run_with_prod(page)
+            assert "warn" in e2e.wait_toast(
+                page,
+                "▶ triggered deploy, but the server did not confirm the "
+                "values, so the run may use the defaults",
+            )
+            _param_form_closed(page)
+            # an answer with another value names the parameter
+            page.faults.clear(path)
+            page.faults.rewrite(path, _with_other_target)
+            run_with_prod(page)
+            assert "warn" in e2e.wait_toast(
+                page,
+                "▶ triggered deploy, but the run stores other values for "
+                "target",
+            )
+        assert len(daemon.api("GET", "/dags/deploy/runs")[1]["runs"]) == 3
 
 
 def test_param_form_is_hidden_without_the_params_scope(browser, tmp_path):
@@ -1402,6 +1678,7 @@ def _when_dag(name="cond"):
                 "default": "incremental",
                 "allowed": ["incremental", "full"],
             },
+            {"name": "limit", "type": "integer", "default": 5},
         ],
         "tasks": [
             {"id": "extract", "command": _py("pass")},
@@ -1409,7 +1686,10 @@ def _when_dag(name="cond"):
                 "id": "full",
                 "dependsOn": ["extract"],
                 "command": _py("pass"),
-                "when": [{"param": "mode", "equals": "full"}],
+                "when": [
+                    {"param": "mode", "equals": "full"},
+                    {"param": "limit", "lessThan": 10},
+                ],
             },
             {
                 "id": "incremental",
@@ -1469,7 +1749,10 @@ def test_when_shows_a_marker_and_the_condition_that_skipped_a_task(
             }
             assert rows["publish"]["when"] is None
             assert rows["full"]["when"] == "when"
-            assert rows["full"]["whenTitle"] == "when: param mode equals full"
+            # each comparison in the configuration's words, numbers included
+            assert rows["full"]["whenTitle"] == (
+                "when: param mode equals full; param limit lessThan 10"
+            )
             assert rows["incremental"]["whenTitle"] == (
                 "when: param mode notEquals full; "
                 "xcom extract/row_count notIn 0, none"
@@ -1495,7 +1778,8 @@ def test_when_shows_a_marker_and_the_condition_that_skipped_a_task(
             }
             assert nodes["full"] == {
                 "title": "full · skipped (param mode equals full: the value "
-                "is incremental) · when: param mode equals full",
+                "is incremental) · when: param mode equals full; param "
+                "limit lessThan 10",
                 "when": True,
             }
             assert nodes["incremental"] == {

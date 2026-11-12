@@ -788,6 +788,27 @@ async def test_backfill_cap_counts_created_and_existing(
     again = await cron._dag.backfill("bf", *window)
     assert (again["created"], again["existing"]) == (0, 2)
     assert again["existingRunKeys"] == first["runKeys"]
+    # a call that the bound cuts short says so, and names where the next
+    # call starts
+    assert first["truncated"] is True and again["truncated"] is True
+    assert first["nextFrom"] == "2026-01-01T02:00:00+00:00"
+    # an offset in the range leaves nextFrom in UTC
+    shifted = await cron._dag.backfill(
+        "bf", "2026-01-01T01:00:00+01:00", "2026-01-01T06:30:00+01:00"
+    )
+    assert shifted["nextFrom"] == "2026-01-01T02:00:00+00:00"
+    # calls that each start at the last one's nextFrom cover the range
+    result, calls = first, 1
+    while result["truncated"]:
+        result = await cron._dag.backfill("bf", result["nextFrom"], window[1])
+        calls += 1
+    assert calls == 3 and "nextFrom" not in result
+    assert len(await cron._dag.list_runs("bf")) == 6
+    # a range that ends on the bound's last instant is whole
+    exact = await cron._dag.backfill(
+        "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+00:00"
+    )
+    assert exact["truncated"] is False and "nextFrom" not in exact
 
 
 async def test_backfill_without_a_backend_raises(tmp_path, dag_cron):
@@ -2228,10 +2249,10 @@ async def test_one_launch_failure_does_not_skip_the_batch(tmp_path, dag_cron):
     _set_cmd(cron, "lf", "b", [_PY, "-c", "pass"])
     orig = cron._dag._launch_task
 
-    async def flaky(dagcfg, ref, run_id, intent, params=None):
+    async def flaky(dagcfg, ref, run_id, intent, *rest):
         if intent.task_id == "a":
             raise RuntimeError("boom")
-        return await orig(dagcfg, ref, run_id, intent, params)
+        return await orig(dagcfg, ref, run_id, intent, *rest)
 
     cron._dag._launch_task = flaky
     run_key = (await cron._dag.trigger("lf"))["runKey"]
@@ -4043,6 +4064,55 @@ async def test_prepare_task_run_env_and_secrets(tmp_path, caplog, dag_cron):
     assert env[dag.ENV_DAG_NAME] == "sec"
     await cron._job_api.finish_run(token)  # unregister; no leak
 
+    # the logical date is exported as the run document holds it, and a
+    # run with none, or with a damaged one, exports the empty string
+    cron._job_api = None
+    for stored, exported in (
+        ("2026-01-05T02:00:00+00:00", "2026-01-05T02:00:00+00:00"),
+        (None, ""),
+        (20260105, ""),
+    ):
+        _token, env = await cron._dag._prepare_task_run(
+            dagcfg, run_id, "manual-1", intent, template, None, stored
+        )
+        assert env[dag.ENV_DAG_LOGICAL_DATE] == exported
+    cron._job_api = api
+
+
+async def test_a_task_reads_the_logical_date_of_its_run(tmp_path, dag_cron):
+    # a backfill run reads the date it was created for, whatever day its
+    # task runs on
+    out = tmp_path / "dates.txt"
+    yaml = (
+        "dags:\n  - name: ld\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await dag_cron(yaml)
+    script = (
+        "import os\n"
+        "date = os.environ['CRONSTABLE_DAG_LOGICAL_DATE']\n"
+        "open({!r}, 'a').write(date + '\\n')\n".format(str(out))
+    )
+    _set_cmd(cron, "ld", "a", [_PY, "-c", script])
+    res = await cron._dag.backfill(
+        "ld", "2026-01-04T05:00:00+00:00", "2026-01-04T05:30:00+00:00"
+    )
+    (backfilled,) = res["runKeys"]
+    assert (await _drive(cron, "ld", backfilled))["state"] == dag.SUCCESS
+    # a trigger that names a date exports it in UTC, as the run stores it
+    named = await cron._dag.trigger(
+        "ld", logical_date="2026-01-05T01:00:00+02:00"
+    )
+    assert (await _drive(cron, "ld", named["runKey"]))["state"] == dag.SUCCESS
+    # a manual run that names none exports the empty string
+    bare = await cron._dag.trigger("ld")
+    assert (await _drive(cron, "ld", bare["runKey"]))["state"] == dag.SUCCESS
+    assert out.read_text().splitlines() == [
+        "2026-01-04T05:00:00+00:00",
+        "2026-01-04T23:00:00+00:00",
+        "",
+    ]
+
 
 # --------------------------------------------------------------------------
 # flush_completions: a run whose flush raises has its WHOLE batch re-queued for
@@ -5114,7 +5184,7 @@ async def test_launch_cancel_propagates_out_of_advance(
     cron = await dag_cron(yaml)
     _set_cmd(cron, "lp", "a", [_PY, "-c", "pass"])
 
-    async def _cancel(dagcfg, ref, run_id, intent, params=None):
+    async def _cancel(dagcfg, ref, run_id, intent, *rest):
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(cron._dag, "_launch_task", _cancel)
@@ -7760,6 +7830,91 @@ async def test_when_xcom_values_the_comparison_reads(
         # both branches skipped, so the join has nothing to publish
         assert _states(body)["publish"] == dag.SKIPPED
     assert body["state"] == dag.SUCCESS
+
+
+# The same branch on a count: the load runs when `extract` published more
+# rows than the run's `floor` parameter, and at least one row.
+_COUNTED = """
+dags:
+  - name: counted
+    params:
+      - name: floor
+        type: integer
+        default: 0
+    tasks:
+      - id: extract
+        command: 'x'
+      - id: load
+        command: 'x'
+        dependsOn:
+          - extract
+        when:
+          - xcom:
+              task: extract
+              key: rows
+            greaterThan: '0'
+          - param: floor
+            lessThan: '10'
+"""
+
+
+@pytest.mark.parametrize(
+    "published, floor, detail",
+    [
+        pytest.param(b"12\n", 0, None, id="rows-above-zero"),
+        pytest.param(
+            b"0\n",
+            0,
+            "xcom extract/rows greaterThan 0: the value is 0",
+            id="no-rows",
+        ),
+        pytest.param(
+            b"none\n",
+            0,
+            "xcom extract/rows greaterThan 0: the value is none, which is "
+            "not a number",
+            id="not-a-number",
+        ),
+        pytest.param(
+            None,
+            0,
+            "xcom extract/rows greaterThan 0: the key is not published",
+            id="unpublished",
+        ),
+        pytest.param(
+            b"12\n",
+            10,
+            "param floor lessThan 10: the value is 10",
+            id="parameter-at-the-bound",
+        ),
+    ],
+)
+async def test_when_compares_numbers(
+    tmp_path, dag_cron, published, floor, detail
+):
+    cron = await dag_cron(_COUNTED)
+    _set_cmd(cron, "counted", "load", _OK)
+    if published is None:
+        _set_cmd(cron, "counted", "extract", _OK)
+    else:
+        value = tmp_path / "rows"
+        value.write_bytes(published)
+        _set_cmd(cron, "counted", "extract", _push("rows", value))
+    started = await cron._dag.trigger("counted", params={"floor": floor})
+    body = await _drive(cron, "counted", started["runKey"])
+    assert body["state"] == dag.SUCCESS
+    load = body["tasks"]["load"]
+    if detail is None:
+        assert load["state"] == dag.SUCCESS and load["whenMet"] is True
+    else:
+        assert load["state"] == dag.SKIPPED
+        assert load["skipReason"] == {"kind": "condition", "detail": detail}
+    # GET /dags serves each comparison with its number
+    (listed,) = await cron._dag.list_dags()
+    assert listed["tasks"][1]["when"] == [
+        {"xcom": {"task": "extract", "key": "rows"}, "greaterThan": 0},
+        {"param": "floor", "lessThan": 10},
+    ]
 
 
 async def test_read_xcom_text_outcomes(tmp_path, dag_cron, monkeypatch):

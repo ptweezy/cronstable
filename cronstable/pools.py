@@ -352,6 +352,7 @@ class PoolScheduler:
         resume=False,
         catchup_after=None,
         params=None,
+        triggered_by=None,
     ):
         slot = self.cron._last_run_slot.get(job.name)
         retry_state = (
@@ -388,6 +389,10 @@ class PoolScheduler:
             # checked; the launch reads them back from the entry. An entry
             # without the key runs with the job's defaults.
             payload["params"] = params
+            if triggered_by is not None:
+                # the label of the token that supplied them, for the run's
+                # record
+                payload["triggeredBy"] = triggered_by
         return await self.enqueue(
             job,
             key=key,

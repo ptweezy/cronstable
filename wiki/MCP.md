@@ -138,14 +138,18 @@ defaults to `dry_run: true`. The default dry run confirms the workflow exists
 and echoes the range; the range itself is validated only when `dry_run: false`
 and `confirm: true` execute it. An executed backfill returns the runs it
 created (`created`, `runKeys`) and the dates that already had a run
-(`existing`, `existingRunKeys`).
+(`existing`, `existingRunKeys`). One call covers at most 100 scheduled
+dates. A call that stops there returns `truncated: true` and `nextFrom`,
+and a call with `from` set to `nextFrom` continues.
 
 For a job that declares [run parameters](Commands-and-Environment#params), `cron_list_jobs` returns the
 declaration under `params`, and `cron_run_job` takes a `params` object. The
 result lists the values the run takes. A refused value returns an error that
 names it, and nothing starts. With scoped web tokens, a non-empty `params`
 object needs the `params` scope in addition to `control`, and a call without
-`params` starts the job with the declared defaults. A start that the job's
+`params` starts the job with the declared defaults. A run that takes
+supplied values records the caller's token label as `triggeredBy`, or `mcp`
+for a call that no token authenticates. A start that the job's
 `concurrencyPolicy` refuses returns an error too. A start that waits for
 another node to yield the job's cluster concurrency slot returns
 `pending: true` (see

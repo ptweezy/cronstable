@@ -1192,6 +1192,60 @@ def test_an_unchanged_job_param_form_starts_without_values(browser, tmp_path):
         assert last["params"] == {"region": "eu", "rows": 100, "dry": False}
 
 
+def test_a_start_that_does_not_confirm_its_values_warns(browser, tmp_path):
+    path = r"/jobs/report/start"
+
+    def without_params(body):
+        # the answer of a daemon that ignores the request body
+        body.pop("params", None)
+        return body
+
+    def with_other_region(body):
+        body["params"]["region"] = "eu"
+        return body
+
+    def run_in_us(page):
+        # the Run button is back once the last run has ended
+        page.wait_for_selector('#rows [data-run="report"]')
+        _click(page, '#rows [data-run="report"]')
+        page.wait_for_selector("#paramWrap.open")
+        page.select_option("#paramF0", "us")
+        page.click("#paramGo")
+        page.wait_for_function(
+            "!document.getElementById('paramWrap').classList"
+            ".contains('open')"
+        )
+
+    with e2e.Daemon(tmp_path, jobs=[_param_job()]) as daemon:
+        prefs = {"pollMs": 1000}
+        with e2e.open_page(browser, daemon.url, prefs=prefs) as page:
+            # one that ignores the body starts the run with the defaults
+            page.faults.rewrite(path, without_params)
+            run_in_us(page)
+            assert "warn" in e2e.wait_toast(
+                page,
+                "▶ started report, but the server did not confirm the "
+                "values, so the run may use the defaults",
+            )
+            # an answer with another value names the parameter
+            page.faults.clear(path)
+            page.faults.rewrite(path, with_other_region)
+            run_in_us(page)
+            assert "warn" in e2e.wait_toast(
+                page,
+                "▶ started report, but the run stores other values for "
+                "region",
+            )
+            # the daemon's own answer confirms them: no warning
+            page.faults.clear(path)
+            page.wait_for_function(
+                "document.querySelectorAll('#toasts .toast').length === 0"
+            )
+            run_in_us(page)
+            assert "ok" in e2e.wait_toast(page, "▶ started report")
+            assert page.query_selector("#toasts .toast.warn") is None
+
+
 def test_a_param_form_sends_a_default_a_reload_replaced(browser, tmp_path):
     with e2e.Daemon(tmp_path, jobs=[_param_job()]) as daemon:
         prefs = {"pollMs": 1000}

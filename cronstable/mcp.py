@@ -1445,12 +1445,13 @@ class MCPHandler:
                 "Run a scheduled workflow for each of its scheduled times "
                 "in a date range, earliest first, up to {} times per call. "
                 "Times that already have a run count toward that limit and "
-                "get no second run, so split a longer range into several "
-                "calls. By default it's a dry run that creates nothing; to "
-                "create the runs, set dry_run=false and confirm=true. Use "
-                "it for scheduled times the workflow missed; use "
-                "cron_recover_dag to rerun failed tasks in existing "
-                "runs.".format(DAG_MAX_CATCHUP),
+                "get no second run. A call that stops at the limit returns "
+                "truncated=true and nextFrom; call again with from set to "
+                "nextFrom to continue. By default it's a dry run that "
+                "creates nothing; to create the runs, set dry_run=false "
+                "and confirm=true. Use it for scheduled times the workflow "
+                "missed; use cron_recover_dag to rerun failed tasks in "
+                "existing runs.".format(DAG_MAX_CATCHUP),
                 obj(
                     {
                         "dag": _DAG_ARG,
@@ -1957,7 +1958,10 @@ class MCPHandler:
         _require_confirm(args, "running")
         try:
             started = await self._cron.start_job(
-                name, args.get("params"), scopes=_scopes()
+                name,
+                args.get("params"),
+                scopes=_scopes(),
+                triggered_by=_attribution(None),
             )
         except ParamError as ex:
             return _tool_error(_param_error_text(ex))
@@ -2194,13 +2198,18 @@ class MCPHandler:
             return _tool_error("backfill state is unavailable")
         if not result.get("ok"):
             return _tool_error(str(result.get("reason")))
-        return _result(
-            result,
+        summary = (
             "backfilled dag {!r} from {} to {}: {} created, {} already "
             "existed".format(
                 dag, start, end, result["created"], result["existing"]
-            ),
+            )
         )
+        if result["truncated"]:
+            summary += (
+                ". The call stopped at its limit of scheduled times; call "
+                "again with from={} to continue".format(result["nextFrom"])
+            )
+        return _result(result, summary)
 
     async def _t_decide_gate(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")

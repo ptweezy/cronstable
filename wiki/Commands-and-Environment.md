@@ -327,16 +327,33 @@ How the command reads them:
   [CLI reference](CLI-Reference#param-getlistdump-run-parameters)).
 - A run of a job that declares `params` sees only its own values. A
   `CRONSTABLE_PARAM_*` variable in the daemon's own environment is dropped.
+- At load and under `--validate-config`, cronstable logs a warning for a
+  `command` that names `CRONSTABLE_PARAM_<NAME>` for a parameter the job
+  does not declare, and for one that `cmd.exe` parses when it holds
+  `%CRONSTABLE_PARAM_<NAME>%` for a `string` parameter with no `allowed`
+  list and no `pattern`. The configuration still loads. See
+  [reading values in a task](Orchestration-and-DAGs#reading-values-in-a-task)
+  for the log lines.
 
 The run history records the values each run took under `params`, and so does
 the durable run ledger. Every reader with the `view` scope sees them, so a
-parameter name that reads as a secret, such as one that ends with `password`
-or `token`, is a configuration error. Keep a secret in the job's
+parameter name that reads as a secret, such as one that ends with
+`password`, `passwords`, or `token`, is a configuration error (see
+[what a run stores](Orchestration-and-DAGs#what-a-run-stores) for the
+words). Keep a secret in the job's
 [`secrets`](Durable-State#run-scoped-secrets) block. A parameter can carry
 the secret's name, as in `secret_name`.
 
+For a start that supplies values, the run history and the ledger also record
+the label of the requesting token under `triggeredBy`. The daemon log names
+the parameters and the label, as in
+`Job reindex: manual start launched with parameters index by release`, and
+never holds a value.
+
 `params` is a job key, so a `defaults:` block cannot set it. A change to the
-declaration changes the job's [job-set ID](Job-Set-ID).
+declaration changes the job's [job-set ID](Job-Set-ID). A parameter's
+`description` and the order of the parameters are display only, so a change
+to either one leaves the ID as it is.
 
 ## workingDirectory
 

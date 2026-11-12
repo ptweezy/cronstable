@@ -17,7 +17,7 @@ import types
 import jsonschema
 import pytest
 
-from cronstable import _json
+from cronstable import _json, dagrun
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
 from cronstable.cron import (
@@ -816,8 +816,8 @@ async def test_run_job_success_and_confirm_gate(monkeypatch):
     h = _handler()
     launched = []
 
-    async def fake_start(name, params=None, scopes=None):
-        launched.append(name)
+    async def fake_start(name, params=None, scopes=None, triggered_by=None):
+        launched.append((name, triggered_by))
         return {"queued": None, "params": None}
 
     monkeypatch.setattr(h._cron, "start_job", fake_start)
@@ -826,7 +826,8 @@ async def test_run_job_success_and_confirm_gate(monkeypatch):
     assert launched == []
     result = await _call(h, "cron_run_job", {"name": "hello", "confirm": True})
     assert result["structuredContent"] == {"started": "hello"}
-    assert launched == ["hello"]
+    # a call that no token authenticates is attributed to the server
+    assert launched == [("hello", "mcp")]
 
 
 async def test_run_job_reports_a_start_that_waits_for_its_cluster_slot(
@@ -834,7 +835,7 @@ async def test_run_job_reports_a_start_that_waits_for_its_cluster_slot(
 ):
     h = _handler()
 
-    async def fake_start(name, params=None, scopes=None):
+    async def fake_start(name, params=None, scopes=None, triggered_by=None):
         return {"queued": None, "params": {"region": "us"}, "pending": True}
 
     monkeypatch.setattr(h._cron, "start_job", fake_start)
@@ -1504,7 +1505,7 @@ async def test_dag_tools_full_flow(tmp_path):
         await _teardown(cron)
 
 
-async def test_backfill_tool_dry_run_default_and_real(tmp_path):
+async def test_backfill_tool_dry_run_default_and_real(tmp_path, monkeypatch):
     h, cron = await _state_handler(tmp_path)
     try:
         result = await _call(
@@ -1550,7 +1551,26 @@ async def test_backfill_tool_dry_run_default_and_real(tmp_path):
         )
         assert result["structuredContent"]["created"] == 0
         assert result["structuredContent"]["existing"] == 2
-        assert "0 created, 2 already existed" in result["content"][0]["text"]
+        assert result["structuredContent"]["truncated"] is False
+        text = result["content"][0]["text"]
+        assert text.endswith("0 created, 2 already existed")
+
+        # a call that stops at its limit says where the next one starts
+        monkeypatch.setattr(dagrun, "DAG_MAX_CATCHUP", 1)
+        result = await _call(
+            h,
+            "cron_backfill_dag",
+            {**args, "dry_run": False, "confirm": True},
+        )
+        body = result["structuredContent"]
+        assert (body["existing"], body["truncated"]) == (1, True)
+        assert body["nextFrom"] == "2026-01-01T01:00:00+00:00"
+        assert result["content"][0]["text"].endswith(
+            "0 created, 1 already existed. The call stopped at its limit "
+            "of scheduled times; call again with "
+            "from=2026-01-01T01:00:00+00:00 to continue"
+        )
+        monkeypatch.undo()
 
         # an unparseable range surfaces the engine's reason as a tool error
         result = await _call(

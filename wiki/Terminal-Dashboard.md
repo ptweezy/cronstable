@@ -153,7 +153,16 @@ The TUI includes:
   selected run stores. When the daemon refuses a trigger or a backfill, the
   row stays open with its text. The line under the row shows the daemon's
   reasons, such as `batch_size must be at least 1; ticket is required`,
-  until you edit the text.
+  until you edit the text. Each trigger carries a `requestId` that the
+  dashboard keeps until the daemon answers, so the same trigger sent again
+  after a timeout starts one run. One backfill covers at most 100 scheduled
+  dates. For a longer range, the row stays open on the rest of the range,
+  and `Enter` continues. While another live host on the shared store runs a
+  build below the
+  [run engine level](Orchestration-and-DAGs#run-engine-levels) that a
+  workflow needs, the drawer shows the workflow's `fleetWarnings` lines,
+  each of which names a host to upgrade. The workflow list shows the first
+  line and a count of the rest.
 - The **cluster panel**, **fleet matrix** (jobs × nodes, failing-only
   filter), **node resources**, **activity heatmap** punchcard, and
   **upcoming runs**.

@@ -4737,6 +4737,125 @@ def test_when_xcom_detail_text():
     assert dag._condition_text(_p("mode", "in", "a", True, 3)) == (
         "param mode in a, true, 3"
     )
+    assert dag._condition_text(_x("extract", "rows", "greaterThan", 0)) == (
+        "xcom extract/rows greaterThan 0"
+    )
+    assert dag._condition_text(_p("ratio", "lessThanOrEqual", 0.5)) == (
+        "param ratio lessThanOrEqual 0.5"
+    )
+
+
+_NOT_A_NUMBER = ", which is not a number"
+
+
+@pytest.mark.parametrize(
+    "stored, cond, detail",
+    [
+        (5, _p("v", "lessThan", 10), None),
+        (10, _p("v", "lessThan", 10), "the value is 10"),
+        (10, _p("v", "lessThanOrEqual", 10), None),
+        (11, _p("v", "lessThanOrEqual", 10), "the value is 11"),
+        (11, _p("v", "greaterThan", 10), None),
+        (10, _p("v", "greaterThan", 10), "the value is 10"),
+        (10, _p("v", "greaterThanOrEqual", 10), None),
+        (9, _p("v", "greaterThanOrEqual", 10), "the value is 9"),
+        # an integer and a float compare by value
+        (0.5, _p("v", "lessThan", 1), None),
+        (2, _p("v", "greaterThan", 1.5), None),
+        (-3, _p("v", "greaterThanOrEqual", -2.5), "the value is -3"),
+        # A reload can leave a run with a value of another type than the
+        # one the comparison was loaded for. Text that reads as a number
+        # compares as one, and no other value holds.
+        ("7", _p("v", "lessThan", 10), None),
+        ("abc", _p("v", "lessThan", 10), "the value is abc" + _NOT_A_NUMBER),
+        (True, _p("v", "lessThan", 5), "the value is true" + _NOT_A_NUMBER),
+        ("", _p("v", "lessThanOrEqual", 0), "the value is empty"),
+    ],
+)
+def test_ordering_operators_over_a_parameter(stored, cond, detail):
+    spec = _spec(TaskSpec("t", when=(cond,)))
+    body = _when_body(spec, {"v": stored})
+    outcome = dag._when_outcome(spec, body, spec.by_id["t"], None)
+    if detail is None:
+        assert outcome is True
+    else:
+        assert outcome == "{}: {}".format(dag._condition_text(cond), detail)
+    body, res = _pass(spec, body, 1.0)
+    entry = body["tasks"]["t"]
+    if detail is None:
+        assert entry["state"] == dag.RUNNING and entry["whenMet"] is True
+    else:
+        assert entry["state"] == dag.SKIPPED
+        assert entry["skipReason"] == {
+            "kind": dag.SKIP_CONDITION,
+            "detail": outcome,
+        }
+
+
+@pytest.mark.parametrize("op", sorted(dag.WHEN_ORDERING))
+def test_an_ordering_operator_fails_a_run_without_the_parameter(op):
+    spec = _spec(TaskSpec("t", when=(_p("v", op, 0),)))
+    body = _when_body(spec, {})
+    assert dag._when_outcome(spec, body, spec.by_id["t"], None) == (
+        "param v {} 0: the run has no such parameter".format(op)
+    )
+
+
+@pytest.mark.parametrize(
+    "read, cond, detail",
+    [
+        ("12", _x("pub", "rows", "greaterThan", 0), None),
+        ("0", _x("pub", "rows", "greaterThan", 0), "the value is 0"),
+        ("0", _x("pub", "rows", "lessThanOrEqual", 0), None),
+        # the text is read as a `number` value is: spaces, a fraction, and
+        # an exponent
+        (" 3.5 ", _x("pub", "rows", "lessThan", 4), None),
+        ("1e3", _x("pub", "rows", "greaterThanOrEqual", 1000), None),
+        ("-2", _x("pub", "rows", "greaterThanOrEqual", -1),
+         "the value is -2"),
+        # text that is no finite number holds for no operator
+        ("many", _x("pub", "rows", "greaterThan", 0),
+         "the value is many" + _NOT_A_NUMBER),
+        ("1e999", _x("pub", "rows", "greaterThan", 0),
+         "the value is 1e999" + _NOT_A_NUMBER),
+        ("nan", _x("pub", "rows", "lessThan", 0),
+         "the value is nan" + _NOT_A_NUMBER),
+        ("", _x("pub", "rows", "lessThan", 1), "the value is empty"),
+        # and neither does a source with no value
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "greaterThan", 0),
+         "the key is not published"),
+        (dag.XCOM_UNPUBLISHED, _x("pub", "rows", "lessThan", 0),
+         "the key is not published"),
+        (dag.XCOM_TOO_LARGE, _x("pub", "rows", "lessThanOrEqual", 0),
+         "the value is over 4096 bytes"),
+        (dag.XCOM_NOT_TEXT, _x("pub", "rows", "greaterThanOrEqual", 0),
+         "the value is not UTF-8 text"),
+    ],
+)
+def test_ordering_operators_over_an_xcom_value(read, cond, detail):
+    spec = _xcom_spec(cond)
+    body = _published(spec)
+    assert dag.tasks_awaiting_conditions(spec, body) == [("pub", "rows")]
+    body, res = _pass(spec, body, 6.0, {("pub", "rows"): read})
+    entry = body["tasks"]["t"]
+    if detail is None:
+        assert entry["state"] == dag.RUNNING and entry["whenMet"] is True
+        assert [i.taskkey for i in res.launches] == ["t"]
+    else:
+        assert entry["state"] == dag.SKIPPED
+        assert entry["skipReason"] == {
+            "kind": dag.SKIP_CONDITION,
+            "detail": "{}: {}".format(dag._condition_text(cond), detail),
+        }
+        assert not res.launches
+    assert dag.tasks_awaiting_conditions(spec, body) == []
+
+
+def test_an_ordering_operator_needs_the_same_engine_level_as_the_others():
+    for op in dag.WHEN_ORDERING:
+        spec = _spec(TaskSpec("t", when=(_p("v", op, 1),)))
+        assert spec.engine == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    assert dag.WHEN_OPERATORS[4:] == tuple(dag.WHEN_ORDERING)
 
 
 def test_combined_transform_hands_an_xcom_comparison_to_the_driver():
@@ -5605,6 +5724,45 @@ def _when_entry(*lines):
             "`xcom` needs a `task` and a `key`",
             id="xcom-empty-key",
         ),
+        pytest.param(
+            _when_entry("param: mode", "lessThan: '3'"),
+            "when entry 1: `lessThan` compares numbers, and param 'mode' "
+            "has the type string",
+            id="ordering-a-string-param",
+        ),
+        pytest.param(
+            _when_entry("param: dry", "greaterThanOrEqual: '0'"),
+            "`greaterThanOrEqual` compares numbers, and param 'dry' has "
+            "the type boolean",
+            id="ordering-a-boolean-param",
+        ),
+        pytest.param(
+            _when_entry("param: count", "greaterThan: many"),
+            "when entry 1: `greaterThan` value 'many' must be a number",
+            id="ordering-value-not-a-number",
+        ),
+        pytest.param(
+            _when_entry("xcom:", "  task: a", "  key: k", "lessThan: ''"),
+            "`lessThan` value '' must be a number",
+            id="ordering-xcom-value-not-a-number",
+        ),
+        pytest.param(
+            _when_entry("param: ratio", "lessThanOrEqual: 1e999"),
+            "`lessThanOrEqual` value '1e999' must be a finite number",
+            id="ordering-value-not-finite",
+        ),
+        pytest.param(
+            _when_entry("param: count", "lessThan: '3'", "greaterThan: '1'"),
+            "when entry 1: names exactly one operator: `equals`, "
+            "`notEquals`, `in`, `notIn`, `lessThan`, `lessThanOrEqual`, "
+            "`greaterThan`, or `greaterThanOrEqual`",
+            id="two-ordering-operators",
+        ),
+        pytest.param(
+            _when_entry("param: nope", "lessThan: '3'"),
+            "param 'nope' is not a parameter this workflow declares",
+            id="ordering-an-undeclared-param",
+        ),
     ],
 )
 def test_when_load_rejections(entries, message):
@@ -5673,6 +5831,50 @@ def test_when_loads_typed_and_exports_in_the_configuration_shape():
     json.dumps(dag.when_export(when))  # serves as JSON
     # a node key, so it never reaches the launch template
     assert not hasattr(cfg.dags[0].task_templates["b"], "when")
+
+
+def test_ordering_operators_load_one_number_for_either_source():
+    cfg = _dagcfg(
+        _WHEN_YAML
+        + _when_entry("param: count", "greaterThan: '0'")
+        # a threshold is a number whatever the parameter's type, and it is
+        # free of the parameter's own bounds
+        + _when_entry("param: count", "lessThan: '2.5'")
+        + _when_entry("param: count", "greaterThanOrEqual: '-1'")
+        # a whole number takes its integer form, as a stored value does
+        + _when_entry("param: ratio", "lessThanOrEqual: '1.0'")
+        + _when_entry(
+            "xcom:", "  task: a", "  key: rows", "greaterThan: ' 1e2 '"
+        )
+        + _when_entry(
+            "xcom:", "  task: a", "  key: rows", "lessThan: '0.25'"
+        )
+    )
+    spec = cfg.dags[0].spec
+    when = spec.by_id["b"].when
+    assert when == (
+        _p("count", "greaterThan", 0),
+        _p("count", "lessThan", 2.5),
+        _p("count", "greaterThanOrEqual", -1),
+        _p("ratio", "lessThanOrEqual", 1),
+        _x("a", "rows", "greaterThan", 100),
+        _x("a", "rows", "lessThan", 0.25),
+    )
+    assert [type(cond.values[0]) for cond in when] == [
+        int, float, int, int, int, float,
+    ]
+    assert spec.engine == dag.BRANCHING_PARAMS_ENGINE_LEVEL
+    # an XCom source is read before the claim, whichever operator reads it
+    assert [t.id for t in spec.conditional_tasks] == ["b"]
+    assert dag.when_export(when) == [
+        {"param": "count", "greaterThan": 0},
+        {"param": "count", "lessThan": 2.5},
+        {"param": "count", "greaterThanOrEqual": -1},
+        {"param": "ratio", "lessThanOrEqual": 1},
+        {"xcom": {"task": "a", "key": "rows"}, "greaterThan": 100},
+        {"xcom": {"task": "a", "key": "rows"}, "lessThan": 0.25},
+    ]
+    json.dumps(dag.when_export(when))
 
 
 def test_the_join_lint_names_a_join_below_two_conditional_branches(caplog):

@@ -878,6 +878,18 @@ paths:
                     type: array
                     items: { type: string }
                     description: Run keys of the runs that already existed.
+                  truncated:
+                    type: boolean
+                    description: >-
+                      True when the request reached its limit of 100
+                      scheduled instants before the end of the range.
+                  nextFrom:
+                    type: string
+                    format: date-time
+                    description: >-
+                      The first scheduled instant the request did not reach,
+                      in UTC. Present only when `truncated` is true. Send it
+                      as `from` with the same `to` to continue.
         "400":
           description: >-
             A bad range, an unknown/unscheduled DAG, an unknown body field,
@@ -3027,6 +3039,13 @@ components:
           description: >-
             The same instant as `finished_at`. Present only on a row that
             carries `suppliedParams`.
+        triggeredBy:
+          type: string
+          description: >-
+            The label of the token whose manual start supplied the run
+            parameter values. Present only on a row that carries
+            `suppliedParams`, and absent when no token authenticated the
+            start.
       additionalProperties: true
 
     RunResources:
@@ -3323,9 +3342,11 @@ components:
       description: >-
         One `when` comparison of a task, in the shape the configuration
         writes it. It carries one source, `param` or `xcom`, and one
-        operator: `equals`, `notEquals`, `in`, or `notIn`. A comparison on a
-        parameter carries values in the parameter's declared type. A
-        comparison on an XCom value carries strings.
+        operator: `equals`, `notEquals`, `in`, `notIn`, `lessThan`,
+        `lessThanOrEqual`, `greaterThan`, or `greaterThanOrEqual`. A
+        comparison on a parameter carries values in the parameter's declared
+        type. A comparison on an XCom value carries strings. The last four
+        operators carry one number for either source.
       properties:
         param:
           type: string
@@ -3348,6 +3369,20 @@ components:
           type: array
           description: Holds when the source equals none of these values.
           items: {}
+        lessThan:
+          type: number
+          description: >-
+            Holds when the source is a number below this one. An XCom value
+            is text and is read as a number.
+        lessThanOrEqual:
+          type: number
+          description: Holds when the source is a number at or below this one.
+        greaterThan:
+          type: number
+          description: Holds when the source is a number above this one.
+        greaterThanOrEqual:
+          type: number
+          description: Holds when the source is a number at or above this one.
       additionalProperties: true
 
     DagRunParams:

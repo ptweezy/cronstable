@@ -456,16 +456,36 @@ def test_is_secret_name_reads_the_end_of_the_name():
         "AWS_SECRET_ACCESS_KEY",
         "private_key",
         "rediscli_auth",
+        # the plural of a keyword holds secrets too
+        "passwords",
+        "DB_PASSWORDS",
+        "passwds",
+        "pwds",
+        "secrets",
+        "api_keys",
+        "apikeys",
+        "access-keys",
+        "secret_keys",
+        "auth_tokens",
+        "credentials",
+        "private_keys",
     ):
         assert is_secret_name(name), name
     # a keyword earlier in the name describes the value
     for name in (
         "secret_name",
-        "max_tokens",
         "token_count",
         "password_policy",
         "credential_provider",
         "region",
+        # a name that ends with `tokens` alone usually counts them
+        "max_tokens",
+        "tokens",
+        "api_tokens",
+        # a further letter makes another word
+        "passwordss",
+        "secretsmanager",
+        "keys",
     ):
         assert not is_secret_name(name), name
 

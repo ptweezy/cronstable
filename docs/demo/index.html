@@ -927,6 +927,7 @@
   }
   .toast .g { font-weight: 700; }
   .toast.ok .g { color: var(--ok); } .toast.err .g { color: var(--fail); } .toast.info .g { color: var(--accent); }
+  .toast.warn .g { color: var(--pending); }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
   @media (max-width: 820px) {
@@ -1455,6 +1456,10 @@
     border: 1px solid color-mix(in srgb, var(--fail) 35%, var(--border)); }
   .ha-chip.cap-off { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
     border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border)); }
+  /* a workflow with live hosts below the run engine level it needs */
+  .ha-chip.fleet { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border)); }
+  .drawer-head .meta.fleetwarn { color: var(--pending); flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
   .drawer-head .meta .ha-chip { margin-left: 0; font-size: 11px; }
   .runtable td .ha-chip { margin: 0 6px 0 0; }
 
@@ -1856,12 +1861,14 @@
     </div>
     <div class="meta" id="dgMeta"></div>
     <div class="meta" id="dgParams" style="display:none"></div>
-    <div id="dgBackfill" style="display:none; margin-top:8px; gap:6px; align-items:center;" class="approw">
+    <div class="meta fleetwarn" id="dgFleet" role="status" style="display:none"></div>
+    <div id="dgBackfill" style="display:none; margin-top:8px; gap:6px; align-items:center; flex-wrap:wrap;" class="approw">
       <span class="faint">backfill</span>
       <input type="text" id="dgBfFrom" placeholder="from ISO (2026-07-01T00:00:00)" style="width:220px" autocomplete="off" spellcheck="false">
       <input type="text" id="dgBfTo" placeholder="to ISO" style="width:220px" autocomplete="off" spellcheck="false">
       <button class="btn primary" id="dgBfGo">run backfill</button>
       <label class="toggle"><input type="checkbox" id="dgBfFailed"> Failed dates only</label>
+      <span class="faint" id="dgBfNote" role="status" style="flex-basis:100%"></span>
     </div>
     <section id="dgRecoveryResults" style="display:none; margin-top:12px" aria-live="polite"></section>
     <section id="dgRecovery" style="display:none; margin-top:12px" aria-live="polite"></section>
@@ -6516,6 +6523,7 @@ var qrcode = function() {
     connected: true,
     auth: null,                // /whoami payload; null until the probe resolves (scope-aware chrome)
     paramForm: null,           // the open run-parameters dialog: { dag, decl, backfill }
+    triggerRequest: null,      // the trigger the server has not answered: { key, id } (see triggerRequestId)
     clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
     clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     nodeLimits: null,          // /node `limits`: the caps this host can apply; null until known
@@ -9356,10 +9364,13 @@ var qrcode = function() {
       if (params) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify({ params: params }); }
       const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/start", opts);
       if (res.ok) {
+        const r = (await res.json().catch(() => ({}))) || {};
         // A 200 that carries `pending` starts nothing yet: the run waits
         // for another node to yield the job's cluster slot.
-        const waiting = res.status === 200 && (await res.json().catch(() => ({}))).pending === true;
-        if (waiting) toast("info", name + " starts when another node yields its cluster slot");
+        const waiting = res.status === 200 && r.pending === true;
+        const doubt = paramsUnconfirmed(params, r);
+        if (doubt) toast("warn", (res.status === 202 ? "Queued " : waiting ? "Accepted " : "▶ started ") + name + ", but " + doubt);
+        else if (waiting) toast("info", name + " starts when another node yields its cluster slot");
         else toast("ok", (res.status === 202 ? "Queued " : "▶ started ") + name);
         if (res.status === 202) loadPools();
         if (res.status !== 202 && !waiting && state.drawerJob === name) setTimeout(() => startStream(name, true), 250);
@@ -9756,7 +9767,9 @@ var qrcode = function() {
         (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
                   "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
         '<td class="reason">' + limitsChips(r.limits, r.verification && r.verification.limits) + esc(r.fail_reason || r.skip_reason || "") + verificationDetail(r.verification) +
-          (r.params ? ' <span class="faint runparams" title="' + escAttr(paramsText(r.params)) + '">' + esc(truncStr(paramsText(r.params), 60)) + "</span>" : "") + "</td>" +
+          (r.params ? ' <span class="faint runparams" title="' + escAttr(paramsText(r.params)) + '">' + esc(truncStr(paramsText(r.params), 60)) + "</span>" : "") +
+          // a manual start that supplied values: the label of its token
+          (r.triggeredBy ? ' <span class="faint">by ' + esc(truncStr(r.triggeredBy, 40)) + "</span>" : "") + "</td>" +
       "</tr>";
     }
     const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th>' +
@@ -11260,12 +11273,14 @@ var qrcode = function() {
     updateAuthBtn(); closeModal(); loadWhoami(); loadJobs();
   }
 
+  // A "warn" toast reports an action that went through with a caveat. It
+  // holds a full sentence, so it stays longer than the others.
   function toast(kind, msg) {
     const e = el("div", "toast " + kind);
-    const g = kind === "ok" ? "✓" : kind === "err" ? "✕" : "›";
+    const g = kind === "ok" ? "✓" : kind === "err" ? "✕" : kind === "warn" ? "!" : "›";
     e.innerHTML = '<span class="g">' + g + '</span><span>' + esc(msg) + "</span>";
     $("toasts").appendChild(e);
-    setTimeout(() => { e.style.opacity = "0"; e.style.transition = "opacity .3s"; setTimeout(() => e.remove(), 300); }, 3000);
+    setTimeout(() => { e.style.opacity = "0"; e.style.transition = "opacity .3s"; setTimeout(() => e.remove(), 300); }, kind === "warn" ? 9000 : 3000);
   }
   function copyText(text, what) {
     const done = () => toast("ok", "copied " + (what || "text"));
@@ -11570,7 +11585,7 @@ var qrcode = function() {
   }
   // a task's when: comparisons as one phrase, in the words the configuration
   // uses: "param mode equals full; xcom extract/row_count notIn 0"
-  const WHEN_OPS = ["equals", "notEquals", "in", "notIn"];
+  const WHEN_OPS = ["equals", "notEquals", "in", "notIn", "lessThan", "lessThanOrEqual", "greaterThan", "greaterThanOrEqual"];
   function whenText(spec) {
     return ((spec && spec.when) || []).map((c) => {
       const src = c.xcom ? "xcom " + c.xcom.task + "/" + c.xcom.key : "param " + c.param;
@@ -11695,7 +11710,7 @@ var qrcode = function() {
     const sig = JSON.stringify(dags.map((d) => [
       d.name, d.enabled, d.schedule, (d.tasks || []).length, d.totalRuns,
       d.latestRun && d.latestRun.state, d.latestRun && d.latestRun.updatedAt,
-      d.runCounts, state.dagDrawer.dag, canControl(),
+      d.runCounts, state.dagDrawer.dag, canControl(), d.fleetWarnings,
     ]));
     if (sig === state.dags.sig) return;
     state.dags.sig = sig;
@@ -11718,7 +11733,7 @@ var qrcode = function() {
       const rowCls = (state.dagDrawer.dag === d.name ? "active" : "") + (d.enabled ? "" : " muted");
       return '<tr data-dag="' + escAttr(d.name) + '" class="' + rowCls + '">' +
         "<td>" + status + "</td>" +
-        '<td><div class="dagname">' + esc(d.name) + (d.enabled ? "" : " (disabled)") + "</div>" +
+        '<td><div class="dagname">' + esc(d.name) + (d.enabled ? "" : " (disabled)") + fleetChip(d) + "</div>" +
         '<div class="dagmeta">' + esc(tasks.length + " task" + (tasks.length === 1 ? "" : "s") + (kindStr && kindStr !== tasks.length + "" ? " · " + kindStr : "")) + mapped + "</div></td>" +
         "<td>" + sched + "</td>" +
         '<td class="muted">' + esc(kindStr || tasks.length) + "</td>" +
@@ -11733,6 +11748,18 @@ var qrcode = function() {
         '<button class="btn" data-dagopen="' + escAttr(d.name) + '">Open</button>' +
         "</div></td></tr>";
     }).join("");
+  }
+  // `fleetWarnings` (GET /dags): one line for each live host on the shared
+  // store whose build is below the run engine level the workflow needs.
+  function fleetWarnings(d) {
+    return Array.isArray(d && d.fleetWarnings) ? d.fleetWarnings.filter((w) => typeof w === "string" && w) : [];
+  }
+  // the card's chip: how many hosts, with every line in its tooltip
+  function fleetChip(d) {
+    const warns = fleetWarnings(d);
+    if (!warns.length) return "";
+    return '<span class="ha-chip fleet" title="' + escAttr(warns.join("\n")) + '">⚠ ' +
+      warns.length + (warns.length === 1 ? " host needs" : " hosts need") + " an upgrade</span>";
   }
   // a compact stacked bar of a dag's run outcomes (success/failed/running)
   function dagHistBar(counts, total) {
@@ -11760,6 +11787,7 @@ var qrcode = function() {
     $("dagScrim").classList.add("open");
     $("dgName").textContent = dag;
     $("dgBackfill").style.display = "none";
+    $("dgBfNote").textContent = "";
     renderDagDrawerHead();
     renderDagCard();
     switchDagTab(tab || (runKey ? "tasks" : "runs"));
@@ -11821,6 +11849,10 @@ var qrcode = function() {
       if (recovery.error) bits.push('<span role="alert" class="fail">' + esc(recovery.error) + '</span>');
     }
     $("dgMeta").innerHTML = bits.join("");
+    // every line in full: each names a host to upgrade
+    const warns = fleetWarnings(d);
+    $("dgFleet").style.display = warns.length ? "" : "none";
+    $("dgFleet").innerHTML = warns.map((w) => "<span>⚠ " + esc(w) + "</span>").join("");
     renderRecoveryResults();
   }
   function switchDagTab(tab) {
@@ -12429,7 +12461,42 @@ var qrcode = function() {
     if (state.paramForm !== form) return;
     $("paramGo").disabled = false;
     if (result === true) closeParamForm();
+    else if (result && result.more) {
+      // A backfill that stopped at the server's limit. The dialog stays
+      // open with its values, and Run continues from the next date.
+      form.backfill.from = result.more;
+      showParamErrors({}, "");
+      $("paramMsg").textContent = "The server stopped at its limit for one backfill. Run again to continue from " + result.more + " with these values.";
+    }
     else if (result) showParamErrors(result.paramErrors, result.error);
+  }
+  // Why a response fails to confirm the values a request chose, or "" when
+  // it confirms them. A server that takes the values echoes the run's whole
+  // map as `params`. One that ignores the request body sends no map, and
+  // its run takes the defaults.
+  function paramsUnconfirmed(sent, body) {
+    const names = Object.keys(sent || {});
+    if (!names.length) return "";
+    const echoed = body && body.params;
+    if (!echoed || typeof echoed !== "object") return "the server did not confirm the values, so the run may use the defaults";
+    const differing = names.filter((n) => !Object.prototype.hasOwnProperty.call(echoed, n) || echoed[n] !== sent[n]).sort();
+    return differing.length ? "the run stores other values for " + differing.join(", ") : "";
+  }
+  // A trigger's requestId. The server derives the run key from it, so a
+  // trigger sent again with the same ID returns the first run. A trigger
+  // keeps its ID until the server answers it. A trigger of another workflow
+  // or with other values takes a new ID.
+  function triggerRequestId(name, params) {
+    const key = JSON.stringify([name, params || {}]);
+    if (!state.triggerRequest || state.triggerRequest.key !== key) {
+      const bytes = new Uint8Array(16);
+      // crypto.randomUUID needs a secure context, and this page is often
+      // served over plain HTTP
+      if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+      else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+      state.triggerRequest = { key: key, id: Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("") };
+    }
+    return state.triggerRequest.id;
   }
   // An error response as { error, paramErrors }. 4xx bodies are the uniform
   // JSON envelope; the raw-text fallback keeps an older daemon's plain body.
@@ -12451,12 +12518,20 @@ var qrcode = function() {
   // already reported, and the error body for a refusal the caller shows.
   async function postTrigger(name, params) {
     try {
-      const opts = { method: "POST" };
-      if (params) { opts.headers = { "Content-Type": "application/json" }; opts.body = JSON.stringify({ params: params }); }
-      const res = await apiFetch("/dags/" + encodeURIComponent(name) + "/trigger", opts);
+      const body = { requestId: triggerRequestId(name, params) };
+      if (params) body.params = params;
+      const res = await apiFetch("/dags/" + encodeURIComponent(name) + "/trigger",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      // the server answered: the next trigger is a new request
+      if (res.status < 500) state.triggerRequest = null;
       if (res.ok) {
-        let rk = null; try { rk = (await res.json()).runKey; } catch (_) {}
-        toast("ok", "▶ triggered " + name);
+        const r = (await res.json().catch(() => ({}))) || {};
+        const rk = r.runKey || null;
+        const doubt = paramsUnconfirmed(params, r);
+        if (doubt) toast("warn", "▶ triggered " + name + ", but " + doubt);
+        // the run that an unanswered trigger created
+        else if (r.created === false) toast("info", name + " run " + rk + " was already started by this trigger");
+        else toast("ok", "▶ triggered " + name);
         loadDags();
         if (state.dagDrawer.dag === name) { setTimeout(() => { loadDagRuns(); if (rk) selectDagRun(rk, true); }, 300); }
         return true;
@@ -12464,7 +12539,11 @@ var qrcode = function() {
       if (res.status === 404) { toast("err", "no such dag"); return null; }
       if (res.status === 400 || res.status === 403 || res.status === 409) return await errorBody(res);
       toast("err", "trigger failed (HTTP " + res.status + ")");
-    } catch (e) { if (e.message !== "unauthorized") toast("err", "trigger failed"); }
+    } catch (e) {
+      // the server may have the request; the held requestId makes the same
+      // trigger return that run
+      if (e.message !== "unauthorized") toast("warn", "trigger got no answer; trigger " + name + " again with the same values, and the run starts only once");
+    }
     return null;
   }
   async function dagBackfill() {
@@ -12477,9 +12556,11 @@ var qrcode = function() {
     }
     if (dagParamDecl(dag).length && canParams()) { openParamForm(dag, { from: from, to: to }); return; }
     const result = await postBackfill(dag, from, to, null);
-    if (result && result !== true) toast("err", "backfill: " + errorBodyText(result));
+    if (result && result !== true && !result.more) toast("err", "backfill: " + errorBodyText(result));
   }
-  // POST the backfill; resolves like postTrigger.
+  // POST the backfill; resolves like postTrigger. A backfill that the
+  // server cut short at its limit resolves { more }, the date the next one
+  // starts from, and leaves the row open on the rest of the range.
   async function postBackfill(dag, from, to, params) {
     try {
       const body = { from: from, to: to };
@@ -12489,9 +12570,18 @@ var qrcode = function() {
       if (res.ok) {
         let r = {}; try { r = (await res.json()) || {}; } catch (_) {}
         const created = r.created;
-        toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + (r.existing ? ", " + r.existing + " already existed" : "") + ")" : ""));
-        $("dgBackfill").style.display = "none";
+        const queued = "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + (r.existing ? ", " + r.existing + " already existed" : "") + ")" : "");
         setTimeout(loadDagRuns, 300);
+        if (r.truncated === true && typeof r.nextFrom === "string") {
+          $("dgBfFrom").value = r.nextFrom;
+          $("dgBfNote").textContent = "The server stopped at its limit for one backfill. Run it again to continue from " + r.nextFrom + ".";
+          $("dgBackfill").style.display = "flex";
+          toast("warn", queued + ". The range holds more dates: run the backfill again to continue from " + r.nextFrom);
+          return { more: r.nextFrom };
+        }
+        toast("ok", queued);
+        $("dgBfNote").textContent = "";
+        $("dgBackfill").style.display = "none";
         return true;
       }
       return await errorBody(res);

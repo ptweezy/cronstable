@@ -21,6 +21,7 @@ import types
 
 import pytest
 
+from cronstable import config as config_module
 from cronstable import dag, dagrun, params, recovery
 from cronstable.config import (
     ConfigError,
@@ -269,6 +270,45 @@ def test_a_number_beyond_the_integer_ceiling_is_stored_as_a_float():
                 "        default: 10000000000000000\n"
             )
         )
+
+
+def test_a_whole_number_has_one_stored_form():
+    # 5 and 5.0 are one value, so a run stores it, and a task reads it, the
+    # same way whichever client sent it
+    specs = (params.ParamSpec(name="n", type="number", default=1),)
+
+    def stored(sent):
+        return params.resolve(specs, {"n": sent}, "workflow 'w'")["n"]
+
+    for sent, whole in (
+        (5, 5),
+        (5.0, 5),
+        (-0.0, 0),
+        (1e3, 1000),
+        (2.0**53 - 1, params.MAX_INTEGER),
+    ):
+        assert stored(sent) == whole and type(stored(sent)) is int, sent
+    assert params.environment({"n": stored(5.0)}) == {
+        "CRONSTABLE_PARAM_N": "5"
+    }
+    # a fraction stays a float, and so does a whole number beyond the
+    # largest integer a JSON double carries exactly
+    for sent in (0.5, -2.25, 2.0**53, 1e300):
+        assert stored(sent) == sent and type(stored(sent)) is float, sent
+    # a default and an allowed value take the same form at load
+    (spec,) = _specs(
+        _one_param(
+            "      - name: n\n        type: number\n        default: 5.0\n"
+            "        allowed:\n          - 5.0\n          - 0.5\n"
+        )
+    )
+    assert spec.default == 5 and type(spec.default) is int
+    assert [type(value) for value in spec.allowed] == [int, float]
+    assert params.declaration((spec,))[0]["default"] == 5
+    # the integer type takes no float, whole or not
+    assert params.check_value(_spec(type="integer"), 5.0) == (
+        "must be an integer"
+    )
 
 
 def test_resolve_reports_every_offending_name():
@@ -774,6 +814,217 @@ def test_a_parser_failure_loses_only_the_warning(caplog, monkeypatch, parser):
     assert slug.pattern == "([a-z0-9]+-?)+"
     assert params.check_value(slug, "release-2") is None
     assert params.check_value(slug, "Release") is not None
+
+
+# One job and one workflow whose commands read parameters. The job names
+# the Windows default shell, so it loads the same on every host.
+_READERS = """
+jobs:
+  - name: report
+    command: {job_command}
+    shell: ''
+    schedule: '0 0 1 1 *'
+    params:
+      - name: region
+        default: eu
+dags:
+  - name: deploy
+    params:
+      - name: target
+        default: staging
+      - name: env
+        default: staging
+        allowed:
+          - staging
+          - prod
+      - name: ticket
+        default: OPS-1
+        pattern: 'OPS-[0-9]+'
+      - name: batch_size
+        type: integer
+        default: 5
+    tasks:
+      - id: release
+{task}
+      - id: gate
+        type: approval
+"""
+
+
+def _load_warnings(caplog, yaml, check, **kwargs):
+    """Each warning ``check`` logs for the config ``yaml`` loads to."""
+    config = parse_config_string(_STATE + yaml, "")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        check(config, **kwargs)
+    return [record.getMessage() for record in caplog.records]
+
+
+def _readers(job_command="'x'", task="        command: 'x'"):
+    return _READERS.format(job_command=job_command, task=task)
+
+
+def test_a_reference_to_an_undeclared_parameter_warns_at_load(caplog):
+    yaml = _readers(
+        # one typo, one declared name, and a prefix that names no variable
+        job_command=(
+            "'run $CRONSTABLE_PARAM_REGOIN ${CRONSTABLE_PARAM_REGION} "
+            "CRONSTABLE_PARAM_*'"
+        ),
+        task=(
+            "        command:\n          - ./release.sh\n"
+            "          - '$CRONSTABLE_PARAM_TARGET'\n"
+            "          - '$CRONSTABLE_PARAM_TRAGET'\n"
+            "          - '$CRONSTABLE_PARAM_TRAGET'"
+        ),
+    )
+    assert _load_warnings(
+        caplog, yaml, config_module._warn_if_param_references_misfire
+    ) == [
+        "job 'report': the command reads CRONSTABLE_PARAM_REGOIN, and the "
+        "job declares no parameter of that name, so the variable is unset "
+        "when the command runs",
+        "dag 'deploy': task 'release': the command reads "
+        "CRONSTABLE_PARAM_TRAGET, and the workflow declares no parameter "
+        "of that name, so the variable is unset when the command runs",
+    ]
+    # the whole load logs the same lines, and still loads
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        _validate_cross_sections(parse_config_string(_STATE + yaml, ""))
+    assert sum("is unset when" in r.getMessage() for r in caplog.records) == 2
+
+
+def test_a_job_with_no_declaration_warns_for_any_reference(caplog):
+    yaml = (
+        "jobs:\n  - name: plain\n    schedule: '0 0 1 1 *'\n"
+        "    command: 'echo $CRONSTABLE_PARAM_REGION'\n"
+    )
+    (warned,) = _load_warnings(
+        caplog, yaml, config_module._warn_if_param_references_misfire
+    )
+    assert warned.startswith(
+        "job 'plain': the command reads CRONSTABLE_PARAM_REGION"
+    )
+
+
+_CMD_WARNING = (
+    "{}: cmd.exe replaces %CRONSTABLE_PARAM_{}% with the value before it "
+    "parses the command, and param {!r} takes any string. A value that "
+    "holds &, |, <, >, or a double quote runs as part of the command line. "
+    "Give the parameter an allowed list or a pattern, or read the variable "
+    "from PowerShell or a script file"
+)
+
+
+def test_cmd_expansion_of_an_unconstrained_string_warns_at_load(caplog):
+    # the reference names the variable in any case, as cmd.exe reads it
+    task = (
+        "        shell: ''\n"
+        "        command: 'deploy %CRONSTABLE_PARAM_TARGET% "
+        "%cronstable_param_target% %CRONSTABLE_PARAM_ENV% "
+        "%CRONSTABLE_PARAM_TICKET% %CRONSTABLE_PARAM_BATCH_SIZE%'"
+    )
+    yaml = _readers(
+        job_command="'report %CRONSTABLE_PARAM_REGION%'", task=task
+    )
+    check = config_module._warn_if_param_references_misfire
+    # each string with no allowed list and no pattern draws it
+    assert _load_warnings(caplog, yaml, check, windows=True) == [
+        _CMD_WARNING.format("job 'report'", "REGION", "region"),
+        _TARGET_WARNING,
+    ]
+    # off Windows a string command runs under another shell
+    assert _load_warnings(caplog, yaml, check, windows=False) == []
+
+
+_TARGET_WARNING = _CMD_WARNING.format(
+    "dag 'deploy': task 'release'", "TARGET", "target"
+)
+_PERCENT = "        command: 'd %CRONSTABLE_PARAM_TARGET%'"
+
+
+@pytest.mark.parametrize(
+    "task, windows, warns",
+    [
+        ("        shell: cmd\n" + _PERCENT, True, True),
+        (
+            "        shell: 'C:\\Windows\\System32\\cmd.exe'\n" + _PERCENT,
+            True,
+            True,
+        ),
+        ("        shell: powershell\n" + _PERCENT, True, False),
+        ("        shell: cmd\n" + _PERCENT, False, False),
+        # an argument list that starts with cmd.exe reaches it on any host
+        (
+            "        command:\n          - cmd.exe\n          - /c\n"
+            "          - 'd %CRONSTABLE_PARAM_TARGET%'",
+            False,
+            True,
+        ),
+        (
+            "        command:\n          - deploy.exe\n"
+            "          - '%CRONSTABLE_PARAM_TARGET%'",
+            True,
+            False,
+        ),
+        # delayed expansion does not parse the value again
+        (
+            "        shell: ''\n"
+            "        command: 'd !CRONSTABLE_PARAM_TARGET!'",
+            True,
+            False,
+        ),
+    ],
+    ids=[
+        "shell-cmd",
+        "cmd-path",
+        "powershell",
+        "cmd-off-windows",
+        "argv-cmd",
+        "argv-program",
+        "delayed-expansion",
+    ],
+)
+def test_cmd_expansion_warning_follows_the_shell(
+    caplog, task, windows, warns
+):
+    warned = _load_warnings(
+        caplog,
+        _readers(task=task),
+        config_module._warn_if_param_references_misfire,
+        windows=windows,
+    )
+    assert warned == ([_TARGET_WARNING] if warns else [])
+
+
+def test_skip_exit_codes_that_failures_return_warn_at_load(caplog):
+    yaml = (
+        "dags:\n  - name: etl\n    tasks:\n"
+        "      - id: load\n        command: 'x'\n"
+        "        skipExitCodes:\n          - 127\n          - 99\n"
+        "          - 1\n"
+        "      - id: clean\n        command: 'x'\n"
+        "        skipExitCodes:\n          - 99\n          - 3\n"
+        "      - id: plain\n        command: 'x'\n"
+    )
+    assert _load_warnings(
+        caplog, yaml, config_module._warn_if_skip_exit_codes_hide_failures
+    ) == [
+        "dag 'etl': task 'load': skipExitCodes holds 1, 127. A shell or a "
+        "failing program exits with 1 or 2 for an ordinary error, 126 for "
+        "a file it cannot run, and 127 for a command it cannot find, so a "
+        "broken command would end the task skipped. Use a code that only "
+        "the command's own skip decision returns, such as 99"
+    ]
+    # the load logs it, and the task keeps the codes it lists
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cronstable.config"):
+        config = parse_config_string(_STATE + yaml, "")
+        _validate_cross_sections(config)
+    logged = [record.getMessage() for record in caplog.records]
+    assert sum("skipExitCodes holds" in message for message in logged) == 1
+    assert config.dags[0].tasks[0].spec.skip_exit_codes == (1, 99, 127)
 
 
 # --------------------------------------------------------------------------
@@ -1903,6 +2154,14 @@ def test_configuration_revision_reads_the_declaration():
         "        default: 10\n        description: Rows per batch\n",
     )
     assert revision(described) == base
+    # so is the order of the parameters, which only arranges the forms
+    mode = (
+        "      - name: mode\n        default: incremental\n"
+        "        allowed:\n          - incremental\n          - full\n"
+    )
+    limit = "      - name: limit\n        type: integer\n        default: 10\n"
+    assert mode + limit in _NIGHTLY
+    assert revision(_NIGHTLY.replace(mode + limit, limit + mode)) == base
     # a workflow that declares nothing digests the bare task list
     # parameters existed
     without = _NIGHTLY[: _NIGHTLY.index("    params:")] + (

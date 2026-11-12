@@ -156,14 +156,9 @@ def loggable_spawn_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
-def is_cmd_shell(shell: str) -> bool:
-    """Whether ``shell`` names the Windows command processor.
-
-    Matched on the basename, so ``cmd``, ``cmd.exe`` and a full
-    ``C:\\Windows\\System32\\cmd.exe`` all resolve alike.
-    """
-    name = os.path.basename(shell.replace("\\", "/")).lower()
-    return name in ("cmd", "cmd.exe")
+#: Whether a ``shell:`` names the Windows command processor. It lives in
+#: :mod:`cronstable.platform`, where the configuration loader reads it too.
+is_cmd_shell = platform.is_cmd_shell
 
 
 def shell_spawn(
@@ -2324,6 +2319,9 @@ class RunningJob:
         # retry, its success or cancellation settles none, and it never
         # counts as the run that supersedes a pending retry.
         self.supplied_params = False
+        # the label of the token whose manual start supplied them; None for
+        # a start that no token authenticated
+        self.triggered_by: str | None = None
         # whether this run has parameters of its own (see
         # drop_inherited_params)
         self.owns_params = dag_ref is not None or bool(

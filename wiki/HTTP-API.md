@@ -675,6 +675,9 @@ declared JSON type, and the answer lists the values the run takes:
   [Troubleshooting](Troubleshooting#a-start-a-trigger-or-a-backfill-answers-400-and-the-daemon-logs-web-refused)).
 - The `202` of a pooled job carries `params` as well, and the queue entry
   keeps the values until the pool admits the run.
+- A start that supplies values logs the parameter names and the label of
+  the requesting token at `INFO`, and the run records the label as
+  `triggeredBy` (see [`GET /jobs/{name}/runs`](#get-jobsnameruns)).
 
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
 applies. If an instance is already running, `Allow` starts another and
@@ -883,7 +886,9 @@ is `ranAt`. The run of a manual start that supplied
 [run parameter](Commands-and-Environment#params) values carries
 `suppliedRanAt` in its place, beside `suppliedParams: true`, because the run
 stays outside the job's
-[retry sequence](Failure-Detection-and-Retries#retry-lifecycle). `resources`
+[retry sequence](Failure-Detection-and-Retries#retry-lifecycle). That run
+also carries `triggeredBy`, the label of the token that supplied the values,
+when a token authenticated the start. `resources`
 is `null` unless the job opted into
 [`monitorResources`](Resource-Monitoring), in which case it is
 `{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
@@ -1156,7 +1161,9 @@ the configuration writes them:
 
 `equals` and `notEquals` carry one value, and `in` and `notIn` carry a list.
 A comparison on a parameter carries values in the parameter's declared type,
-and a comparison on an XCom value carries strings.
+and a comparison on an XCom value carries strings. `lessThan`,
+`lessThanOrEqual`, `greaterThan`, and `greaterThanOrEqual` carry one number
+for either source.
 
 An entry for a DAG that declares
 [run parameters](Orchestration-and-DAGs#run-parameters) carries `params`, the
@@ -1179,7 +1186,8 @@ trigger or a backfill only for a DAG whose entry has this key.
 An entry carries `fleetWarnings`, a list of strings, while another live host
 on the shared store runs a build below the
 [run engine level](Orchestration-and-DAGs#run-engine-levels) the DAG needs.
-Each string names one host.
+Each string names one host. The web dashboard and the terminal dashboard
+show the strings on the workflow.
 
 #### `GET /dags/{name}/runs`
 
@@ -1289,7 +1297,7 @@ the reason for each name. The request creates no run:
 Replay a scheduled DAG across a historical range. Body:
 `{"from": "<ISO>", "to": "<ISO>"}`. Each scheduled date in the range gets a
 run unless one already exists, so repeating a backfill creates no duplicate.
-One request covers at most 100 dates.
+One request covers at most 100 dates, earliest first.
 
 The body accepts `from`, `to`, and `params`, and any other field answers
 `400`, so a misspelled key never starts a backfill. The daemon logs that
@@ -1316,12 +1324,27 @@ values, and `existingRunKeys` names it. A non-empty `params` object needs the
 ```json
 {"ok": true, "created": 3, "existing": 4,
  "runKeys": ["2026-01-05T02:00:00_00:00", "…"],
- "existingRunKeys": ["2026-01-01T02:00:00_00:00", "…"]}
+ "existingRunKeys": ["2026-01-01T02:00:00_00:00", "…"],
+ "truncated": false}
 ```
 
 `created` counts the runs this request created, and `runKeys` lists them.
 `existing` counts the dates that already had a run, listed in
-`existingRunKeys`. Those runs are unchanged. `400` on a bad range, on a DAG
+`existingRunKeys`. Those runs are unchanged.
+
+`truncated` is `true` when the request reached its 100 dates before the end
+of the range. The response then carries `nextFrom`, the first scheduled date
+that the request did not reach, as a UTC date and time. Send `nextFrom` as
+`from` with the same `to` to continue, and repeat until `truncated` is
+`false`:
+
+```json
+{"ok": true, "created": 100, "existing": 0, "runKeys": ["…"],
+ "existingRunKeys": [], "truncated": true,
+ "nextFrom": "2026-04-11T02:00:00+00:00"}
+```
+
+`400` on a bad range, on a DAG
 that is unknown or has no schedule, on an unknown body field, and on refused
 parameters, which add
 `paramErrors` as the trigger route does. `403` when the body has a non-empty

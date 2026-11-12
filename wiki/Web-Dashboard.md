@@ -128,7 +128,7 @@ spells them out beside the badge.
 Clicking a job (or pressing `Enter` on the selected row) opens a detail drawer
 with four tabs: **Logs**, **History**, **Resources**, and **Schedule**. The
 **History** tab lists the parameter values each run of a job that declares
-them took. The
+them took, and the token that supplied them on a manual start. The
 drawer header repeats the job's status, its schedule (with the plain-English
 reading), the running PID(s), and a one-click button to copy the command. For a
 running job with [resource monitoring](Resource-Monitoring) on, the header adds
@@ -289,6 +289,12 @@ palette): one row per DAG with its latest run's state, its name and task count
 plain-English reading; `manual` for an unscheduled DAG), a stacked bar of recent
 run outcomes, the total run count, and one-click **Run** / **Open** actions.
 
+While another live host on the shared store runs a build below the
+[run engine level](Orchestration-and-DAGs#run-engine-levels) that a DAG
+needs, the DAG's row carries a **⚠ 1 host needs an upgrade** chip with the
+host count, and the DAG drawer lists each host under its header. The text
+is the DAG's `fleetWarnings` from `GET /dags`.
+
 **Open** (or clicking a row) opens the **DAG drawer**, with **Trigger**,
 **▦ Backfill**, and **Retry failed tasks** buttons in its header and five tabs:
 
@@ -320,11 +326,17 @@ run outcomes, the total run count, and one-click **Run** / **Open** actions.
 
 **Trigger** (and the card's **Run** button) starts a manual run now with
 [`POST /dags/{name}/trigger`](HTTP-API#post-dagsnametrigger). In the drawer, the
-new run is selected as soon as it is created. **▦ Backfill** opens a from/to ISO
+new run is selected as soon as it is created. Each trigger carries a
+`requestId` that the page keeps until the daemon answers. When a trigger
+gets no answer, trigger the workflow again with the same values: the daemon
+returns the run that the first request created, or starts it if that
+request never arrived. **▦ Backfill** opens a from/to ISO
 date-range form wired to
 [`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill). Its
 confirmation shows how many runs the backfill created and how many dates
-already had one. It is disabled only without the `control` scope. For a manual-only DAG the form forces
+already had one. One backfill covers at most 100 scheduled dates. For a
+longer range, the form stays open with **from** set to the next date, and
+**run backfill** continues from there. The **▦ Backfill** button is disabled only without the `control` scope. For a manual-only DAG the form forces
 **Failed dates only**, which posts to `/dags/{name}/recover` instead.
 
 For a workflow that declares
@@ -341,6 +353,11 @@ of sending the request at once:
   required parameters, a dialog submitted unchanged sends no values, and the
   run stores the defaults. When the daemon refuses a value, its reason
   appears under its field and the dialog stays open.
+- The daemon answers with the values the run stores. The confirmation
+  warns when the answer holds no values or other values for a parameter
+  that the dialog sent.
+- After a backfill that stops at 100 dates, the dialog stays open with its
+  values, and **Run backfill** continues from the next date.
 - A workflow with no parameters keeps its one-click trigger.
 
 A selected run lists the values it stores in a **parameters** row under the

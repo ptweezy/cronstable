@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import datetime
 import json
+import logging
 import sys
 import time
 
@@ -38,11 +39,15 @@ from tests.test_state_dag_run import _start_web
 
 _PY = sys.executable
 
+# Each fixture job sets a short killTimeout. A test that stops a run before
+# its process is up waits the whole timeout on Windows (see _up), and the
+# default is 30 seconds.
 _JOBS = """
 jobs:
   - name: report
     command: 'x'
     schedule: '0 0 1 1 *'
+    killTimeout: 1
     captureStdout: true
     params:
       - name: region
@@ -61,6 +66,7 @@ jobs:
   - name: plain
     command: 'x'
     schedule: '0 0 1 1 *'
+    killTimeout: 1
     captureStdout: true
 """
 
@@ -123,6 +129,7 @@ jobs:
             time.sleep(1)
         sys.exit(3 if act == 'fail' else 0)
 {once}    schedule: '0 0 1 1 *'
+    killTimeout: 1
     captureStdout: true
     concurrencyPolicy: {policy}
     concurrencyScope: {scope}
@@ -347,6 +354,7 @@ jobs:
   - name: s
     command: 'x'
     schedule: '0 0 1 1 *'
+    killTimeout: 1
     captureStdout: true
     concurrencyScope: cluster
     concurrencyPolicy: Replace
@@ -463,7 +471,7 @@ def test_the_declaration_is_part_of_the_job_digest_only_when_set():
     # a job that declares none keeps the digest it has without the key
     bare = _JOBS.split("    params:")[0] + "  - name: plain\n" + (
         "    command: 'x'\n    schedule: '0 0 1 1 *'\n"
-        "    captureStdout: true\n"
+        "    killTimeout: 1\n    captureStdout: true\n"
     )
     assert digest(bare, "plain") == digest(_JOBS, "plain")
     assert "params" not in fingerprint.canonical_job(
@@ -481,6 +489,15 @@ def test_the_declaration_is_part_of_the_job_digest_only_when_set():
     assert digest(
         _JOBS.replace("Region to report on", "Where to run"), "report"
     ) == base
+    # so is the order of the parameters: a reorder keeps the digest, and
+    # with it a pending retry and a queued pool entry
+    rows = (
+        "      - name: rows\n        type: integer\n        default: 100\n"
+        "        minimum: 1\n"
+    )
+    dry = "      - name: dry\n        type: boolean\n        default: false\n"
+    assert rows + dry in _JOBS
+    assert digest(_JOBS.replace(rows + dry, dry + rows), "report") == base
 
 
 # --------------------------------------------------------------------------
@@ -2472,10 +2489,13 @@ async def test_http_start_needs_the_params_scope_to_choose_values(dag_cron):
                 assert r.status == 200
                 assert (await r.json())["params"] == _DEFAULTS
             await _finish(cron)
+            assert cron.last_run["report"].triggered_by is None
             async with s.post(url, json=body, headers=auth("t-params")) as r:
                 assert r.status == 200
                 assert (await r.json())["params"]["region"] == "us"
             await _finish(cron)
+            # the run names the token that chose its values
+            assert cron.last_run["report"].triggered_by == "release"
     finally:
         await cron.start_stop_web_app(None)
 
@@ -2500,3 +2520,157 @@ async def test_http_start_of_a_pooled_job_answers_202_with_the_values(
     assert body["queued"] == "report" and body["pool"] == "database"
     assert body["params"] == {**_DEFAULTS, "rows": 3}
     await cron._pools.cancel("database", body["queueId"], "test over")
+
+
+# --------------------------------------------------------------------------
+# Who started a run with values
+# --------------------------------------------------------------------------
+
+
+def _start_lines(caplog):
+    """Each line the daemon logged for a manual start with values."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "manual start" in record.getMessage()
+    ]
+
+
+async def test_a_start_with_values_records_who_asked(dag_cron, caplog):
+    cron = await _cron(dag_cron)
+    with caplog.at_level(logging.INFO, logger="cronstable"):
+        await cron.start_job(
+            "report", {"rows": 5, "region": "us"}, triggered_by="release"
+        )
+    (running,) = cron.running_jobs["report"]
+    assert running.triggered_by == "release"
+    # the names and the label: a value never reaches the log
+    assert _start_lines(caplog) == [
+        "Job report: manual start launched with parameters region, rows "
+        "by release"
+    ]
+    await _finish(cron)
+    assert cron.last_run["report"].triggered_by == "release"
+    stored = await cron.state_backend.list_records(cron._run_stream("report"))
+    assert stored[-1]["triggeredBy"] == "release"
+    runs = cron.job_runs_payload("report")["runs"]
+    assert runs[-1]["triggeredBy"] == "release"
+    # a start with no values runs as a scheduled run does, so it records
+    # no label and logs no line
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="cronstable"):
+        await cron.start_job("report", triggered_by="release")
+        (running,) = cron.running_jobs["report"]
+        assert running.triggered_by is None
+        await _finish(cron)
+        # a start that no token authenticates has values and no label
+        await cron.start_job("report", {"region": "us"})
+        await _finish(cron)
+    assert _start_lines(caplog) == [
+        "Job report: manual start launched with parameters region"
+    ]
+    plain, unlabeled = cron.job_runs_payload("report")["runs"][-2:]
+    assert "triggeredBy" not in plain and "triggeredBy" not in unlabeled
+    assert unlabeled["suppliedParams"] is True
+
+
+def test_the_run_record_round_trips_the_label():
+    record = JobRunInfo(
+        outcome="success",
+        exit_code=0,
+        started_at=None,
+        finished_at=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        fail_reason=None,
+        output=None,  # the stream is not serialized
+        params={"region": "us"},
+        supplied_params=True,
+        triggered_by="release",
+    ).to_dict()
+    assert record["triggeredBy"] == "release"
+    back = _job_run_info_from_dict(json.loads(json.dumps(record)))
+    assert back.triggered_by == "release"
+    # a damaged label reads as none
+    record["triggeredBy"] = 7
+    assert _job_run_info_from_dict(record).triggered_by is None
+
+
+async def test_the_inflight_record_carries_the_label_to_reconciliation(
+    dag_cron,
+):
+    cron = await _cron(
+        dag_cron, command=[_PY, "-c", "import time; time.sleep(30)"]
+    )
+    await cron.start_job("report", {"rows": 9}, triggered_by="release")
+    await _drain_pending(cron)
+    stream = cron._inflight_stream("report")
+    (record,) = await cron.state_backend.list_records(stream)
+    assert record["triggeredBy"] == "release"
+    # the run a crash interrupted is recorded with its label
+    cron._reconcile_open_record(
+        "report", cron.cron_jobs["report"], record, "reconciled-crash"
+    )
+    assert cron.last_run["report"].triggered_by == "release"
+    await _drain_pending(cron)
+    rows = await cron.state_backend.list_records(cron._run_stream("report"))
+    assert rows[-1]["outcome"] == "unknown"
+    assert rows[-1]["triggeredBy"] == "release"
+    (running,) = cron.running_jobs["report"]
+    await _stop_run(cron, running)
+    assert cron.last_run["report"].outcome == "cancelled"
+    assert cron.last_run["report"].triggered_by == "release"
+
+
+async def test_the_pool_entry_carries_the_label_through_the_queue(
+    dag_cron, monkeypatch, caplog
+):
+    cron = await _cron(dag_cron, _POOLED)
+    monkeypatch.setattr(cron._pools, "service", lambda: None)
+    with caplog.at_level(logging.INFO, logger="cronstable"):
+        started = await cron.start_job(
+            "report", {"region": "us"}, triggered_by="release"
+        )
+    assert _start_lines(caplog) == [
+        "Job report: manual start queued with parameters region by release"
+    ]
+    # a start with no values queues behind it, with no label in its entry
+    second = await cron.start_job("report", triggered_by="release")
+    pool = await cron.state_backend.read_document(POOL_NAMESPACE, "database")
+    entries = {e["id"]: e["payload"] for e in pool["entries"].values()}
+    assert entries[started["queued"]]["triggeredBy"] == "release"
+    assert "triggeredBy" not in entries[second["queued"]]
+    await cron._pools.tick()
+    (running,) = cron.running_jobs["report"]
+    assert running.triggered_by == "release"
+    await _finish(cron)
+    assert cron.last_run["report"].triggered_by == "release"
+    await cron._pools.tick()
+    (running,) = cron.running_jobs["report"]
+    assert running.triggered_by is None
+    await _finish(cron)
+
+
+async def test_a_start_that_waits_for_the_cluster_slot_keeps_the_label(
+    dag_cron, caplog
+):
+    cron, foreign = await _slot_cron(dag_cron)
+    with caplog.at_level(logging.INFO, logger="cronstable"):
+        started = await cron.start_job(
+            "s", {"region": "us"}, triggered_by="release"
+        )
+    assert started["pending"] is True
+    assert _start_lines(caplog) == [
+        "Job s: manual start accepted with parameters region by release"
+    ]
+    # the label waits beside the values
+    assert cron._slot_pursuit_launch["s"] == {
+        "with_retries": False,
+        "params": {"region": "us"},
+        "triggered_by": "release",
+    }
+    pursuit = cron._slot_pursuits["s"]
+    await cron.state_backend.release_lease(foreign)  # the other node yields
+    await asyncio.wait_for(pursuit, timeout=30)
+    (running,) = cron.running_jobs["s"]
+    assert running.supplied_params and running.triggered_by == "release"
+    await _settle(cron)
+    assert cron.last_run["s"].triggered_by == "release"

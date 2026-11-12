@@ -91,6 +91,11 @@ dags:
   # `skipped` task. `publish` joins the two branches with
   # none_failed_min_one_success, so it runs after the branch that ran. The
   # default all_success would skip it whenever either branch skipped.
+  #
+  # Each load reads the weekday from CRONSTABLE_DAG_LOGICAL_DATE, the run's
+  # logical date in UTC, so a backfill, a catch-up run, or a recovery run
+  # takes the branch of the date it stands for. A manual run that names no
+  # logicalDate has an empty variable, and `:-now` then reads the clock.
   - name: nightly-load
     schedule: "0 3 * * *"
     tasks:
@@ -104,7 +109,8 @@ dags:
         skipExitCodes:
           - 99
         command: |
-          [ "$(date +%u)" = 7 ] || exit 99
+          day=$(date -u -d "${CRONSTABLE_DAG_LOGICAL_DATE:-now}" +%u)
+          [ "$day" = 7 ] || exit 99
           echo "full load"
 
       # Every other day the two swap.
@@ -114,7 +120,8 @@ dags:
         skipExitCodes:
           - 99
         command: |
-          [ "$(date +%u)" != 7 ] || exit 99
+          day=$(date -u -d "${CRONSTABLE_DAG_LOGICAL_DATE:-now}" +%u)
+          [ "$day" != 7 ] || exit 99
           echo "incremental load"
 
       - id: publish

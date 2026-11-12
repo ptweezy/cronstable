@@ -725,6 +725,20 @@ def _refuse(
         refusals.append((status, reason))
 
 
+def _launch_request(
+    with_retries: bool,
+    params: dict[str, Any] | None,
+    triggered_by: str | None = None,
+) -> dict[str, Any]:
+    """The keyword arguments of one :meth:`Cron.maybe_launch_job` call, in
+    the form a Replace pursuit holds while the launch waits for the job's
+    cluster slot. ``triggered_by`` is a key only when it is set."""
+    launch: dict[str, Any] = {"with_retries": with_retries, "params": params}
+    if triggered_by is not None:
+        launch["triggered_by"] = triggered_by
+    return launch
+
+
 async def _bounded(
     op: Coroutine[Any, Any, Any], cap: float | None, deadline: float | None
 ) -> Any:
@@ -1054,6 +1068,9 @@ class JobRunInfo:
     # whether a manual start supplied those values (see
     # RunningJob.supplied_params)
     supplied_params: bool = False
+    # the label of the token that supplied them (see
+    # RunningJob.triggered_by)
+    triggered_by: str | None = None
     # Elapsed seconds, derived once at construction (both operands are
     # immutable). compare=False keeps equality over the recorded fields.
     duration: float | None = field(default=None, init=False, compare=False)
@@ -1090,7 +1107,8 @@ class JobRunInfo:
         intentionally advances over pause-skipped slots. A run with
         supplied values carries ``suppliedParams`` and mirrors the instant
         under ``suppliedRanAt``, the key that catch-up's skip-blind
-        watermark folds in beside ``ranAt``.
+        watermark folds in beside ``ranAt``. ``triggeredBy`` is present on
+        such a run when a labeled token started it.
         """
         # one isoformat for the two keys that carry the same instant
         finished = self.finished_at.isoformat()
@@ -1126,6 +1144,8 @@ class JobRunInfo:
             data["limits"] = self.limits.to_dict()
         if self.params is not None:
             data["params"] = self.params
+        if self.triggered_by is not None:
+            data["triggeredBy"] = self.triggered_by
         return data
 
 
@@ -1583,7 +1603,15 @@ def _job_run_info_from_dict(
         if isinstance(rec.get("params"), dict)
         else None,
         supplied_params=rec.get("suppliedParams") is True,
+        triggered_by=_triggered_by(rec),
     )
+
+
+def _triggered_by(rec: dict[str, Any]) -> str | None:
+    """A stored record's ``triggeredBy``, or ``None`` for a record with no
+    label."""
+    label = rec.get("triggeredBy")
+    return label if isinstance(label, str) else None
 
 
 def _load_index_bytes() -> bytes:
@@ -5240,6 +5268,7 @@ class Cron:
         params: Any = None,
         *,
         scopes: Collection[str] | None = None,
+        triggered_by: str | None = None,
     ) -> dict[str, Any]:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
 
@@ -5259,7 +5288,9 @@ class Cron:
         :class:`~cronstable.params.ParamError` and start nothing. A start
         that supplies values is one attempt: it stays outside the job's
         retry ladder, whose retries run with the defaults like the
-        scheduled runs they repeat.
+        scheduled runs they repeat. ``triggered_by`` is the label of
+        whoever asked for the start. A start that supplies values logs it
+        beside the parameter names and records it on the run.
 
         Returns ``queued``, the pool queue ID or ``None`` for a job that
         is not pooled, and ``params``, the values the run takes or
@@ -5284,8 +5315,21 @@ class Cron:
             getattr(job, "params", ()), params, "job {!r}".format(name), scopes
         )
         # a start with no values runs as a scheduled run would, so only
-        # supplied values travel with the launch
+        # supplied values travel with the launch, and the label with them
         chosen = resolved if params else None
+        by = triggered_by if chosen is not None else None
+
+        def accepted(how: str) -> None:
+            if chosen is not None:
+                # names only: a value never reaches the log
+                logger.info(
+                    "Job %s: manual start %s with parameters %s%s",
+                    name,
+                    how,
+                    ", ".join(sorted(params)),
+                    "" if by is None else " by " + by,
+                )
+
         # A manual start of a job still pending as a deferred @reboot
         # one-shot IS its boot run: retire the pending entry and record the
         # run with the cluster, or _process_pending_reboots would run the
@@ -5321,8 +5365,9 @@ class Cron:
         if getattr(job, "pool", None) is not None:
             try:
                 entry = await self._pools.enqueue_job(
-                    job, manual=True, params=chosen
+                    job, manual=True, params=chosen, triggered_by=by
                 )
+                accepted("queued")
                 return {"queued": str(entry["id"]), "params": resolved}
             except POOL_UNAVAILABLE as ex:
                 raise ApiActionError(
@@ -5330,10 +5375,7 @@ class Cron:
                 ) from ex
             except PoolError as ex:
                 raise ApiActionError(str(ex), status=409) from ex
-        launch: dict[str, Any] = {
-            "with_retries": chosen is None,
-            "params": chosen,
-        }
+        launch = _launch_request(chosen is None, chosen, by)
         refusals: list[tuple[int, str]] = []
         launched = await self.maybe_launch_job(
             job, refusals=refusals, **launch
@@ -5362,6 +5404,7 @@ class Cron:
                     status=409,
                 )
             started["pending"] = True
+        accepted("accepted" if "pending" in started else "launched")
         return started
 
     async def cancel_job_by_name(self, name: str) -> int:
@@ -6086,9 +6129,13 @@ class Cron:
         # The body is optional, and a JSON object when present.
         payload = await self._web_json_body(request)
         self._web_known_fields(payload, "start", "params", request=request)
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
             started = await self.start_job(
-                name, payload.get("params"), scopes=self._web_scopes(request)
+                name,
+                payload.get("params"),
+                scopes=self._web_scopes(request),
+                triggered_by=None if matched is None else matched.label,
             )
         except ParamError as ex:
             return self._web_param_error(request, ex)
@@ -12127,6 +12174,7 @@ class Cron:
         catchup_after: datetime.datetime | None = None,
         params: dict[str, Any] | None = None,
         refusals: "list[tuple[int, str]] | None" = None,
+        triggered_by: str | None = None,
     ) -> bool | None:
         """Accept a job into its pool queue or launch it immediately.
 
@@ -12137,7 +12185,8 @@ class Cron:
         the fire's retry sequence, unless Forbid drops the fire. ``params``
         carries the run parameter values a manual start supplied, already
         checked; a launch without them uses the job's defaults (see
-        _launch_params).
+        _launch_params). ``triggered_by`` is the label of the token that
+        supplied them, for the run's record.
 
         Any other return means that nothing started. False covers a
         launch that the job's Replace pursuit holds until another node
@@ -12155,6 +12204,7 @@ class Cron:
                 with_retries=with_retries,
                 catchup_after=catchup_after,
                 params=params,
+                triggered_by=triggered_by,
             )
             return True
         # A launch that carries supplied values takes the job's retry lock
@@ -12194,6 +12244,7 @@ class Cron:
                 params,
                 asyncio.current_task() in self._fire_tasks,
                 refusals,
+                triggered_by,
             )
 
     @staticmethod
@@ -12224,6 +12275,23 @@ class Cron:
             declared, {}, "job {!r}".format(job.name)
         )
         return defaults, False
+
+    @staticmethod
+    def _launch_label(
+        pool_ticket: Ticket | None, supplied: bool, triggered_by: str | None
+    ) -> str | None:
+        """The ``triggeredBy`` label one launch records: that of the token
+        whose manual start supplied the launch's values.
+
+        ``None`` for a launch that takes the defaults. A pooled launch
+        reads the label from the entry that carried the values through the
+        queue.
+        """
+        if not supplied:
+            return None
+        if pool_ticket is not None:
+            return _triggered_by(pool_ticket.payload)
+        return triggered_by
 
     def _take_retry_ladder(
         self, name: str
@@ -12270,6 +12338,7 @@ class Cron:
         params: dict[str, Any] | None = None,
         scheduled_fire: bool = False,
         refusals: "list[tuple[int, str]] | None" = None,
+        triggered_by: str | None = None,
     ) -> bool | None:
         """The body of :meth:`maybe_launch_job`, under its per-job lock."""
         retry_current = True
@@ -12284,6 +12353,7 @@ class Cron:
                 )
                 return False
         values, supplied = self._launch_params(job, pool_ticket, params)
+        triggered_by = self._launch_label(pool_ticket, supplied, triggered_by)
         # the launch that waits in the job's Replace pursuit, read before
         # the pursuit can take it. This launch takes its place by starting,
         # or when the claim parks this one there (see
@@ -12332,6 +12402,7 @@ class Cron:
             waiting,
             fire_ladder,
             refusals,
+            triggered_by,
         )
         if not claimed:
             return claimed
@@ -12374,6 +12445,7 @@ class Cron:
             )
             running_job.params = values
             running_job.supplied_params = supplied
+            running_job.triggered_by = triggered_by
             running_job.pool_ticket = pool_ticket
             if pool_ticket is not None:
                 pool_ticket.running = running_job
@@ -12616,6 +12688,7 @@ class Cron:
         waiting: dict[str, Any] | None,
         fire_ladder: JobRetryState | None,
         refusals: "list[tuple[int, str]] | None" = None,
+        triggered_by: str | None = None,
     ) -> bool | None:
         """:meth:`_claim_cluster_slot` for the launch that
         :meth:`_launch_job_locked` makes. True for a job outside
@@ -12625,6 +12698,7 @@ class Cron:
         a scheduled fire, goes back unclaimed. ``waiting`` is the launch
         that waited in the job's Replace pursuit before the claim (see
         _end_replaced_retries). ``refusals`` passes through to the claim.
+        ``triggered_by`` goes with a launch that the claim parks.
         """
         if job.concurrencyScope != "cluster":
             return True
@@ -12638,7 +12712,7 @@ class Cron:
             # it, so a pursuit has nothing to launch for it
             None
             if pool_ticket is not None
-            else {"with_retries": with_retries, "params": params},
+            else _launch_request(with_retries, params, triggered_by),
             refusals,
         )
         if claimed:
@@ -13284,6 +13358,9 @@ class Cron:
             # so the row that reconciles an interrupted run stays outside
             # the retry ladder, like the row of a run that finishes
             record["suppliedParams"] = True
+        label = getattr(running_job, "triggered_by", None)
+        if label is not None:
+            record["triggeredBy"] = label
         stream = self._inflight_stream(job.name)
         try:
             # Bounded: a wedged mount must not hang this tracked task and
@@ -13631,6 +13708,9 @@ class Cron:
         supplied = rec.get("suppliedParams") is True
         if supplied:
             data["suppliedParams"] = True
+        label = _triggered_by(rec)
+        if label is not None:
+            data["triggeredBy"] = label
         if job is None or job.onMissed == "skip":
             data["finished_at"] = started_iso
             # the run-instant mirror the durable superseded-by-run guard
@@ -13667,6 +13747,7 @@ class Cron:
             output=output,
             params=values,
             supplied_params=supplied,
+            triggered_by=label,
         )
         # Whose crash this was decides whether the row outranks a newer
         # completion. THIS host's interrupted run is the latest news about
@@ -15149,6 +15230,7 @@ class Cron:
                     limits=getattr(job, "limits_record", None),
                     params=getattr(job, "params", None),
                     supplied_params=getattr(job, "supplied_params", False),
+                    triggered_by=getattr(job, "triggered_by", None),
                 ),
             )
             if self._ends_retry_sequence(job):
@@ -15189,6 +15271,7 @@ class Cron:
                 limits=getattr(job, "limits_record", None),
                 params=getattr(job, "params", None),
                 supplied_params=getattr(job, "supplied_params", False),
+                triggered_by=getattr(job, "triggered_by", None),
             ),
         )
         self._queue_job_completion(job, failed=fail_reason is not None)

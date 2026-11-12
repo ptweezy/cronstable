@@ -298,17 +298,26 @@ _STEPS: tuple[
     for (pattern, repl), gate in zip(_PATTERNS, _PATTERN_GATES, strict=True)
 )
 
-_SECRET_NAME = re.compile("(?i)(?:" + "|".join(_KEY_KEYWORDS) + r")\Z")
+#: A name that ends with a :data:`_KEY_KEYWORDS` entry or with its plural.
+#: ``token`` has no plural here, because a name that ends with ``tokens``
+#: usually counts them, as ``max_tokens`` does. ``auth_tokens`` still
+#: matches, as the plural of its own entry.
+_SECRET_NAME = re.compile(
+    "(?i)(?:token|(?:"
+    + "|".join(keyword for keyword in _KEY_KEYWORDS if keyword != "token")
+    + r")s?)\Z"
+)
 
 
 def is_secret_name(name: str) -> bool:
     """Whether ``name`` ends with a keyword the key=value pattern redacts
-    under.
+    under, or with the plural of one.
 
     Decides which names a configuration may not use for a value every
     reader sees, such as a run parameter. A keyword earlier in the name
-    describes the value, as in ``secret_name`` and ``max_tokens``, so it
-    passes.
+    describes the value, as in ``secret_name`` and ``password_policy``, so
+    it passes. So does a name that ends with ``tokens`` alone, as
+    ``max_tokens`` does.
     """
     return _SECRET_NAME.search(name) is not None
 

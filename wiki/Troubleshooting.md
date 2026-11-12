@@ -724,7 +724,8 @@ node, or grow by one to tolerate an extra failure. See
 **Symptom.** A run stays `running` with its tasks `pending`, and a node logs
 `dag run <dag>/<run>: needs run engine level <N> and this build supports level
 <M>; leaving the run for an upgraded node`. `GET /dags` can list
-`fleetWarnings` for the same workflow.
+`fleetWarnings` for the same workflow, and the web dashboard and the
+terminal dashboard show those lines on the workflow.
 
 **Cause.** The nodes on the shared store run different cronstable versions,
 and the run's workflow uses a feature that the logging node's build does not
@@ -814,6 +815,55 @@ stopped by `executionTimeout` or a cancel also never skips.
           - 99
 ```
 
+### A task ends `skipped` although its command is broken
+
+**Symptom.** A task ends `skipped` with `skipReason` `exit code 127`, `126`,
+`1`, or `2`, and its command never did its work. At load the daemon logs
+`dag '<dag>': task '<task>': skipExitCodes holds <codes>`.
+
+**Cause.** The task lists a code that a failure also returns. A shell or a
+failing program exits with `1` or `2` for an ordinary error, with `126` for
+a file that it cannot run, and with `127` for a command that it cannot find.
+
+**Fix.** Have the command exit with a code that only its own skip decision
+returns, such as `99`, and list that code in `skipExitCodes`.
+
+### A backfill, catch-up, or recovery run takes the branch of the wrong day
+
+**Symptom.** A task that branches on the date, for example with
+`date +%u`, takes one branch in the scheduled run and another in a run that
+a backfill, a catch-up, or a recovery created for the same date.
+
+**Cause.** The command reads the clock, and those runs start after the date
+they stand for.
+
+**Fix.** Read the run's logical date from `CRONSTABLE_DAG_LOGICAL_DATE`, an
+ISO 8601 instant in UTC:
+
+```yaml
+        command: |
+          day=$(date -u -d "${CRONSTABLE_DAG_LOGICAL_DATE:-now}" +%u)
+          [ "$day" = 7 ] || exit 99
+          ./load.sh --full
+```
+
+The variable is the empty string for a manual run that names no
+`logicalDate`. See
+[conditional branching](Orchestration-and-DAGs#conditional-branching).
+
+### A backfill of a long range creates 100 runs
+
+**Symptom.** `POST /dags/{name}/backfill` answers `created` and `existing`
+that add up to 100, and the later dates of the range have no run.
+
+**Cause.** One backfill request covers at most 100 scheduled dates, earliest
+first. The response says so with `"truncated": true`.
+
+**Fix.** Send the request again with `from` set to the response's `nextFrom`
+and the same `to`, until `truncated` is `false`. The web dashboard's
+backfill form and the terminal dashboard's backfill row fill in `nextFrom`
+for you.
+
 ### A task is skipped and its reason starts with `param` or `xcom`
 
 **Symptom.** A task ends `skipped` without starting. Its `skipReason` has the
@@ -824,7 +874,9 @@ kind `condition` and a detail such as
 the detail names did not hold for this run. The text after the colon is what
 the comparison read. When the two values look equal, as in
 `xcom extract/mode equals full: the value is full`, the published value can
-end in a space, which the detail does not show.
+end in a space, which the detail does not show. A numeric comparison such as
+`greaterThan` adds `which is not a number` when the source holds text that
+it cannot read as a number.
 
 **Fix.** Start a run whose parameters meet the condition, for example with
 `{"params": {"mode": "full"}}` in the trigger body. A scheduled run stores
@@ -932,12 +984,28 @@ five unknown fields and no value from the body.
 The other routes that read a JSON body log the two `request body` lines in
 the same form.
 
+### A command reads a parameter and gets an empty value
+
+**Symptom.** A job or a task command reads `CRONSTABLE_PARAM_<NAME>` and the
+variable is unset. At load the daemon logs `the command reads
+CRONSTABLE_PARAM_<NAME>, and the workflow declares no parameter of that
+name`, or the same line for a job.
+
+**Cause.** The name after `CRONSTABLE_PARAM_` matches no parameter in the
+`params:` declaration of the command's job or workflow. The variable name is
+the parameter name in upper case, so `batch_size` reads as
+`CRONSTABLE_PARAM_BATCH_SIZE`.
+
+**Fix.** Correct the name in the command, or declare the parameter.
+
 ### A Windows job or task runs part of a parameter value as a command
 
 **Symptom.** A job or a workflow task on Windows reads
 `%CRONSTABLE_PARAM_TARGET%`, and a value that holds `&`, `|`, or `>` runs a
 second command or writes a file. Or the command reads
-`!CRONSTABLE_PARAM_TARGET!` and receives that literal text.
+`!CRONSTABLE_PARAM_TARGET!` and receives that literal text. At load the
+daemon can log `cmd.exe replaces %CRONSTABLE_PARAM_TARGET% with the value
+before it parses the command, and param 'target' takes any string`.
 
 **Cause.** `cmd.exe` reads the text of an expanded `%VAR%` as command text,
 so those characters in a value act as command syntax. Double quotes around

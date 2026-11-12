@@ -27,13 +27,21 @@ recomputed, so a crash-resumed run reconstructs the identical mapped set rather
 than re-deriving it from a possibly-changed upstream output.
 """
 
+import math
+import operator
 import re
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
 from cronstable import _json
-from cronstable.params import CONTROL_CHARACTERS, ParamSpec, env_text
+from cronstable.params import (
+    CONTROL_CHARACTERS,
+    NUMBER,
+    ParamSpec,
+    env_text,
+    parse_text,
+)
 
 # --------------------------------------------------------------------------
 # Durable namespaces (under the backend's docs/ and records/ trees)
@@ -68,6 +76,9 @@ XCOM_SCOPE_PREFIX = "dagxcom/"
 ENV_DAG_NAME = "CRONSTABLE_DAG_NAME"
 ENV_DAG_RUN_ID = "CRONSTABLE_DAG_RUN_ID"
 ENV_DAG_RUN_KEY = "CRONSTABLE_DAG_RUN_KEY"
+# the run's logical date as the run document holds it: an ISO 8601 instant in
+# UTC, or empty for a run that has none
+ENV_DAG_LOGICAL_DATE = "CRONSTABLE_DAG_LOGICAL_DATE"
 ENV_DAG_TASK = "CRONSTABLE_DAG_TASK"  # the base task id
 ENV_DAG_TASKKEY = "CRONSTABLE_DAG_TASKKEY"  # the instance key (id or id#index)
 ENV_DAG_MAP_INDEX = "CRONSTABLE_DAG_MAP_INDEX"
@@ -144,14 +155,37 @@ WHEN_PARAM = "param"
 WHEN_XCOM = "xcom"
 
 #: ``when:`` operators, in documentation order. ``equals`` and ``in`` hold
-#: when the source equals one of the values; the other two hold when it
-#: equals none of them.
+#: when the source equals one of the values, and ``notEquals`` and ``notIn``
+#: when it equals none of them. The other four read the source as a number
+#: and compare it with one number (see :data:`WHEN_ORDERING`).
 WHEN_EQUALS = "equals"
 WHEN_NOT_EQUALS = "notEquals"
 WHEN_IN = "in"
 WHEN_NOT_IN = "notIn"
-WHEN_OPERATORS = (WHEN_EQUALS, WHEN_NOT_EQUALS, WHEN_IN, WHEN_NOT_IN)
+WHEN_LESS_THAN = "lessThan"
+WHEN_LESS_THAN_OR_EQUAL = "lessThanOrEqual"
+WHEN_GREATER_THAN = "greaterThan"
+WHEN_GREATER_THAN_OR_EQUAL = "greaterThanOrEqual"
+WHEN_OPERATORS = (
+    WHEN_EQUALS,
+    WHEN_NOT_EQUALS,
+    WHEN_IN,
+    WHEN_NOT_IN,
+    WHEN_LESS_THAN,
+    WHEN_LESS_THAN_OR_EQUAL,
+    WHEN_GREATER_THAN,
+    WHEN_GREATER_THAN_OR_EQUAL,
+)
 _WHEN_POSITIVE = frozenset({WHEN_EQUALS, WHEN_IN})
+#: The operators that compare numbers, each with the test it applies to the
+#: source and the comparison's one value. A source that holds no number
+#: fails every one of them.
+WHEN_ORDERING = {
+    WHEN_LESS_THAN: operator.lt,
+    WHEN_LESS_THAN_OR_EQUAL: operator.le,
+    WHEN_GREATER_THAN: operator.gt,
+    WHEN_GREATER_THAN_OR_EQUAL: operator.ge,
+}
 
 #: Byte ceiling on an XCom value a ``when:`` comparison reads, and on each
 #: value it compares with. A larger published value reads as no value.
@@ -212,9 +246,11 @@ class Condition:
 
     ``source`` is :data:`WHEN_PARAM` or :data:`WHEN_XCOM`. ``name`` is the
     parameter name or the id of the task that published the XCom value, and
-    ``key`` is the XCom key (empty for a parameter). ``values`` holds one
-    value for ``equals`` and ``notEquals`` and the whole list for ``in`` and
-    ``notIn``: text for XCom, and the declared type for a parameter.
+    ``key`` is the XCom key (empty for a parameter). ``values`` holds the
+    whole list for ``in`` and ``notIn`` and one value for every other
+    operator: text for XCom, and the declared type for a parameter. The
+    one value of a :data:`WHEN_ORDERING` operator is a number for either
+    source.
     """
 
     source: str
@@ -1219,6 +1255,28 @@ def _same_value(left: Any, right: Any) -> bool:
     return (type(left) is bool) == (type(right) is bool) and left == right
 
 
+def _number(value: Any) -> int | float | None:
+    """``value`` as the number a :data:`WHEN_ORDERING` operator compares,
+    or ``None`` when it holds none.
+
+    An integer or a finite float is itself. Text, which is what an XCom
+    source holds, is read the way a configuration reads a ``number``
+    value. A boolean is no number.
+    """
+    if isinstance(value, str):
+        try:
+            value = parse_text(NUMBER, value)
+        except ValueError:
+            return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
 def _one_line(text: str) -> str:
     """``text`` with each control character as its backslash escape.
 
@@ -1288,7 +1346,8 @@ def _when_outcome(
     not answer.
 
     A source with no value fails ``equals`` and ``in`` and passes
-    ``notEquals`` and ``notIn``.
+    ``notEquals`` and ``notIn``. It fails each :data:`WHEN_ORDERING`
+    operator, and so does a value that is not a number.
     """
     params = body.get("params")
     unknown = False
@@ -1307,10 +1366,23 @@ def _when_outcome(
                 continue
             if isinstance(value, NoXcomValue):
                 reason = value.reason
-        found = reason is None and any(
-            _same_value(value, wanted) for wanted in cond.values
-        )
-        if found != (cond.op in _WHEN_POSITIVE):
+        ordering = WHEN_ORDERING.get(cond.op)
+        if ordering is not None:
+            number = None if reason is not None else _number(value)
+            holds = number is not None and ordering(number, cond.values[0])
+            if reason is None and number is None:
+                shown = _clip(env_text(value))
+                reason = (
+                    "the value is {}, which is not a number".format(shown)
+                    if shown
+                    else "the value is empty"
+                )
+        else:
+            found = reason is None and any(
+                _same_value(value, wanted) for wanted in cond.values
+            )
+            holds = found == (cond.op in _WHEN_POSITIVE)
+        if not holds:
             if reason is None:
                 reason = "the value is {}".format(_clip(env_text(value)))
             return "{}: {}".format(_condition_text(cond), reason)

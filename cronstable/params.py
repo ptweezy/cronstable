@@ -313,12 +313,19 @@ def _choices(items: Any) -> int:
 def stored_form(spec: ParamSpec, value: Any) -> Any:
     """A checked value as a run stores it.
 
-    The value itself, except that a ``number`` given as an integer beyond
-    :data:`MAX_INTEGER` is stored as the float it equals, so every stored
-    number is one a JSON double carries.
+    The value itself, except for a ``number``, which has one stored form
+    whichever JSON spelling a client sends. A whole number up to
+    :data:`MAX_INTEGER` in magnitude is stored as an integer, so ``5.0``
+    and ``5`` both store ``5`` and a task reads ``5``. Any other number is
+    stored as a float, including an integer beyond that magnitude, so every
+    stored number is one a JSON double carries.
     """
-    if spec.type == NUMBER and type(value) is int and abs(value) > MAX_INTEGER:
-        return float(value)
+    if spec.type != NUMBER:
+        return value
+    if type(value) is int:
+        return value if abs(value) <= MAX_INTEGER else float(value)
+    if value.is_integer() and abs(value) <= MAX_INTEGER:
+        return int(value)
     return value
 
 
@@ -445,8 +452,8 @@ def check_reuse(
     A recovery run reuses its source run's map as it is. A caller without
     the scope starts runs with the declared defaults, so the only map it
     reuses is the one a run stores when nobody chooses, with every declared
-    name at its default. Values compare as the run document writes them, so
-    the number ``5.0`` differs from a default of ``5``. A ``required``
+    name at its default. Values compare as the run document writes them,
+    and :func:`stored_form` gives a number one written form. A ``required``
     parameter has no default, so its value is always a chosen one.
     ``scopes`` are the scopes of the caller's token, or ``None`` for a
     caller that no token restricts.

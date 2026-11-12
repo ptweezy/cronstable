@@ -84,8 +84,10 @@ def configuration_revision(config):
     revision as it is.
 
     A DAG that declares run parameters also digests the declaration, minus
-    each description. The task list is wrapped in an object only for such a
-    DAG, so every other DAG keeps the digest of the bare list.
+    each description and in name order, so neither a description nor the
+    order of the parameters changes the revision. The task list is wrapped
+    in an object only for such a DAG, so every other DAG keeps the digest
+    of the bare list.
     """
     tasks = []
     for task in config.tasks:
@@ -110,6 +112,7 @@ def configuration_revision(config):
         entry = asdict(param)
         del entry["description"]
         declared.append(entry)
+    declared.sort(key=lambda entry: entry["name"])
     return digest({"tasks": tasks, "params": declared})
 
 
