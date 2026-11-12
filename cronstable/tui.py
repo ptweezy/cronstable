@@ -116,6 +116,10 @@ HEAT_MAX_JOBS = 80
 #: The boot self-test replays after this long, like the web page's.
 BOOT_EVERY_S = 12 * 3600
 
+#: A trigger that got no answer keeps its ``requestId`` for this long after
+#: it was last sent, like the web page's.
+TRIGGER_REQUEST_HOLD_S = 10 * 60
+
 #: Status glyphs, identical to the web dashboard's GLYPH map, with a
 #: plain-ASCII fallback for terminals/fonts that lack them (--ascii).
 GLYPH = {
@@ -3532,8 +3536,8 @@ class App:
         self.fleet: dict[str, Any] | None = None
         self.dags: list[dict[str, Any]] = []
         # the trigger the daemon has not answered: (workflow, values as
-        # JSON, requestId); see _trigger_request_id
-        self._trigger_request: tuple[str, str, str] | None = None
+        # JSON, requestId, time last sent); see _trigger_request_id
+        self._trigger_request: tuple[str, str, str, float] | None = None
         self.state_data: dict[str, Any] | None = None
         self.node: dict[str, Any] | None = None
         self.connected = False
@@ -5453,14 +5457,25 @@ class AppActions(App):
         """The ``requestId`` for a trigger of ``name`` with ``params``.
 
         A trigger keeps its ID until the daemon answers it, so the same
-        trigger sent again after a timeout names the same run. A trigger
-        of another workflow or with other values takes a new ID.
+        trigger sent again after a timeout names the same run. It takes a
+        new ID once :data:`TRIGGER_REQUEST_HOLD_S` have passed since it was
+        last sent, and so does a trigger of another workflow or with other
+        values.
         """
         key = (name, json.dumps(params or {}, sort_keys=True))
+        # wall clock, so the time a suspended machine sleeps counts
+        now = time.time()
         held = self._trigger_request
-        if held is None or held[:2] != key:
-            held = self._trigger_request = (*key, os.urandom(16).hex())
-        return held[2]
+        if (
+            held is None
+            or held[:2] != key
+            or now - held[3] > TRIGGER_REQUEST_HOLD_S
+        ):
+            request_id = os.urandom(16).hex()
+        else:
+            request_id = held[2]
+        self._trigger_request = (*key, request_id, now)
+        return request_id
 
     async def dag_trigger_or_prompt(self, name: str) -> None:
         """Trigger ``name``, or open its parameter row when it declares
@@ -5511,7 +5526,8 @@ class AppActions(App):
                 "fail",
                 None,
                 "trigger %s: no answer from the daemon; send the same "
-                "trigger again, and the run starts only once" % name,
+                "trigger again within %d minutes, and the run starts only "
+                "once" % (name, TRIGGER_REQUEST_HOLD_S // 60),
             )
             return False
         except Exception as exc:  # noqa: BLE001

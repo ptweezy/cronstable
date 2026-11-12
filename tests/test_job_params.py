@@ -845,6 +845,30 @@ async def test_forbid_holds_a_due_retry_behind_a_start_with_values(
     await _stop_run(cron, retry)
 
 
+async def test_an_ended_start_with_values_holds_no_due_retry(
+    dag_cron, tmp_path
+):
+    cron = await dag_cron(
+        _ladder_yaml(policy="Forbid", delay=0, once=tmp_path / "once")
+    )
+    ladder = await _arm_ladder(cron)
+    await cron.start_job("report", {"region": "us", "act": "pass"})
+    (one_off,) = cron.running_jobs["report"]
+    await one_off.wait()
+    # the one-off has ended, and the reaper has yet to record it
+    assert one_off.ended and cron.running_jobs["report"] == [one_off]
+    # Forbid admits a run again, so the retry launches on this check
+    await _step_retry(ladder)
+    assert ladder.task.done() and not ladder.task.cancelled()
+    (retry,) = [r for r in cron.running_jobs["report"] if r is not one_off]
+    assert retry.retry_state is ladder and not retry.supplied_params
+    await _drain_pending(cron)
+    assert (await _retry_records(cron))[-1] == ("settled", "launched", 1)
+    await _up(retry)
+    await _stop_run(cron, retry)
+    assert cron.running_jobs.get("report") in (None, [])
+
+
 def _due_mid_start(cron, monkeypatch, ladder, reload=None):
     """Make ``ladder``'s retry come due while a start with supplied values
     holds the job's launch lock, before the start spawns. ``reload`` runs

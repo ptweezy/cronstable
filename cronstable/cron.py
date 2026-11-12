@@ -15617,11 +15617,12 @@ class Cron:
         """Why ``job``'s due retry has to wait, or ``None`` when it may go.
 
         A pause holds it until the job resumes. Under concurrencyPolicy:
-        Forbid, an instance with supplied values that runs on this node
-        holds it too. That run is outside the ladder, so a launch that
-        Forbid refused behind it would spend the attempt with nothing left
-        to arm the next one. A pooled retry waits in its queue entry
-        instead (see PoolScheduler._tick_pool).
+        Forbid, a live instance with supplied values on this node holds it
+        too. That run is outside the ladder, so a launch that Forbid
+        refused behind it would spend the attempt with nothing left to arm
+        the next one. An instance that has ended holds neither Forbid nor
+        the retry (see _live_instances). A pooled retry waits in its queue
+        entry instead (see PoolScheduler._tick_pool).
         """
         pause = self._pause_active(job.name)
         if pause is not None:
@@ -15631,7 +15632,7 @@ class Cron:
             and job.concurrencyPolicy == "Forbid"
             and any(
                 getattr(running, "supplied_params", False)
-                for running in self.running_jobs.get(job.name) or ()
+                for running in self._live_instances(job.name)
             )
         ):
             return (

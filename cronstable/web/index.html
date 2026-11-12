@@ -5499,7 +5499,7 @@ var qrcode = function() {
     connected: true,
     auth: null,                // /whoami payload; null until the probe resolves (scope-aware chrome)
     paramForm: null,           // the open run-parameters dialog: { dag, decl, backfill }
-    triggerRequest: null,      // the trigger the server has not answered: { key, id } (see triggerRequestId)
+    triggerRequest: null,      // the trigger the server has not answered: { key, id, at } (see triggerRequestId)
     clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
     clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     nodeLimits: null,          // /node `limits`: the caps this host can apply; null until known
@@ -11460,19 +11460,26 @@ var qrcode = function() {
   }
   // A trigger's requestId. The server derives the run key from it, so a
   // trigger sent again with the same ID returns the first run. A trigger
-  // keeps its ID until the server answers it. A trigger of another workflow
-  // or with other values takes a new ID.
+  // keeps its ID until the server answers it. It takes a new ID once
+  // TRIGGER_REQUEST_HOLD_MS have passed since it was last sent, and so does
+  // a trigger of another workflow or with other values.
+  const TRIGGER_REQUEST_HOLD_MS = 10 * 60 * 1000;
   function triggerRequestId(name, params) {
     const key = JSON.stringify([name, params || {}]);
-    if (!state.triggerRequest || state.triggerRequest.key !== key) {
+    const held = state.triggerRequest;
+    // wall clock, so the time a suspended machine sleeps counts
+    const now = Date.now();
+    let id = held && held.key === key && now - held.at <= TRIGGER_REQUEST_HOLD_MS ? held.id : "";
+    if (!id) {
       const bytes = new Uint8Array(16);
       // crypto.randomUUID needs a secure context, and this page is often
       // served over plain HTTP
       if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
       else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-      state.triggerRequest = { key: key, id: Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("") };
+      id = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
     }
-    return state.triggerRequest.id;
+    state.triggerRequest = { key: key, id: id, at: now };
+    return id;
   }
   // An error response as { error, paramErrors }. 4xx bodies are the uniform
   // JSON envelope; the raw-text fallback keeps an older daemon's plain body.
@@ -11518,7 +11525,7 @@ var qrcode = function() {
     } catch (e) {
       // the server may have the request; the held requestId makes the same
       // trigger return that run
-      if (e.message !== "unauthorized") toast("warn", "trigger got no answer; trigger " + name + " again with the same values, and the run starts only once");
+      if (e.message !== "unauthorized") toast("warn", "trigger got no answer; trigger " + name + " again with the same values within " + TRIGGER_REQUEST_HOLD_MS / 60000 + " minutes, and the run starts only once");
     }
     return null;
   }

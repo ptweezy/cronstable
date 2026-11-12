@@ -154,8 +154,9 @@ The TUI includes:
   row stays open with its text. The line under the row shows the daemon's
   reasons, such as `batch_size must be at least 1; ticket is required`,
   until you edit the text. Each trigger carries a `requestId` that the
-  dashboard keeps until the daemon answers, so the same trigger sent again
-  after a timeout starts one run. One backfill covers at most 100 scheduled
+  dashboard keeps until the daemon answers, for up to 10 minutes after the
+  trigger was last sent. The same trigger sent again within that time
+  starts one run. One backfill covers at most 100 scheduled
   dates. For a longer range, the row stays open on the rest of the range,
   and `Enter` continues. While another live host on the shared store runs a
   build below the

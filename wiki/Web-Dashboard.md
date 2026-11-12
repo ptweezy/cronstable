@@ -327,10 +327,12 @@ is the DAG's `fleetWarnings` from `GET /dags`.
 **Trigger** (and the card's **Run** button) starts a manual run now with
 [`POST /dags/{name}/trigger`](HTTP-API#post-dagsnametrigger). In the drawer, the
 new run is selected as soon as it is created. Each trigger carries a
-`requestId` that the page keeps until the daemon answers. When a trigger
-gets no answer, trigger the workflow again with the same values: the daemon
+`requestId` that the page keeps until the daemon answers, for up to 10
+minutes after the trigger was last sent. When a trigger gets no answer,
+trigger the workflow again with the same values within that time: the daemon
 returns the run that the first request created, or starts it if that
-request never arrived. **▦ Backfill** opens a from/to ISO
+request never arrived. After 10 minutes, the same trigger is a new request
+and starts a run of its own. **▦ Backfill** opens a from/to ISO
 date-range form wired to
 [`POST /dags/{name}/backfill`](HTTP-API#post-dagsnamebackfill). Its
 confirmation shows how many runs the backfill created and how many dates

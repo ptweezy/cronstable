@@ -580,7 +580,7 @@ def test_trigger_failures_are_reported(browser, tmp_path):
             assert "warn" in e2e.wait_toast(
                 page,
                 "trigger got no answer; trigger plain again with the same "
-                "values, and the run starts only once",
+                "values within 10 minutes, and the run starts only once",
             )
         assert daemon.api("GET", "/dags/plain/runs")[1]["runs"] == []
 
@@ -614,6 +614,45 @@ def test_a_trigger_sent_again_after_no_answer_starts_one_run(
             assert _request_ids(page, path) == [lost, lost]
             assert len(daemon.api("GET", "/dags/plain/runs")[1]["runs"]) == 1
             # the daemon answered, so the next trigger is a new request
+            _click(page, button)
+            assert "ok" in e2e.wait_toast(page, "▶ triggered plain")
+            assert _request_ids(page, path)[-1] != lost
+        assert len(daemon.api("GET", "/dags/plain/runs")[1]["runs"]) == 2
+
+
+def test_an_unanswered_trigger_is_a_new_request_ten_minutes_later(
+    browser, tmp_path
+):
+    path = "/dags/plain/trigger"
+    button = '#dagRows [data-dagtrigger="plain"]'
+    dags = [e2e.diamond_dag("plain", gate=False)]
+    with e2e.Daemon(tmp_path, dags=dags) as daemon:
+        with e2e.open_page(
+            browser,
+            daemon.url,
+            before_goto=lambda page: page.clock.install(),
+        ) as page:
+            page.faults.record()
+            page.wait_for_selector(button)
+            page.faults.abort(path, times=3)
+            _click(page, button)
+            assert "warn" in e2e.wait_toast(page, "trigger got no answer")
+            # each send inside the ten minutes keeps the ID and starts the
+            # ten minutes again
+            for sent in (2, 3):
+                page.clock.fast_forward(9 * 60 * 1000)
+                _click(page, button)
+                e2e.wait_until(
+                    lambda sent=sent: len(_request_ids(page, path)) == sent,
+                    page,
+                )
+            (lost,) = set(_request_ids(page, path))
+            # the daemon had the request, and created its run
+            assert daemon.api("POST", path, body={"requestId": lost})[1][
+                "created"
+            ]
+            # past the ten minutes, the same trigger starts a run of its own
+            page.clock.fast_forward(11 * 60 * 1000)
             _click(page, button)
             assert "ok" in e2e.wait_toast(page, "▶ triggered plain")
             assert _request_ids(page, path)[-1] != lost

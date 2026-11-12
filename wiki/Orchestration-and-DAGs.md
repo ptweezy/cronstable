@@ -712,8 +712,9 @@ curl -X POST http://127.0.0.1:8080/dags/deploy/trigger \
   is compared with the stored values after defaults are applied, so it
   answers `409` when a reload changed a default in between. The web
   dashboard and the terminal dashboard send a `requestId` with every
-  trigger and keep it until the daemon answers, so a trigger that you send
-  again after a timeout starts one run.
+  trigger. They keep it until the daemon answers, for up to 10 minutes after
+  the trigger was last sent, so a trigger that you send again within that
+  time starts one run.
 
 The [web dashboard](Web-Dashboard#dag-orchestration) opens a form for a workflow
 that declares parameters, the [terminal dashboard](Terminal-Dashboard) takes

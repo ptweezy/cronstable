@@ -3545,8 +3545,8 @@ async def test_dag_action_error_and_status_paths(tmp_path):
     app.api.post = _raise_timeout
     await app.dag_trigger("d")
     assert _msgs(app)[-1] == (
-        "trigger d: no answer from the daemon; send the same trigger again,"
-        " and the run starts only once"
+        "trigger d: no answer from the daemon; send the same trigger again"
+        " within 10 minutes, and the run starts only once"
     )
     app.api.post = _post_status(500)
     await app.dag_trigger("d")
@@ -7564,6 +7564,34 @@ async def test_a_trigger_keeps_its_request_id_until_the_daemon_answers(
     await asyncio.sleep(0.05)
 
 
+async def test_an_unanswered_trigger_takes_a_new_request_id_after_the_hold(
+    tmp_path, monkeypatch
+):
+    app = _param_app(tmp_path)
+    app.dags = [{"name": "d", "params": _DECLARED}]
+    sent = []
+    clock = [1000.0]
+    monkeypatch.setattr(tui.time, "time", lambda: clock[0])
+
+    async def post(path, body=None):
+        sent.append(body["requestId"])
+        raise TimeoutError
+
+    app.api.post = post
+    values = {"ticket": "OPS-1"}
+    assert not await app.dag_trigger("d", values)
+    # each send starts the hold again
+    for _ in range(3):
+        clock[0] += tui.TRIGGER_REQUEST_HOLD_S
+        assert not await app.dag_trigger("d", values)
+    assert len(set(sent)) == 1
+    # past the hold, the same trigger is a new request
+    clock[0] += tui.TRIGGER_REQUEST_HOLD_S + 1
+    assert not await app.dag_trigger("d", values)
+    assert sent[-1] != sent[-2]
+    await asyncio.sleep(0.05)
+
+
 _UNCONFIRMED = (
     "the daemon did not confirm the values, so the run may use the defaults"
 )
@@ -8001,7 +8029,8 @@ async def test_each_input_row_shows_why_its_commit_failed(tmp_path, cols):
     app.toasts = []
     assert (
         "run with: ▌ trigger deploy: no answer from the daemon; send the"
-        " same trigger again, and the run starts only once ─"
+        " same trigger again within 10 minutes, and the run starts only"
+        " once ─"
     ) in _drawer_text(app)
     # the row closes with its drawer and opens again with the hint
     await app.handle_key("esc")

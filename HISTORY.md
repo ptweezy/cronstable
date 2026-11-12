@@ -3,86 +3,153 @@
 ## 1.2.76
 
 - The `-fedora` image is built on Fedora 45 and runs Python 3.15.
-- A job or a workflow declares run parameters under `params:`, each with a
-  type and constraints such as `allowed` or `pattern`. A manual start, a
-  trigger, or a backfill supplies values, and a command reads them from
-  `CRONSTABLE_PARAM_<NAME>` variables or with `cronstable param`. With
-  scoped tokens, choosing values needs the `params` scope in addition to
-  `control`.
-- At load, the daemon logs a warning for a parameter `pattern` that holds a
-  repeat inside an unbounded repeat with nothing required between them, as
-  `(a+)+` does. Checking a value against such a pattern can take time that
-  grows exponentially with the length of the value.
-- At load, the daemon logs a warning for a command that reads a
-  `CRONSTABLE_PARAM_*` variable its job or workflow does not declare, for a
-  `cmd.exe` command that holds `%CRONSTABLE_PARAM_<NAME>%` for a string
-  parameter with no `allowed` list and no `pattern`, and for a task whose
-  `skipExitCodes` holds `1`, `2`, `126`, or `127`.
-- The run of a manual job start that supplies values records the label of
-  the requesting token as `triggeredBy`, and the daemon logs the parameter
-  names and the label.
-- A workflow branches on skipped tasks. A task ends `skipped` when its
-  command exits with a code in its `skipExitCodes`, or before it starts
-  when a `when:` comparison on a run parameter or an XCom value does not
-  hold. A comparison tests equality, as `equals` and `in` do, or compares
-  numbers, as `lessThan` and `greaterThan` do. The trigger rules
-  `none_failed`, `none_failed_min_one_success`, and
-  `all_done_min_one_failed` join branches and run failure handlers, and a
-  skipped task records why in `skipReason`.
-- A workflow task reads its run's logical date, in UTC, from
-  `CRONSTABLE_DAG_LOGICAL_DATE`. A command that branches on that date takes
-  the same branch in a backfill, a catch-up run, and a recovery run.
-- A workflow that uses `params:`, `when:`, `skipExitCodes`, or one of those
-  trigger rules needs run engine level 2, and its runs record `engine: 2`.
-  An earlier release refuses such a configuration, and it advances a level 2
-  run under the rules it knows. On a store that several nodes share, upgrade
-  every node before a configuration uses one of the keys.
-- The web dashboard and the terminal dashboard show a workflow's
-  `fleetWarnings`: each live host on the shared store that runs a build
-  below the run engine level the workflow needs.
-- `POST /jobs/{name}/start` and `POST /dags/{name}/trigger` answer `400` for
-  a body that is not a JSON object or that holds a field the route does not
-  take, and `POST /dags/{name}/backfill` answers `400` for a field in
-  addition to `from`, `to`, and `params`. Nothing starts, and the daemon
-  logs each refusal as a warning. The body is optional on the start and
-  trigger routes.
-- A backfill's `created` counts the runs that the request created, and
-  `existing` counts the dates that already had a run. `runKeys` and
-  `existingRunKeys` list them, so a repeated backfill answers `created: 0`.
-- A backfill of a range that holds more than 100 scheduled dates answers
-  `truncated: true` and `nextFrom`, the `from` of the request that
-  continues. The dashboards keep the backfill open on the rest of the range.
-- The web dashboard and the terminal dashboard send a `requestId` with each
-  workflow trigger, so sending a trigger again after a timeout starts one
-  run. Both warn when the daemon's answer does not confirm the values that a
-  start or a trigger chose.
-- Backfill and failed-dates recovery read `from` and `to` as RFC 3339 dates
-  or date-times, such as `2026-01-05` or `2026-01-05T02:00:00+00:00`, on
-  every Python version. They refuse the ISO 8601 basic and week forms, such
-  as `20260105T020000Z`.
-- A mapped task whose list is empty waits for every upstream and then
-  follows its `triggerRule` as a single task does, so its downstream tasks
-  wait as well. Under the default rule, it ends `upstream_failed` when
-  another upstream fails.
+- Jobs and workflows can declare run parameters under `params:`. Each
+  parameter is a `string`, `integer`, `number`, or `boolean` with a default
+  and optional constraints: `allowed`, `minimum`, `maximum`, `pattern`, and
+  `maxLength`. A workflow without a schedule can mark a parameter
+  `required: true` in place of a default. You supply values when you start
+  a job, trigger a workflow, or run a backfill, and a run that gets none
+  uses the defaults. A value that doesn't fit the declaration returns `400`
+  with the reason under `paramErrors`, and nothing starts.
+- A command reads its run's values from `CRONSTABLE_PARAM_<NAME>`
+  environment variables, or by running `cronstable param`, which needs a
+  `state:` section. Every workflow task, and every job that declares
+  `params`, gets only its own run's values: a `CRONSTABLE_PARAM_*` variable
+  in the daemon's environment isn't passed on. Anyone with the `view` scope
+  can read a run's values, so keep secrets in `secrets:`. A parameter whose
+  name ends in a word such as `password` or `token` is a configuration
+  error.
+- With scoped tokens, supplying values needs the `params` scope as well as
+  `control`. A token without `params` can still start, trigger, and
+  backfill with the defaults, and gets a `403` when its request carries
+  values. `GET /whoami` reports `allScopes: false` for a token that has
+  `view`, `control`, and `approve` but not `params`.
+- A job run that was started with values is a single attempt outside the
+  job's retry sequence. Its failure isn't retried, and its success or
+  cancellation leaves a pending retry in place. The run records the
+  requesting token's label as `triggeredBy`, and so does a workflow run
+  that a trigger or a backfill created.
+- Workflows can branch. A task ends `skipped` when its command exits with a
+  code listed in its `skipExitCodes`, or when a `when:` condition on a run
+  parameter or an upstream XCom value isn't met, in which case the command
+  never starts. A condition tests for equality with `equals`, `notEquals`,
+  `in`, or `notIn`, or compares numbers with `lessThan`, `lessThanOrEqual`,
+  `greaterThan`, or `greaterThanOrEqual`. The task's `skipReason` records
+  why, and both dashboards show it.
+- A `triggerRule` joins the branches back together. `none_failed` runs a
+  task when no upstream failed, even if some were skipped.
+  `none_failed_min_one_success` also requires at least one upstream to
+  succeed. `all_done_min_one_failed` runs a task only when an upstream
+  failed, which makes it a failure handler. Under the default
+  `all_success`, a skipped upstream skips the task too.
+- `skipExitCodes` and `when:` also work on sensors and mapped tasks, and
+  `when:` works on approval gates. A gate whose condition isn't met is
+  skipped without asking anyone to decide, and a mapped task whose condition
+  isn't met creates no instances. A skip uses no retry attempt, runs no
+  `verify` step, and fires neither `onFailure` nor `onSuccess`.
+- A `when:` condition is a configuration error when it names an undeclared
+  parameter, compares against a value the parameter can never hold, or
+  reads XCom from a task that is mapped or isn't upstream. A misspelled
+  value such as `equals: ful` fails the load.
+- Every workflow task gets its run's logical date in
+  `CRONSTABLE_DAG_LOGICAL_DATE`, as a UTC timestamp such as
+  `2026-01-05T02:00:00+00:00`. A backfill, catch-up, or recovery run can
+  start days after the date it stands for, so use this variable in a
+  command that depends on the date. It's empty for a manual run that was
+  triggered without a `logicalDate`.
+- A workflow that uses `params:`, `when:`, `skipExitCodes`, or a
+  `triggerRule` other than `all_success` and `all_done` needs run engine
+  level 2. An earlier release refuses such a configuration, and if it picks
+  up a level 2 run, it ignores the run's conditions and parameters. On a
+  state store that several nodes share, upgrade every node before any
+  configuration uses these keys.
+- While a live host on a shared store runs a build below the level a
+  workflow needs, `GET /dags` names the host in the workflow's
+  `fleetWarnings`, and both dashboards show the warning.
+- `GET /dags` returns each task's `skipExitCodes` and `when:` conditions. A
+  run document records `engine: 2` for a workflow that needs level 2, and
+  `whenMet: true` on a task whose conditions were met.
+- At load, the daemon warns about three parameter problems: a `pattern`
+  with nested repeats such as `(a+)+`, which can take exponential time to
+  check; a command that reads a `CRONSTABLE_PARAM_*` variable that its job
+  or workflow doesn't declare; and a `cmd.exe` command that expands
+  `%CRONSTABLE_PARAM_<NAME>%` for a string parameter with no `allowed` list
+  or `pattern`, because `cmd.exe` can run part of the value as a command.
+- The daemon also warns at load about `skipExitCodes` that include `1`,
+  `2`, `126`, or `127`, because a broken command exits with those codes
+  too, and about an `all_success` task that joins branches that can skip,
+  because one skipped branch skips the join. A configuration with any of
+  these warnings still loads.
+- `POST /jobs/{name}/start`, `POST /dags/{name}/trigger`, and
+  `POST /dags/{name}/backfill` return `400`, start nothing, and log a
+  warning for a body that isn't a JSON object or that has a field the route
+  doesn't accept, so a misspelled `params` key can't start a run with the
+  defaults. The body is optional on start and trigger.
+- On a trigger, `logicalDate` sets the date that a manual run stands for,
+  and `requestId` makes the request safe to repeat: a second request with
+  the same ID returns the first run with `created: false`. The same ID with
+  other parameters or another date returns `409`.
+- A backfill response counts the runs that the request created (`created`,
+  `runKeys`) separately from the dates that already had a run (`existing`,
+  `existingRunKeys`), so repeating a backfill returns `created: 0`. One
+  request covers at most 100 scheduled dates. For a longer range, the
+  response has `truncated: true` and `nextFrom`, the `from` to send next.
+- Backfill, failed-dates recovery, and a trigger's `logicalDate` take RFC
+  3339 dates or date-times, such as `2026-01-05` or
+  `2026-01-05T02:00:00+00:00`, and read a value with no offset as UTC. They
+  refuse the ISO 8601 basic form, such as `20260105T020000Z`, and week
+  dates.
+- When a manual start of a `concurrencyPolicy: Replace` job has to wait for
+  another node to yield the job's cluster concurrency slot,
+  `POST /jobs/{name}/start` returns `200` with `pending: true`, and the run
+  starts when the slot frees.
+- The MCP tools `cron_run_job`, `cron_trigger_dag`, and `cron_backfill_dag`
+  take a `params` argument, and `cron_trigger_dag` also takes
+  `logical_date` and `request_id`. `cron_backfill_dag` returns the same
+  counts and `truncated` flag as the HTTP route. `cron_list_jobs` and
+  `cron_list_dags` return each `params` declaration, as `GET /jobs` and
+  `GET /dags` do.
+- A recovery run reuses its source run's parameter values, and the preview
+  lists them. With scoped tokens, executing a recovery needs the `params`
+  scope when a stored value differs from its declared default. Recovery
+  returns `409` when the stored values don't fit the current declaration.
+- A recovery run keeps a skipped branch skipped, and the preview lists those
+  tasks under `preservedSkipped`. To decide a branch again, recover from the
+  task that skipped: its command runs again, or its `when:` condition is
+  read again.
+- For a job or workflow that declares parameters, the web dashboard's Run,
+  Trigger, and backfill buttons open a form with a field for each
+  parameter. In the terminal dashboard, `r` and `t` open a row that takes
+  `name=value` pairs, and the backfill row takes the same pairs after its
+  dates. When the daemon refuses a request, the form or row stays open and
+  shows the daemon's reasons.
+- Both dashboards send a `requestId` with each workflow trigger and keep it
+  until the daemon answers, for up to 10 minutes after the last attempt, so
+  you can send an unanswered trigger again without starting a second run.
+  Both warn when the daemon's response doesn't confirm the values you sent
+  with a start or a trigger.
+- After a backfill, the dashboards report how many runs it created and how
+  many dates already had one, and they keep the backfill open on the rest
+  of a truncated range. They also show a workflow run's parameter values
+  and mark each task that has a `when:` condition or a trigger rule other
+  than `all_success`. The web dashboard's History tab lists the values each
+  job run took and the token that supplied them.
+- A mapped task whose list is empty waits for all of its upstreams and then
+  follows its `triggerRule`, as any other task does, so it can end
+  `skipped` or `upstream_failed`.
 - Workflow catch-up counts missed dates from the latest scheduled or
-  catch-up run. A manual run, a backfill, and a recovery leave that point
-  where it is. Retention always keeps the run that holds it, which can be
-  one terminal run beyond `retainRuns`.
-- When another node takes over a workflow run while a node reads from the
-  state store before it starts tasks, for example the XCom values for a
-  mapped task's list or a `when:` comparison, the first node starts none of
+  catch-up run. Manual runs, backfills, and recovery runs don't move that
+  starting point. Retention always keeps that run, so a workflow can hold
+  one terminal run more than `retainRuns`.
+- If another node takes over a workflow run while a node is reading XCom
+  values for it or preparing a recovery run, the first node starts none of
   the run's tasks.
-- `GET /whoami` reports `allScopes: false` for a token that lists `view`,
-  `control`, and `approve`, because `params` is a fourth scope. Such a token
-  passes every route's check and starts runs with the declared parameter
-  defaults.
-- The Sentry reporter's client sends the daemon's error events with their
-  tracebacks and without the local variables of the stack frames or the
-  body of an HTTP request.
-- In the terminal dashboard, a job start, a trigger, or a backfill that the
-  daemon refuses keeps its input row open with its text and shows the
-  daemon's reasons under the row. The toast leads with the same reasons, and
-  long input scrolls so that the cursor stays in view.
+- A daemon that refuses a reloaded configuration keeps running its
+  durable-state chores: it writes its store manifest, collects garbage, and
+  claims retries from other nodes.
+- The Sentry reporter's client sends the daemon's error events without the
+  local variables of the stack frames and without HTTP request bodies, so
+  neither can carry a parameter value to Sentry.
 
 ## 1.2.75
 
