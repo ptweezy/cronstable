@@ -90,6 +90,10 @@ def authenticate(env):
         raise ValueError(
             "WINGET_TOKEN must be a classic PAT with public_repo or repo scope"
         )
+    # wingetcreate syncs the fork before it opens the PR. GitHub rejects a
+    # sync that carries upstream workflow changes without this scope.
+    if "workflow" not in scopes:
+        raise ValueError("WINGET_TOKEN classic PAT needs workflow scope")
 
 
 def authenticate_pypi(env):

@@ -1437,6 +1437,34 @@ def test_configured_release_token_still_requires_access(
         )
 
 
+@pytest.mark.parametrize(
+    "scopes, error",
+    [
+        ("public_repo, workflow", None),
+        ("repo, workflow", None),
+        ("public_repo", "WINGET_TOKEN.*workflow"),
+        ("workflow", "WINGET_TOKEN.*public_repo"),
+    ],
+)
+def test_winget_token_requires_fork_sync_scopes(
+    monkeypatch, release_env, scopes, error
+):
+    pre = load("release_preflight")
+
+    def github(path, credential):
+        if path == "user":
+            return {}, {"X-OAuth-Scopes": scopes}
+        return {"permissions": {"push": True}}, {"X-OAuth-Scopes": "repo"}
+
+    monkeypatch.setattr(pre, "github", github)
+    env = dict(release_env, GITHUB_REPOSITORY="ptweezy/cronstable")
+    if error is None:
+        pre.authenticate(env)
+    else:
+        with pytest.raises(ValueError, match=error):
+            pre.authenticate(env)
+
+
 def test_pypi_preflight_exchanges_identity_without_publishing(monkeypatch):
     pre = load("release_preflight")
     calls = []

@@ -4511,8 +4511,10 @@ jobs:
           git push
 
   # Submit ptweezy.cronstable to microsoft/winget-pkgs from the manifests
-  # sign-windows validated. WINGET_TOKEN (classic PAT, public_repo scope) is
-  # required; its account owns the fork and the PRs.
+  # sign-windows validated. WINGET_TOKEN (classic PAT, public_repo and
+  # workflow scopes) is required; its account owns the fork and the PRs.
+  # wingetcreate syncs the fork first, and GitHub rejects a sync that carries
+  # upstream workflow changes for a token without the workflow scope.
   winget:
     needs: [version, release, sign-windows]
     if: needs.version.outputs.release == 'true'
@@ -4565,7 +4567,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${WINGET_TOKEN:-}" ]; then
-            echo "::error::WINGET_TOKEN is not set; the winget manifest would go stale. Add it as a repo secret (a GitHub PAT with public_repo scope)." >&2
+            echo "::error::WINGET_TOKEN is not set; the winget manifest would go stale. Add it as a repo secret (a classic GitHub PAT with public_repo and workflow scopes)." >&2
             exit 1
           fi
           # The limits make a stalled download fail, so the curl retries
