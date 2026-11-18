@@ -956,8 +956,8 @@ jobs:
             runner: ubuntu-26.04
             platform: linux/amd64
             image: quay.io/pypa/manylinux2014_x86_64:2026.08.15-1
-            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.14.8+20261009-x86_64-unknown-linux-gnu-install_only.tar.gz'
-            pysha: '83f9cb480b702548c592443f86209cf0fc03448d90692df257f095c01791dccc'
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.15.2+20261110-x86_64-unknown-linux-gnu-install_only.tar.gz'
+            pysha: '182e7adf7e4f0e32dafac5143f00d466afd20eef45918ea170f78884e503ac18'
             floor: '2.17'
             # 64-bit, little-endian, EM_X86_64.
             archspec: elf:2:1:62
@@ -971,8 +971,8 @@ jobs:
             runner: ubuntu-26.04
             platform: linux/amd64
             image: quay.io/pypa/manylinux2014_x86_64:2026.08.15-1
-            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.14.8+20261009-x86_64_v3-unknown-linux-gnu-install_only.tar.gz'
-            pysha: '37f748ae662fb29f7716242ea214ac7cd64cbea545eab4eb2de16ab0b1447e68'
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.15.2+20261110-x86_64_v3-unknown-linux-gnu-install_only.tar.gz'
+            pysha: 'f63f23275c9ab41e59ded3d64f1efe00f51f7a2034f043e029e0c6a521a1e88e'
             floor: '2.17'
             archspec: elf:2:1:62
             nacl: hard
@@ -983,8 +983,8 @@ jobs:
             runner: ubuntu-26.04-arm
             platform: linux/arm64
             image: quay.io/pypa/manylinux2014_aarch64:2026.08.15-1
-            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.14.8+20261009-aarch64-unknown-linux-gnu-install_only.tar.gz'
-            pysha: '2a99838d2ba71c91d9c72929ee73cdfad2ccd093d7746a14094f50e583989ec3'
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.15.2+20261110-aarch64-unknown-linux-gnu-install_only.tar.gz'
+            pysha: '362378c07e01f1d7b18406760ace75e794c21dfff3693535b1bbffe88eec2e52'
             floor: '2.17'
             archspec: elf:2:1:183   # 64-bit, little-endian, EM_AARCH64
             nacl: hard
@@ -998,8 +998,8 @@ jobs:
             # manylinux_2_28: the only ppc64le cryptography wheel is tagged
             # manylinux_2_28, so the floor here is 2.28 (RHEL 8, Debian 10).
             image: quay.io/pypa/manylinux_2_28_ppc64le:2026.08.15-1
-            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.14.8+20261009-ppc64le-unknown-linux-gnu-install_only.tar.gz'
-            pysha: '378833ef071e097935f96ba2e1ee3fb0623f4bfd1ae69fe49bfdcee79637eb4a'
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.15.2+20261110-ppc64le-unknown-linux-gnu-install_only.tar.gz'
+            pysha: 'd9af6aa7469ddfe82b6f51ad7c32565368aa124cdc83863ccae746c5a0535a73'
             floor: '2.28'
             archspec: elf:2:1:21    # 64-bit, little-endian, EM_PPC64
             nacl: soft
@@ -1011,8 +1011,8 @@ jobs:
             platform: linux/s390x
             qemu: true
             image: quay.io/pypa/manylinux2014_s390x:2026.08.15-1
-            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.14.8+20261009-s390x-unknown-linux-gnu-install_only.tar.gz'
-            pysha: 'e7dec125d83b556789f6b4a3bdadf60d2c18b0ad517bd30620d90651b7cb403f'
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.15.2+20261110-s390x-unknown-linux-gnu-install_only.tar.gz'
+            pysha: 'd5ad8401c18d8d08f27aacf80c37530388f3e64d39be375ff7932273c1215154'
             floor: '2.17'
             archspec: elf:2:2:22    # 64-bit, BIG-endian, EM_S390
             nacl: soft
@@ -1029,8 +1029,8 @@ jobs:
             qemu: true
             # No manylinux2014 armv7l image exists; this one sets a 2.31 floor.
             image: quay.io/pypa/manylinux_2_31_armv7l:2026.08.15-1
-            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.14.8+20261009-armv7-unknown-linux-gnueabihf-install_only.tar.gz'
-            pysha: '803714458e62af8a78f33d4b1ddd83fad35ccc1c313e2214ac0fb3f85b364e2f'
+            pyurl: 'https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.15.2+20261110-armv7-unknown-linux-gnueabihf-install_only.tar.gz'
+            pysha: 'fdd489fc5072028cd4d1d353bba4ee33b1eec8fb6c0aa47e7e32e0ea13ed126b'
             floor: '2.31'
             archspec: elf:1:1:40    # 32-bit, little-endian, EM_ARM
             # Hard-float, and nothing in the bundle may need above ARMv7.
@@ -1145,9 +1145,10 @@ jobs:
               # else a source build. verify_extra.py uninstalls a build that
               # cannot run a loop (QEMU can miscompile), leaving asyncio.
               sh pyinstaller/install_extra.sh uvloop "@" soft "using asyncio"
-              # Bundle orjson (the `speedups` extra): a wheel on amd64/arm64,
-              # else a Rust build via RUST_SETUP. Without either, the binary
-              # uses the byte-compatible stdlib encoder in cronstable/_json.
+              # Bundle orjson (the `speedups` extra): a Rust build via
+              # RUST_SETUP, because the cp315 orjson wheels for glibc need
+              # glibc 2.39 or later. Without Rust, the binary uses the
+              # byte-compatible stdlib encoder in cronstable/_json.
               RUST_SETUP=""
               if [ "${{ matrix.rust }}" = "1" ]; then
                 RUST_SETUP="$RUST_SETUP_CMD"
@@ -1297,7 +1298,7 @@ jobs:
           # limits on each rustup download make a stalled attempt fail, so
           # curl and `retry` both retry it.
           - libc: musl
-            image: python:3.14-alpine3.23
+            image: python:3.15-alpine3.23
             suffix: -musl
             toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev'
             nacl_tools: 'retry 3 apk add --no-cache libffi-dev make >/dev/null 2>&1 || true'
@@ -1308,7 +1309,7 @@ jobs:
             pq_tools: 'retry 5 apk add --no-cache rust cargo openssl-dev pkgconf'
           - libc: glibc
             # Overridden per row: bookworm for i686, trixie for riscv64.
-            image: python:3.14-slim-trixie
+            image: python:3.15-slim-trixie
             suffix: ''
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev'
             nacl_tools: 'retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true'
@@ -1350,7 +1351,7 @@ jobs:
           # build for the manylinux route. riscv64 needs trixie for the port.
           - libc: glibc
             arch: i686
-            image: python:3.14-slim-bookworm
+            image: python:3.15-slim-bookworm
             floor: '2.36'
             # bookworm has OpenSSL 3.0 and rustc 1.63 (cryptography needs 3.5
             # and 1.83), so pq_openssl builds with rustup Rust and a static
@@ -1361,7 +1362,7 @@ jobs:
             pq_openssl: '1'
             pq_tools: 'retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates perl make pkg-config'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --default-host i686-unknown-linux-gnu --profile minimal --no-modify-path'
-          - {libc: glibc, arch: riscv64, image: python:3.14-slim-trixie, floor: '2.41', pq: soft, pq_src: '1'}
+          - {libc: glibc, arch: riscv64, image: python:3.15-slim-trixie, floor: '2.41', pq: soft, pq_src: '1'}
     runs-on: ${{ matrix.runner }}
     steps:
       # Shallow checkout; see the dist job.
@@ -1532,7 +1533,7 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-  # Self-contained MIPS binaries. Its own job because no `python:3.14-*` image
+  # Self-contained MIPS binaries. Its own job because no `python:3.15-*` image
   # has a mips variant: the base is Debian, Python comes from apt (3.11, the
   # newest for this port), and the build uses a venv because bookworm marks
   # that interpreter externally managed (PEP 668).
@@ -1660,7 +1661,7 @@ jobs:
   # Self-contained binaries for the legacy 32-bit ARM ABIs, both glibc:
   # hard-float ARMv6 (Raspberry Pi 1 and Zero) and soft-float armel (Kirkwood
   # NAS boxes). Debian armhf is ARMv7, so no `library/debian` or
-  # `python:3.14-*` image can supply an ARMv6 base; Python comes from apt
+  # `python:3.15-*` image can supply an ARMv6 base; Python comes from apt
   # (3.11), as on MIPS. PyPI has no ARMv6 or armel wheels, so everything
   # compiles, PyInstaller included. Two guards keep ARMv7 code out.
   # _PYTHON_HOST_PLATFORM: QEMU reports armv7l from uname, and this makes pip
@@ -1823,7 +1824,7 @@ jobs:
     steps: *legacy-arm-steps
 
   # Self-contained LoongArch binaries, glibc and musl. Its own job because
-  # `library/debian`, `library/alpine` and `python:3.14-*` have no loong64:
+  # `library/debian`, `library/alpine` and `python:3.15-*` have no loong64:
   # both bases are third-party, and the musl row installs Python from apk.
   # They target the new-world ABI; old-world distros (Loongnix, Kylin, UOS)
   # are binary-incompatible and not served. PyPI has no loong64 wheels, so
@@ -1840,7 +1841,7 @@ jobs:
             suffix: ''
             # A python.org build on Debian trixie: the only tag line in this
             # namespace that gets rebuilt (sid-slim and forky-slim are stale).
-            image: ghcr.io/loong64/python:3.14-slim-trixie
+            image: ghcr.io/loong64/python:3.15-slim-trixie
             toolchain: 'retry 5 apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev curl ca-certificates'
             rust_setup: '. /src/.github/scripts/retry.sh && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 --connect-timeout 30 --max-time 60 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
             # OpenSSL 3.5 headers for the cryptography source build; Rust
@@ -1993,7 +1994,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
+          python-version: '3.15'  # set explicitly; don't rely on the runner's preinstalled patch level
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.SETUP_UV_VERSION }}
@@ -2052,8 +2053,8 @@ jobs:
         run: |
           set -euo pipefail
           # Install into a throwaway uv venv on the runner's native arch and
-          # freeze from it with `uv run` (uv discovers the setup-python 3.14).
-          uv venv --python "${{ steps.runtime.outputs.python-path || '3.14' }}"
+          # freeze from it with `uv run` (uv discovers the setup-python 3.15).
+          uv venv --python "${{ steps.runtime.outputs.python-path || '3.15' }}"
           uv pip install -r pyinstaller/build-requirements.txt
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop, orjson and isal (see binaries): wheels on both
@@ -2223,13 +2224,13 @@ jobs:
           - arch: amd64
             vmarch: x86_64
             # Host-native, so the orjson Rust build is cheap enough to try.
-            pkgs: python314 rust gmake pkgconf libsodium
+            pkgs: python315 rust gmake pkgconf libsodium
             orjson: '1'
             pq: '1'
             cflags: -I/usr/local/include
           - arch: amd64v3
             vmarch: x86_64
-            pkgs: python314 rust gmake pkgconf libsodium libffi sqlite3
+            pkgs: python315 rust gmake pkgconf libsodium libffi sqlite3
             orjson: '1'
             pq: '1'
             cflags: -I/usr/local/include
@@ -2239,7 +2240,7 @@ jobs:
             # compile from Rust source, and stdlib json is the fallback.
             # cryptography is built anyway because post-quantum push needs
             # it; a build that fails the X-Wing probe leaves x25519 sealing.
-            pkgs: python314 rust gmake pkgconf libsodium
+            pkgs: python315 rust gmake pkgconf libsodium
             orjson: '0'
             pq: '1'
             cflags: -I/usr/local/include -include sys/cdefs.h
@@ -2284,12 +2285,12 @@ jobs:
             set -eu
             . .github/scripts/retry.sh
 
-            # lang/python314 is built --without-ensurepip, so the venv has no
+            # lang/python315 is built --without-ensurepip, so the venv has no
             # pip; bootstrap it with base fetch, retrying only the download.
-            runtime=python3.14
+            runtime=python3.15
             if [ "${{ matrix.arch }}" = amd64v3 ]; then
               CFLAGS="-I/usr/local/include" LDFLAGS="-L/usr/local/lib" \
-                python3.14 docker/python_runtime.py --variant amd64v3 --prefix /tmp/cronstable-python-amd64v3
+                python3.15 docker/python_runtime.py --variant amd64v3 --prefix /tmp/cronstable-python-amd64v3
               runtime=/tmp/cronstable-python-amd64v3/bin/python3
               RUSTFLAGS="-C target-cpu=x86-64-v3"
               export RUSTFLAGS
@@ -2357,7 +2358,7 @@ jobs:
             mv dist/cronstable "dist/cronstable-freebsd-${{ matrix.arch }}"
             # Package with pkg(8) inside the VM; freebsd_pkg.py says why fpm
             # on Linux is not equivalent. The script is stdlib-only.
-            python3.14 .github/scripts/freebsd_pkg.py               "$SETUPTOOLS_SCM_PRETEND_VERSION"               "dist/cronstable-freebsd-${{ matrix.arch }}" dist/pkgout
+            python3.15 .github/scripts/freebsd_pkg.py               "$SETUPTOOLS_SCM_PRETEND_VERSION"               "dist/cronstable-freebsd-${{ matrix.arch }}" dist/pkgout
             # Install the package to run its post-install (pw service account)
             # and prove the payload runs from its installed path.
             pkg add dist/pkgout/cronstable-*.pkg
@@ -2426,7 +2427,7 @@ jobs:
             # gives pkg a configuration directory that lists only the local
             # repository.
             next="${SETUPTOOLS_SCM_PRETEND_VERSION},1"
-            python3.14 .github/scripts/freebsd_pkg.py "$next" \
+            python3.15 .github/scripts/freebsd_pkg.py "$next" \
               "dist/cronstable-freebsd-${{ matrix.arch }}" /tmp/cronstable-next
             pkg repo /tmp/cronstable-next
             mkdir /tmp/cronstable-repos
@@ -2857,7 +2858,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         id: py
         with:
-          python-version: '3.14'
+          python-version: '3.15'
           architecture: ${{ matrix.pyarch }}
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -2877,8 +2878,8 @@ jobs:
           CRONSTABLE_BUNDLE: both
         run: |
           set -euo pipefail
-          # Pass the interpreter path, not `--python 3.14`: on the i686 row a
-          # bare version can resolve to the x64 3.14 and ship a 64-bit build
+          # Pass the interpreter path, not `--python 3.15`: on the i686 row a
+          # bare version can resolve to the x64 3.15 and ship a 64-bit build
           # under a 32-bit name.
           uv venv --python "${{ steps.runtime.outputs.python-path || steps.py.outputs.python-path }}"
           uv pip install -r pyinstaller/build-requirements.txt

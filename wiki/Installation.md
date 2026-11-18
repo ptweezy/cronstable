@@ -665,6 +665,12 @@ wheel. The `amd64`, `amd64v3`, and `arm64` builds for Linux (both libcs),
 macOS, and Windows include it. The other builds gzip web and cluster responses with
 the standard library's `zlib`, which produces the same format more slowly.
 
+The glibc `armv7` build ships without `orjson`, the JSON library in the
+`speedups` extra, and uses the standard library JSON encoder. The Python 3.15
+`orjson` wheel for ARMv7 requires glibc 2.39, newer than the 2.31 that this
+build targets, and the build installs no Rust toolchain to compile `orjson`
+from source.
+
 The `mips64le` build covers 64-bit little-endian MIPS on glibc hosts. It is
 built in an emulated Debian bookworm container, the last Debian suite that
 carries this port, pinned to a snapshot of that archive because bookworm's LTS

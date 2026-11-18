@@ -5,9 +5,10 @@
 # non-fatal -- it just records, per arch, which way this build went (grep the
 # build log for "orjson"). The script always exits 0.
 #
-# orjson is a Rust extension with a fairly new MSRV. amd64/arm64 (and macOS/
-# Windows), plus most manylinux/musllinux arches, install a prebuilt wheel and
-# need no toolchain. The wheel-less arches (riscv64, armv6) source-build it, so
+# orjson is a Rust extension with a fairly new MSRV. macOS, x64 and ARM64
+# Windows, and amd64/arm64 musl install a prebuilt wheel and need no toolchain.
+# The cp315 glibc wheels need glibc 2.39 or later, so the glibc lanes on an
+# older base source-build it, as do the wheel-less arches (riscv64, armv6).
 # RUST_SETUP installs a CURRENT stable Rust via rustup into /opt/cargo +
 # /opt/rustup -- the distro rustc packages are often older than orjson's MSRV
 # (Debian's riscv64 rustc is 1.85; orjson 3.11 needs 1.95). A source build
