@@ -52,6 +52,24 @@ logger = logging.getLogger("cronstable")
 # to balloon the in-memory history, whatever it claims.
 MAX_SERIES_POINTS = 4096
 
+# Any node that shares the state backend can write a ledger record, so the
+# same parse also bounds its figures. A record outside these ranges is
+# malformed.
+#
+# MAX_CPU_SECONDS caps each CPU time at 2**53 seconds, about 285 million
+# years. Two finite doubles near the float maximum can sum to infinity. An
+# API response carries infinity as null with orjson, and without orjson as
+# an Infinity token that JSON.parse rejects. Under the cap, a run's total
+# and the mean that cronstable.cron._run_stats takes over thousands of runs
+# stay finite.
+#
+# MAX_RSS_BYTES is the int64 maximum, the type the API declares for memory
+# figures. int() turns the float literal 1e308 into a 309-digit integer
+# that orjson cannot encode, and a longer numeric string into one that
+# float() cannot convert.
+MAX_CPU_SECONDS = 2.0**53
+MAX_RSS_BYTES = 2**63 - 1
+
 # Node history defaults: one sample every 5s, 720 points = the last hour.
 # Overrides: web.nodeHistory.{interval,points} (cronstable.config).
 NODE_HISTORY_INTERVAL = 5.0
@@ -179,7 +197,8 @@ def _parse_series(raw: Any) -> list[list[float]] | None:
 
     Applies the same distrust as :meth:`ResourceUsage.from_dict`: entries
     must be ``[t, cpu%, rss]`` triples of finite numbers (bools excluded --
-    they are int subclasses), anything else is dropped point-wise, and the
+    they are int subclasses) whose ``rss`` is at most
+    :data:`MAX_RSS_BYTES`, anything else is dropped point-wise, and the
     whole list is capped at :data:`MAX_SERIES_POINTS`.  Returns ``None``
     rather than an empty list so "no series" has a single spelling.
     """
@@ -197,7 +216,9 @@ def _parse_series(raw: Any) -> list[list[float]] | None:
             rss = int(entry[2])
         except (TypeError, ValueError, OverflowError):
             continue
-        if not (math.isfinite(t) and math.isfinite(cpu)):
+        if not (
+            math.isfinite(t) and math.isfinite(cpu) and rss <= MAX_RSS_BYTES
+        ):
             continue
         out.append([t, max(0.0, cpu), max(0, rss)])
     return out or None
@@ -255,8 +276,11 @@ class ResourceUsage:
         """Rebuild from :meth:`to_dict` output; ``None`` if malformed.
 
         Survives foreign / hand-edited ledger records the same way the run
-        record parsers do: a missing or wrong-typed field yields ``None``
-        (the run simply has no resource stats) rather than raising.
+        record parsers do: a missing, wrong-typed, or out-of-range field
+        yields ``None`` (the run simply has no resource stats) rather than
+        raising.  Each CPU time must be at least 0 and at most
+        :data:`MAX_CPU_SECONDS`, and the peak RSS at least 0 and at most
+        :data:`MAX_RSS_BYTES`.
         """
         if not isinstance(data, dict):
             return None
@@ -276,7 +300,13 @@ class ResourceUsage:
         except (TypeError, ValueError, OverflowError):
             # OverflowError: int(float("inf")).
             return None
-        if not (math.isfinite(cpu_user) and math.isfinite(cpu_system)):
+        # The ranges also reject both infinities, and NaN, since every
+        # comparison with NaN is false.
+        if not (
+            0.0 <= cpu_user <= MAX_CPU_SECONDS
+            and 0.0 <= cpu_system <= MAX_CPU_SECONDS
+            and 0 <= max_rss <= MAX_RSS_BYTES
+        ):
             return None
         samples = data.get("samples")
         if not isinstance(samples, int) or isinstance(samples, bool):
