@@ -1,7 +1,8 @@
 # ClusterFuzzLite fuzzing of the parsers in fuzz/; see fuzz/README.md.
-# A pull request fuzzes for five minutes. The daily batch run fuzzes for an
-# hour, keeps each target's corpus as an Actions artifact for the next run,
-# then prunes it. A crash fails the run and uploads its input as an artifact.
+# A pull request fuzzes for five minutes, starting from the seed corpora. The
+# daily batch run fuzzes for an hour, keeps each target's corpus as an Actions
+# artifact for the next run, then prunes it. A crash fails the run and uploads
+# its input as an artifact.
 
 name: fuzz
 
@@ -19,27 +20,49 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ClusterFuzzLite finds a stored corpus, coverage report, or base build by
+  # paging through the repository's Actions artifacts until a name matches.
+  # Past the first page, the artifacts API often returns a server error, and
+  # a request that gets no response blocks run_fuzzers until the job times
+  # out. This job makes none of those lookups, so a crash that reproduces
+  # fails it right away.
   pr:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
-      # to download the corpus the batch run stored
-      actions: read
     steps:
       - name: Build fuzzers
+        id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           language: python
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Choosing only the affected targets needs a coverage report, and
+          # this workflow uploads none.
+          keep-unaffected-fuzz-targets: true
       - name: Run fuzzers
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        env:
+          # The action has no input for this; run_fuzzers reads it from the
+          # environment. It makes run_fuzzers fuzz from the seed corpora,
+          # count a reproduced crash as new, and skip its own crash upload,
+          # which the next step does instead.
+          NO_CLUSTERFUZZ_DEPLOYMENT: "true"
         with:
           language: python
           github-token: ${{ secrets.GITHUB_TOKEN }}
           mode: code-change
           fuzz-seconds: 300
+      - name: Upload the crash
+        if: failure() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crashes
+          path: out/artifacts
+          if-no-files-found: warn
+          retention-days: 30
 
   batch:
     if: github.event_name != 'pull_request'
