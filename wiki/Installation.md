@@ -101,7 +101,7 @@ FROM ghcr.io/ptweezy/cronstable:latest
 COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 ```
 
-The image is built from `python:3.14-slim` (a multi-stage build that copies a
+The image is built from `python:3.15-slim` (a multi-stage build that copies a
 self-contained venv into the runtime stage) and sets `PYTHONUNBUFFERED=1` and
 `PYTHONDONTWRITEBYTECODE=1`. It requires no writable paths at runtime. For the
 hardened Kubernetes/Docker setup (read-only root filesystem, dropped
@@ -124,8 +124,8 @@ also available explicitly as `-debian`:
 
 | Tag suffix | Base image | Python | Notes |
 | --- | --- | --- | --- |
-| *(none)* / `-debian` | `python:3.14-slim` | 3.14 | Default. Widest architecture coverage. |
-| `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
+| *(none)* / `-debian` | `python:3.15-slim` | 3.15 | Default. Widest architecture coverage. |
+| `-alpine` | `python:3.15-alpine` | 3.15 | musl libc; smallest image. |
 | `-ubuntu` | `ubuntu:26.04` | 3.14 | Ubuntu LTS userland. |
 | `-rhel` | UBI 10 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
 | `-fedora` | `fedora:45` | 3.15 | Leading-edge RPM userland. |
@@ -664,6 +664,12 @@ promise and how to check a binary.
 wheel. The `amd64`, `amd64v3`, and `arm64` builds for Linux (both libcs),
 macOS, and Windows include it. The other builds gzip web and cluster responses with
 the standard library's `zlib`, which produces the same format more slowly.
+
+The glibc `armv7` build ships without `orjson`, the JSON library in the
+`speedups` extra, and uses the standard library JSON encoder. The Python 3.15
+`orjson` wheel for ARMv7 requires glibc 2.39, newer than the 2.31 that this
+build targets, and the build installs no Rust toolchain to compile `orjson`
+from source.
 
 The `mips64le` build covers 64-bit little-endian MIPS on glibc hosts. It is
 built in an emulated Debian bookworm container, the last Debian suite that

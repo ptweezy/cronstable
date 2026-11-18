@@ -44,7 +44,7 @@ See [CPU requirements and variant selection](Installation#amd64v3-cpu-requiremen
 | --- | --- |
 | Registry/image | `ghcr.io/ptweezy/cronstable` |
 | Tags | the release version (for example, `1.2.60`), plus `latest` |
-| Base | `python:3.14-slim` (multi-stage; runtime stage copies a self-contained venv) |
+| Base | `python:3.15-slim` (multi-stage; runtime stage copies a self-contained venv) |
 | User | `65534:65534` (`nobody`), set with `USER` in the `Dockerfile` |
 | Entrypoint | `cronstable` |
 | Default command | `-c /etc/cronstable.d` |
@@ -55,7 +55,7 @@ See [CPU requirements and variant selection](Installation#amd64v3-cpu-requiremen
 `PYTHONDONTWRITEBYTECODE` prevents `.pyc` writes. Both matter under a read-only
 root filesystem.
 
-> A second `python:3.14-slim`-based Dockerfile under `example/docker/` exists for
+> A second `python:3.15-slim`-based Dockerfile under `example/docker/` exists for
 > demonstration. It `pip install`s cronstable and is **not** non-root. For
 > production, use the published GHCR image (or base your own image on it,
 > described later), not the example.

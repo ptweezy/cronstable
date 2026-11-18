@@ -19,7 +19,7 @@
 #
 # Every command here runs on both supported hosts: bash plus python3 only, no
 # curl and no coreutils-only binaries, because the container image is
-# python:3.14-slim and the native host is a Mac.
+# python:3.15-slim and the native host is a Mac.
 #
 # Bring-up: launchd/install.sh (native launchd agent + Cloudflare Tunnel, the
 # live deployment) or docker-compose.yml next to this file. Both retarget the

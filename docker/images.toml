@@ -6,7 +6,7 @@
 # new digests in the generated Dockerfiles; copy them here and regenerate.
 
 [debian]
-builder = "python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170"
+builder = "python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928"
 toolchain = '''
     retry apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update; \
     retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev git; \
@@ -32,7 +32,7 @@ extra_labels = '''
 
 # musl wheels and the musl runtime must stay paired.
 [alpine]
-builder = "python:3.14-alpine@sha256:5862d971d1f0ae26b258cefa4e893556b1d3aba81bd2ff30888704ad378bab67"
+builder = "python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd"
 toolchain = "    retry apk add --no-cache build-base libffi-dev git"
 python = "python"
 libc = "musl"

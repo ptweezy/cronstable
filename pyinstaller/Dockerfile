@@ -5,17 +5,17 @@ RUN apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && DEBIA
 		curl git ca-certificates build-essential zlib1g-dev \
 		libbz2-dev libssl-dev libreadline-dev libffi-dev \
 		liblzma-dev libsqlite3-dev tk-dev
-# pyenv v2.8.10, fetched by commit. Its python-build must define the CPython
+# pyenv v2.8.15, fetched by commit. Its python-build must define the CPython
 # release installed below.
 RUN git init -q /root/.pyenv \
-	&& git -C /root/.pyenv fetch -q --depth 1 https://github.com/pyenv/pyenv.git 288b3e19879613f0389bd614c7bb0f02d5f52f04 \
+	&& git -C /root/.pyenv fetch -q --depth 1 https://github.com/pyenv/pyenv.git 03ffc48ef3cd33808899773df586f3cc7f74470a \
 	&& git -C /root/.pyenv checkout -q FETCH_HEAD
 
 ENV PATH="/root/.pyenv/bin:$PATH"
 
 # The CPython release the CI binary lanes freeze.
-RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.14.8
-RUN pyenv global 3.14.8
+RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.15.2
+RUN pyenv global 3.15.2
 
 # uv accelerates the installs below (parallel downloads + a shared cache). This
 # is an amd64-only local build, so the amd64/arm64 uv image covers it and the
@@ -24,9 +24,9 @@ RUN pyenv global 3.14.8
 # SETUP_UV_VERSION in .github/workflows/release.yml.
 COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /uvx /bin/
 
-RUN /root/.pyenv/versions/3.14.8/bin/python -m venv /cronstable
+RUN /root/.pyenv/versions/3.15.2/bin/python -m venv /cronstable
 # Point uv at that venv (VIRTUAL_ENV) and never let it fetch a managed Python --
-# the pyenv-built 3.14.8 (--enable-shared, above) is what must be baked in.
+# the pyenv-built 3.15.2 (--enable-shared, above) is what must be baked in.
 ENV PATH=/cronstable/bin:$PATH \
     VIRTUAL_ENV=/cronstable \
     UV_PYTHON_DOWNLOADS=never
