@@ -889,6 +889,50 @@ def test_run_stats_no_monitored_runs_leaves_resource_fields_none():
     assert stats["last_cpu_seconds"] is None
 
 
+def test_run_stats_stay_finite_over_ledger_records_near_the_float_limit():
+    # Ledger records from any node that shares the store. The first two
+    # each have a finite CPU total, but the mean sums the totals, and that
+    # sum is infinite. A 400-digit peak RSS is too large for the mean's
+    # float division. The parse reads all three as unmonitored runs.
+    import json
+
+    from cronstable.resources import MAX_CPU_SECONDS, MAX_RSS_BYTES
+
+    base = _mk_run("success").to_dict()
+
+    def restore(cpu_user, cpu_system, max_rss):
+        resources = {
+            "cpu_user_seconds": cpu_user,
+            "cpu_system_seconds": cpu_system,
+            "max_rss_bytes": max_rss,
+            "samples": 1,
+        }
+        info = cronstable.cron._job_run_info_from_dict(
+            dict(base, resources=resources)
+        )
+        assert info is not None
+        return info
+
+    runs = [
+        restore(1e308, 0.0, 1),
+        restore(1e308, 0.0, 1),
+        restore(1.0, 0.0, "9" * 400),
+    ]
+    assert all(r.resource_usage is None for r in runs)
+    stats = cronstable.cron._run_stats(runs)
+    assert stats["avg_cpu_seconds"] is None
+    assert stats["avg_rss_bytes"] is None
+    json.dumps(stats, allow_nan=False)
+    # a full trends scan of records at the caps keeps a finite mean
+    capped = restore(MAX_CPU_SECONDS, MAX_CPU_SECONDS, MAX_RSS_BYTES)
+    stats = cronstable.cron._run_stats(
+        [capped] * cronstable.cron.TREND_SCAN_LIMIT
+    )
+    assert stats["avg_cpu_seconds"] == 2 * MAX_CPU_SECONDS
+    assert stats["max_rss_bytes"] == MAX_RSS_BYTES
+    json.dumps(stats, allow_nan=False)
+
+
 def test_record_run_caps_history():
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     limit = cronstable.cron.RUN_HISTORY_LIMIT

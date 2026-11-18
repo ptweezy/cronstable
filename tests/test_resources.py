@@ -2,7 +2,10 @@
 
 import asyncio
 import contextlib
+import itertools
+import json
 import logging
+import math
 import sys
 from collections import deque
 from types import SimpleNamespace
@@ -11,7 +14,10 @@ import psutil
 import pytest
 
 import cronstable.resources as resources
+from cronstable import _json
 from cronstable.resources import (
+    MAX_CPU_SECONDS,
+    MAX_RSS_BYTES,
     MAX_SERIES_POINTS,
     NODE_SNAPSHOT_TTL,
     NodeResourceSampler,
@@ -111,6 +117,90 @@ def test_resource_usage_from_dict_defaults_samples():
     assert usage is not None
     assert usage.samples == 0
     assert usage.cpu_total_seconds == 3.0
+
+
+# The fuzz_peer target's input. Each CPU time is a finite double, but their
+# sum, the record's cpu_total_seconds, is infinite.
+_FUZZ_OVERFLOW = (
+    b'{"cpu_user_seconds":1e308, "cpu_system_seconds": 1.711e308, '
+    b'"max_rss_bytes": 730320, "sampls": [[0, 666660320]]}\n'
+)
+
+
+def test_resource_usage_from_dict_rejects_the_fuzzers_overflowing_total():
+    assert ResourceUsage.from_dict(_json.loads(_FUZZ_OVERFLOW)) is None
+
+
+@pytest.mark.parametrize(
+    ("cpu_user", "cpu_system", "max_rss"),
+    [
+        # finite times whose sum is infinite
+        (1e308, 1.711e308, 730320),
+        (sys.float_info.max, sys.float_info.max, 0),
+        (-1e308, -1e308, 0),
+        # a finite total with a time out of range
+        (sys.float_info.max, 0.0, 0),
+        (math.nextafter(MAX_CPU_SECONDS, math.inf), 0.0, 0),
+        (0.0, math.nextafter(MAX_CPU_SECONDS, math.inf), 0),
+        (-1.0, 0.0, 0),
+        # int() of a float literal and of a long numeric string, the first
+        # value past the int64 maximum, and a negative peak
+        (0.0, 0.0, 1e308),
+        (0.0, 0.0, "9" * 400),
+        (0.0, 0.0, MAX_RSS_BYTES + 1),
+        (0.0, 0.0, -1),
+    ],
+)
+def test_resource_usage_from_dict_rejects_out_of_range_figures(
+    cpu_user, cpu_system, max_rss
+):
+    data = {
+        "cpu_user_seconds": cpu_user,
+        "cpu_system_seconds": cpu_system,
+        "max_rss_bytes": max_rss,
+        "samples": 1,
+    }
+    assert ResourceUsage.from_dict(data) is None
+
+
+def test_resource_usage_near_the_float_limit_round_trips_as_strict_json():
+    # Each pair of these CPU times fails the parse, or yields a record whose
+    # to_dict() output encodes with allow_nan=False (the fuzz harness's
+    # check) and with the ledger's encoder, and parses back unchanged.
+    edges = [
+        0.0,
+        -0.0,
+        5e-324,
+        1.0,
+        MAX_CPU_SECONDS,
+        math.nextafter(MAX_CPU_SECONDS, math.inf),
+        1e308,
+        sys.float_info.max,
+        -1.0,
+        -sys.float_info.max,
+        math.inf,
+        math.nan,
+    ]
+    for cpu_user, cpu_system in itertools.product(edges, repeat=2):
+        usage = ResourceUsage.from_dict(
+            {
+                "cpu_user_seconds": cpu_user,
+                "cpu_system_seconds": cpu_system,
+                "max_rss_bytes": MAX_RSS_BYTES,
+                "samples": 1,
+            }
+        )
+        in_range = all(
+            0.0 <= v <= MAX_CPU_SECONDS for v in (cpu_user, cpu_system)
+        )
+        assert (usage is not None) == in_range, (cpu_user, cpu_system)
+        if usage is None:
+            continue
+        data = usage.to_dict()
+        assert math.isfinite(data["cpu_total_seconds"])
+        text = json.dumps(data, allow_nan=False)
+        _json.dumps_bytes(data)
+        assert ResourceUsage.from_dict(json.loads(text)) == usage
 
 
 # ---- ResourceMonitor lifecycle -------------------------------------------
@@ -700,6 +790,29 @@ def test_resource_usage_series_parse_is_capped():
     assert usage is not None
     assert usage.series is not None
     assert len(usage.series) == MAX_SERIES_POINTS
+
+
+def test_resource_usage_series_drops_points_past_the_rss_cap():
+    base = {
+        "cpu_user_seconds": 1.0,
+        "cpu_system_seconds": 0.0,
+        "max_rss_bytes": 5,
+        "samples": 1,
+    }
+    usage = ResourceUsage.from_dict(
+        dict(
+            base,
+            series=[
+                [1.0, 2.0, MAX_RSS_BYTES],  # at the cap: kept
+                [2.0, 2.0, MAX_RSS_BYTES + 1],
+                [3.0, 2.0, 1e308],  # int() makes it 309 digits long
+                [4.0, 2.0, "9" * 400],
+            ],
+        )
+    )
+    assert usage is not None
+    assert usage.series == [[1.0, 2.0, MAX_RSS_BYTES]]
+    _json.dumps_bytes(usage.to_dict(include_series=True))
 
 
 # ---- ResourceMonitor series capture ----------------------------------------
