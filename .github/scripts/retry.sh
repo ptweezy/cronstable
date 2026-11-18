@@ -7,7 +7,7 @@
 #
 # Usage: retry <attempts> <command> [args...]
 #
-#     retry 5 docker pull python:3.14-alpine
+#     retry 5 docker pull python:3.15-alpine
 #     retry 5 apk add --no-cache build-base
 #
 # Only wrap the NETWORK operation, never a long build. The emulated foreign-arch
@@ -50,7 +50,7 @@ retry() {
 
 # Usage: pull_base <image[:tag]> <platform>
 #
-#     pull_base python:3.14-alpine linux/arm/v6
+#     pull_base python:3.15-alpine linux/arm/v6
 #
 # Pull a Docker OFFICIAL image with registry failover: Docker Hub first, then
 # the two public full mirrors of the official library, ECR Public (Docker Inc
@@ -64,7 +64,7 @@ retry() {
 #
 # Official `library/` images only: the mirror paths hardcode that namespace, so
 # a namespaced image (org/name) would be rewritten to a path that does not
-# exist. The one call site, binaries-container, passes python:3.14-* images
+# exist. The one call site, binaries-container, passes python:3.15-* images
 # from its matrix.
 pull_base() {
   _pull_image=$1

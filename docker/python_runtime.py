@@ -5,8 +5,8 @@ python-build-standalone; other systems compile the same CPython release. The
 prefix's python-path file is written only after the runtime passes its probes.
 Baseline mode records the calling interpreter and downloads nothing.
 
-Pins: https://github.com/astral-sh/python-build-standalone/releases/tag/20261009
-      https://www.python.org/downloads/release/python-3148/
+Pins: https://github.com/astral-sh/python-build-standalone/releases/tag/20261110
+      https://www.python.org/downloads/release/python-3152/
 """
 
 import argparse
@@ -26,20 +26,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# TODO: Move the release binaries and Docker images to CPython 3.15 when
-# Docker Hub publishes final `python:3.15-*` images and isal publishes cp315
-# wheels. The orjson cp315 glibc wheels require glibc 2.39 or later, so on
-# 3.15 the binaries built on an older glibc compile orjson from source
-# through RUST_SETUP (pyinstaller/install_orjson.sh). The glibc armv7 row
-# sets no RUST_SETUP and uses stdlib json. The other interpreter pins are in
-# docker/images.toml, pyinstaller/Dockerfile, and the binaries jobs in
-# .github/workflows/release.yml.
-VERSION = "3.14.8"
-SOURCE_SHA = "c2215904f02b175596dc49351585104f4bc20341e1c47378b26a2c274360ce73"
-PBS_RELEASE = "20261009"
+# pyinstaller/Dockerfile and the binaries jobs in .github/workflows/release.yml
+# hold the interpreter pins of the other binaries.
+VERSION = "3.15.2"
+SOURCE_SHA = "8b5536d280142ecf6cdfe15d12a21ba1c65e300bbf7b28a8d0cdb849575797de"
+PBS_RELEASE = "20261110"
 PBS_SHA = {
-    "gnu": "37f748ae662fb29f7716242ea214ac7cd64cbea545eab4eb2de16ab0b1447e68",
-    "musl": "18b8ed1e8e737b432ca783d40c8a9be49bb71aa3827004ed935cdc95705464c9",
+    "gnu": "f63f23275c9ab41e59ded3d64f1efe00f51f7a2034f043e029e0c6a521a1e88e",
+    "musl": "7fc59671832b580cff3f5bb0e446ea61453be45f8fd2403447f687304de85403",
 }
 MARCH = "-march=x86-64-v3"
 
