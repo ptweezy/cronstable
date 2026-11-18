@@ -51,12 +51,23 @@ updates:
   # .clusterfuzzlite/Dockerfile pins the OSS-Fuzz builder's moving v1 tag by
   # digest, so its updates are digest bumps.
   # Review, do not automerge: a new base image can change the default Python.
+  # Dependabot refreshes an open docker group PR only in the directories it
+  # already changes, so the other directories wait for the run after a merge.
   - package-ecosystem: docker
     directories:
       - "/"
       - "/docker"
       - "/pyinstaller"
       - "/.clusterfuzzlite"
+    # Python minor versions move by hand (see the TODO in
+    # docker/python_runtime.py), so python image updates are digest bumps.
+    # Without this rule, Dependabot proposes the next minor's tag in place of
+    # a newer digest for the current one.
+    ignore:
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
     schedule:
       interval: daily
     open-pull-requests-limit: 10
