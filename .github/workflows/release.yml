@@ -2267,10 +2267,13 @@ jobs:
           envs: 'SETUPTOOLS_SCM_PRETEND_VERSION'
           prepare: |
             set -eu
+            . .github/scripts/retry.sh
             # The base OpenSSL 3.0 cannot seal ML-KEM, so the build links
-            # the OpenSSL 3.5 port, security/openssl.
-            pkg install -y ${{ matrix.pkgs }}
-            pkg install -y openssl
+            # the OpenSSL 3.5 port, security/openssl. pkg fetches every
+            # package before it installs any, so a retry after a mirror
+            # error repeats only downloads.
+            retry 5 pkg install -y ${{ matrix.pkgs }}
+            retry 5 pkg install -y openssl
             # The cryptography build is soft: against an older OpenSSL it
             # drops ML-KEM and the job still passes. Fail here instead.
             case "$(/usr/local/bin/openssl version)" in
