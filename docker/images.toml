@@ -32,7 +32,7 @@ extra_labels = '''
 
 # musl wheels and the musl runtime must stay paired.
 [alpine]
-builder = "python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72"
+builder = "python:3.14-alpine@sha256:5862d971d1f0ae26b258cefa4e893556b1d3aba81bd2ff30888704ad378bab67"
 toolchain = "    retry apk add --no-cache build-base libffi-dev git"
 python = "python"
 libc = "musl"
@@ -44,7 +44,7 @@ description = "A job scheduler with retries, alerts, saved run history, workflow
 
 # Amazon Linux's default Python is too old; use 3.11 in both stages.
 [amazonlinux]
-builder = "amazonlinux:2023@sha256:c04a1012acc483977f61f7f91c28624a39a621e56a59781319a75dec528be9b6"
+builder = "amazonlinux:2023@sha256:8ee95c4096d455555cb208d1dcea7b759235afab02253351d566d22d904f2198"
 toolchain = '''
     retry dnf --setopt=retries=10 install -y python3.11 python3.11-pip python3.11-devel gcc git; \
     dnf clean all
@@ -61,7 +61,7 @@ description = "A job scheduler with retries, alerts, saved run history, workflow
 # Debian 13 provides the same Python 3.13 layout as the distroless runtime.
 # An absolute entrypoint and exec-form smoke check work without a shell.
 [distroless]
-builder = "debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad"
+builder = "debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2"
 builder_env = "ENV DEBIAN_FRONTEND=noninteractive"
 toolchain = '''
     retry apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update; \
@@ -69,7 +69,7 @@ toolchain = '''
     rm -rf /var/lib/apt/lists/*
 '''
 python = "python3.13"
-runtime = "gcr.io/distroless/python3-debian13:latest@sha256:9a1ed29d41d7695245ff86bc2e08684d3dd253a3f9c8ca45677427f9f4fe3598"
+runtime = "gcr.io/distroless/python3-debian13:latest@sha256:60faad2efce94a847f32e2adbcaefeb2e4fd3e3a78075a3abb600904a5e010e9"
 entrypoint = "[\"/opt/venv/bin/cronstable\"]"
 description = "A job scheduler with retries, alerts, saved run history, workflows, and dashboards for single machines and clusters (distroless)."
 
@@ -98,7 +98,7 @@ description = "A job scheduler with retries, alerts, saved run history, workflow
 # python313 includes ensurepip; no separate pip package is needed.
 # System libsodium avoids emulated bundled-library builds; ship libsodium26.
 [opensuse]
-builder = "opensuse/leap:16.0@sha256:40b8e1fc290b203380b9adc7cd147ef2141f5a613c7cf7117f678f626855654e"
+builder = "opensuse/leap:16.0@sha256:a4115e2f5aea9712a7c73974fd94000a034fc3051ef29b5f7722fbf04070dd9d"
 toolchain = '''
     retry zypper --non-interactive refresh; \
     retry zypper --non-interactive install python313 python313-devel gcc make libffi-devel libsodium-devel git; \
@@ -125,12 +125,12 @@ description = "A job scheduler with retries, alerts, saved run history, workflow
 
 # UBI builder and ubi-minimal runtime share their Python 3.12 layout.
 [rhel]
-builder = "registry.access.redhat.com/ubi10/ubi:latest@sha256:0e8ccad7d35f5fd756f4f2202f018b8d3c3e8bb9af8e627d874239381a00ab41"
+builder = "registry.access.redhat.com/ubi10/ubi:latest@sha256:73ea54bfbfb586075bd3d45df6483a7f68875233c8cc7cebcf9b2bb42306c308"
 toolchain = '''
     retry dnf --setopt=retries=10 install -y python3 python3-pip python3-devel gcc make libffi-devel git; \
     dnf clean all
 '''
-runtime = "registry.access.redhat.com/ubi10/ubi-minimal:latest@sha256:c3fe95ec9f53a3888c47314eb4d08bde09ebde646a428137b445091afe1daf89"
+runtime = "registry.access.redhat.com/ubi10/ubi-minimal:latest@sha256:45b15b88980995a4939b33dfbdfdb2a5998198d478947ee1e1477d08425a1f25"
 runtime_install = '''
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*30)); done; }; \
