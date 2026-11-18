@@ -20,7 +20,8 @@ any input that raises an unexpected exception or fails a check.
 [ClusterFuzzLite](https://google.github.io/clusterfuzzlite/) builds the
 targets from `.clusterfuzzlite/`, and the `fuzz` workflow runs them:
 
-- On a pull request, the targets share five minutes of fuzzing.
+- On a pull request, the targets share five minutes of fuzzing, starting from
+  their seed corpora.
 - Every day, a batch run fuzzes `main` for an hour, saves each target's
   corpus as an Actions artifact for the next run, and then prunes the corpus.
 
