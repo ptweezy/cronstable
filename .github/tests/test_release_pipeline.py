@@ -558,6 +558,21 @@ sleep() { echo "DELAY:$1"; }
         assert "still failing after 5 attempts" in result.stderr
 
 
+# The binaries-freebsd prepare script for one matrix row, safe to run on the
+# test host: openssl resolves through $PATH.
+def freebsd_prepare(row):
+    step = next(
+        s
+        for s in workflow()["jobs"]["binaries-freebsd"]["steps"]
+        if s.get("uses", "").startswith("vmactions/freebsd-vm@")
+    )
+    return (
+        step["with"]["prepare"]
+        .replace("${{ matrix.pkgs }}", row["pkgs"])
+        .replace("/usr/local/bin/openssl", "openssl")
+    )
+
+
 @pytest.mark.parametrize(
     "version,ok",
     [
@@ -576,11 +591,6 @@ def test_freebsd_installs_the_openssl_port_at_35_or_later(version, ok):
     if shell is None or not Path(shell).is_file():
         pytest.skip("Bash required for the FreeBSD package setup harness")
     job = workflow()["jobs"]["binaries-freebsd"]
-    step = next(
-        s
-        for s in job["steps"]
-        if s.get("uses", "").startswith("vmactions/freebsd-vm@")
-    )
     # Only `pkg install` succeeds: `pkg rquery` exits without output on a
     # VM that has no catalogue yet, so the step cannot use it.
     prelude = """
@@ -593,11 +603,7 @@ openssl() { echo "$OPENSSL_VERSION"; }
 """
     for row in job["strategy"]["matrix"]["include"]:
         assert "openssl" not in row["pkgs"], row
-        prepare = (
-            step["with"]["prepare"]
-            .replace("${{ matrix.pkgs }}", row["pkgs"])
-            .replace("/usr/local/bin/openssl", "openssl")
-        )
+        prepare = freebsd_prepare(row)
         result = subprocess.run(
             [shell, "-c", prelude + prepare],
             cwd=ROOT,
@@ -619,6 +625,50 @@ openssl() { echo "$OPENSSL_VERSION"; }
         if not ok:
             assert "must be 3.5 or later" in result.stderr
             assert version in result.stderr
+
+
+# pkg fails its first $FAILURES installs, and sleep only records the backoff.
+FREEBSD_RETRY_STUBS = """
+attempts=0
+pkg() {
+    [ "$1" = install ] || return 1
+    attempts=$((attempts + 1))
+    echo "INSTALL:$attempts"
+    [ "$attempts" -gt "$FAILURES" ]
+}
+openssl() { echo "OpenSSL 3.5.9 (stub)"; }
+sleep() { echo "DELAY:$1"; }
+"""
+
+
+@pytest.mark.parametrize("failures", [0, 2, 5])
+def test_freebsd_retries_package_downloads(failures):
+    # The step retries a package install that fails on a mirror error.
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        shell = str(Path(os.environ["ProgramFiles"]) / "Git/bin/bash.exe")
+    if shell is None or not Path(shell).is_file():
+        pytest.skip("Bash required for the FreeBSD package setup harness")
+    job = workflow()["jobs"]["binaries-freebsd"]
+    for row in job["strategy"]["matrix"]["include"]:
+        result = subprocess.run(
+            [shell, "-c", FREEBSD_RETRY_STUBS + freebsd_prepare(row)],
+            cwd=ROOT,
+            env={**os.environ, "FAILURES": str(failures)},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        ok = failures < 5
+        assert (result.returncode == 0) == ok, result.stdout + result.stderr
+        # The package install succeeds on attempt failures + 1, and the
+        # openssl install on the next attempt. Five failures use up the
+        # retry before openssl.
+        installs = failures + 2 if ok else 5
+        assert result.stdout.count("INSTALL:") == installs
+        assert result.stdout.count("DELAY:") == min(failures, 4)
+        if not ok:
+            assert "still failing after 5 attempts" in result.stderr
 
 
 # Processes are files in $STATE/proc, named by pid and holding the parent
