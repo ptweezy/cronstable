@@ -426,18 +426,16 @@ jobs:
         os: [ubuntu-26.04, windows-latest, macos-latest]
         python: ['3.11', '3.12', '3.13', '3.14', '3.15']
         include:
-          # Linux ARM64 on the oldest and newest Python, and on 3.14, which
-          # the release binaries bundle: releases ship ARM64 artifacts, and
-          # cryptography and orjson use different wheels there.
+          # Linux ARM64 on the oldest and newest Python. The newest is the
+          # one the release binaries bundle: releases ship ARM64 artifacts,
+          # and cryptography and orjson use different wheels there.
           - os: ubuntu-26.04-arm
             python: '3.11'
           - os: ubuntu-26.04-arm
-            python: '3.14'
-          - os: ubuntu-26.04-arm
             python: '3.15'
-          # Gating win-arm64 row: the released .exe targets it.
+          # Gating win-arm64 row, on the Python the released .exe bundles.
           - os: windows-11-arm
-            python: '3.14'
+            python: '3.15'
     runs-on: ${{ matrix.os }}
     # Cells take 2-9 minutes. 30 bounds a hung asyncio test and leaves
     # headroom for a degraded runner VM; 20 is too tight.
