@@ -26,13 +26,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# TODO: Move the release binaries and Docker images to CPython 3.15 when
-# Docker Hub publishes final `python:3.15-*` images and isal publishes cp315
-# wheels. The orjson cp315 glibc wheels require glibc 2.39 or later, so on
-# 3.15 the binaries built on an older glibc compile orjson from source
-# through RUST_SETUP (pyinstaller/install_orjson.sh). The glibc armv7 row
-# sets no RUST_SETUP and uses stdlib json. The other interpreter pins are in
-# docker/images.toml, pyinstaller/Dockerfile, and the binaries jobs in
+# The Docker images use python:3.15 bases (docker/images.toml). This amd64v3
+# runtime, which the -amd64v3 images and binaries use, and the other release
+# binaries run CPython 3.14.
+# TODO: Move this runtime and the release binaries to CPython 3.15. The
+# orjson cp315 glibc wheels require glibc 2.39 or later, so on 3.15 the
+# binaries built on an older glibc compile orjson from source through
+# RUST_SETUP (pyinstaller/install_orjson.sh). The glibc armv7 row sets no
+# RUST_SETUP and uses stdlib json. The other interpreter pins for the
+# binaries are in pyinstaller/Dockerfile and the binaries jobs in
 # .github/workflows/release.yml.
 VERSION = "3.14.8"
 SOURCE_SHA = "c2215904f02b175596dc49351585104f4bc20341e1c47378b26a2c274360ce73"

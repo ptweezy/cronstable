@@ -101,7 +101,7 @@ FROM ghcr.io/ptweezy/cronstable:latest
 COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 ```
 
-The image is built from `python:3.14-slim` (a multi-stage build that copies a
+The image is built from `python:3.15-slim` (a multi-stage build that copies a
 self-contained venv into the runtime stage) and sets `PYTHONUNBUFFERED=1` and
 `PYTHONDONTWRITEBYTECODE=1`. It requires no writable paths at runtime. For the
 hardened Kubernetes/Docker setup (read-only root filesystem, dropped
@@ -124,8 +124,8 @@ also available explicitly as `-debian`:
 
 | Tag suffix | Base image | Python | Notes |
 | --- | --- | --- | --- |
-| *(none)* / `-debian` | `python:3.14-slim` | 3.14 | Default. Widest architecture coverage. |
-| `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
+| *(none)* / `-debian` | `python:3.15-slim` | 3.15 | Default. Widest architecture coverage. |
+| `-alpine` | `python:3.15-alpine` | 3.15 | musl libc; smallest image. |
 | `-ubuntu` | `ubuntu:26.04` | 3.14 | Ubuntu LTS userland. |
 | `-rhel` | UBI 10 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
 | `-fedora` | `fedora:45` | 3.15 | Leading-edge RPM userland. |
