@@ -1369,7 +1369,8 @@ async def test_a_task_reads_its_parameters(tmp_path, dag_cron, monkeypatch):
         "    'list': cli('list').stdout,\n"
         "    'dump': json.loads(cli('dump').stdout),\n"
         "}\n"
-        "open(" + repr(str(out)) + ", 'w').write(json.dumps(seen))\n"
+        "with open(" + repr(str(out)) + ", 'w') as f:\n"
+        "    f.write(json.dumps(seen))\n"
     )
     # the task's own environment loses to the run's parameter
     _set_cmd(
@@ -1847,9 +1848,9 @@ async def _nightly_run(cron, tmp_path, limit, logical=None, fail=True):
     """
     seen, ready = tmp_path / "seen.txt", tmp_path / "ready"
     load = (
-        "import os; from pathlib import Path; "
-        "limit = os.environ['CRONSTABLE_PARAM_LIMIT']; "
-        "open({!r}, 'a').write(limit + '\\n'); "
+        "import os; from pathlib import Path\n"
+        "limit = os.environ['CRONSTABLE_PARAM_LIMIT']\n"
+        "with open({!r}, 'a') as f: f.write(limit + '\\n')\n"
         "assert Path({!r}).exists()"
     ).format(str(seen), str(ready))
     _set_cmd(cron, "nightly", "load", [_PY, "-c", load])
