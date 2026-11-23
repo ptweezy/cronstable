@@ -1563,7 +1563,8 @@ async def test_a_job_reads_its_values_with_the_param_command(dag_cron, tmp_path)
         " 'missing': run('get', 'nope').returncode,"
         " 'list': run('list').stdout.split(),"
         " 'dump': json.loads(run('dump').stdout)}\n"
-        "open(" + repr(str(out)) + ", 'w').write(json.dumps(seen))\n"
+        "with open(" + repr(str(out)) + ", 'w') as f:\n"
+        "    f.write(json.dumps(seen))\n"
     )
     cron = await _cron(dag_cron, command=[_PY, "-c", script])
     await cron.start_job("report", {"region": "us", "dry": True})

@@ -106,6 +106,51 @@ try:
     )
 except ImportError:
     pass
+
+# On Windows, cryptography's compiled _rust module for Python 3.15 imports
+# python3t.dll, the forwarding stub for the abi3t stable ABI. PyInstaller
+# looks for an extension's DLLs in sys.base_prefix, the interpreter's
+# directory and PATH. With the python.org interpreter from setup-python it
+# finds python3t.dll in none of them, so the bundle leaves it out and the
+# frozen _rust import fails with "DLL load failed". Ask Windows which copy
+# the build interpreter loaded, and bundle that file next to python3X.dll.
+binaries = []
+
+
+def _loaded_dll_path(name):
+    """Return the path of a DLL loaded in this process, or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetModuleFileNameW.argtypes = [
+        wintypes.HMODULE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.GetModuleFileNameW.restype = wintypes.DWORD
+    handle = kernel32.GetModuleHandleW(name)
+    if not handle:
+        return None
+    buf = ctypes.create_unicode_buffer(32768)
+    if kernel32.GetModuleFileNameW(handle, buf, len(buf)) == 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buf.value
+
+
+if sys.platform == "win32":
+    try:
+        import cryptography.hazmat.bindings._rust  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        stub = _loaded_dll_path("python3t.dll")
+        if stub is not None:
+            print("cronstable.spec: bundling {}".format(stub))
+            binaries.append((stub, "."))
+
 # zeroconf (the `discovery` extra, behind web.bonjour): same guarded-import
 # pattern as pynacl above. It is LGPL-2.1; bundling is deliberate and paired
 # with the compliance kit (the in-binary notice behind --third-party-licenses,
@@ -240,7 +285,7 @@ if sys.platform == "win32":
 a = Analysis(
     ["cronstable"],
     pathex=["."],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

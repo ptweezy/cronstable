@@ -543,19 +543,76 @@ sleep() { echo "DELAY:$1"; }
         [f"VERIFY:{digest}  {archive}"] if fetched else []
     )
     # The script unpacks only a verified archive and runs the interpreter
-    # only from one: once for its version and once for the libpython and
-    # ssl probe.
+    # only from one: once for its version, once for the libpython and ssl
+    # probe, and once to drop the build flags the image gcc rejects.
     installed = fetched and digest_ok
     assert [line for line in out if line.startswith("UNPACK:")] == (
         [f"UNPACK:-xzf {archive} -C {prefix} --strip-components=1"]
         if installed
         else []
     )
+    cflags = (ROOT / ".github/scripts/pbs_cflags.py").as_posix()
     assert [line for line in out if line.startswith("RUN:")] == (
-        ["RUN:-VV", "RUN:-"] if installed else []
+        ["RUN:-VV", "RUN:-", f"RUN:{cflags}"] if installed else []
     )
     if not fetched:
         assert "still failing after 5 attempts" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # The sysconfig data module, with a literal that pprint split.
+        (
+            "'BASECFLAGS': '-fno-omit-frame-pointer "
+            "-mno-omit-leaf-frame-pointer '\n"
+            "               '-marm -mno-thumb -Wsign-compare',\n",
+            "'BASECFLAGS': '-fno-omit-frame-pointer '\n"
+            "               '-marm -Wsign-compare',\n",
+        ),
+        # The config Makefile.
+        (
+            "BASECFLAGS=-mno-thumb -marm\nCFLAGS=$(BASECFLAGS) -O3\n",
+            "BASECFLAGS=-marm\nCFLAGS=$(BASECFLAGS) -O3\n",
+        ),
+        # The JSON copy, where the flag ends a string.
+        ('"CFLAGS": "-marm -mno-thumb"', '"CFLAGS": "-marm "'),
+        # A longer flag that starts with a rejected one stays.
+        (
+            "-mno-thumb-interwork -mno-thumb",
+            "-mno-thumb-interwork ",
+        ),
+    ],
+)
+def test_rejected_frame_pointer_flags_leave_whole_tokens(text, expected):
+    # gcc rejects these two on armv7; the others in each sample stay.
+    flags = ["-mno-omit-leaf-frame-pointer", "-mno-thumb"]
+    assert load("pbs_cflags").strip_flags(text, flags) == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX compiler stub")
+def test_frame_pointer_flags_are_tested_like_configure(tmp_path):
+    # configure keeps a flag only when an empty file compiles with it and
+    # -Werror. The stub compiler rejects -mno-thumb, as armv7 gcc does.
+    compiler = tmp_path / "cc"
+    compiler.write_text(
+        "#!/bin/sh\n"
+        'echo "$*" >> "$0.log"\n'
+        "for arg; do\n"
+        '    [ "$arg" = -mno-thumb ] && exit 1\n'
+        "done\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    compiler.chmod(0o755)
+    pbs_cflags = load("pbs_cflags")
+    assert pbs_cflags.accepts([str(compiler)], "-marm")
+    assert not pbs_cflags.accepts([str(compiler)], "-mno-thumb")
+    calls = (tmp_path / "cc.log").read_text(encoding="utf-8").splitlines()
+    assert calls == [
+        f"-Werror {flag} -x c -c - -o {os.devnull}"
+        for flag in ("-marm", "-mno-thumb")
+    ]
 
 
 # The binaries-freebsd prepare script for one matrix row, safe to run on the

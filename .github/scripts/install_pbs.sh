@@ -61,3 +61,7 @@ if not sysconfig.get_config_var("Py_ENABLE_SHARED"):
     raise SystemExit("install_pbs.sh: interpreter has no shared libpython")
 print("install_pbs.sh: shared libpython, " + ssl.OPENSSL_VERSION)
 PY
+# python-build-standalone records the frame-pointer flags its clang accepts,
+# and the image gcc rejects some of them (on armv7, -mno-thumb), which fails
+# every extension source build. Keep only the flags gcc accepts.
+"$prefix/bin/python3" "$here/pbs_cflags.py"

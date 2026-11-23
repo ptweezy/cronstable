@@ -4091,7 +4091,8 @@ async def test_a_task_reads_the_logical_date_of_its_run(tmp_path, dag_cron):
     script = (
         "import os\n"
         "date = os.environ['CRONSTABLE_DAG_LOGICAL_DATE']\n"
-        "open({!r}, 'a').write(date + '\\n')\n".format(str(out))
+        "with open({!r}, 'a') as f:\n"
+        "    f.write(date + '\\n')\n".format(str(out))
     )
     _set_cmd(cron, "ld", "a", [_PY, "-c", script])
     res = await cron._dag.backfill(
@@ -8213,7 +8214,11 @@ async def test_a_lease_that_lapses_during_a_condition_read_starts_no_task(
     # `incremental` compares, so its lease runs out, and node B on another
     # host adopts the run
     marker = tmp_path / "incremental-ran"
-    ran = [_PY, "-c", "open(r'{}', 'a').write('x')".format(marker)]
+    ran = [
+        _PY,
+        "-c",
+        "with open(r'{}', 'a') as f: f.write('x')".format(marker),
+    ]
     a = await _when_cron(dag_cron, tmp_path, b"12\n")
     b = await _when_cron(dag_cron, tmp_path, b"12\n")
     b._state_host = "other-host"
@@ -8376,7 +8381,7 @@ async def test_a_lease_that_lapses_during_recovery_preparation_starts_no_task(
     ran = [
         _PY,
         "-c",
-        "open(r'{}').close(); open(r'{}', 'a').write('x')".format(
+        "open(r'{}').close()\nwith open(r'{}', 'a') as f: f.write('x')".format(
             fixed, marker
         ),
     ]
