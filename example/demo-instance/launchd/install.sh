@@ -7,7 +7,7 @@
 # and waits for the previous daemon and gateway to let go of their ports
 # before the next ones start (the comment above the bootout says why).
 #
-#   brew install cronstable cloudflared
+#   brew install ptweezy/tap/cronstable cloudflared
 #   cloudflared tunnel login
 #   cloudflared tunnel create cronstable-demo
 #   cloudflared tunnel route dns cronstable-demo demo.cronstable.com
@@ -45,7 +45,7 @@ if [ -n "${CRONSTABLE_BIN:-}" ]; then
     # nothing.
     CRONSTABLE="$(cd "$(dirname "$CRONSTABLE_BIN")" && pwd)/$(basename "$CRONSTABLE_BIN")"
 else
-    command -v cronstable >/dev/null || die "cronstable not on PATH (brew install cronstable, or set CRONSTABLE_BIN)"
+    command -v cronstable >/dev/null || die "cronstable not on PATH (brew install ptweezy/tap/cronstable, or set CRONSTABLE_BIN)"
     CRONSTABLE="$(command -v cronstable)"
 fi
 CRONSTABLE_DIR="$(dirname "$CRONSTABLE")"
