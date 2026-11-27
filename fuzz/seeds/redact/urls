@@ -3,4 +3,6 @@ redis://:onlypassword@cache:6379/0
 https://user:pa55word@example.com/path?q=1
 mongodb+srv://admin:hunter2@cluster0.example.net/db
 https://x-access-token:abc,def@github.example/owner/repo
+curl -xhttp://user:pa55word@proxy.example:3128
+access key AKIAIOSFODNN7EXAMPLEconnectinIdb+srv://admin:hunter2@cluster0.example.net/db
 plain https://example.com:8443/no/credentials

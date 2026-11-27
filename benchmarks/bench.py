@@ -5532,8 +5532,8 @@ def bench_redact_adversarial():
                     % (i, i, i % 5)
                 )
             elif r == 1:
-                # a scheme-char run + :// + a long tail with no @: the
-                # backtracking shape the anchored/bounded pattern exists for
+                # a scheme-char run + :// + a long tail with no @: a URL
+                # pattern that starts its match in the run backtracks here
                 out.append("retry %s://%s status=timeout" % (scheme_run, tail))
             elif r == 2:
                 out.append("PGPASSWORD=swordfish%d pg_dump --host prod" % i)
