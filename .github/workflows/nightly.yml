@@ -32,8 +32,10 @@ jobs:
       - name: Install Chromium
         run: |
           set -euo pipefail
+          . .github/scripts/retry.sh
           pip install playwright
-          python -m playwright install --with-deps chromium
+          # The retry covers a package mirror that the runner cannot reach.
+          retry 5 python -m playwright install --with-deps chromium
       - run: tox -e deep
 
   devmode:

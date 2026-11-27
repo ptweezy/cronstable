@@ -46,7 +46,8 @@ updates:
         patterns: ["*"]
 
   # scripts/generate_build_files.py writes /Dockerfile and docker/Dockerfile.*
-  # from docker/images.toml: apply a base-image bump there and rerun it. A uv
+  # and keeps the digest on each FROM line, so a digest bump there needs no
+  # other edit. A tag bump also needs the new tag in docker/images.toml. A uv
   # bump in pyinstaller/Dockerfile also moves SETUP_UV_VERSION in release.yml.
   # .clusterfuzzlite/Dockerfile pins the OSS-Fuzz builder's moving v1 tag by
   # digest, so its updates are digest bumps.

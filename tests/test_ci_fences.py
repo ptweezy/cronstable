@@ -171,6 +171,74 @@ def test_only_dispatches_and_main_pushes_reach_the_release_group():
         assert gated in str(con[key]), "{} lost the main-push gate".format(key)
 
 
+# --------------------------------------------------------------------------
+# One working run per commit
+# --------------------------------------------------------------------------
+
+# A commit on a branch of this repository raises a push event, and a pull
+# request from that branch raises a pull_request event for the same commit.
+# The push run does the work. This condition skips the work in the other run.
+SAME_REPO_PR = (
+    "github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name != github.repository"
+)
+
+
+def _needs(job):
+    needs = job.get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def _ancestors(jobs, name):
+    seen = set()
+    pending = _needs(jobs[name])
+    while pending:
+        parent = pending.pop()
+        if parent not in seen:
+            seen.add(parent)
+            pending.extend(_needs(jobs[parent]))
+    return seen
+
+
+def test_a_same_repository_pull_request_run_keeps_only_the_dco_check():
+    jobs = _workflow()["jobs"]
+    # A job with no `needs` starts on its own, so each one either carries
+    # the condition or is a job that the pull_request run keeps.
+    roots = {name for name, job in jobs.items() if not _needs(job)}
+    assert roots == {"version", "tox-static", "dco", "wiki"}, roots
+    for name in ("version", "tox-static"):
+        assert jobs[name]["if"] == SAME_REPO_PR, name
+    assert jobs["dco"]["if"] == "github.event_name == 'pull_request'"
+    assert "github.event_name == 'push'" in jobs["wiki"]["if"]
+    for name, job in jobs.items():
+        if name in roots:
+            continue
+        # A skipped job skips the jobs that need it, so the two conditions
+        # above reach every job that descends from them.
+        assert {"version", "tox-static"} & _ancestors(jobs, name), name
+        # A status function lets a job run after a skipped one. The rest of
+        # such a condition must be false in a pull_request run.
+        condition = str(job.get("if", ""))
+        if re.search(r"\b(always|cancelled|failure)\(\)", condition):
+            assert (
+                "needs.preflight.result == 'success'" in condition
+                or "github.ref == 'refs/heads/main'" in condition
+            ), "{} can run in a skipped pull_request run".format(name)
+
+
+def test_a_pull_request_run_and_its_push_run_do_not_share_a_group():
+    # In one group, the later of the two runs cancels the earlier one on
+    # every commit of a pull request from this repository.
+    con = _workflow()["concurrency"]
+    group = str(con["group"])
+    release = group.index("&& 'release'")
+    pull_request = group.index("github.event_name == 'pull_request' && 'pr'")
+    # The release arm comes first, so a release keeps its own group.
+    assert release < pull_request < group.index("|| 'ci'"), group
+    # A newer commit replaces the older run of its own kind.
+    assert "pull_request" not in str(con["cancel-in-progress"])
+
+
 def test_perf_gate_override_is_resolved_once_and_honoured_everywhere():
     # The override is resolved in ONE place (the decide step) and read in
     # three that must agree: the perf job's continue-on-error, its compare

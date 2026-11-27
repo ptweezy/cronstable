@@ -216,6 +216,24 @@ Commit the generated files with their inputs. CI runs the same verification
 before its static checks. Builds use the checked-in files directly and never
 run the generator.
 
+Base image digests are the one part of a generated file that has no separate
+input. `docker/images.toml` names each base image by repository and tag, and
+the `FROM` lines of the generated Dockerfile pin that tag to a digest. The
+generator reads the digests from the Dockerfile and writes them into each new
+render, so a Dependabot pull request that updates a digest leaves the file
+current. When Dependabot proposes a different tag, the verification fails
+until `docker/images.toml` names that tag.
+
+To build from a tag that the Dockerfile doesn't pin yet, name the tag in
+`docker/images.toml`, then give the generator its digest. The `Digest` line
+that `docker buildx imagetools inspect` prints is the digest of the tag's
+multi-arch index:
+
+```sh
+docker buildx imagetools inspect fedora:45
+python scripts/generate_build_files.py --pin fedora:45@sha256:<digest>
+```
+
 `requirements/min.txt` pins the minimum runtime and test dependency versions
 for `tox -e mindeps`. Each file in `pyinstaller/requirements/` holds one
 optional dependency's minimum version, and the binary build jobs choose which

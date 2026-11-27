@@ -5495,8 +5495,11 @@ def test_env_interp_unterminated_default_is_linear_not_quadratic():
     # re.sub restart its ``[^}]*`` default scan to end-of-string at every
     # ``${`` offset: O(n^2), a config-load / --validate-config / hot-reload
     # stall.  The hand-written scanner keeps it amortised linear; assert via
-    # growth ratio (~4x per 2x input before the fix, ~2x after) rather than
-    # wall-clock, so a slow CI box cannot flake it.
+    # growth ratio (4x runtime per 2x input for the quadratic scan, ~2x for
+    # the linear one) rather than wall-clock.  One sample of a few
+    # milliseconds can absorb a scheduler stall on a shared CI runner, so
+    # each size keeps its best of five interleaved runs, and an 8x input gap
+    # keeps linear (~8x) far from quadratic (~64x).
     import time
 
     # unterminated (no closing ``}``): every fragment is left verbatim, and a
@@ -5507,13 +5510,14 @@ def test_env_interp_unterminated_default_is_linear_not_quadratic():
     assert config._interpolate_env_value("}" + "${a:-" * 40, "p", "loc") == (
         "}" + "${a:-" * 40
     )
-    timings = []
-    for n in (16_000, 32_000, 64_000):
-        value = "${a:-" * n
-        started = time.perf_counter()
-        config._interpolate_env_value(value, "p", "loc")
-        timings.append(time.perf_counter() - started)
-    assert timings[2] < timings[0] * 8, timings  # quadratic would be ~16x
+    values = ["${a:-" * n for n in (8_000, 64_000)]
+    timings = [float("inf")] * len(values)
+    for _ in range(5):
+        for i, value in enumerate(values):
+            started = time.perf_counter()
+            config._interpolate_env_value(value, "p", "loc")
+            timings[i] = min(timings[i], time.perf_counter() - started)
+    assert timings[1] < timings[0] * 24, timings
 
 
 def test_env_interp_skip_is_structural_not_by_key_name(monkeypatch):
