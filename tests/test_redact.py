@@ -418,15 +418,15 @@ def test_unseparated_compound_key_names_redacted():
 
 
 def test_url_userinfo_pattern_is_linear_not_quadratic():
-    # a long run of scheme characters + "://" + a long '@'-less tail made
-    # the userinfo pattern restart its failing tail scan at every offset in
-    # the run: O(n^2), event-loop starvation on job-controlled stdout.  The
-    # anchored+bounded scheme keeps it amortised linear; assert via growth
-    # ratio (4x runtime per 2x input before the fix, ~2x after) rather than
-    # wall-clock.  One sample of about a millisecond can absorb a scheduler
-    # stall on a shared CI runner, so each size keeps its best of five
-    # interleaved runs, and an 8x input gap keeps linear (~8x) far from
-    # quadratic (~64x).
+    # A long run of scheme characters, then "://" and a long tail with no
+    # "@". A URL pattern that starts its match inside the run rescans the
+    # tail from every offset, which is quadratic and starves the event loop
+    # on output that a job controls. The pattern starts at "://", so the
+    # scan is linear. The assertion compares growth, because wall-clock
+    # time depends on the machine. One sample of about a millisecond can
+    # absorb a scheduler stall on a shared CI runner, so each size keeps
+    # its best of five interleaved runs, and an 8x input gap keeps linear
+    # (~8x) far from quadratic (~64x).
     import time
 
     lines = ["cdn-node." * (n // 9) + "://" + "x" * n for n in (8_000, 64_000)]
@@ -437,7 +437,7 @@ def test_url_userinfo_pattern_is_linear_not_quadratic():
             redact_secrets(line)
             timings[i] = min(timings[i], time.perf_counter() - started)
     assert timings[1] < timings[0] * 24, timings
-    # the anchor loses no real redactions
+    # the linear pattern redacts ordinary URLs
     out = redact_secrets("postgres://user:s3cret@db:5432/app")
     assert "s3cret" not in out and "user:" + REDACTED + "@db" in out
     out = redact_secrets("x redis://:SuperSecret123@cache:6379")
@@ -555,6 +555,55 @@ def test_a_second_pass_leaves_a_redacted_url_password_unchanged():
     assert redact_secrets(marked) == marked
     # a quoted value before an "@" runs on as one shell word
     assert redact_secrets('password="x"@tail') == "password=" + REDACTED
+
+
+def test_text_joined_to_a_url_scheme_does_not_hide_the_password():
+    # A later pattern replaces the access key ID in each line, so the URL
+    # pattern has to find the scheme behind the ID in the same pass. The
+    # first line is the fuzzer's, reduced.
+    for line, redacted in [
+        (
+            "AKIAIOSFODNN7EXAMPLEnectinIdb+srv://:h@",
+            REDACTED + "nectinIdb+srv://:" + REDACTED + "@",
+        ),
+        (
+            "-AKIAIOSFODNN7EXAMPLEs://:2@",
+            "-" + REDACTED + "s://:" + REDACTED + "@",
+        ),
+    ]:
+        assert redact_secrets(line) == redacted
+        assert redact_secrets(redacted) == redacted
+    # URLs with other text joined to the scheme. Each run of scheme
+    # characters before the "://" starts with "-" or a digit, or is longer
+    # than 32 characters.
+    for line, secret in [
+        ("curl -xhttp://user:hunter2@proxy:3128", "hunter2"),
+        ("psql -dpostgresql://app:s3cretpass@db:5432/app", "s3cretpass"),
+        ("12:00:07https://user:pa55word@example.com/path", "pa55word"),
+        ("db-1.internal.example.net.postgres://app:s3cret@db", "s3cret"),
+    ]:
+        once = redact_secrets(line)
+        assert once == line.replace(secret, REDACTED), (line, once)
+        assert redact_secrets(once) == once
+
+
+def test_url_password_is_redacted_only_after_a_scheme():
+    # a scheme ends in a letter, or in a letter and then digits, "+", "."
+    # or "-"
+    for scheme in ("https", "s3", "socks5", "mongodb+srv", "x-1.0"):
+        line = scheme + "://user:hunter2@host"
+        assert redact_secrets(line) == scheme + "://user:" + REDACTED + "@host"
+    # the letter is one of the last 32 characters before the "://"
+    line = "x" + "1" * 31 + "://user:hunter2@host"
+    assert redact_secrets(line) == line.replace("hunter2", REDACTED)
+    for line in [
+        "x" + "1" * 32 + "://user:hunter2@host",
+        "://user:hunter2@host",
+        "see ://user:hunter2@host",
+        "12://user:hunter2@host",
+        "\u00e9://user:hunter2@host",
+    ]:
+        assert redact_secrets(line) == line
 
 
 # ---------------------------------------------------------------------------

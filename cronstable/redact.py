@@ -51,6 +51,28 @@ _KEY_KEYWORDS: tuple[str, ...] = (
     "rediscli[_-]?auth",
 )
 
+#: How many characters before a ``://`` :func:`_redact_url_password` reads
+#: to find the end of a URL scheme.
+_SCHEME_END_WINDOW = 32
+
+
+def _redact_url_password(match: re.Match[str]) -> str:
+    """Redact the password in a ``://user:password@`` match that follows a
+    URL scheme.
+
+    A scheme ends in a letter, or in a letter and then digits, ``+``, ``.``
+    or ``-``, as ``https`` and ``socks5`` do. The check reads only that
+    end, within :data:`_SCHEME_END_WINDOW` characters, so text joined to
+    the front of the scheme cannot hide the URL. Without a scheme, the
+    function returns the match unchanged.
+    """
+    start = match.start()
+    before = match.string[max(start - _SCHEME_END_WINDOW, 0) : start]
+    last_letter = before.rstrip("0123456789+.-")[-1:]
+    if not (last_letter.isascii() and last_letter.isalpha()):
+        return match.group(0)
+    return f"{match.group(1)}{REDACTED}{match.group(3)}"
+
 
 # (compiled pattern, replacement) applied in order.  Replacements that need to
 # keep surrounding context (a key name, a URL host) use a callable; the rest
@@ -117,20 +139,20 @@ _PATTERNS: list[tuple[re.Pattern, _Repl]] = [
     # carry a password with no user -- has an empty username, and requiring a
     # username here leaked those passwords verbatim.  The ``@`` anchor keeps a
     # plain ``host:port`` URL (no userinfo) from matching.
-    # The scheme is ANCHORED (the lookbehind) and BOUNDED ({0,31}): without
-    # the anchor, a long run of scheme characters followed by ``://`` and a
-    # long ``@``-less tail restarts the failing tail scan at every offset in
-    # the run -- O(run) x O(tail) backtracking, a job-controlled ReDoS that
-    # measured a clean 4x per input doubling and blocks the event loop for
-    # the whole archive pass.  With one viable start per run the scan is
-    # amortised linear; the bound is belt-and-braces (real schemes are
-    # < 12 chars) so a pathological run also fails in O(32).
+    # The match starts at the literal "://", which lets sre jump between its
+    # occurrences, and each occurrence starts one scan. Neither the user
+    # name nor the password can contain "/", so a scan stops before the
+    # next "://" and a long line costs linear time, whatever run of scheme
+    # characters comes before a "://".
+    # _redact_url_password checks for the scheme and reads only its end, so
+    # text joined to the front of a scheme cannot hide the URL. The pattern
+    # redacts the password in "-xhttp://user:PASSWORD@proxy", and one whose
+    # scheme follows an access key ID that a later pattern replaces. REDACTED
+    # ends in "*", which cannot end a scheme, so a second pass over the
+    # result finds no new URL and changes nothing.
     (
-        re.compile(
-            r"(?<![a-zA-Z0-9+.\-])"
-            r"([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^:/\s@]*:)([^@/\s]+)(@)"
-        ),
-        lambda m: f"{m.group(1)}{REDACTED}{m.group(3)}",
+        re.compile(r"(://[^:/\s@]*:)([^@/\s]+)(@)"),
+        _redact_url_password,
     ),
     # Authorization: Bearer <token> / Basic <base64 user:pass>.  The Basic
     # form is anchored to the header name: "basic" is an ordinary English

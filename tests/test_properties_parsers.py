@@ -410,6 +410,7 @@ _KEY = st.sampled_from(
 @example('password: "abc" and more text')
 @example('AWS_SECRET_ACCESS_KEY="not-"-real-secret-123"')
 @example("lis://password:on�}passwo@d@Z\x1elo")
+@example("AKIAIOSFODNN7EXAMPLEnectinIdb+srv://:h@")
 def test_redaction_is_total_and_stable(text):
     once = redact_secrets(text)
     assert isinstance(once, str)
