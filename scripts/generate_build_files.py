@@ -1,7 +1,14 @@
 """Generate build inputs from pyproject.toml and the Docker image definitions.
 
-Run: python scripts/generate_build_files.py [--check].
+Run: python scripts/generate_build_files.py [--check] [--pin REFERENCE].
 Generated files stay checked in, so builds do not need a generation step.
+
+docker/images.toml names each base image by repository and tag. The digest
+that pins the tag lives on the FROM lines of the generated Dockerfile, and
+the generator carries it into each new render. Dependabot updates a digest
+there, and the result is a current file. --pin IMAGE:TAG@sha256:DIGEST sets
+the digest of a tag that a Dockerfile does not pin yet.
+
 This script uses only the standard library.
 """
 
@@ -19,6 +26,10 @@ TOKENS = re.compile(r"@@([a-z_]+)@@")
 # Scorecard parses the template as a Dockerfile, so a block placeholder
 # inside a LABEL is a "# @@name@@" comment; it renders like "@@name@@".
 COMMENTED_BLOCK = re.compile(r"# (@@[a-z_]+@@)")
+FROM_REFERENCE = re.compile(r"(?im)^FROM\s+(?:--\S+\s+)*(\S+)")
+PINNED_REFERENCE = re.compile(r"([^\s@]+)@(sha256:[0-9a-f]{64})")
+IMAGES = "docker/images.toml"
+COMMAND = "python scripts/generate_build_files.py"
 IMAGE_DEFAULTS = dict.fromkeys(
     (
         "build_args",
@@ -76,6 +87,55 @@ def minimum_requirements(project):
     return pins
 
 
+class PinError(ValueError):
+    """A base image has no usable digest."""
+
+
+def repository(name):
+    """Return an image name without its tag, keeping a registry port."""
+    head, colon, tag = name.rpartition(":")
+    return head if colon and "/" not in tag else name
+
+
+def base_image_pins(dockerfile, path):
+    """Map each image that a Dockerfile's FROM lines pin to its digest."""
+    pins = {}
+    for reference in FROM_REFERENCE.findall(dockerfile):
+        pinned = PINNED_REFERENCE.fullmatch(reference)
+        if pinned and pins.setdefault(pinned[1], pinned[2]) != pinned[2]:
+            raise PinError(f"{path} pins {pinned[1]} to two digests.")
+    return pins
+
+
+def pin_base_images(image, pins, path):
+    """Return an image's FROM references, each with its pinned digest."""
+    references = {"builder": image["builder"]}
+    if "runtime" in image:
+        references["runtime"] = image["runtime"]
+    for key, name in references.items():
+        if "@" in name:
+            raise PinError(
+                f"{IMAGES} names a digest in {name}. Name the repository"
+                f" and tag there, and keep the digest on the FROM lines of"
+                f" {path}."
+            )
+        if name in pins:
+            references[key] = f"{name}@{pins[name]}"
+            continue
+        add = f"{COMMAND} --pin {name}@sha256:DIGEST"
+        other = sorted(
+            pin for pin in pins if repository(pin) == repository(name)
+        )
+        if other:
+            raise PinError(
+                f"{path} pins {other[0]}, but {IMAGES} declares {name}."
+                f" To build from {other[0]}, name it in {IMAGES}. To build"
+                f" from {name}, run: {add}"
+            )
+        raise PinError(f"{path} pins no digest for {name}. Run: {add}")
+    return references
+
+
 def render_dockerfile(template, image, orjson_requirement):
     values = IMAGE_DEFAULTS | image
     values.setdefault("runtime", values["builder"])
@@ -95,7 +155,7 @@ def render_dockerfile(template, image, orjson_requirement):
     return "\n".join(lines) + "\n"
 
 
-def generated_files(root=ROOT):
+def generated_files(root=ROOT, pins=None):
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
     dev = project["optional-dependencies"]["dev"]
     files = {
@@ -122,11 +182,44 @@ def generated_files(root=ROOT):
             "Docker image definitions must match the release matrix"
         )
     template = (root / "docker/templates/Dockerfile").read_text()
+    requested = dict(pins or {})
+    declared = set()
+    problems = []
     for row in matrix:
+        path = root / row["dockerfile"]
+        image = images[row["distro"]]
+        declared.update((image["builder"], image.get("runtime", "")))
+        try:
+            # A requested pin replaces the digest the Dockerfile holds.
+            current = base_image_pins(
+                path.read_text(encoding="utf-8") if path.exists() else "",
+                row["dockerfile"],
+            )
+            image = image | pin_base_images(
+                image, current | requested, row["dockerfile"]
+            )
+        except PinError as error:
+            problems.append(str(error))
+            continue
         files[row["dockerfile"]] = render_dockerfile(
-            template, images[row["distro"]], floors["orjson"]
+            template, image, floors["orjson"]
         )
+    problems.extend(
+        f"{IMAGES} declares no base image named {name}."
+        for name in sorted(set(requested) - declared)
+    )
+    if problems:
+        raise PinError("\n".join(problems))
     return files
+
+
+def pin_argument(value):
+    pinned = PINNED_REFERENCE.fullmatch(value)
+    if pinned is None:
+        raise argparse.ArgumentTypeError(
+            f"expected IMAGE:TAG@sha256:DIGEST, got {value!r}"
+        )
+    return pinned[1], pinned[2]
 
 
 def main(argv=None):
@@ -134,9 +227,24 @@ def main(argv=None):
     parser.add_argument(
         "--check", action="store_true", help="fail on stale files"
     )
+    parser.add_argument(
+        "--pin",
+        action="append",
+        default=[],
+        type=pin_argument,
+        metavar="IMAGE:TAG@sha256:DIGEST",
+        help="pin a base image to this digest in the generated Dockerfiles",
+    )
     args = parser.parse_args(argv)
+    if args.check and args.pin:
+        parser.error("--pin writes files, so it cannot run with --check")
+    try:
+        files = generated_files(ROOT, dict(args.pin))
+    except PinError as error:
+        print(error)
+        return 1
     stale = []
-    for relative, content in generated_files(ROOT).items():
+    for relative, content in files.items():
         path = ROOT / relative
         if path.exists() and path.read_bytes() == content.encode("utf-8"):
             continue

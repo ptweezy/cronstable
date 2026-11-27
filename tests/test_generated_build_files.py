@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,29 @@ import pytest
 from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[1]
+DIGEST = "sha256:" + "a" * 64
+
+
+def copy_build_inputs(root):
+    """Copy what the generator reads, with each Dockerfile's pinned digests."""
+    matrix = json.loads((ROOT / ".github/docker-matrix.json").read_text())
+    for name in (
+        "pyproject.toml",
+        "docker/images.toml",
+        "docker/templates/Dockerfile",
+        ".github/docker-matrix.json",
+        *(row["dockerfile"] for row in matrix),
+    ):
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, target)
+    return matrix
+
+
+def from_lines(dockerfile):
+    return [
+        line for line in dockerfile.splitlines() if line.startswith("FROM ")
+    ]
 
 
 @pytest.fixture
@@ -93,15 +117,7 @@ def test_push_dependencies_resolve_without_vulnerable_legacy_crypto(
 def test_dependency_bump_reaches_min_pins_binary_and_every_image(
     generator, tmp_path
 ):
-    for name in (
-        "pyproject.toml",
-        "docker/images.toml",
-        "docker/templates/Dockerfile",
-        ".github/docker-matrix.json",
-    ):
-        target = tmp_path / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(ROOT / name, target)
+    matrix = copy_build_inputs(tmp_path)
     project = tmp_path / "pyproject.toml"
     data = generator.tomllib.loads(project.read_text())["project"]
     original = generator.extra_floors(data)["orjson"]
@@ -113,7 +129,6 @@ def test_dependency_bump_reaches_min_pins_binary_and_every_image(
         for line in files["requirements/dev-freethreaded.txt"].splitlines()
     )
     assert files["pyinstaller/requirements/orjson.txt"] == "orjson>=99.0\n"
-    matrix = json.loads((tmp_path / ".github/docker-matrix.json").read_text())
     for row in matrix:
         assert 'install_orjson.sh "orjson>=99.0"' in files[row["dockerfile"]]
 
@@ -125,13 +140,200 @@ def test_check_reports_stale_files_without_writing(
     path.write_text("old\n")
     monkeypatch.setattr(generator, "ROOT", tmp_path)
     monkeypatch.setattr(
-        generator, "generated_files", lambda root: {path.name: "new\n"}
+        generator,
+        "generated_files",
+        lambda root, pins=None: {path.name: "new\n"},
     )
     assert generator.main(["--check"]) == 1
     assert path.read_text() == "old\n"
     assert generator.main([]) == 0
     assert path.read_bytes() == b"new\n"
     assert generator.main(["--check"]) == 0
+
+
+def test_every_generated_dockerfile_pins_its_base_images(generator):
+    matrix = json.loads((ROOT / ".github/docker-matrix.json").read_text())
+    for row in matrix:
+        references = generator.FROM_REFERENCE.findall(
+            (ROOT / row["dockerfile"]).read_text()
+        )
+        assert len(references) == 2, row["dockerfile"]
+        for reference in references:
+            assert generator.PINNED_REFERENCE.fullmatch(reference), reference
+
+
+def test_the_image_definitions_carry_no_digest(generator, tmp_path):
+    # A digest in docker/images.toml would be a second copy that Dependabot
+    # cannot update.
+    images = generator.tomllib.loads((ROOT / "docker/images.toml").read_text())
+    for image in images.values():
+        assert "@" not in image["builder"] + image.get("runtime", "")
+    copy_build_inputs(tmp_path)
+    definitions = tmp_path / "docker/images.toml"
+    declared = images["fedora"]["builder"]
+    definitions.write_text(
+        definitions.read_text().replace(
+            f'"{declared}"', f'"{declared}@{DIGEST}"'
+        )
+    )
+    with pytest.raises(generator.PinError, match="names a digest"):
+        generator.generated_files(tmp_path)
+
+
+def test_a_digest_bump_in_a_dockerfile_leaves_it_current(generator, tmp_path):
+    # Dependabot changes only the digests on a generated Dockerfile's FROM
+    # lines. The generator renders the same file from them.
+    matrix = copy_build_inputs(tmp_path)
+    for row in matrix:
+        path = tmp_path / row["dockerfile"]
+        bumped, count = re.subn(
+            r"@sha256:[0-9a-f]{64}", "@" + DIGEST, path.read_text()
+        )
+        assert count == 2, row["dockerfile"]
+        path.write_text(bumped)
+    files = generator.generated_files(tmp_path)
+    for row in matrix:
+        current = (tmp_path / row["dockerfile"]).read_text()
+        assert files[row["dockerfile"]] == current
+        assert all(DIGEST in line for line in from_lines(current))
+
+
+def test_a_tag_bump_in_a_dockerfile_waits_for_the_image_definition(
+    generator, tmp_path
+):
+    copy_build_inputs(tmp_path)
+    dockerfile = tmp_path / "docker/Dockerfile.fedora"
+    definitions = tmp_path / "docker/images.toml"
+    declared = generator.tomllib.loads(definitions.read_text())["fedora"][
+        "builder"
+    ]
+    bumped = declared + "-next"
+    dockerfile.write_text(
+        dockerfile.read_text().replace(declared + "@", bumped + "@")
+    )
+    with pytest.raises(generator.PinError) as error:
+        generator.generated_files(tmp_path)
+    assert f"docker/Dockerfile.fedora pins {bumped}" in str(error.value)
+    assert f"docker/images.toml declares {declared}" in str(error.value)
+    definitions.write_text(
+        definitions.read_text().replace(f'"{declared}"', f'"{bumped}"')
+    )
+    files = generator.generated_files(tmp_path)
+    assert files["docker/Dockerfile.fedora"] == dockerfile.read_text()
+
+
+def test_a_requested_pin_sets_the_digest_on_every_from_line(
+    generator, tmp_path
+):
+    copy_build_inputs(tmp_path)
+    definitions = tmp_path / "docker/images.toml"
+    declared = generator.tomllib.loads(definitions.read_text())["ubuntu"][
+        "builder"
+    ]
+    moved = generator.repository(declared) + ":next"
+    definitions.write_text(
+        definitions.read_text().replace(f'"{declared}"', f'"{moved}"')
+    )
+    # A tag that no Dockerfile pins yet needs a digest from the caller.
+    with pytest.raises(generator.PinError, match=f"--pin {moved}@sha256:"):
+        generator.generated_files(tmp_path)
+    files = generator.generated_files(tmp_path, {moved: DIGEST})
+    assert from_lines(files["docker/Dockerfile.ubuntu"]) == [
+        f"FROM {moved}@{DIGEST} AS builder",
+        f"FROM {moved}@{DIGEST}",
+    ]
+    # A requested pin also replaces a digest that a Dockerfile holds.
+    debian = generator.tomllib.loads(definitions.read_text())["debian"][
+        "builder"
+    ]
+    files = generator.generated_files(
+        tmp_path, {moved: DIGEST, debian: DIGEST}
+    )
+    assert from_lines(files["Dockerfile"]) == [
+        f"FROM {debian}@{DIGEST} AS builder",
+        f"FROM {debian}@{DIGEST}",
+    ]
+
+
+def test_a_pin_for_an_undeclared_image_is_refused(generator, tmp_path):
+    copy_build_inputs(tmp_path)
+    with pytest.raises(
+        generator.PinError,
+        match="declares no base image named example.invalid/base:1",
+    ):
+        generator.generated_files(tmp_path, {"example.invalid/base:1": DIGEST})
+
+
+def test_one_dockerfile_cannot_pin_an_image_to_two_digests(
+    generator, tmp_path
+):
+    copy_build_inputs(tmp_path)
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        re.sub(
+            r"@sha256:[0-9a-f]{64}",
+            "@" + DIGEST,
+            dockerfile.read_text(),
+            count=1,
+        )
+    )
+    with pytest.raises(generator.PinError, match="Dockerfile pins .* to two"):
+        generator.generated_files(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("fedora:45", "fedora"),
+        ("opensuse/leap:16.0", "opensuse/leap"),
+        ("registry.example:5000/base:1", "registry.example:5000/base"),
+        ("registry.example:5000/base", "registry.example:5000/base"),
+    ],
+)
+def test_repository_drops_only_the_tag(generator, name, expected):
+    assert generator.repository(name) == expected
+
+
+def test_main_reports_a_missing_pin_then_accepts_one(
+    generator, tmp_path, monkeypatch, capsys
+):
+    copy_build_inputs(tmp_path)
+    monkeypatch.setattr(generator, "ROOT", tmp_path)
+    assert generator.main([]) == 0
+    assert generator.main(["--check"]) == 0
+    definitions = tmp_path / "docker/images.toml"
+    declared = generator.tomllib.loads(definitions.read_text())["alpine"][
+        "builder"
+    ]
+    moved = generator.repository(declared) + ":next"
+    definitions.write_text(
+        definitions.read_text().replace(f'"{declared}"', f'"{moved}"')
+    )
+    before = (tmp_path / "docker/Dockerfile.alpine").read_text()
+    capsys.readouterr()
+    assert generator.main(["--check"]) == 1
+    assert f"--pin {moved}@sha256:DIGEST" in capsys.readouterr().out
+    assert generator.main([]) == 1
+    assert (tmp_path / "docker/Dockerfile.alpine").read_text() == before
+    assert generator.main(["--pin", f"{moved}@{DIGEST}"]) == 0
+    assert generator.main(["--check"]) == 0
+    assert f"FROM {moved}@{DIGEST}" in (
+        tmp_path / "docker/Dockerfile.alpine"
+    ).read_text()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--pin", "fedora:45"],
+        ["--pin", "fedora:45@sha256:abc"],
+        ["--check", "--pin", "fedora:45@" + DIGEST],
+    ],
+)
+def test_main_rejects_an_unusable_pin_request(generator, arguments):
+    with pytest.raises(SystemExit) as exit_info:
+        generator.main(arguments)
+    assert exit_info.value.code == 2
 
 
 @pytest.fixture
