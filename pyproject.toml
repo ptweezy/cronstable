@@ -57,7 +57,7 @@ dependencies = [
     "aiohttp>=3.14.4,<4",
     # 2.8.0 fixes CVE-2024-40647, which can expose environment variables to
     # subprocesses.
-    "sentry-sdk>=2.8.0,<3",
+    "sentry-sdk>=2.8.0,<4",
     # 5.1.3 carries the SMTP command-injection and STARTTLS
     # response-injection fixes (CVE-2026-53533, CVE-2026-55558).
     "aiosmtplib>=5.1.3,<6",
