@@ -1,10 +1,14 @@
 name: CI
 
-# Every push (any branch) and pull request runs the static and package
-# checks, then the tox matrix beside the build fan-out: PyInstaller binaries,
-# Docker images (build-only), and the `perf` benchmark against the latest
-# release tag. A release gates on ALL of it except the macOS 26 rows. Outside
-# a release, only wiki/ is published (the ungated `wiki` job, on `main`).
+# Every commit runs the static and package checks, then the tox matrix beside
+# the build fan-out: PyInstaller binaries, Docker images (build-only), and the
+# `perf` benchmark against the latest release tag. A push to any branch of
+# this repository runs it, and so does a pull request from a fork. The pushes
+# to a branch of this repository test a pull request from that branch, so
+# the pull request's own run only checks the DCO (see `SAME_REPO_PR` in
+# tests/test_ci_fences.py). A release gates on ALL of it except the macOS 26
+# rows. Outside a release, only wiki/ is published (the ungated `wiki` job,
+# on `main`).
 #
 # A release happens ONLY on:
 #   - a push to `main` where a pushed commit SUBJECT starts with a marker:
@@ -35,7 +39,7 @@ name: CI
 on:
   push:
     branches: ["**"]  # build + test on every commit, on every branch
-  pull_request:       # and on every PR (covers fork PRs, which don't push here)
+  pull_request:       # fork PRs, which don't push here, and the DCO check
   workflow_dispatch:
     inputs:
       bump:
@@ -53,11 +57,14 @@ on:
         options: [gate, accept, ignore]
         default: gate
 
-# One in-flight run per (head repo, branch, kind); a same-repo push and its PR
-# share a group. The HEAD repo keeps a fork PR from a branch named `main` out
-# of the push-to-main group, where it would cancel a release mid-publish. The
-# kind gives releases their own group: `cancel-in-progress: false` protects
-# only a started run, and a queued one loses its slot to the next push.
+# One in-flight run per (head repo, branch, kind). The kind is `release`,
+# `pr` or `ci`. `pr` keeps a pull_request run apart from the push run of the
+# same commit, so neither cancels the other, and a newer commit replaces
+# the older run of its own kind. The HEAD repo keeps a fork PR from a branch
+# named `main` out of the push-to-main group, where it would cancel a release
+# mid-publish. `release` gives releases their own group:
+# `cancel-in-progress: false` protects only a started run, and a queued one
+# loses its slot to the next push.
 #
 # The release test is a loose superset of `decide` (a false negative could
 # cancel a publish): any dispatch, or a push to `main` that has a message
@@ -65,7 +72,7 @@ on:
 # Like `decide`, it ignores pull requests and other branches, so their runs
 # stay cancellable when they carry `[release` commits from main.
 concurrency:
-  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) && 'release' || 'ci' }}
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) && 'release' || github.event_name == 'pull_request' && 'pr' || 'ci' }}
   cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) }}
 
 # Least-privilege default for all jobs; the publish jobs opt up to the narrower
@@ -97,7 +104,13 @@ jobs:
   # version every builder pins through SETUPTOOLS_SCM_PRETEND_VERSION. One job,
   # so both steps share a full-history checkout. This file runs on every branch
   # and PR, so the decide step enforces the main-only release rule.
+  #
+  # `version` and `tox-static` are the two jobs that every build and test job
+  # needs, so their shared `if` decides whether a run does the work. It skips
+  # the pull_request run of a commit from a branch of this repository: the
+  # push run of that commit already tests it. Such a run keeps only `dco`.
   version:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     outputs:
       release: ${{ steps.d.outputs.release }}
@@ -337,6 +350,8 @@ jobs:
           retention-days: 7
 
   tox-static:
+    # The same condition as `version`; see the comment there.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
